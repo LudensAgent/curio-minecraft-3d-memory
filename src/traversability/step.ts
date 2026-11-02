@@ -185,17 +185,39 @@ function overlaps(min1: number, max1: number, min2: number, max2: number): boole
   return max1 > min2 && min1 < max2;
 }
 
-/** True when [segMin, segMax] is fully inside the union of the given intervals. */
-function covered(intervals: ReadonlyArray<readonly [number, number]>, segMin: number, segMax: number): boolean {
-  if (intervals.length === 0) return false;
+/**
+ * Maximal closed sub-intervals of [segMin, segMax] that no support interval
+ * covers. Intervals are open (positive-area contact only), so edge contact and
+ * intervals that merely touch at an endpoint do not count as support.
+ */
+function uncoveredGaps(
+  intervals: ReadonlyArray<readonly [number, number]>,
+  segMin: number,
+  segMax: number,
+): Array<[number, number]> {
   const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
   const merged: Array<[number, number]> = [];
   for (const [lo, hi] of sorted) {
     const last = merged[merged.length - 1];
-    if (last === undefined || lo > last[1] + EPS) merged.push([lo, hi]);
-    else last[1] = Math.max(last[1], hi);
+    if (last !== undefined && lo < last[1]) last[1] = Math.max(last[1], hi);
+    else merged.push([lo, hi]);
   }
-  return merged.some(([lo, hi]) => lo <= segMin + EPS && hi >= segMax - EPS);
+
+  const gaps: Array<[number, number]> = [];
+  let cursor = segMin;
+  for (const [lo, hi] of merged) {
+    if (hi <= cursor) continue;
+    if (lo > segMax) break;
+    if (lo >= cursor) {
+      gaps.push([cursor, Math.min(lo, segMax)]);
+      cursor = hi;
+    } else {
+      cursor = hi; // cursor is strictly inside (lo, hi)
+    }
+    if (cursor >= segMax) break;
+  }
+  if (cursor <= segMax) gaps.push([cursor, segMax]);
+  return gaps;
 }
 
 /**
@@ -312,20 +334,21 @@ export function evaluateWalkStep(
 
   const neighborRead: NeighborRead = {
     cell(x, y, z) {
+      const pos = { x, y, z };
       const read = readCell(x, y, z);
       switch (read.kind) {
         case 'observed':
-          return { kind: 'observed', state: read.evidence.observation.state };
+          return { pos, kind: 'observed', state: read.evidence.observation.state };
         case 'missing':
-          return { kind: 'unobserved' };
+          return { pos, kind: 'unobserved' };
         case 'incomplete':
-          return { kind: 'incomplete' };
+          return { pos, kind: 'incomplete' };
         case 'stale':
-          return { kind: 'stale', reason: 'stale' };
+          return { pos, kind: 'stale', reason: 'stale' };
         case 'expired':
-          return { kind: 'stale', reason: 'expired' };
+          return { pos, kind: 'stale', reason: 'expired' };
         case 'session':
-          return { kind: 'stale', reason: 'session' };
+          return { pos, kind: 'stale', reason: 'session' };
       }
     },
   };
@@ -364,8 +387,8 @@ export function evaluateWalkStep(
       continue;
     }
     if (shape.kind === 'gap') {
-      if (shape.view.kind === 'stale') acc.staleCells.push(cell);
-      else acc.unknownCells.push(cell);
+      if (shape.view.kind === 'stale') acc.staleCells.push(shape.view.pos);
+      else acc.unknownCells.push(shape.view.pos);
       continue;
     }
     for (const box of shape.shape.boxes) {
@@ -465,8 +488,8 @@ export function evaluateWalkStep(
               continue;
             }
             if (shape.kind === 'gap') {
-              if (shape.view.kind === 'stale') staleCellsHere.push(cell);
-              else unknownCellsHere.push(cell);
+              if (shape.view.kind === 'stale') staleCellsHere.push(shape.view.pos);
+              else unknownCellsHere.push(shape.view.pos);
               continue;
             }
             for (const face of shape.shape.supportFaces) {
@@ -488,7 +511,8 @@ export function evaluateWalkStep(
       }
     }
 
-    if (covered(intervals, segMin, segMax)) return;
+    const gaps = uncoveredGaps(intervals, segMin, segMax);
+    if (gaps.length === 0) return;
     if (unsupportedCells.length > 0) {
       if (acc.unsupported === null) {
         acc.unsupported = {
@@ -505,12 +529,20 @@ export function evaluateWalkStep(
       acc.unknownCells.push(...unknownCellsHere);
       return;
     }
-    // Every candidate support cell was confirmed, yet none provides a face covering the sweep.
+    // Every candidate support cell was confirmed, yet some part of the sweep is
+    // uncovered — report the support cell under that gap, not the move start.
     if (acc.blocked === null) {
-      const supportCell: Vec3Like = { x: Math.floor(from.x), y: floorY - 1, z: Math.floor(from.z) };
+      const supportY = Number.isInteger(fy) ? floorY - 1 : floorY;
+      const gapCells = gaps.map(([gapLo, gapHi]) => {
+        const along = Math.floor((gapLo + gapHi) / 2);
+        const perp = Math.floor(perpCoord);
+        return axis === 'x'
+          ? { x: along, y: supportY, z: perp }
+          : { x: perp, y: supportY, z: along };
+      });
       acc.blocked = {
         reason: `no support under the move at feet height ${fy}`,
-        problem: { kind: 'missing_support', cells: [supportCell], detail: `no standable surface at y=${fy} covers the swept footprint` },
+        problem: { kind: 'missing_support', cells: gapCells, detail: `no standable surface at y=${fy} covers the swept footprint` },
         obstacles: [],
       };
     }

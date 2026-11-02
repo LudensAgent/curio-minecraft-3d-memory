@@ -51,6 +51,28 @@ function gateMap(): VoxelMap {
   return map;
 }
 
+/**
+ * Body from x=14.5 to x=15.5 (sweep stays in section cx=0); gate at x=15; the
+ * gate's required neighbour is x=16, in section cx=1 — read only by the shape
+ * rule, never by the body sweep.
+ */
+function gateMap15(): VoxelMap {
+  const map = new VoxelMap('world');
+  fill(map, STONE, [
+    [14, -1, 0],
+    [15, -1, 0],
+  ]);
+  fill(map, AIR, [
+    [14, 0, 0],
+    [14, 1, 0],
+    [15, 1, 0],
+  ]);
+  map.observe(obs(GATE, { x: 15, y: 0, z: 0 }));
+  return map;
+}
+
+const q15 = stepQuery({ body: bodyAt(14.5, 0, 0.5) });
+
 describe('neighbour-dependent shape rules', () => {
   it('neighbour state changes the gate shape and therefore the conclusion', () => {
     const map = gateMap();
@@ -64,36 +86,86 @@ describe('neighbour-dependent shape rules', () => {
   });
 
   it('a neighbour in another section locally invalidates the cached result', () => {
-    const map = new VoxelMap('world');
-    fill(map, STONE, [
-      [15, -1, 0],
-      [16, -1, 0],
-    ]);
-    fill(map, AIR, [
-      [15, 0, 0],
-      [15, 1, 0],
-      [16, 1, 0],
-    ]);
-    map.observe(obs(GATE, { x: 16, y: 0, z: 0 }));
-    map.observe(obs(AIR, { x: 17, y: 0, z: 0 })); // front is in section cx=1
+    const map = gateMap15();
+    map.observe(obs(AIR, { x: 16, y: 0, z: 0 })); // neighbour in section cx=1
     const cache = new TraversabilityCache(map, { now: () => 2000 });
-    const q = stepQuery({ body: bodyAt(15.5, 0, 0.5) });
 
-    expect(cache.get(q, gateProvider).status).toBe('OPEN');
+    expect(cache.get(q15, gateProvider).status).toBe('OPEN');
 
-    cache.invalidate(map.observe(obs(STONE, { x: 17, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 })));
-    expect(cache.get(q, gateProvider).status).toBe('BLOCKED');
+    cache.invalidate(map.observe(obs(STONE, { x: 16, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 })));
+    expect(cache.get(q15, gateProvider).status).toBe('BLOCKED');
   });
 
   it('an unobserved neighbour is a gap, and first observation recovers', () => {
-    const map = gateMap(); // (2,0,0) left unobserved
+    const map = gateMap15(); // (16,0,0) left unobserved → section cx=1 missing
     const cache = new TraversabilityCache(map, { now: () => 2000 });
-    const q = stepQuery();
 
-    expect(cache.get(q, gateProvider).status).toBe('UNKNOWN');
+    expect(cache.get(q15, gateProvider).status).toBe('UNKNOWN');
 
-    cache.invalidate(map.observe(obs(AIR, { x: 2, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 })));
-    expect(cache.get(q, gateProvider).status).toBe('OPEN');
+    cache.invalidate(map.observe(obs(AIR, { x: 16, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 })));
+    expect(cache.get(q15, gateProvider).status).toBe('OPEN');
+  });
+
+  it('an unobserved neighbour reports the neighbour coordinate, not the gate cell', () => {
+    const map = gateMap15(); // (16,0,0) left unobserved
+    const result = evaluateWalkStep(map, q15, gateProvider, 2000);
+
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.problem?.cells).toContainEqual({ x: 16, y: 0, z: 0 });
+    expect(result.problem?.cells).not.toContainEqual({ x: 15, y: 0, z: 0 });
+  });
+
+  it('a neighbour from an older session cannot yield OPEN', () => {
+    const map = gateMap15();
+    map.observe(obs(AIR, { x: 16, y: 0, z: 0 })); // neighbour observed in s1
+    map.beginSession('s2');
+    // Re-observe everything except the neighbour in s2.
+    for (const cell of [
+      [14, -1, 0],
+      [15, -1, 0],
+      [14, 0, 0],
+      [14, 1, 0],
+      [15, 1, 0],
+    ] as Cell[]) {
+      const state = cell[1] === -1 ? STONE : AIR;
+      map.observe(obs(state, { x: cell[0], y: cell[1], z: cell[2] }, { sessionId: 's2', observedAt: 2000, sequence: 2 }));
+    }
+    map.observe(obs(GATE, { x: 15, y: 0, z: 0 }, { sessionId: 's2', observedAt: 2000, sequence: 2 }));
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(14.5, 0, 0.5), sessionId: 's2' }),
+      gateProvider,
+      3000,
+    );
+    expect(result.status).toBe('STALE');
+  });
+
+  it('neighbour TTL bounds cached validity, and re-observation recovers', () => {
+    const map = new VoxelMap('world');
+    fillAt(map, STONE, [
+      [14, -1, 0],
+      [15, -1, 0],
+    ], 100_000);
+    fillAt(map, AIR, [
+      [14, 0, 0],
+      [14, 1, 0],
+      [15, 1, 0],
+    ], 100_000);
+    map.observe(obs(GATE, { x: 15, y: 0, z: 0 }, { observedAt: 100_000 }));
+    map.observe(obs(AIR, { x: 16, y: 0, z: 0 }, { observedAt: 1000 })); // neighbour validUntil 61_000
+
+    let clock = 2000;
+    const cache = new TraversabilityCache(map, { now: () => clock });
+
+    expect(cache.get(q15, gateProvider).status).toBe('OPEN');
+
+    clock = 70_000; // past the neighbour's validity, but not the others'
+    expect(cache.get(q15, gateProvider).status).toBe('STALE');
+
+    clock = 71_000;
+    cache.invalidate(map.observe(obs(AIR, { x: 16, y: 0, z: 0 }, { observedAt: 71_000 })));
+    expect(cache.get(q15, gateProvider).status).toBe('OPEN');
   });
 
   it('an expired neighbour cannot yield OPEN', () => {

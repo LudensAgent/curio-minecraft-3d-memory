@@ -46,11 +46,12 @@ export interface CollisionShape {
 }
 
 /** What a controlled neighbour read returns. `observed` states are always complete. */
-export type NeighborCellView =
+export type NeighborCellView = { pos: Vec3Like } & (
   | { kind: 'observed'; state: BlockState }
   | { kind: 'unobserved' }
   | { kind: 'incomplete' }
-  | { kind: 'stale'; reason: 'stale' | 'expired' | 'session' };
+  | { kind: 'stale'; reason: 'stale' | 'expired' | 'session' }
+);
 
 /**
  * Controlled evidence read for shape rules. The provider can only inspect cells

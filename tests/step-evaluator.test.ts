@@ -264,6 +264,99 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     );
     expect(result.status).toBe('BLOCKED');
     expect(result.problem?.kind).toBe('missing_support');
+    expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 }); // the gap, not the start
+  });
+
+  it('start-edge contact is not support', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[1, -1, 0]]);
+    fill(map, AIR, [
+      [0, -1, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.7, 0, 0.5) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_support');
+  });
+
+  it('end-edge contact is not support', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[0, -1, 0]]);
+    fill(map, AIR, [
+      [1, -1, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.3, 0, 0.5) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_support');
+  });
+
+  it('two support intervals touching only at an endpoint are not continuous support', () => {
+    const map = new VoxelMap('world');
+    // body width 1.0 → faces [0,1] and [2,3] yield centre-valid intervals touching at 1.5
+    fill(map, STONE, [
+      [0, -1, 0],
+      [2, -1, 0],
+    ]);
+    fill(map, AIR, [
+      [1, -1, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+      [2, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.5, 0, 0.5, 1.0, 1.8) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_support');
+  });
+
+  it('partial overhang with positive contact remains supported', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[0, -1, 0]]);
+    fill(map, AIR, [
+      [-1, -1, 0],
+      [1, -1, 0],
+      [-1, 0, 0],
+      [-1, 1, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.1, 0, 0.5) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('OPEN');
   });
 
   it('support requires horizontal overlap of the top face with the footprint', () => {
