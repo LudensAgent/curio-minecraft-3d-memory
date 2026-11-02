@@ -13,6 +13,7 @@ export type {
   ArrivalSpec,
   FollowKnownPathRequest,
   Frontier,
+  LastObservation,
   NavigateRequest,
   NavOutcome,
   NavProblem,

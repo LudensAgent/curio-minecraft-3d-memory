@@ -5,6 +5,7 @@ export type {
   EventContext,
   MaterialAllowance,
   MoveOpts,
+  MoveRejection,
   MoveTarget,
   PerceptionEvent,
   SwimOptions,

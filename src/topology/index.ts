@@ -3,6 +3,7 @@ export type {
   ConnectionType,
   LandmarkTag,
   NodeKind,
+  NodeSource,
   SpatialEdge,
   SpatialNode,
 } from './graph.js';

@@ -35,9 +35,19 @@ export type LandmarkTag =
   | 'herd'
   | 'portal';
 
+/**
+ * Who recorded this anchor (design §5 "命名空间分流"). Drives eviction durability
+ * and display namespace: `agent` points are persistent and never auto-evicted;
+ * `program` points are capacity-bounded (oldest evicted first) and must not share a
+ * display namespace with agent-named points.
+ */
+export type NodeSource = 'agent' | 'program';
+
 export interface SpatialNode {
   id: string;
   kind: NodeKind;
+  /** Who recorded it — orthogonal to `kind`/`tag`; drives eviction and display. */
+  source: NodeSource;
   /** Semantic tag; `label` carries the meaning, which is opaque to the library. */
   tag?: LandmarkTag;
   label?: string;

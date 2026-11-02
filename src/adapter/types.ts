@@ -18,6 +18,8 @@ export interface AgentState {
   worldId: string;
   sessionId: string;
   observationId: number;
+  /** Real timestamp this body snapshot was captured; never fabricated from log/offline duration. */
+  observedAt: number;
   alive: boolean;
   connected: boolean;
   observationReady: boolean;
@@ -40,31 +42,82 @@ export interface MaterialAllowance {
   maxCount: number;
 }
 
-/** Per-delegation movement constraints (mirrors §2.2 field mapping). */
+/**
+ * Why the executor refused a request it cannot honor. The executor throws one of
+ * these rather than silently dropping a constraint; the navigation layer maps it
+ * to a `NavProblem`.
+ */
+export type MoveRejection =
+  | { kind: 'unsupported_mode'; mode: MoveMode; supported: readonly MoveMode[] }
+  | { kind: 'unsupported_exploration'; requested: 'known_only' | 'allow_frontier' }
+  | { kind: 'not_authorized'; constraint: string }
+  | { kind: 'material_unavailable'; name: string; maxCount: number };
+
+/** Per-delegation movement constraints (design §2.2 / §7). */
 export interface MoveOpts {
   signal: AbortSignal;
+  /** Original delegation deadline (epoch ms); retries and nesting share it — never reset per move. */
+  deadlineMs: number;
+  /** Per-move timeout budget within the delegation. */
   timeoutMs: number;
+  /** Full set of modes the delegation authorizes; unsupported combinations are rejected, never silently dropped. */
+  allowedModes: readonly MoveMode[];
+  /** Search scope: `known_only` confines planning to verified space; `allow_frontier` permits frontier candidates. */
+  exploration: 'known_only' | 'allow_frontier';
+  /** allowDigging. */
   allowTerrainChanges: boolean;
+  /** allowPlacing. */
   allowPlace: boolean;
+  /** Towering is authorized separately; never implied by `allowPlace`. */
   allowTower: boolean;
-  allowSwimming: boolean;
-  maxDropDown: number;
-  avoid: readonly Vec3Like[];
+  /** Per-material allowance cap; the executor reports consumption and the store tracks the remaining amount. */
   materials: readonly MaterialAllowance[];
+  /** Max single-step drop-down (adjacent xyz), not a global route height constraint. */
+  maxDropDown: number;
+  /** Blocks to avoid. */
+  avoid: readonly Vec3Like[];
 }
 
-/** Surface-swim options; extended by the execution adapter at integration time. */
+/** Surface-swim constraints (design §2.1 / §7). The concrete adapter extends this. */
 export interface SwimOptions {
-  // Reserved for the concrete adapter's surface-swim controls (target, budget, …).
+  /** Whether the swim must end by landing on solid ground; false = remaining afloat satisfies the target. */
+  requireLanding: boolean;
+  /** Delegation deadline (epoch ms); shared with retries/nesting. */
+  deadlineMs: number;
+  /** Per-swim timeout budget. */
+  timeoutMs?: number;
 }
 
-/** Body action result shell; the concrete adapter extends it. */
+/**
+ * Body action result shell; the concrete adapter extends it.
+ *
+ * `ok` means "the declared effect was confirmed", not merely "the call returned".
+ * On cancel/timeout, the confirmed partial effects are still preserved here with
+ * their original scope and time.
+ */
 export interface ActionResult {
   ok: boolean;
+  /** Confirmed effects, kept even when the action is cancelled or fails partway. */
+  effects: readonly EffectEvidence[];
 }
 
-/** Confirmed effect evidence for an own action (design §3.2). */
+/** Structured, confirmed effect evidence for an own action (design §3.2). */
 export interface EffectEvidence {
+  /** What was confirmed (e.g. block dug/placed, item received, moved, turned). */
+  kind: string;
+  /** Where the effect occurred. */
+  at?: Vec3Like;
+  /** Block name when the effect is a block change. */
+  block?: string;
+  /** Real timestamp the effect was confirmed — not the request time. */
+  observedAt: number;
+  /** Scope where the effect was observed. */
+  worldId: string;
+  dim: string;
+  sessionId: string;
+  /** Which own action confirmed it; never inferred from time proximity. */
+  actionId?: string;
+  /** Confirmed, not merely requested. */
   verified: boolean;
 }
 
@@ -96,7 +149,7 @@ export interface WorldAdapter {
   observeBatch(positions: Vec3Like[]): ObservationBatch;
   capabilities(): { fullBlockState: boolean; movementModes: MoveMode[] };
 
-  /** L1 body — the library only stably executes a destination the agent already chose. */
+  /** L1 body — stably executes a destination the agent already chose. Rejects with a `MoveRejection` when a constraint in `opts` cannot be honored. */
   moveTo(target: MoveTarget, opts: MoveOpts): Promise<void>;
   swimTo?(
     target: Vec3Like | null,

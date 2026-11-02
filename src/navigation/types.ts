@@ -61,33 +61,59 @@ export interface FollowKnownPathRequest {
   pathId: string;
 }
 
-export interface NavResult {
-  outcome: NavOutcome;
+/** Body/world evidence snapshot that must accompany an ARRIVED position (§7). */
+export interface LastObservation {
+  worldId: string;
+  dim: string;
+  sessionId: string;
+  observedAt: number;
+  onGround: boolean;
+  inWater: boolean;
+  /** absent = not provided, not "confirmed unmounted". */
+  riding?: string | null;
+}
+
+interface NavResultBase {
   message: string;
-  /** Last *confirmed* position; omitted when there is no evidence (never the requested position). */
-  lastPosition?: Vec3Like;
-  lastObservation?: {
-    worldId: string;
-    dim: string;
-    sessionId: string;
-    observedAt: number;
-    onGround: boolean;
-    inWater: boolean;
-    /** absent = not provided, not "confirmed unmounted". */
-    riding?: string | null;
-  };
-  problem?: NavProblem;
   trace: { pos: Vec3Like; ts: number }[];
   consumption?: {
     placed: { pos: Vec3Like; name: string }[];
     durabilityLost?: number;
     digMs?: number;
   };
-  /** true only when outcome is backed by a position confirmation; ARRIVED requires it. */
-  confirmed: boolean;
   /** `saved` requires a commit confirmation; never rewrites a completed body effect into "didn't happen". */
   memoryWrite?: 'saved' | 'pending' | 'failed';
 }
+
+/**
+ * Navigation result envelope, discriminated on `outcome` (design §7).
+ *
+ * This is a compile-time contract only: emitting `ARRIVED` still requires the
+ * runtime to have validated the original completion condition against a measured
+ * position — the type cannot prove that on its own.
+ */
+export type NavResult =
+  | (NavResultBase & {
+      outcome: 'ARRIVED';
+      lastPosition: Vec3Like;
+      lastObservation: LastObservation;
+      confirmed: true;
+      problem?: never;
+    })
+  | (NavResultBase & {
+      outcome: 'PARTIAL';
+      lastPosition?: Vec3Like;
+      lastObservation?: LastObservation;
+      confirmed: boolean;
+      problem?: NavProblem;
+    })
+  | (NavResultBase & {
+      outcome: 'NO_PATH' | 'BLOCKED' | 'CANCELLED' | 'TIMEOUT' | 'FAILED';
+      lastPosition?: Vec3Like;
+      lastObservation?: LastObservation;
+      confirmed: boolean;
+      problem: NavProblem;
+    });
 
 /** Unknown-boundary candidate with reachability and observation basis; never a chosen target. */
 export interface Frontier {
@@ -124,9 +150,9 @@ export interface ActionRecord {
     block?: string;
     origin: 'agent' | 'execution_helper' | 'scheduler';
     targetRole?: 'body' | 'head' | 'support' | 'placement_target' | 'reference_face';
-    /** ok = declared effect confirmed; noop = confirmed no effect; unknown = unconfirmed. */
-    outcome: 'ok' | 'noop' | 'unknown' | 'refused' | 'failed';
-    effect?: EffectEvidence;
+    /** ok = declared effect confirmed; noop = confirmed no effect; unknown = unconfirmed; cancelled = stopped partway, partial effects kept. */
+    outcome: 'ok' | 'noop' | 'unknown' | 'refused' | 'failed' | 'cancelled';
+    effects?: readonly EffectEvidence[];
   }[];
   from: Vec3Like;
   to?: Vec3Like;
