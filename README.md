@@ -1,38 +1,46 @@
-# 空间记忆库（curio-minecraft-3d-memory）
+# Spatial Memory Library
 
-为 Minecraft Java 1.20.1 的 Agent 提供**空间事实、历史几何、通行验证和可组合的导航辅助**的独立 TypeScript 库。范围限于**陆地行走**与**水面移动**（含跳跃、台阶、梯子、下落衔接、水面游泳、已乘船移动及上下岸）。
+Spatial facts, historical geometry, traversability verification, and composable navigation helpers for a Minecraft Java 1.20.1 agent — scoped to **land walking** and **surface-water movement** (jumping, steps, ladders, drop transitions, surface swimming, boating, and shore in/out).
 
-- **只提供事实与执行辅助**：回答「这里最后观察到什么、曾经如何经过、当前证据是否支持通行、哪段需要重新验证」。目标、策略、资源投入、风险取舍与技能学习由 Agent 决定。
-- **数据三层分离**：历史几何（永不因堵塞删除）、最近观测状态（版本化、带证据）、派生通行性（可失效缓存）。
-- **不反向依赖宿主**：通过 `WorldAdapter` 抽象消费 mineflayer/Curio 的感知与执行，不 import 宿主源码。
+> 中文说明见 [README_ZH.md](README_ZH.md).
 
-设计依据与开发约束见 [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design.md) 与 [`AGENTS.md`](AGENTS.md)。设计文档中的接口是**目标契约**，本仓库当前为**初步目录架构**：类型与目录已就位，各阶段实现按设计 §10 逐步落地。
+## Overview
 
-## 目录结构
+- **Facts and execution assistance only.** Answers *what was last observed here, how it was traversed before, whether current evidence supports passage, and which segment needs re-verification*. Goals, strategy, resource spend, and risk trade-offs remain the agent's decision.
+- **Three-layer data separation.** Historical geometry (never deleted on blockage), recent observation state (versioned, evidence-backed), derived traversability (invalidation-friendly cache).
+- **No host coupling.** Consumes mineflayer/Curio perception and execution through a `WorldAdapter` abstraction; never imports host source.
+
+See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design.md) and [`AGENTS.md`](AGENTS.md) for the design rationale and development constraints. Interfaces in the design doc are **target contracts**; this repository is currently the **initial directory architecture** — types and structure are in place, behavior lands per design §10.
+
+## Project structure
 
 ```
 src/
-├── index.ts            # 公共 API 出口（最小且明确的导出面）
-├── constants.ts        # 单一配置常量（Section 尺寸、PASSAGE_LINK 等）
-├── types.ts            # 基础原语（Vec3Like / BlockState / WorldScope / MoveMode）
-├── observation/        # World Observer：Observation / 证据 / 新鲜度（§3.2）
-├── voxel/              # Spatial Mapper：Section / Palette / 位打包（§4）
-├── traversability/     # 派生通行性：Traversability / HazardFact（§3.3）
-├── topology/           # Topology Manager：路径片段 / 节点 / 边（§3.1、§5）
-├── adapter/            # WorldAdapter 目标适配面（§2.1）
-├── navigation/         # L2 导航原语与结果信封（§7）
-├── store/              # SpatialMemoryStore 运行态接口（§9）
-├── storage/            # SQLite 持久化与 Worker（§9，阶段 5）
-└── compat/             # 旧 WorldMemory 入口的兼容层（§8、§9.1）
+├── index.ts            # public API entry (minimal, explicit export surface)
+├── constants.ts        # single-source config constants (section size, PASSAGE_LINK, …)
+├── types.ts            # base primitives (Vec3Like / BlockState / WorldScope / MoveMode)
+├── observation/        # World Observer: Observation / evidence / freshness (§3.2)
+├── voxel/              # Spatial Mapper: Section / Palette / bit-packing (§4)
+├── traversability/     # derived traversability: Traversability / HazardFact (§3.3)
+├── topology/           # Topology Manager: path fragments / nodes / edges (§3.1, §5)
+├── adapter/            # WorldAdapter target surface (§2.1)
+├── navigation/         # L2 navigation primitives and result envelope (§7)
+├── store/              # SpatialMemoryStore runtime interface (§9)
+├── storage/            # SQLite persistence and worker (§9, phase 5)
+└── compat/             # legacy WorldMemory entry compatibility layer (§8, §9.1)
 ```
 
-## 开发
+## Development
 
 ```bash
 npm install
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run
-npm run build       # 产出 dist/（NodeNext ESM + 类型声明）
+npm run build       # emits dist/ (NodeNext ESM + type declarations)
 ```
 
-> 持久化驱动（`better-sqlite3`）按设计 §9.2 在阶段 5 接入，本阶段 `storage/` 仅含接口与 schema 契约，未引入原生依赖。
+> The persistence driver (`better-sqlite3`) is wired in at phase 5 (design §9.2); `storage/` currently holds only the schema contract and worker interface, with no native dependency.
+
+## License
+
+UNLICENSED (private).
