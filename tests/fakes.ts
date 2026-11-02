@@ -7,17 +7,23 @@ import type { BodyContext, StepQuery } from '../src/traversability/step.js';
 /** Fake collision rules for tests — NOT Minecraft 1.20.1 collision rules. */
 export const FULL_CUBE: CollisionShape = {
   boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }],
-  supportTop: 1,
+  supportFaces: [{ top: 1, minX: 0, minZ: 0, maxX: 1, maxZ: 1 }],
 };
-export const EMPTY: CollisionShape = { boxes: [], supportTop: null };
+export const EMPTY: CollisionShape = { boxes: [], supportFaces: [] };
 export const BOTTOM_SLAB: CollisionShape = {
   boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.5, maxZ: 1 }],
-  supportTop: 0.5,
+  supportFaces: [{ top: 0.5, minX: 0, minZ: 0, maxX: 1, maxZ: 1 }],
+};
+/** A full-height column occupying only the [0,0.2]×[0,0.2] corner of its cell. */
+export const THIN_COLUMN: CollisionShape = {
+  boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 0.2, maxY: 1, maxZ: 0.2 }],
+  supportFaces: [{ top: 1, minX: 0, minZ: 0, maxX: 0.2, maxZ: 0.2 }],
 };
 
 export const AIR: BlockState = { name: 'minecraft:air', properties: {} };
 export const STONE: BlockState = { name: 'minecraft:stone', properties: {} };
 export const SLAB: BlockState = { name: 'minecraft:smooth_stone_slab', properties: {} };
+export const THIN: BlockState = { name: 'minecraft:thin', properties: {} };
 
 export const fakeProvider: CollisionShapeProvider = {
   version: 'fake-1',
@@ -30,6 +36,9 @@ export const fakeProvider: CollisionShapeProvider = {
     }
     if (state.name === 'minecraft:smooth_stone_slab') {
       return { kind: 'shape', shape: BOTTOM_SLAB };
+    }
+    if (state.name === 'minecraft:thin') {
+      return { kind: 'shape', shape: THIN_COLUMN };
     }
     return { kind: 'unsupported_shape', block: serializeBlockState(state), detail: `no fake rule for ${state.name}` };
   },

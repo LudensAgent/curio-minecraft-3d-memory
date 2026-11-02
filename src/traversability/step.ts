@@ -13,6 +13,11 @@
  * supplied by the caller or the injected provider — never read from host global
  * state. Reads go through the map's read-only snapshot API, so an evaluation
  * never mutates evidence, time or version.
+ *
+ * Support is checked continuously over the whole move: the swept footprint must
+ * overlap some standable top face at every instant (exact interval coverage,
+ * not fixed sampling), so a narrow gap is never missed and a partial overhang
+ * is not mistaken for total loss of support.
  */
 
 import type { CellEvidence } from '../observation/types.js';
@@ -21,7 +26,7 @@ import { blockToSection, cellIndex } from '../voxel/coordinates.js';
 import type { Section, SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
-import type { CollisionShapeProvider, UnitBox } from './collision-shape.js';
+import type { CollisionShape, CollisionShapeProvider, NeighborCellView, NeighborRead, UnitBox } from './collision-shape.js';
 import type { ObstacleEvidence, Traversability } from './types.js';
 
 /** The four passage states plus the capability gap they cannot express. */
@@ -63,7 +68,6 @@ export interface StepProblem {
     | 'missing_support'
     | 'unobserved'
     | 'stale'
-    | 'incomplete_state'
     | 'unsupported_mode'
     | 'unsupported_shape';
   cells: Vec3Like[];
@@ -83,7 +87,7 @@ export interface StepEvaluation {
   dependencies: { key: SectionKey; revision: number }[];
   sessionId: string;
   computedAt: number;
-  /** min validUntil over dependency evidence; Infinity when not evidence-bound. */
+  /** min validUntil over all evidence read; Infinity only when no evidence was read. */
   validUntil: number;
 }
 
@@ -103,8 +107,14 @@ type CellRead =
   | { kind: 'missing'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'stale'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'expired'; sectionKey: SectionKey; sectionRevision: number }
+  | { kind: 'session'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'incomplete'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'observed'; sectionKey: SectionKey; sectionRevision: number; evidence: CellEvidence };
+
+type ShapeResult =
+  | { kind: 'shape'; shape: CollisionShape }
+  | { kind: 'unsupported'; cell: Vec3Like; detail: string }
+  | { kind: 'gap'; view: NeighborCellView };
 
 interface Accumulator {
   blocked: { reason: string; problem: StepProblem; obstacles: ObstacleEvidence[] } | null;
@@ -171,6 +181,23 @@ function boxOverlaps(cx: number, cy: number, cz: number, box: UnitBox, aabb: Aab
   );
 }
 
+function overlaps(min1: number, max1: number, min2: number, max2: number): boolean {
+  return max1 > min2 && min1 < max2;
+}
+
+/** True when [segMin, segMax] is fully inside the union of the given intervals. */
+function covered(intervals: ReadonlyArray<readonly [number, number]>, segMin: number, segMax: number): boolean {
+  if (intervals.length === 0) return false;
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const [lo, hi] of sorted) {
+    const last = merged[merged.length - 1];
+    if (last === undefined || lo > last[1] + EPS) merged.push([lo, hi]);
+    else last[1] = Math.max(last[1], hi);
+  }
+  return merged.some(([lo, hi]) => lo <= segMin + EPS && hi >= segMax - EPS);
+}
+
 /**
  * Evaluate one walk step. Pure with respect to the map: it reads snapshots and
  * never writes, scans, or refreshes evidence.
@@ -206,7 +233,7 @@ export function evaluateWalkStep(
     return {
       ...base,
       reason: `mode "${query.mode}" is not supported by the walk evaluator`,
-      problem: { kind: 'unsupported_mode', cells: [], detail: `supported mode: walk` },
+      problem: { kind: 'unsupported_mode', cells: [], detail: 'supported mode: walk' },
     };
   }
   if (direction.axis !== 'x' && direction.axis !== 'z') {
@@ -248,6 +275,7 @@ export function evaluateWalkStep(
 
   const sectionCache = new Map<string, Section | null>();
   let minValidUntil = Number.POSITIVE_INFINITY;
+
   const readCell = (x: number, y: number, z: number): CellRead => {
     const { cx, cz, sy, lx, ly, lz } = blockToSection(x, y, z);
     const sectionKey: SectionKey = { worldId: query.worldId, dim, cx, cz, sy };
@@ -266,8 +294,12 @@ export function evaluateWalkStep(
     if (evidence === undefined) {
       return { kind: 'missing', sectionKey, sectionRevision: section.revision };
     }
+    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
     if (evidence.freshness === 'STALE') {
       return { kind: 'stale', sectionKey, sectionRevision: section.revision };
+    }
+    if (evidence.observation.sessionId !== query.sessionId) {
+      return { kind: 'session', sectionKey, sectionRevision: section.revision };
     }
     if (now > evidence.validUntil) {
       return { kind: 'expired', sectionKey, sectionRevision: section.revision };
@@ -275,21 +307,38 @@ export function evaluateWalkStep(
     if (!evidence.observation.stateComplete) {
       return { kind: 'incomplete', sectionKey, sectionRevision: section.revision };
     }
-    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
     return { kind: 'observed', sectionKey, sectionRevision: section.revision, evidence };
   };
 
-  const resolveBoxes = (evidence: CellEvidence, cell: Vec3Like): UnitBox[] | null => {
-    const resolution = shapeProvider.resolve(evidence.observation.state);
-    if (resolution.kind === 'unsupported_shape') {
-      if (acc.unsupported === null) {
-        acc.unsupported = {
-          problem: { kind: 'unsupported_shape', cells: [cell], detail: resolution.detail },
-        };
+  const neighborRead: NeighborRead = {
+    cell(x, y, z) {
+      const read = readCell(x, y, z);
+      switch (read.kind) {
+        case 'observed':
+          return { kind: 'observed', state: read.evidence.observation.state };
+        case 'missing':
+          return { kind: 'unobserved' };
+        case 'incomplete':
+          return { kind: 'incomplete' };
+        case 'stale':
+          return { kind: 'stale', reason: 'stale' };
+        case 'expired':
+          return { kind: 'stale', reason: 'expired' };
+        case 'session':
+          return { kind: 'stale', reason: 'session' };
       }
-      return null;
+    },
+  };
+
+  const resolveShape = (evidence: CellEvidence, cell: Vec3Like): ShapeResult => {
+    const resolution = shapeProvider.resolve(evidence.observation.state, cell, neighborRead);
+    if (resolution.kind === 'unsupported_shape') {
+      return { kind: 'unsupported', cell, detail: resolution.detail };
     }
-    return [...resolution.shape.boxes];
+    if (resolution.kind === 'neighbor_gap') {
+      return { kind: 'gap', view: resolution.view };
+    }
+    return { kind: 'shape', shape: resolution.shape };
   };
 
   // Collision: the body sweep must not intersect any solid shape.
@@ -299,7 +348,7 @@ export function evaluateWalkStep(
       acc.unknownCells.push(cell);
       continue;
     }
-    if (read.kind === 'stale' || read.kind === 'expired') {
+    if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
       acc.staleCells.push(cell);
       continue;
     }
@@ -307,9 +356,19 @@ export function evaluateWalkStep(
       acc.unknownCells.push(cell);
       continue;
     }
-    const boxes = resolveBoxes(read.evidence, cell);
-    if (boxes === null) continue;
-    for (const box of boxes) {
+    const shape = resolveShape(read.evidence, cell);
+    if (shape.kind === 'unsupported') {
+      if (acc.unsupported === null) {
+        acc.unsupported = { problem: { kind: 'unsupported_shape', cells: [cell], detail: shape.detail } };
+      }
+      continue;
+    }
+    if (shape.kind === 'gap') {
+      if (shape.view.kind === 'stale') acc.staleCells.push(cell);
+      else acc.unknownCells.push(cell);
+      continue;
+    }
+    for (const box of shape.shape.boxes) {
       if (boxOverlaps(cell.x, cell.y, cell.z, box, sweep)) {
         if (acc.blocked === null) {
           const state = read.evidence.observation.state;
@@ -324,66 +383,8 @@ export function evaluateWalkStep(
     }
   }
 
-  // Support: both feet positions need a standable surface at their exact height.
-  const classifySupport = (foot: Vec3Like): void => {
-    const byLow = Math.floor(foot.y) - 1;
-    const byHigh = Math.floor(foot.y);
-    const minBX = Math.floor(foot.x - half);
-    const maxBX = Math.floor(foot.x + half - EPS);
-    const minBZ = Math.floor(foot.z - half);
-    const maxBZ = Math.floor(foot.z + half - EPS);
-
-    let supported = false;
-    let footStale = false;
-    let footUnknown = false;
-
-    for (let bx = minBX; bx <= maxBX; bx++) {
-      for (let bz = minBZ; bz <= maxBZ; bz++) {
-        for (const by of [byLow, byHigh]) {
-          const cell = { x: bx, y: by, z: bz };
-          const read = readCell(bx, by, bz);
-          if (read.kind === 'observed') {
-            const resolution = shapeProvider.resolve(read.evidence.observation.state);
-            if (resolution.kind === 'unsupported_shape') {
-              if (acc.unsupported === null) {
-                acc.unsupported = {
-                  problem: { kind: 'unsupported_shape', cells: [cell], detail: resolution.detail },
-                };
-              }
-              continue;
-            }
-            const top = resolution.shape.supportTop;
-            if (top !== null && Math.abs(by + top - foot.y) < EPS) {
-              supported = true;
-            }
-          } else if (read.kind === 'stale' || read.kind === 'expired') {
-            acc.staleCells.push(cell);
-            footStale = true;
-          } else {
-            // missing or incomplete
-            acc.unknownCells.push(cell);
-            footUnknown = true;
-          }
-        }
-      }
-    }
-
-    if (supported) return;
-    if (footStale) return;
-    if (footUnknown) return;
-    // Every support cell was observed and none provides a surface at the feet height.
-    if (acc.blocked === null) {
-      const supportCell = { x: Math.floor(foot.x), y: byLow, z: Math.floor(foot.z) };
-      acc.blocked = {
-        reason: `no support under (${supportCell.x}, ${supportCell.y}, ${supportCell.z}) at feet height ${foot.y}`,
-        problem: { kind: 'missing_support', cells: [supportCell], detail: `no standable surface at y=${foot.y}` },
-        obstacles: [],
-      };
-    }
-  };
-
-  classifySupport(body.feet);
-  classifySupport(to);
+  // Support: the swept footprint must overlap a standable face at every instant.
+  evaluateSupport(body.feet, to);
 
   let status: StepStatus;
   let reason: string | undefined;
@@ -416,6 +417,102 @@ export function evaluateWalkStep(
     reason,
     problem,
     dependencies: [...deps.values()],
-    validUntil: status === 'OPEN' || status === 'BLOCKED' ? minValidUntil : Number.POSITIVE_INFINITY,
+    validUntil: minValidUntil,
   };
+
+  function evaluateSupport(from: Vec3Like, to: Vec3Like): void {
+    const fy = from.y;
+    const axis = direction.axis;
+
+    // Perpendicular extent is fixed for the whole step.
+    const perpCoord = axis === 'x' ? from.z : from.x;
+    const perpMin = perpCoord - half;
+    const perpMax = perpCoord + half;
+
+    // Along-axis swept extent and the center segment that must stay supported.
+    const fromA = axis === 'x' ? from.x : from.z;
+    const toA = axis === 'x' ? to.x : to.z;
+    const segMin = Math.min(fromA, toA);
+    const segMax = Math.max(fromA, toA);
+    const sweepAMin = segMin - half;
+    const sweepAMax = segMax + half;
+
+    // Only cells whose top could be exactly at the feet height can provide support.
+    const floorY = Math.floor(fy);
+    const supportYs = [floorY - 1, floorY].filter((by) => by <= fy + EPS && by + 1 >= fy - EPS);
+
+    const aCellMin = Math.floor(sweepAMin);
+    const aCellMax = Math.floor(sweepAMax - EPS);
+    const pCellMin = Math.floor(perpMin);
+    const pCellMax = Math.floor(perpMax - EPS);
+
+    const intervals: Array<[number, number]> = [];
+    const unsupportedCells: Vec3Like[] = [];
+    const staleCellsHere: Vec3Like[] = [];
+    const unknownCellsHere: Vec3Like[] = [];
+
+    for (const by of supportYs) {
+      for (let a = aCellMin; a <= aCellMax; a++) {
+        for (let p = pCellMin; p <= pCellMax; p++) {
+          const x = axis === 'x' ? a : p;
+          const z = axis === 'x' ? p : a;
+          const cell: Vec3Like = { x, y: by, z };
+          const read = readCell(x, by, z);
+          if (read.kind === 'observed') {
+            const shape = resolveShape(read.evidence, cell);
+            if (shape.kind === 'unsupported') {
+              unsupportedCells.push(cell);
+              continue;
+            }
+            if (shape.kind === 'gap') {
+              if (shape.view.kind === 'stale') staleCellsHere.push(cell);
+              else unknownCellsHere.push(cell);
+              continue;
+            }
+            for (const face of shape.shape.supportFaces) {
+              if (Math.abs(by + face.top - fy) >= EPS) continue;
+              const [perpFaceMin, perpFaceMax] =
+                axis === 'x' ? [z + face.minZ, z + face.maxZ] : [x + face.minX, x + face.maxX];
+              if (!overlaps(perpFaceMin, perpFaceMax, perpMin, perpMax)) continue;
+              const [alongFaceMin, alongFaceMax] =
+                axis === 'x' ? [x + face.minX, x + face.maxX] : [z + face.minZ, z + face.maxZ];
+              intervals.push([alongFaceMin - half, alongFaceMax + half]);
+            }
+          } else if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
+            staleCellsHere.push(cell);
+          } else {
+            // missing or incomplete
+            unknownCellsHere.push(cell);
+          }
+        }
+      }
+    }
+
+    if (covered(intervals, segMin, segMax)) return;
+    if (unsupportedCells.length > 0) {
+      if (acc.unsupported === null) {
+        acc.unsupported = {
+          problem: { kind: 'unsupported_shape', cells: unsupportedCells, detail: 'support depends on an unresolvable shape' },
+        };
+      }
+      return;
+    }
+    if (staleCellsHere.length > 0) {
+      acc.staleCells.push(...staleCellsHere);
+      return;
+    }
+    if (unknownCellsHere.length > 0) {
+      acc.unknownCells.push(...unknownCellsHere);
+      return;
+    }
+    // Every candidate support cell was confirmed, yet none provides a face covering the sweep.
+    if (acc.blocked === null) {
+      const supportCell: Vec3Like = { x: Math.floor(from.x), y: floorY - 1, z: Math.floor(from.z) };
+      acc.blocked = {
+        reason: `no support under the move at feet height ${fy}`,
+        problem: { kind: 'missing_support', cells: [supportCell], detail: `no standable surface at y=${fy} covers the swept footprint` },
+        obstacles: [],
+      };
+    }
+  }
 }

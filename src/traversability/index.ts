@@ -7,7 +7,10 @@ export type {
 export type {
   CollisionShape,
   CollisionShapeProvider,
+  NeighborCellView,
+  NeighborRead,
   ShapeResolution,
+  SupportFace,
   UnitBox,
 } from './collision-shape.js';
 export { evaluateWalkStep } from './step.js';

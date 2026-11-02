@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { evaluateWalkStep, VoxelMap } from '../src/index.js';
 import type { Section } from '../src/index.js';
-import { AIR, bodyAt, fakeProvider, obs, SLAB, STONE, stepQuery } from './fakes.js';
+import { AIR, bodyAt, fakeProvider, obs, SLAB, STONE, stepQuery, THIN } from './fakes.js';
 
 type Cell = [number, number, number];
 
@@ -238,5 +238,116 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     expect(map.sectionAt('overworld', 0, 0, 0)!.revision).toBe(revisionBefore);
     const section: Section = map.sectionAt('overworld', 0, 0, 0)!;
     expect(section.lastObservedAt).toBe(1000);
+  });
+
+  it('continuous support: a one-cell gap mid-step is missing support, not OPEN', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [0, -1, 0],
+      [2, -1, 0],
+    ]);
+    fill(map, AIR, [
+      [1, -1, 0], // the gap under the swept footprint
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+      [2, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.9, 0, 0.5) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_support');
+  });
+
+  it('support requires horizontal overlap of the top face with the footprint', () => {
+    const map = new VoxelMap('world');
+    fill(map, THIN, [[0, -1, 0]]); // face only covers [0,0.2]×[0,0.2]
+    fill(map, AIR, [
+      [1, -1, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.8, 0, 0.8, 0.2, 1.8) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_support');
+  });
+
+  it('an unresolvable support shape is UNSUPPORTED, never a fake missing_support', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[0, -1, 0]]);
+    map.observe(obs({ name: 'minecraft:chest', properties: {} }, { x: 1, y: -1, z: 0 }));
+    fill(map, AIR, [
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+    ]);
+
+    const result = evaluateWalkStep(map, stepQuery(), fakeProvider, 2000);
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem?.kind).toBe('unsupported_shape');
+  });
+
+  it('does not read or depend on a cell that cannot affect support', () => {
+    const map = new VoxelMap('world');
+    fill(map, SLAB, [
+      [0, 0, 0],
+      [1, 0, 0],
+    ]);
+    fill(map, AIR, [
+      [0, 1, 0],
+      [1, 1, 0],
+      [0, 2, 0],
+      [1, 2, 0],
+    ]);
+    // y = -1 is deliberately unobserved; it can never support feet at 0.5.
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.5, 0.5, 0.5) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('OPEN');
+    expect(result.dependencies.every((d) => d.key.sy !== -1)).toBe(true);
+  });
+
+  it('a late query from an older session reports STALE, not OPEN', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [0, -1, 0],
+      [1, -1, 0],
+    ]);
+    fill(map, AIR, SWEPT_AIR);
+    map.beginSession('s2');
+    for (const cell of [
+      [0, -1, 0],
+      [1, -1, 0],
+      ...SWEPT_AIR,
+    ] as Cell[]) {
+      const state = cell[1] === -1 ? STONE : AIR;
+      map.observe(obs(state, { x: cell[0], y: cell[1], z: cell[2] }, { sessionId: 's2', observedAt: 2000, sequence: 2 }));
+    }
+
+    const stale = evaluateWalkStep(map, stepQuery({ sessionId: 's1' }), fakeProvider, 3000);
+    expect(stale.status).toBe('STALE');
+
+    const open = evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 3000);
+    expect(open.status).toBe('OPEN');
   });
 });

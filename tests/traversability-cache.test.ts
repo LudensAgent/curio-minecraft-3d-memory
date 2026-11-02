@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { TraversabilityCache, VoxelMap } from '../src/index.js';
+import { evaluateWalkStep, TraversabilityCache, VoxelMap } from '../src/index.js';
 import type { BlockState } from '../src/types.js';
 import type { CollisionShapeProvider } from '../src/traversability/collision-shape.js';
 import { AIR, bodyAt, fakeProvider, obs, STONE, stepQuery } from './fakes.js';
@@ -29,34 +29,89 @@ function openMap(): VoxelMap {
 }
 
 describe('TraversabilityCache', () => {
-  it('serves a repeated identical query from cache', () => {
+  it('serves a repeated identical query from cache without re-evaluating', () => {
     const map = openMap();
-    const cache = new TraversabilityCache({ now: () => 2000 });
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
+    let resolves = 0;
+    const counting: CollisionShapeProvider = {
+      version: 'fake-1',
+      resolve(state, cell, read) {
+        resolves += 1;
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
 
-    const first = cache.get(map, stepQuery(), fakeProvider);
-    const second = cache.get(map, stepQuery(), fakeProvider);
+    const first = cache.get(stepQuery(), counting);
     expect(first.status).toBe('OPEN');
-    expect(second).toBe(first);
+    const afterFirst = resolves;
+
+    cache.get(stepQuery(), counting);
+    expect(resolves).toBe(afterFirst); // cache hit — no new shape resolutions
     expect(cache.size).toBe(1);
   });
 
   it('does not serve a cached OPEN past the evidence validUntil', () => {
     const map = openMap();
     let clock = 2000;
-    const cache = new TraversabilityCache({ now: () => clock });
+    const cache = new TraversabilityCache(map, { now: () => clock });
 
-    expect(cache.get(map, stepQuery(), fakeProvider).status).toBe('OPEN');
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('OPEN');
 
     clock = 70_000; // past observedAt 1000 + 60_000 window
-    expect(cache.get(map, stepQuery(), fakeProvider).status).toBe('STALE');
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('STALE');
+  });
 
-    clock = 80_000;
-    expect(cache.get(map, stepQuery(), fakeProvider).status).toBe('STALE'); // cached STALE
+  it('recovers to OPEN after expiry when the same state is re-observed', () => {
+    const map = openMap();
+    let clock = 2000;
+    const cache = new TraversabilityCache(map, { now: () => clock });
+    const q = stepQuery();
+
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
+
+    clock = 70_000;
+    expect(cache.get(q, fakeProvider).status).toBe('STALE');
+
+    clock = 71_000;
+    for (const cell of [
+      [0, -1, 0],
+      [1, -1, 0],
+      ...SWEPT_AIR,
+    ] as Cell[]) {
+      const state = cell[1] === -1 ? STONE : AIR;
+      cache.invalidate(map.observe(obs(state, { x: cell[0], y: cell[1], z: cell[2] }, { observedAt: 71_000 })));
+    }
+
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
+    expect(evaluateWalkStep(map, q, fakeProvider, 71_000).status).toBe('OPEN');
+  });
+
+  it('UNKNOWN with partial evidence expires to STALE, matching direct evaluation', () => {
+    const map = new VoxelMap('world');
+    let clock = 2000;
+    const cache = new TraversabilityCache(map, { now: () => clock });
+    fill(map, STONE, [[0, -1, 0]]);
+    fill(map, AIR, SWEPT_AIR); // (1,-1,0) unobserved → UNKNOWN
+    const q = stepQuery();
+
+    expect(cache.get(q, fakeProvider).status).toBe('UNKNOWN');
+
+    clock = 70_000;
+    expect(cache.get(q, fakeProvider).status).toBe('STALE'); // observed cells expired, not stale UNKNOWN
+    expect(evaluateWalkStep(map, q, fakeProvider, 70_000).status).toBe('STALE');
   });
 
   it('invalidates only entries depending on the changed section', () => {
     const map = new VoxelMap('world');
-    const cache = new TraversabilityCache({ now: () => 2000 });
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
+    let resolves = 0;
+    const counting: CollisionShapeProvider = {
+      version: 'fake-1',
+      resolve(state, cell, read) {
+        resolves += 1;
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
 
     fill(map, STONE, [
       [0, -1, 0],
@@ -68,72 +123,65 @@ describe('TraversabilityCache', () => {
 
     const qA = stepQuery({ body: bodyAt(0.5, 0, 0.5) });
     const qB = stepQuery({ body: bodyAt(100.5, 0, 0.5) });
-    const a1 = cache.get(map, qA, fakeProvider);
-    const b1 = cache.get(map, qB, fakeProvider);
+    expect(cache.get(qA, counting).status).toBe('OPEN');
+    expect(cache.get(qB, counting).status).toBe('OPEN');
 
     // Change a cell in qA's section (cx=0), not qB's (cx=6).
-    const report = map.observe(obs(AIR, { x: 0, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    cache.invalidate(report);
+    cache.invalidate(map.observe(obs(AIR, { x: 0, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 })));
 
-    const a2 = cache.get(map, qA, fakeProvider);
-    const b2 = cache.get(map, qB, fakeProvider);
-    expect(a2).not.toBe(a1);
-    expect(b2).toBe(b1);
+    expect(cache.get(qA, counting).status).toBe('BLOCKED'); // support under qA now missing
+
+    const beforeQb = resolves;
+    expect(cache.get(qB, counting).status).toBe('OPEN'); // untouched section
+    expect(resolves).toBe(beforeQb); // qB served from cache — no re-evaluation
   });
 
   it('re-evaluates an UNKNOWN result once the missing cell is first observed', () => {
     const map = new VoxelMap('world');
-    const cache = new TraversabilityCache({ now: () => 2000 });
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
     fill(map, STONE, [[0, -1, 0]]);
-    fill(map, AIR, SWEPT_AIR); // (1,-1,0) left unobserved
-
+    fill(map, AIR, SWEPT_AIR);
     const q = stepQuery();
-    expect(cache.get(map, q, fakeProvider).status).toBe('UNKNOWN');
-    expect(cache.get(map, q, fakeProvider).status).toBe('UNKNOWN'); // cached
 
+    expect(cache.get(q, fakeProvider).status).toBe('UNKNOWN');
     const report = map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
     cache.invalidate(report);
-    expect(cache.get(map, q, fakeProvider).status).toBe('OPEN');
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
   });
 
-  it('re-evaluates an UNKNOWN result once a missing section is first observed', () => {
+  it('re-evaluates once a missing section is first observed', () => {
     const map = new VoxelMap('world');
-    const cache = new TraversabilityCache({ now: () => 2000 });
-    // Step +X from x=15.5 crosses the cx=0 / cx=1 boundary.
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
     fill(map, STONE, [[15, -1, 0]]);
     fill(map, AIR, [
       [15, 0, 0],
       [15, 1, 0],
     ]);
-
     const q = stepQuery({ body: bodyAt(15.5, 0, 0.5) });
-    expect(cache.get(map, q, fakeProvider).status).toBe('UNKNOWN');
+    expect(cache.get(q, fakeProvider).status).toBe('UNKNOWN');
 
-    let report = map.observe(obs(STONE, { x: 16, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    cache.invalidate(report);
-    report = map.observe(obs(AIR, { x: 16, y: 0, z: 0 }, { observedAt: 1500, sequence: 3 }));
-    cache.invalidate(report);
-    report = map.observe(obs(AIR, { x: 16, y: 1, z: 0 }, { observedAt: 1500, sequence: 4 }));
-    cache.invalidate(report);
+    cache.invalidate(map.observe(obs(STONE, { x: 16, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 })));
+    cache.invalidate(map.observe(obs(AIR, { x: 16, y: 0, z: 0 }, { observedAt: 1500, sequence: 3 })));
+    cache.invalidate(map.observe(obs(AIR, { x: 16, y: 1, z: 0 }, { observedAt: 1500, sequence: 4 })));
 
-    expect(cache.get(map, q, fakeProvider).status).toBe('OPEN');
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
   });
 
   it('STALE recovers to OPEN after the section is re-observed and invalidated', () => {
     let clock = 2000;
     const map = new VoxelMap('world', { now: () => clock });
-    const cache = new TraversabilityCache({ now: () => clock });
+    const cache = new TraversabilityCache(map, { now: () => clock });
     fill(map, STONE, [
       [0, -1, 0],
       [1, -1, 0],
     ]);
     fill(map, AIR, SWEPT_AIR);
-
     const q = stepQuery();
-    expect(cache.get(map, q, fakeProvider).status).toBe('OPEN');
+
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
 
     cache.invalidate(map.markStale('overworld', 'unloaded'));
-    expect(cache.get(map, q, fakeProvider).status).toBe('STALE');
+    expect(cache.get(q, fakeProvider).status).toBe('STALE');
 
     clock = 3000;
     for (const cell of [
@@ -145,60 +193,64 @@ describe('TraversabilityCache', () => {
       cache.invalidate(map.observe(obs(state, { x: cell[0], y: cell[1], z: cell[2] }, { observedAt: 3000 })));
     }
 
-    expect(cache.get(map, q, fakeProvider).status).toBe('OPEN');
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
   });
 
   it('changes to body context, direction or constraints are never cross-reused', () => {
     const map = openMap();
-    const cache = new TraversabilityCache({ now: () => 2000 });
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
     const q = stepQuery();
 
-    expect(cache.get(map, q, fakeProvider).status).toBe('OPEN');
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
     expect(cache.size).toBe(1);
 
-    cache.get(map, stepQuery({ body: bodyAt(0.5, 0, 0.5, 1.2, 1.8) }), fakeProvider);
-    expect(cache.size).toBe(2); // different body width
+    cache.get(stepQuery({ body: bodyAt(0.5, 0, 0.5, 1.2, 1.8) }), fakeProvider);
+    expect(cache.size).toBe(2);
 
-    cache.get(map, stepQuery({ direction: { axis: 'z', sign: 1 } }), fakeProvider);
-    expect(cache.size).toBe(3); // different direction
+    cache.get(stepQuery({ direction: { axis: 'z', sign: 1 } }), fakeProvider);
+    expect(cache.size).toBe(3);
 
-    cache.get(map, stepQuery({ constraints: { avoid: [{ x: 1, y: 0, z: 0 }] } }), fakeProvider);
-    expect(cache.size).toBe(4); // different constraints
+    cache.get(stepQuery({ constraints: { avoid: [{ x: 1, y: 0, z: 0 }] } }), fakeProvider);
+    expect(cache.size).toBe(4);
 
-    cache.get(map, stepQuery({ constraints: { avoid: [{ x: 1, y: 0, z: 0 }] } }), fakeProvider);
-    expect(cache.size).toBe(4); // identical constraints reuse
+    cache.get(stepQuery({ constraints: { avoid: [{ x: 1, y: 0, z: 0 }] } }), fakeProvider);
+    expect(cache.size).toBe(4);
   });
 
   it('rule version participates in the cache key', () => {
     const map = openMap();
-    const cache = new TraversabilityCache({ now: () => 2000 });
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
     const q = stepQuery();
 
     const solid: CollisionShapeProvider = {
       version: 'solid-stone',
       resolve: (state) =>
         state.name === 'minecraft:stone'
-          ? { kind: 'shape', shape: { boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }], supportTop: 1 } }
-          : { kind: 'shape', shape: { boxes: [], supportTop: null } },
+          ? {
+              kind: 'shape',
+              shape: {
+                boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }],
+                supportFaces: [{ top: 1, minX: 0, minZ: 0, maxX: 1, maxZ: 1 }],
+              },
+            }
+          : { kind: 'shape', shape: { boxes: [], supportFaces: [] } },
     };
     const hollow: CollisionShapeProvider = {
       version: 'hollow-stone',
-      resolve: () => ({ kind: 'shape', shape: { boxes: [], supportTop: null } }),
+      resolve: () => ({ kind: 'shape', shape: { boxes: [], supportFaces: [] } }),
     };
 
-    expect(cache.get(map, q, solid).status).toBe('OPEN');
-    expect(cache.get(map, q, hollow).status).toBe('BLOCKED'); // no support under hollow rules
+    expect(cache.get(q, solid).status).toBe('OPEN');
+    expect(cache.get(q, hollow).status).toBe('BLOCKED');
     expect(cache.size).toBe(2);
   });
 
   it('full loop: observe → ChangeReport → invalidate → re-evaluate', () => {
     const map = new VoxelMap('world');
-    const cache = new TraversabilityCache({ now: () => 2000 });
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
 
-    // Initially unknown: no evidence yet.
-    expect(cache.get(map, stepQuery(), fakeProvider).status).toBe('UNKNOWN');
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('UNKNOWN');
 
-    // Observe support + swept air, feeding each report back into the cache.
     for (const [state, cells] of [
       [STONE, [[0, -1, 0], [1, -1, 0]]],
       [AIR, SWEPT_AIR],
@@ -208,6 +260,77 @@ describe('TraversabilityCache', () => {
       }
     }
 
-    expect(cache.get(map, stepQuery(), fakeProvider).status).toBe('OPEN');
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('OPEN');
+  });
+
+  it('isolates two VoxelMap instances even with the same worldId', () => {
+    const mapA = openMap();
+    const mapB = new VoxelMap('world'); // same worldId, no evidence
+    const cacheA = new TraversabilityCache(mapA, { now: () => 2000 });
+    const cacheB = new TraversabilityCache(mapB, { now: () => 2000 });
+
+    expect(cacheA.get(stepQuery(), fakeProvider).status).toBe('OPEN');
+    expect(cacheB.get(stepQuery(), fakeProvider).status).toBe('UNKNOWN');
+    expect(cacheA.get(stepQuery(), fakeProvider).status).toBe('OPEN'); // A not polluted
+
+    expect(() => cacheA.get(stepQuery({ worldId: 'other' }), fakeProvider)).toThrow(/does not match/);
+  });
+
+  it('returns copies: mutating a result cannot pollute the cache', () => {
+    const map = openMap();
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
+    let resolves = 0;
+    const counting: CollisionShapeProvider = {
+      version: 'fake-1',
+      resolve(state, cell, read) {
+        resolves += 1;
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+
+    const first = cache.get(stepQuery(), counting);
+    expect(first.status).toBe('OPEN');
+    const afterFirst = resolves;
+
+    first.status = 'BLOCKED';
+    first.from.x = 999;
+    first.to.y = 888;
+    first.problem = { kind: 'collision', cells: [{ x: 1, y: 2, z: 3 }] };
+    first.obstacles.push({ kind: 'contact', pos: { x: 0, y: 0, z: 0 }, observedAt: 1, sessionId: 'x' });
+    first.dependencies[0]!.key.cx = 999;
+
+    const second = cache.get(stepQuery(), counting);
+    expect(resolves).toBe(afterFirst); // served from cache, not re-evaluated
+    expect(second.status).toBe('OPEN');
+    expect(second.from).toEqual({ x: 0.5, y: 0, z: 0.5 });
+    expect(second.to).toEqual({ x: 1.5, y: 0, z: 0.5 });
+    expect(second.problem).toBeUndefined();
+    expect(second.obstacles).toEqual([]);
+    expect(second.dependencies[0]!.key.cx).not.toBe(999);
+  });
+
+  it('cleans every reverse index when an entry is invalidated', () => {
+    const map = new VoxelMap('world');
+    const cache = new TraversabilityCache(map, { now: () => 2000 });
+    // Cross-boundary step depends on sections cx=0 and cx=1 across sy=-1 and sy=0.
+    fill(map, STONE, [
+      [15, -1, 0],
+      [16, -1, 0],
+    ]);
+    fill(map, AIR, [
+      [15, 0, 0],
+      [15, 1, 0],
+      [16, 0, 0],
+      [16, 1, 0],
+    ]);
+    const q = stepQuery({ body: bodyAt(15.5, 0, 0.5) });
+
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
+    expect(cache.dependencyIndexSize).toBeGreaterThan(0);
+
+    // Change one support cell → invalidates the entry and removes its key from all indexes.
+    cache.invalidate(map.observe(obs(AIR, { x: 15, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 })));
+    expect(cache.size).toBe(0);
+    expect(cache.dependencyIndexSize).toBe(0);
   });
 });

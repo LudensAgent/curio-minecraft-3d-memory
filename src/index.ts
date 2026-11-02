@@ -50,7 +50,10 @@ export { evaluateWalkStep, TraversabilityCache } from './traversability/index.js
 export type {
   CollisionShape,
   CollisionShapeProvider,
+  NeighborCellView,
+  NeighborRead,
   ShapeResolution,
+  SupportFace,
   TraversabilityCacheOptions,
   UnitBox,
 } from './traversability/index.js';

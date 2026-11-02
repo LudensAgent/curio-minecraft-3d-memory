@@ -1,17 +1,20 @@
 /**
  * Traversability cache (design §3.3, §6.2).
  *
- * Memoizes single-step evaluations keyed by world/dim/session, from/to/direction,
- * mode + body context, delegation constraints and the collision-rule version. It
- * consumes the `VoxelMap`'s `ChangeReport` so that only entries depending on a
- * changed section are dropped — an unrelated section never clears the cache.
+ * Bound to one `VoxelMap`; entries are keyed by world/dim/session,
+ * from/to/direction, mode + body context, delegation constraints and the
+ * collision-rule version. It consumes the map's `ChangeReport` so that only
+ * entries depending on a changed section are dropped — an unrelated section
+ * never clears the cache.
  *
- * An entry is never served past its `validUntil`: OPEN/BLOCKED carry the minimum
- * dependency validUntil, so advancing time past it forces a re-evaluation (which
- * then reports STALE). UNKNOWN/STALE/UNSUPPORTED are invalidated by change, not
- * time, so their entries are served until a relevant section changes.
+ * An entry is never served past its `validUntil`, which is the minimum
+ * validUntil over every evidence cell the evaluation read (including expired,
+ * stale, session-mismatched or incomplete cells), so an expired OPEN/UNKNOWN
+ * re-evaluates to STALE instead of sticking. Returned evaluations are deep
+ * copies: mutating them can never pollute the cache or its reverse index.
  */
 
+import type { Observation } from '../observation/types.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import type { CollisionShapeProvider } from './collision-shape.js';
@@ -29,11 +32,13 @@ interface CacheEntry {
 }
 
 export class TraversabilityCache {
+  private readonly map: VoxelMap;
   private readonly now: () => number;
   private readonly entries = new Map<string, CacheEntry>();
   private readonly bySection = new Map<string, Set<string>>();
 
-  constructor(options: TraversabilityCacheOptions = {}) {
+  constructor(map: VoxelMap, options: TraversabilityCacheOptions = {}) {
+    this.map = map;
     this.now = options.now ?? Date.now;
   }
 
@@ -42,52 +47,71 @@ export class TraversabilityCache {
     return this.entries.size;
   }
 
+  /** Total reverse-index mappings; exposed to verify the index never leaks deleted entries. */
+  get dependencyIndexSize(): number {
+    let total = 0;
+    for (const set of this.bySection.values()) total += set.size;
+    return total;
+  }
+
   /** Return a cached evaluation, or compute and cache it on miss/expiry. */
-  get(map: VoxelMap, query: StepQuery, shapeProvider: CollisionShapeProvider): StepEvaluation {
+  get(query: StepQuery, shapeProvider: CollisionShapeProvider): StepEvaluation {
+    if (query.worldId !== this.map.worldId) {
+      throw new Error(`query worldId "${query.worldId}" does not match cache map worldId "${this.map.worldId}"`);
+    }
     const key = stepKey(query, shapeProvider.version);
     const entry = this.entries.get(key);
     if (entry !== undefined && this.now() <= entry.validUntil) {
-      return entry.evaluation;
+      return cloneEvaluation(entry.evaluation);
     }
-    const evaluation = evaluateWalkStep(map, query, shapeProvider, this.now());
+    const evaluation = evaluateWalkStep(this.map, query, shapeProvider, this.now());
     this.store(key, evaluation);
-    return evaluation;
+    return cloneEvaluation(evaluation);
   }
 
   /**
    * Invalidate entries that depended on any section whose revision advanced.
    * Refresh-only (`invalidated: false`) changes do not invalidate: they only
-   * extend evidence validity, never change content.
+   * extend evidence validity, which the time-based `validUntil` check already
+   * handles on the next read.
    */
   invalidate(report: ChangeReport): void {
+    const toDelete = new Set<string>();
     for (const section of report.sections) {
       if (!section.invalidated) continue;
       const keys = this.bySection.get(sectionKeyString(section.key));
       if (keys === undefined) continue;
-      for (const key of keys) {
-        this.entries.delete(key);
-      }
-      this.bySection.delete(sectionKeyString(section.key));
+      for (const key of keys) toDelete.add(key);
     }
+    for (const key of toDelete) this.removeEntry(key);
   }
 
   private store(key: string, evaluation: StepEvaluation): void {
-    const previous = this.entries.get(key);
-    if (previous !== undefined) {
-      for (const dep of previous.evaluation.dependencies) {
-        this.bySection.get(sectionKeyString(dep.key))?.delete(key);
-      }
-    }
+    this.removeEntry(key);
     this.entries.set(key, { evaluation, validUntil: evaluation.validUntil });
     for (const dep of evaluation.dependencies) {
       const depKey = sectionKeyString(dep.key);
-      let keys = this.bySection.get(depKey);
-      if (keys === undefined) {
-        keys = new Set();
-        this.bySection.set(depKey, keys);
+      let set = this.bySection.get(depKey);
+      if (set === undefined) {
+        set = new Set();
+        this.bySection.set(depKey, set);
       }
-      keys.add(key);
+      set.add(key);
     }
+  }
+
+  /** Remove one entry and clean its key out of every reverse-index set it was in. */
+  private removeEntry(key: string): void {
+    const entry = this.entries.get(key);
+    if (entry === undefined) return;
+    for (const dep of entry.evaluation.dependencies) {
+      const depKey = sectionKeyString(dep.key);
+      const set = this.bySection.get(depKey);
+      if (set === undefined) continue;
+      set.delete(key);
+      if (set.size === 0) this.bySection.delete(depKey);
+    }
+    this.entries.delete(key);
   }
 }
 
@@ -118,4 +142,24 @@ function normalizeConstraints(constraints: StepConstraints | undefined): string 
     .sort()
     .join(';');
   return `avoid=${avoid}`;
+}
+
+function cloneObservation(o: Observation): Observation {
+  return { ...o, pos: { ...o.pos }, state: { name: o.state.name, properties: { ...o.state.properties } } };
+}
+
+/** Deep-copy an evaluation so callers can never mutate the cached copy. */
+function cloneEvaluation(e: StepEvaluation): StepEvaluation {
+  return {
+    ...e,
+    from: { ...e.from },
+    to: { ...e.to },
+    problem: e.problem === undefined ? undefined : { ...e.problem, cells: e.problem.cells.map((c) => ({ ...c })) },
+    obstacles: e.obstacles.map((o) =>
+      o.kind === 'block'
+        ? { kind: 'block', observation: cloneObservation(o.observation) }
+        : { kind: 'contact', pos: { ...o.pos }, observedAt: o.observedAt, sessionId: o.sessionId },
+    ),
+    dependencies: e.dependencies.map((d) => ({ key: { ...d.key }, revision: d.revision })),
+  };
 }
