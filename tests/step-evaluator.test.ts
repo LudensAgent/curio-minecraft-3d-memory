@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { evaluateWalkStep, VoxelMap } from '../src/index.js';
 import type { Section } from '../src/index.js';
+import type { CollisionShapeProvider } from '../src/traversability/collision-shape.js';
 import { AIR, bodyAt, fakeProvider, obs, SLAB, STONE, stepQuery, THIN } from './fakes.js';
 
 type Cell = [number, number, number];
@@ -478,28 +479,41 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 });
   });
 
-  it('an unsupported candidate that cannot cover the gap does not mask the real one', () => {
+  it('an unsupported candidate that is read but cannot cover the gap does not mask the real one', () => {
     const map = new VoxelMap('world');
-    const body = bodyAt(0, 0, 0.5, 2.0, 1.0); // wide body: single-point gap at centre x=1.0
-    // Collision cells (y=0) are air; support cells (y=-1):
-    //   x=-1 stone (observed support), x=0 air, x=1 unobserved (the real gap),
-    //   x=2 chest (unsupported, only edge-touches the foot at the gap point).
-    for (let z = -1; z <= 1; z++) {
-      fill(map, AIR, [
-        [-1, 0, z],
-        [0, 0, z],
-        [1, 0, z],
-        [2, 0, z],
-      ]);
-      map.observe(obs(STONE, { x: -1, y: -1, z }));
-      map.observe(obs(AIR, { x: 0, y: -1, z }));
-      map.observe(obs({ name: 'minecraft:chest', properties: {} }, { x: 2, y: -1, z }));
-    }
+    // Observed support is a thin slab (along-axis face [0,0.2], full Z). Its
+    // support interval ends at x=0.7, leaving a gap [0.7, 1] that only x=1 can
+    // cover. The chest at x=-1 is read (it is in the sweep) but its full-cell
+    // potential (-1.5, 0.5) never reaches that gap.
+    const thinXProvider: CollisionShapeProvider = {
+      version: 'thin-x-1',
+      resolve(state, cell, read) {
+        if (state.name === 'minecraft:thin_x') {
+          return {
+            kind: 'shape',
+            shape: {
+              boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 0.2, maxY: 1, maxZ: 1 }],
+              supportFaces: [{ top: 1, minX: 0, minZ: 0, maxX: 0.2, maxZ: 1 }],
+            },
+          };
+        }
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
 
-    const result = evaluateWalkStep(map, stepQuery({ body }), fakeProvider, 2000);
+    fill(map, AIR, [
+      [-1, 0, 0],
+      [0, 0, 0],
+      [1, 0, 0],
+    ]);
+    map.observe(obs({ name: 'minecraft:chest', properties: {} }, { x: -1, y: -1, z: 0 }));
+    map.observe(obs({ name: 'minecraft:thin_x', properties: {} }, { x: 0, y: -1, z: 0 }));
+    // (1,-1,0) left unobserved (the real gap)
+
+    const result = evaluateWalkStep(map, stepQuery({ body: bodyAt(0, 0, 0.5, 1.0, 1.0) }), thinXProvider, 2000);
     expect(result.status).toBe('UNKNOWN');
     expect(result.problem?.kind).toBe('unobserved');
     expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 });
-    expect(result.problem?.cells).not.toContainEqual({ x: 2, y: -1, z: 0 });
+    expect(result.problem?.cells).not.toContainEqual({ x: -1, y: -1, z: 0 });
   });
 });
