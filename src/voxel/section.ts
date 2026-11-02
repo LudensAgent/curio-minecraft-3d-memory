@@ -17,6 +17,14 @@ export interface SectionKey {
 }
 
 /**
+ * Canonical string form of a section key, for cache/dependency maps. A JSON
+ * array of the five fields is unambiguous and ASCII-clean.
+ */
+export function sectionKeyString(key: SectionKey): string {
+  return JSON.stringify([key.worldId, key.dim, key.cx, key.cz, key.sy]);
+}
+
+/**
  * One sparse 16×16×16 section.
  *
  * - `cells` is a bit-packed byte stream, width `bits`, index 0 reserved for air.

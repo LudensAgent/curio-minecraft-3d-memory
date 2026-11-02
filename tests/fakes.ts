@@ -1,0 +1,68 @@
+import type { Observation } from '../src/observation/types.js';
+import { serializeBlockState } from '../src/index.js';
+import type { BlockState, Vec3Like } from '../src/types.js';
+import type { CollisionShape, CollisionShapeProvider } from '../src/traversability/collision-shape.js';
+import type { BodyContext, StepQuery } from '../src/traversability/step.js';
+
+/** Fake collision rules for tests — NOT Minecraft 1.20.1 collision rules. */
+export const FULL_CUBE: CollisionShape = {
+  boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }],
+  supportTop: 1,
+};
+export const EMPTY: CollisionShape = { boxes: [], supportTop: null };
+export const BOTTOM_SLAB: CollisionShape = {
+  boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.5, maxZ: 1 }],
+  supportTop: 0.5,
+};
+
+export const AIR: BlockState = { name: 'minecraft:air', properties: {} };
+export const STONE: BlockState = { name: 'minecraft:stone', properties: {} };
+export const SLAB: BlockState = { name: 'minecraft:smooth_stone_slab', properties: {} };
+
+export const fakeProvider: CollisionShapeProvider = {
+  version: 'fake-1',
+  resolve(state) {
+    if (state.name === 'minecraft:air' || state.name === 'air') {
+      return { kind: 'shape', shape: EMPTY };
+    }
+    if (state.name === 'minecraft:stone' || state.name === 'minecraft:dirt') {
+      return { kind: 'shape', shape: FULL_CUBE };
+    }
+    if (state.name === 'minecraft:smooth_stone_slab') {
+      return { kind: 'shape', shape: BOTTOM_SLAB };
+    }
+    return { kind: 'unsupported_shape', block: serializeBlockState(state), detail: `no fake rule for ${state.name}` };
+  },
+};
+
+export function obs(state: BlockState, pos: Vec3Like, overrides: Partial<Observation> = {}): Observation {
+  return {
+    worldId: 'world',
+    dim: 'overworld',
+    sessionId: 's1',
+    observedAt: 1000,
+    sequence: 1,
+    source: 'vision',
+    evidence: 'seen',
+    stateComplete: true,
+    state,
+    pos: { ...pos },
+    ...overrides,
+  };
+}
+
+export function bodyAt(x: number, y: number, z: number, width = 0.6, height = 1.8): BodyContext {
+  return { feet: { x, y, z }, width, height, pose: 'standing' };
+}
+
+export function stepQuery(overrides: Partial<StepQuery> = {}): StepQuery {
+  return {
+    worldId: 'world',
+    dim: 'overworld',
+    sessionId: 's1',
+    mode: 'walk',
+    body: bodyAt(0.5, 0, 0.5),
+    direction: { axis: 'x', sign: 1 },
+    ...overrides,
+  };
+}

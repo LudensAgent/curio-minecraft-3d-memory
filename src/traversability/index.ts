@@ -4,3 +4,21 @@ export type {
   Traversability,
   TraversabilityEntry,
 } from './types.js';
+export type {
+  CollisionShape,
+  CollisionShapeProvider,
+  ShapeResolution,
+  UnitBox,
+} from './collision-shape.js';
+export { evaluateWalkStep } from './step.js';
+export type {
+  BodyContext,
+  StepConstraints,
+  StepDirection,
+  StepEvaluation,
+  StepProblem,
+  StepQuery,
+  StepStatus,
+} from './step.js';
+export { TraversabilityCache } from './cache.js';
+export type { TraversabilityCacheOptions } from './cache.js';

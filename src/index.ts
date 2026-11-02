@@ -46,6 +46,23 @@ export type {
 } from './voxel/index.js';
 
 // Traversability
+export { evaluateWalkStep, TraversabilityCache } from './traversability/index.js';
+export type {
+  CollisionShape,
+  CollisionShapeProvider,
+  ShapeResolution,
+  TraversabilityCacheOptions,
+  UnitBox,
+} from './traversability/index.js';
+export type {
+  BodyContext,
+  StepConstraints,
+  StepDirection,
+  StepEvaluation,
+  StepProblem,
+  StepQuery,
+  StepStatus,
+} from './traversability/index.js';
 export type {
   HazardFact,
   ObstacleEvidence,
