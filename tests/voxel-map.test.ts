@@ -323,6 +323,32 @@ describe('lifecycle invalidation', () => {
     expect(post.sections[0]!.cells[0]!.kind).toBe('restored');
     expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('FRESH');
   });
+
+  it('rejects pre-interruption observations for previously-unknown cells', () => {
+    const map = new VoxelMap('world', { now: () => 160 });
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100 }));
+    map.markStale('overworld', 'unloaded');
+
+    // A delayed observation of a never-observed cell, acquired before the
+    // interruption, must not be written as FRESH.
+    const report = map.observe(obs({ state: dirt, pos: { x: 1, y: 0, z: 0 }, observedAt: 150 }));
+    expect(report.sections).toEqual([]);
+    expect(map.cellAt('overworld', 1, 0, 0).observed).toBe(false);
+  });
+
+  it('records the interruption boundary even when the dimension has no sections yet', () => {
+    const map = new VoxelMap('world', { now: () => 160 });
+    map.markStale('overworld', 'unloaded'); // empty dimension
+
+    // First observation, acquired before the interruption, is rejected.
+    const pre = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 150 }));
+    expect(pre.sections).toEqual([]);
+    expect(map.cellAt('overworld', 0, 0, 0).observed).toBe(false);
+
+    // A post-interruption observation is accepted.
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 170, sequence: 2 }));
+    expect(map.cellAt('overworld', 0, 0, 0).observed).toBe(true);
+  });
 });
 
 describe('input and read isolation', () => {

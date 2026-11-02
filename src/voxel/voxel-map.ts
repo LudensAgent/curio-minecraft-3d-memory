@@ -118,9 +118,11 @@ export class VoxelMap {
    * deferred; this round invalidates at dimension scope.
    */
   markStale(dim: string, reason: StaleReason): ChangeReport {
+    // Record the boundary even when the dimension has no sections yet, so a
+    // delayed pre-interruption observation of a still-unknown cell is rejected.
+    this.staleBoundaries.set(dim, this.now());
     const dimMap = this.sections.get(dim);
     if (dimMap === undefined) return { sections: [] };
-    this.staleBoundaries.set(dim, this.now());
 
     const bySection = new Map<Section, SectionChange>();
     for (const section of dimMap.values()) {
@@ -226,24 +228,24 @@ export class VoxelMap {
       return null;
     }
 
+    if (observation.observedAt <= this.boundaryFor(observation.dim)) {
+      // Acquired at or before the latest interruption for this dimension: it
+      // predates the interruption and cannot establish current (FRESH) state,
+      // for known, stale, or still-unknown cells alike.
+      return null;
+    }
+
     const { x, y, z } = observation.pos;
     const { cx, cz, sy, lx, ly, lz } = blockToSection(x, y, z);
     const section = this.getOrCreateSection(observation.dim, cx, cz, sy);
     const index = cellIndex(lx, ly, lz);
     const existing = section.evidence.get(index);
 
-    if (existing !== undefined) {
-      if (observation.observedAt <= existing.observation.observedAt) {
-        // Not strictly newer by acquisition time (same-session out-of-order or
-        // duplicate): never overwrite newer evidence. `sequence` is receive
-        // order, not acquisition order, so it must not decide this.
-        return null;
-      }
-      if (existing.freshness === 'STALE' && observation.observedAt <= this.boundaryFor(observation.dim)) {
-        // Acquired before the interruption that made this cell stale: it cannot
-        // restore staleness; only post-interruption evidence can.
-        return null;
-      }
+    if (existing !== undefined && observation.observedAt <= existing.observation.observedAt) {
+      // Not strictly newer by acquisition time (same-session out-of-order or
+      // duplicate): never overwrite newer evidence. `sequence` is receive
+      // order, not acquisition order, so it must not decide this.
+      return null;
     }
 
     const validUntil = observation.observedAt + this.validityWindowMs;
