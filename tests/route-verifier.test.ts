@@ -67,6 +67,12 @@ function status(verifier: RouteVerifier): RouteStatus {
   return s;
 }
 
+function applyStatus(verifier: RouteVerifier, report: Parameters<RouteVerifier['apply']>[0], budget: number): RouteStatus {
+  const s = verifier.apply(report, budget);
+  if (s === null) throw new Error('expected a registered route');
+  return s;
+}
+
 describe('RouteVerifier — decomposition and bounded verification', () => {
   it('verifies a multi-step route all OPEN only after full advance', () => {
     const map = new VoxelMap('world');
@@ -254,12 +260,13 @@ describe('RouteVerifier — decomposition and bounded verification', () => {
     ).toThrow(/does not match/);
   });
 
-  it('requires a registered route before advance/apply and returns null status', () => {
+  it('requires a registered route before advance and returns null status', () => {
     const map = new VoxelMap('world');
     const verifier = new RouteVerifier(map, { now: () => 2000 });
     expect(verifier.status()).toBeNull();
     expect(() => verifier.advance(1)).toThrow(/no route registered/);
-    expect(() => verifier.apply({ sections: [] }, 1)).toThrow(/no route registered/);
+    // apply with no route still consumes the report into the cache and returns null.
+    expect(verifier.apply({ sections: [] }, 1)).toBeNull();
   });
 });
 
@@ -294,7 +301,7 @@ describe('RouteVerifier — dependency-driven partial re-verification', () => {
     clock = 3000;
     // Change a cell only in cx = 0 (x=15): step 0 depends on it, step 1 does not.
     const report = map.observe(obs(AIR, { x: 15, y: -1, z: 0 }, { observedAt: 3000, sequence: 2 }));
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
 
     expect(s.steps[0]!.kind).toBe('verified');
     expect(s.steps[0]!.kind === 'verified' && s.steps[0]!.result.status).toBe('BLOCKED');
@@ -316,7 +323,7 @@ describe('RouteVerifier — dependency-driven partial re-verification', () => {
     const after = resolves();
 
     const report = map.observe(obs(STONE, { x: 100, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
 
     expect(s.verdict).toBe('OPEN');
     expect(resolves()).toBe(after); // no step re-evaluated
@@ -362,12 +369,12 @@ describe('RouteVerifier — dependency-driven partial re-verification', () => {
 
     // First observation of the neighbour section recovers.
     let report = map.observe(obs(AIR, { x: 16, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    let s = verifier.apply(report, 10);
+    let s = applyStatus(verifier, report, 10);
     expect(s.verdict).toBe('OPEN');
 
     // Neighbour becomes solid → locally re-verified to BLOCKED.
     report = map.observe(obs(STONE, { x: 16, y: 0, z: 0 }, { observedAt: 2000, sequence: 3 }));
-    s = verifier.apply(report, 10);
+    s = applyStatus(verifier, report, 10);
     expect(s.verdict).toBe('BLOCKED');
   });
 });
@@ -398,7 +405,7 @@ describe('RouteVerifier — time, session and context changes', () => {
       unobserved: [],
     };
     const report = map.observeBatch(batch);
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
     expect(s.verdict).toBe('OPEN');
   });
 
@@ -410,7 +417,7 @@ describe('RouteVerifier — time, session and context changes', () => {
     expect(verifier.advance(10).verdict).toBe('OPEN');
 
     const report = map.beginSession('s2');
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
     expect(s.verdict).toBe('STALE');
   });
 
@@ -423,7 +430,7 @@ describe('RouteVerifier — time, session and context changes', () => {
 
     // Conflicting content at the exact same timestamp as the original observation.
     const report = map.observe(obs(AIR, { x: 0, y: -1, z: 0 }, { observedAt: 1000, sequence: 2 }));
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
     expect(s.verdict).not.toBe('OPEN');
   });
 
@@ -482,7 +489,7 @@ describe('RouteVerifier — bounded re-verification under budget pressure', () =
 
     // Remove support in cx=1 → invalidates steps 1 and 2, but not step 0 (cx=0).
     const report = map.observe(obs(AIR, { x: 16, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    const s = verifier.apply(report, 1); // budget only enough for one re-verification
+    const s = applyStatus(verifier, report, 1); // budget only enough for one re-verification
 
     expect(s.steps[0]!.kind === 'verified' && s.steps[0]!.result.status).toBe('OPEN'); // preserved
     expect(s.steps[1]!.kind === 'verified' && s.steps[1]!.result.status).toBe('BLOCKED'); // re-verified
@@ -524,7 +531,7 @@ describe('RouteVerifier — replace/clear isolation', () => {
     expect(verifier.advance(10).verdict).toBe('OPEN');
 
     const report = map.observe(obs(AIR, { x: 0, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
     expect(s.verdict).toBe('OPEN'); // route B unaffected by route A's old section
   });
 
@@ -599,10 +606,180 @@ describe('RouteVerifier — immutability and read-only guarantees', () => {
 
     // World changes: a wall appears mid-route.
     const report = map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    const s = verifier.apply(report, 10);
+    const s = applyStatus(verifier, report, 10);
 
     expect(s.verdict).toBe('BLOCKED');
     expect(s.earliestProblem?.stepIndex).toBe(0); // the wall is in step 0's sweep
     expect(s.steps[0]!.kind === 'verified' && s.steps[0]!.result.status).toBe('BLOCKED');
+  });
+});
+
+describe('RouteVerifier — regression fixes', () => {
+  it('consumes a ChangeReport while idle so stale cache entries cannot resurface', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+    verifier.clear();
+
+    // A wall appears in the route's section while no route is registered.
+    const report = map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
+    expect(verifier.apply(report, 10)).toBeNull();
+
+    // Re-register the same route: it must reflect the wall, not a stale cache hit.
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('BLOCKED');
+  });
+
+  it('revokes an OPEN that expires within a single verification call', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    // Clock sequence: verify OPEN at 2000, then cross the 61000 validity boundary
+    // between the expiry pass and the snapshot pass of the second advance.
+    const seq = [2000, 2000, 2000, 2000, 2000, 2000, 61001];
+    let i = 0;
+    const verifier = new RouteVerifier(map, { now: () => seq[Math.min(i++, seq.length - 1)]! });
+
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+
+    const s = verifier.advance(10);
+    expect(s.verdict).not.toBe('OPEN');
+    expect(s.openPrefix).toBe(0);
+    expect(s.steps[0]).toEqual({ kind: 'pending', reason: 'invalidated' });
+  });
+
+  it('a step re-verified as STALE is kept and does not block later steps', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 3); // 2 steps
+    const verifier = new RouteVerifier(map, { now: () => clock });
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+
+    clock = 70_000; // all evidence expired
+    const s1 = verifier.advance(1); // re-verify step 0 → STALE
+    expect(s1.steps[0]!.kind === 'verified' && s1.steps[0]!.result.status).toBe('STALE');
+    expect(s1.steps[1]!.kind).toBe('pending');
+
+    // status() keeps the confirmed STALE diagnosis instead of dropping it.
+    const afterStatus = status(verifier);
+    expect(afterStatus.steps[0]!.kind === 'verified' && afterStatus.steps[0]!.result.status).toBe('STALE');
+
+    // The next round advances to step 1, not re-verifying step 0 forever.
+    const s2 = verifier.advance(1);
+    expect(s2.steps[0]!.kind === 'verified' && s2.steps[0]!.result.status).toBe('STALE');
+    expect(s2.steps[1]!.kind === 'verified' && s2.steps[1]!.result.status).toBe('STALE');
+  });
+
+  it('freezes the rule context at registration', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 3); // 2 steps
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+
+    const provider: CollisionShapeProvider = {
+      version: 'v1',
+      resolve(state, cell, read) {
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    verifier.register(routeRequest(points, { shapeProvider: provider }));
+    verifier.advance(1); // step 0 under v1 → OPEN
+
+    // Mutate the same provider object after registration: v2 makes nothing solid.
+    provider.version = 'v2';
+    provider.resolve = () => ({ kind: 'shape', shape: { boxes: [], supportFaces: [] } });
+
+    const s = verifier.advance(10);
+    expect(s.ruleVersion).toBe('v1');
+    expect(s.verdict).toBe('OPEN');
+    expect(s.steps[0]!.kind === 'verified' && s.steps[0]!.result.status).toBe('OPEN');
+    expect(s.steps[1]!.kind === 'verified' && s.steps[1]!.result.status).toBe('OPEN');
+  });
+
+  it('accepts normal fractional coordinates without rounding', () => {
+    const map = new VoxelMap('world');
+    // 1.3 → 2.3 is a +1 X move, but 2.3 − 1.3 = 0.9999999999999998.
+    const points: Vec3Like[] = [
+      { x: 1.3, y: 0, z: 0.5 },
+      { x: 2.3, y: 0, z: 0.5 },
+    ];
+    fill(map, STONE, [
+      [1, -1, 0],
+      [2, -1, 0],
+    ]);
+    fill(map, AIR, [
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+      [2, 1, 0],
+    ]);
+
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+    expect(status(verifier).points).toEqual([
+      { x: 1.3, y: 0, z: 0.5 },
+      { x: 2.3, y: 0, z: 0.5 },
+    ]);
+  });
+
+  it('computes the route verdict by severity, not just the earliest problem', () => {
+    const map = new VoxelMap('world');
+    // Step 0 UNKNOWN (missing support at x=0), step 2 BLOCKED (wall at x=3).
+    fill(map, STONE, [
+      [1, -1, 0],
+      [2, -1, 0],
+      [3, -1, 0],
+      [3, 0, 0],
+    ]);
+    fill(map, AIR, [
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+      [2, 1, 0],
+      [3, 1, 0],
+    ]);
+    const points: Vec3Like[] = [
+      { x: 0.5, y: 0, z: 0.5 },
+      { x: 1.5, y: 0, z: 0.5 },
+      { x: 2.5, y: 0, z: 0.5 },
+      { x: 3.5, y: 0, z: 0.5 },
+    ];
+
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+    verifier.register(routeRequest(points));
+    const s = verifier.advance(10);
+
+    expect(s.earliestProblem?.stepIndex).toBe(0);
+    expect(s.earliestProblem?.status).toBe('UNKNOWN');
+    expect(s.verdict).toBe('BLOCKED'); // the definite obstacle dominates the summary
+  });
+
+  it('a rejected registration leaves the existing route intact', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+
+    const duplicate = [
+      { x: 0.5, y: 0, z: 0.5 },
+      { x: 0.5, y: 0, z: 0.5 },
+    ];
+    expect(() => verifier.register(routeRequest(duplicate))).toThrow(/exactly one cell/);
+
+    expect(status(verifier).verdict).toBe('OPEN');
+  });
+
+  it('rejects a broken clock at registration', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const verifier = new RouteVerifier(map, { now: () => Number.NaN });
+    expect(() => verifier.register(routeRequest(points))).toThrow(/finite/);
   });
 });

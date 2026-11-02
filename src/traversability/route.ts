@@ -124,6 +124,15 @@ interface RegisteredRoute {
 
 const DEFAULT_MAX_ROUTE_LENGTH = 1024;
 
+/** Overall-severity order over single-step statuses; mirrors the single-step evaluator's precedence. */
+const STATUS_PRIORITY: Record<StepStatus, number> = {
+  OPEN: 0,
+  UNKNOWN: 1,
+  STALE: 2,
+  UNSUPPORTED: 3,
+  BLOCKED: 4,
+};
+
 /**
  * @example Full call order (observe → ChangeReport → invalidate → bounded re-verify → read):
  * ```ts
@@ -137,10 +146,10 @@ const DEFAULT_MAX_ROUTE_LENGTH = 1024;
  *   points: [{ x: 0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }],
  * });
  *
- * let status = verifier.advance(2);            // bounded verification round
- * const report = map.observe(observation);     // caller writes the real observation first
- * status = verifier.apply(report, 2);          // invalidate affected steps, re-verify within budget
- * const current = verifier.status();           // read-only snapshot, never mutates the map
+ * verifier.advance(2);                        // bounded verification round
+ * const report = map.observe(observation);    // caller writes the real observation first
+ * verifier.apply(report, 2);                  // invalidate affected steps, re-verify within budget
+ * const current = verifier.status();          // read-only snapshot, never mutates the map
  * ```
  */
 export class RouteVerifier {
@@ -170,9 +179,9 @@ export class RouteVerifier {
 
   /**
    * Register (or replace) the tracked route. Snapshots the request and returns
-   * the initial status with every walk step pending. Replacing clears the
-   * previous route's results and reverse index; it never clears the shared
-   * single-step cache.
+   * the initial status with every walk step pending. All validation happens
+   * before the current route is replaced, so a rejected request leaves the
+   * existing route intact.
    */
   register(request: RouteRequest): RouteStatus {
     if (request.worldId !== this.map.worldId) {
@@ -188,51 +197,54 @@ export class RouteVerifier {
       throw new Error(`body.feet ${fmt(body.feet)} must equal the first route point ${fmt(points[0]!)}`);
     }
     const constraints = snapshotConstraints(request.constraints);
+    // Snapshot the rule context so a later mutation of the caller's provider
+    // cannot split one route across two rule versions.
+    const shapeProvider: CollisionShapeProvider = {
+      version: request.shapeProvider.version,
+      resolve: request.shapeProvider.resolve,
+    };
+    // Validate the clock before replacing state, so a broken clock cannot leave a
+    // half-registered route.
+    this.currentNow();
 
-    this.route = null;
+    const candidate: RegisteredRoute =
+      request.mode !== 'walk'
+        ? {
+            worldId: request.worldId,
+            dim: request.dim,
+            sessionId: request.sessionId,
+            mode: request.mode,
+            body,
+            constraints,
+            shapeProvider,
+            ruleVersion: shapeProvider.version,
+            points,
+            unsupportedReason: `mode "${request.mode}" is outside the walk route verifier's range`,
+            queries: [],
+          }
+        : {
+            worldId: request.worldId,
+            dim: request.dim,
+            sessionId: request.sessionId,
+            mode: 'walk',
+            body,
+            constraints,
+            shapeProvider,
+            ruleVersion: shapeProvider.version,
+            points,
+            queries: buildQueries(request.worldId, request.dim, request.sessionId, body, constraints, points),
+          };
+
+    this.route = candidate;
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
-
-    if (request.mode !== 'walk') {
-      this.route = {
-        worldId: request.worldId,
-        dim: request.dim,
-        sessionId: request.sessionId,
-        mode: request.mode,
-        body,
-        constraints,
-        shapeProvider: request.shapeProvider,
-        ruleVersion: request.shapeProvider.version,
-        points,
-        unsupportedReason: `mode "${request.mode}" is outside the walk route verifier's range`,
-        queries: [],
-      };
-      return this.snapshot();
-    }
-
-    const queries = buildQueries(request.worldId, request.dim, request.sessionId, body, constraints, points);
-
-    this.route = {
-      worldId: request.worldId,
-      dim: request.dim,
-      sessionId: request.sessionId,
-      mode: 'walk',
-      body,
-      constraints,
-      shapeProvider: request.shapeProvider,
-      ruleVersion: request.shapeProvider.version,
-      points,
-      queries,
-    };
-
-    for (let i = 0; i < queries.length; i++) this.pending.set(i, 'unprocessed');
+    for (let i = 0; i < candidate.queries.length; i++) this.pending.set(i, 'unprocessed');
     return this.snapshot();
   }
 
   /** Read-only snapshot of the current verification state; `null` before any route is registered. */
   status(): RouteStatus | null {
-    this.expireStale();
     return this.route === null ? null : this.snapshot();
   }
 
@@ -242,7 +254,7 @@ export class RouteVerifier {
    */
   advance(budget: number): RouteStatus {
     this.requireRoute();
-    this.expireStale();
+    this.expireStale(this.currentNow());
     this.runPending(budget);
     return this.snapshot();
   }
@@ -251,10 +263,17 @@ export class RouteVerifier {
    * Consume a `ChangeReport`: invalidate the single-step cache, drop every step
    * result that depended on a changed section (via the reverse index), then
    * re-verify within `budget`. Unaffected steps keep their current results.
+   *
+   * When no route is registered, the report is still consumed into the cache so
+   * stale single-step entries cannot survive a later re-registration, and `null`
+   * is returned.
    */
-  apply(report: ChangeReport, budget: number): RouteStatus {
-    this.requireRoute();
-    this.expireStale();
+  apply(report: ChangeReport, budget: number): RouteStatus | null {
+    if (this.route === null) {
+      this.cache.invalidate(report);
+      return null;
+    }
+    this.expireStale(this.currentNow());
     this.invalidateByReport(report);
     this.cache.invalidate(report);
     this.runPending(budget);
@@ -273,6 +292,14 @@ export class RouteVerifier {
 
   private requireRoute(): void {
     if (this.route === null) throw new Error('no route registered');
+  }
+
+  private currentNow(): number {
+    const now = this.now();
+    if (!Number.isFinite(now)) {
+      throw new Error(`now() must return a finite number: ${now}`);
+    }
+    return now;
   }
 
   private runPending(budget: number): void {
@@ -331,15 +358,16 @@ export class RouteVerifier {
     }
   }
 
-  /** Move any verified step whose evidence has expired back to pending. Never touches map state. */
-  private expireStale(): void {
-    const now = this.now();
-    if (!Number.isFinite(now)) {
-      throw new Error(`now() must return a finite number: ${now}`);
-    }
+  /**
+   * Move a verified step back to pending only when its evidence expired *after*
+   * it was computed. A step already re-verified as STALE on expired evidence
+   * (`computedAt > validUntil`) is a current conclusion and is kept, so it does
+   * not repeatedly consume budget. Never touches map state.
+   */
+  private expireStale(now: number): void {
     const expired: number[] = [];
     for (const [i, result] of this.results) {
-      if (now > result.validUntil) expired.push(i);
+      if (now > result.validUntil && result.computedAt <= result.validUntil) expired.push(i);
     }
     for (const i of expired) this.invalidateStep(i);
   }
@@ -347,15 +375,16 @@ export class RouteVerifier {
   private snapshot(): RouteStatus {
     const route = this.route;
     if (route === null) throw new Error('no route registered');
-    const now = this.now();
+    const now = this.currentNow();
+    this.expireStale(now);
 
     const steps: RouteStepState[] = [];
     const verifiedStepIndexes: number[] = [];
     const pendingStepIndexes: number[] = [];
-    let openPrefix = 0;
     let invalidatedCount = 0;
     let validUntil = Number.POSITIVE_INFINITY;
     let earliestProblem: RouteStatus['earliestProblem'] = null;
+    let worst: StepStatus | null = null;
 
     for (let i = 0; i < route.queries.length; i++) {
       const result = this.results.get(i);
@@ -368,16 +397,22 @@ export class RouteVerifier {
         steps.push({ kind: 'verified', result: cloneEvaluation(result) });
         verifiedStepIndexes.push(i);
         validUntil = Math.min(validUntil, result.validUntil);
-        if (result.status !== 'OPEN' && earliestProblem === null) {
-          earliestProblem = {
-            stepIndex: i,
-            status: result.status,
-            problem: result.problem === undefined ? undefined : cloneProblem(result.problem),
-          };
+        if (result.status !== 'OPEN') {
+          if (earliestProblem === null) {
+            earliestProblem = {
+              stepIndex: i,
+              status: result.status,
+              problem: result.problem === undefined ? undefined : cloneProblem(result.problem),
+            };
+          }
+          if (worst === null || STATUS_PRIORITY[result.status] > STATUS_PRIORITY[worst]) {
+            worst = result.status;
+          }
         }
       }
     }
 
+    let openPrefix = 0;
     for (let i = 0; i < route.queries.length; i++) {
       const result = this.results.get(i);
       if (result !== undefined && result.status === 'OPEN') openPrefix += 1;
@@ -385,8 +420,8 @@ export class RouteVerifier {
     }
 
     let verdict: RouteVerdict;
-    if (earliestProblem !== null) {
-      verdict = earliestProblem.status;
+    if (worst !== null) {
+      verdict = worst;
     } else if (route.unsupportedReason !== undefined) {
       verdict = 'UNSUPPORTED';
     } else if (pendingStepIndexes.length === 0 && route.queries.length > 0) {
@@ -431,33 +466,50 @@ function buildQueries(
   for (let i = 0; i < points.length - 1; i++) {
     const from = points[i]!;
     const to = points[i + 1]!;
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const dz = to.z - from.z;
-    const xMove = dx !== 0;
-    const zMove = dz !== 0;
-    if (dy !== 0) {
-      throw new Error(`step ${i} changes height (Δy=${dy}); only same-height walk steps are supported`);
-    }
-    if (xMove === zMove) {
-      throw new Error(`step ${i} must move exactly one cell along X or Z (got Δx=${dx}, Δz=${dz})`);
-    }
-    const delta = xMove ? dx : dz;
-    if (delta !== 1 && delta !== -1) {
-      throw new Error(`step ${i} must be ±1 cell (got Δ=${delta})`);
-    }
-    const direction: StepDirection = { axis: xMove ? 'x' : 'z', sign: delta === 1 ? 1 : -1 };
     queries.push({
       worldId,
       dim,
       sessionId,
       mode: 'walk',
       body: { feet: { ...from }, width: body.width, height: body.height, pose: body.pose },
-      direction,
+      direction: classifyDirection(from, to, i),
       constraints,
     });
   }
   return queries;
+}
+
+/**
+ * Classify a consecutive pair as a walk direction. Compares the target against
+ * the start plus/minus one cell (matching how `evaluateWalkStep` generates its
+ * target), so normal fractional coordinates such as `1.3 → 2.3` are accepted
+ * despite floating-point subtraction error. Nothing is rounded or rewritten.
+ */
+function classifyDirection(from: Vec3Like, to: Vec3Like, i: number): StepDirection {
+  if (to.y !== from.y) {
+    throw new Error(`step ${i} changes height (Δy=${to.y - from.y}); only same-height walk steps are supported`);
+  }
+  if (to.x === from.x + 1 && to.z === from.z) return { axis: 'x', sign: 1 };
+  if (to.x === from.x - 1 && to.z === from.z) return { axis: 'x', sign: -1 };
+  if (to.z === from.z + 1 && to.x === from.x) return { axis: 'z', sign: 1 };
+  if (to.z === from.z - 1 && to.x === from.x) return { axis: 'z', sign: -1 };
+
+  const dx = to.x - from.x;
+  const dz = to.z - from.z;
+  const xSame = to.x === from.x;
+  const zSame = to.z === from.z;
+  if (xSame && zSame) {
+    throw new Error(`step ${i} must move exactly one cell along X or Z (duplicate point)`);
+  }
+  const xUnit = to.x === from.x + 1 || to.x === from.x - 1;
+  const zUnit = to.z === from.z + 1 || to.z === from.z - 1;
+  if (xUnit && zUnit) {
+    throw new Error(`step ${i} must move exactly one cell along X or Z (got Δx=${dx}, Δz=${dz})`);
+  }
+  if (xSame) {
+    throw new Error(`step ${i} must be ±1 cell (got Δz=${dz})`);
+  }
+  throw new Error(`step ${i} must be ±1 cell (got Δx=${dx})`);
 }
 
 function snapshotPoints(points: readonly Vec3Like[]): Vec3Like[] {
