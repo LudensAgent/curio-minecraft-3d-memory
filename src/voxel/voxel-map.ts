@@ -241,15 +241,36 @@ export class VoxelMap {
     const index = cellIndex(lx, ly, lz);
     const existing = section.evidence.get(index);
 
-    if (existing !== undefined && observation.observedAt <= existing.observation.observedAt) {
-      // Not strictly newer by acquisition time (same-session out-of-order or
-      // duplicate): never overwrite newer evidence. `sequence` is receive
-      // order, not acquisition order, so it must not decide this.
+    if (existing !== undefined && observation.observedAt < existing.observation.observedAt) {
+      // Genuinely older acquisition (same-session out-of-order): never overwrite
+      // newer evidence. `sequence` is receive order, not acquisition order.
       return null;
     }
 
     const validUntil = observation.observedAt + this.validityWindowMs;
     const serialized = serializeBlockState(observation.state);
+
+    if (existing !== undefined && observation.observedAt === existing.observation.observedAt) {
+      const sameContent =
+        serializeBlockState(existing.observation.state) === serialized &&
+        existing.observation.stateComplete === observation.stateComplete;
+      if (sameContent) {
+        // Exact duplicate at the same timestamp — nothing changed.
+        return null;
+      }
+      // Same timestamp, conflicting content: the timestamp carries no uniqueness
+      // guarantee, so these cannot be ordered. Invalidate the old conclusion
+      // instead of silently keeping it, and report the conflict explicitly.
+      section.evidence.set(index, {
+        ...existing,
+        freshness: 'STALE',
+        staleReason: 'conflict',
+        revision: existing.revision + 1,
+      });
+      section.revision += 1;
+      setBit(section.stale, index, true);
+      return { section, kind: 'staled', x, y, z };
+    }
 
     if (existing !== undefined) {
       const sameContent =
@@ -409,6 +430,9 @@ function validateObservation(worldId: string, observation: Observation): void {
     );
   }
   assertIntegerCoords(observation.pos.x, observation.pos.y, observation.pos.z);
+  if (!Number.isFinite(observation.observedAt)) {
+    throw new Error(`observation observedAt must be a finite number: ${observation.observedAt}`);
+  }
 }
 
 function assertIntegerCoords(x: number, y: number, z: number): void {

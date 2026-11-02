@@ -235,8 +235,20 @@ export function evaluateWalkStep(
   }
 
   const { body, direction, dim, sessionId } = query;
+  if (
+    !Number.isFinite(body.feet.x) ||
+    !Number.isFinite(body.feet.y) ||
+    !Number.isFinite(body.feet.z) ||
+    !Number.isFinite(body.width) ||
+    !Number.isFinite(body.height)
+  ) {
+    throw new Error(`body feet and dimensions must be finite numbers`);
+  }
   if (body.width <= 0 || body.height <= 0) {
     throw new Error(`body dimensions must be positive: width ${body.width}, height ${body.height}`);
+  }
+  if (!Number.isFinite(now)) {
+    throw new Error(`now must be a finite number: ${now}`);
   }
 
   const base: StepEvaluation = {
@@ -460,80 +472,99 @@ export function evaluateWalkStep(
     const sweepAMin = segMin - half;
     const sweepAMax = segMax + half;
 
-    // Only cells whose top could be exactly at the feet height can provide support.
+    // The only cell level whose top can equal the feet height: the block below
+    // integer feet, or the slab level under fractional feet.
     const floorY = Math.floor(fy);
-    const supportYs = [floorY - 1, floorY].filter((by) => by <= fy + EPS && by + 1 >= fy - EPS);
+    const supportY = Number.isInteger(fy) ? floorY - 1 : floorY;
 
     const aCellMin = Math.floor(sweepAMin);
     const aCellMax = Math.floor(sweepAMax - EPS);
     const pCellMin = Math.floor(perpMin);
     const pCellMax = Math.floor(perpMax - EPS);
 
-    const intervals: Array<[number, number]> = [];
+    const observedIntervals: Array<[number, number]> = [];
+    const potentialIntervals: Array<[number, number]> = [];
     const unsupportedCells: Vec3Like[] = [];
     const staleCellsHere: Vec3Like[] = [];
     const unknownCellsHere: Vec3Like[] = [];
 
-    for (const by of supportYs) {
-      for (let a = aCellMin; a <= aCellMax; a++) {
-        for (let p = pCellMin; p <= pCellMax; p++) {
-          const x = axis === 'x' ? a : p;
-          const z = axis === 'x' ? p : a;
-          const cell: Vec3Like = { x, y: by, z };
-          const read = readCell(x, by, z);
-          if (read.kind === 'observed') {
-            const shape = resolveShape(read.evidence, cell);
-            if (shape.kind === 'unsupported') {
-              unsupportedCells.push(cell);
-              continue;
-            }
-            if (shape.kind === 'gap') {
-              if (shape.view.kind === 'stale') staleCellsHere.push(shape.view.pos);
-              else unknownCellsHere.push(shape.view.pos);
-              continue;
-            }
-            for (const face of shape.shape.supportFaces) {
-              if (Math.abs(by + face.top - fy) >= EPS) continue;
-              const [perpFaceMin, perpFaceMax] =
-                axis === 'x' ? [z + face.minZ, z + face.maxZ] : [x + face.minX, x + face.maxX];
-              if (!overlaps(perpFaceMin, perpFaceMax, perpMin, perpMax)) continue;
-              const [alongFaceMin, alongFaceMax] =
-                axis === 'x' ? [x + face.minX, x + face.maxX] : [z + face.minZ, z + face.maxZ];
-              intervals.push([alongFaceMin - half, alongFaceMax + half]);
-            }
-          } else if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
-            staleCellsHere.push(cell);
-          } else {
-            // missing or incomplete
-            unknownCellsHere.push(cell);
+    // Best-case support a still-unknown cell could provide: a full-cell top face.
+    const addPotential = (x: number, z: number): void => {
+      const perpCellMin = axis === 'x' ? z : x;
+      if (!overlaps(perpCellMin, perpCellMin + 1, perpMin, perpMax)) return;
+      const alongCell = axis === 'x' ? x : z;
+      potentialIntervals.push([alongCell - half, alongCell + 1 + half]);
+    };
+
+    for (let a = aCellMin; a <= aCellMax; a++) {
+      for (let p = pCellMin; p <= pCellMax; p++) {
+        const x = axis === 'x' ? a : p;
+        const z = axis === 'x' ? p : a;
+        const cell: Vec3Like = { x, y: supportY, z };
+        const read = readCell(x, supportY, z);
+        if (read.kind === 'observed') {
+          const shape = resolveShape(read.evidence, cell);
+          if (shape.kind === 'unsupported') {
+            unsupportedCells.push(cell);
+            addPotential(x, z);
+            continue;
           }
+          if (shape.kind === 'gap') {
+            if (shape.view.kind === 'stale') staleCellsHere.push(shape.view.pos);
+            else unknownCellsHere.push(shape.view.pos);
+            addPotential(x, z);
+            continue;
+          }
+          for (const face of shape.shape.supportFaces) {
+            if (Math.abs(supportY + face.top - fy) >= EPS) continue;
+            const [perpFaceMin, perpFaceMax] =
+              axis === 'x' ? [z + face.minZ, z + face.maxZ] : [x + face.minX, x + face.maxX];
+            if (!overlaps(perpFaceMin, perpFaceMax, perpMin, perpMax)) continue;
+            const [alongFaceMin, alongFaceMax] =
+              axis === 'x' ? [x + face.minX, x + face.maxX] : [z + face.minZ, z + face.maxZ];
+            observedIntervals.push([alongFaceMin - half, alongFaceMax + half]);
+          }
+        } else if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
+          staleCellsHere.push(cell);
+          addPotential(x, z);
+        } else {
+          // missing or incomplete
+          unknownCellsHere.push(cell);
+          addPotential(x, z);
         }
       }
     }
 
-    const gaps = uncoveredGaps(intervals, segMin, segMax);
-    if (gaps.length === 0) return;
-    if (unsupportedCells.length > 0) {
-      if (acc.unsupported === null) {
-        acc.unsupported = {
-          problem: { kind: 'unsupported_shape', cells: unsupportedCells, detail: 'support depends on an unresolvable shape' },
-        };
+    const observedGaps = uncoveredGaps(observedIntervals, segMin, segMax);
+    if (observedGaps.length === 0) return; // confirmed support covers the sweep
+
+    // A gap is only BLOCKED when it remains uncovered even if every unknown,
+    // stale or unsupported candidate were a full cube. Otherwise those
+    // candidates could fill it and the result stays UNKNOWN/STALE/UNSUPPORTED.
+    const confirmedGaps = uncoveredGaps([...observedIntervals, ...potentialIntervals], segMin, segMax);
+    if (confirmedGaps.length === 0) {
+      if (unsupportedCells.length > 0) {
+        if (acc.unsupported === null) {
+          acc.unsupported = {
+            problem: { kind: 'unsupported_shape', cells: unsupportedCells, detail: 'support depends on an unresolvable shape' },
+          };
+        }
+        return;
+      }
+      if (staleCellsHere.length > 0) {
+        acc.staleCells.push(...staleCellsHere);
+        return;
+      }
+      if (unknownCellsHere.length > 0) {
+        acc.unknownCells.push(...unknownCellsHere);
+        return;
       }
       return;
     }
-    if (staleCellsHere.length > 0) {
-      acc.staleCells.push(...staleCellsHere);
-      return;
-    }
-    if (unknownCellsHere.length > 0) {
-      acc.unknownCells.push(...unknownCellsHere);
-      return;
-    }
-    // Every candidate support cell was confirmed, yet some part of the sweep is
-    // uncovered — report the support cell under that gap, not the move start.
+
+    // Report the support cell under each confirmed gap, not the move start.
     if (acc.blocked === null) {
-      const supportY = Number.isInteger(fy) ? floorY - 1 : floorY;
-      const gapCells = gaps.map(([gapLo, gapHi]) => {
+      const gapCells = confirmedGaps.map(([gapLo, gapHi]) => {
         const along = Math.floor((gapLo + gapHi) / 2);
         const perp = Math.floor(perpCoord);
         return axis === 'x'

@@ -68,7 +68,7 @@ export interface CellEvidence {
   /** Advances when content / completeness / validity changes; re-confirming the same state only refreshes time. */
   revision: number;
   freshness: Freshness;
-  staleReason?: 'unloaded' | 'observation_gap' | 'expired' | 'pending_effect';
+  staleReason?: 'unloaded' | 'observation_gap' | 'expired' | 'pending_effect' | 'conflict';
   /** Local cache validity ceiling; does not guarantee the world did not change meanwhile. */
   validUntil: number;
 }

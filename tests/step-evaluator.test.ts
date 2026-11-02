@@ -443,4 +443,38 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     const open = evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 3000);
     expect(open.status).toBe('OPEN');
   });
+
+  it('rejects non-finite coordinates, dimensions and query time', () => {
+    const map = new VoxelMap('world');
+
+    expect(() => evaluateWalkStep(map, stepQuery({ body: bodyAt(Number.NaN, 0, 0.5) }), fakeProvider, 2000)).toThrow(/finite/);
+    expect(() => evaluateWalkStep(map, stepQuery({ body: bodyAt(0.5, 0, 0.5, Number.NaN, 1.8) }), fakeProvider, 2000)).toThrow(/finite/);
+    expect(() => evaluateWalkStep(map, stepQuery({ body: bodyAt(0.5, 0, 0.5, 0.6, Number.NaN) }), fakeProvider, 2000)).toThrow(/finite/);
+    expect(() => evaluateWalkStep(map, stepQuery(), fakeProvider, Number.NaN)).toThrow(/finite/);
+  });
+
+  it('unknown cells that cannot cover a confirmed gap do not mask BLOCKED', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[0, -1, 0]]);
+    fill(map, AIR, [
+      [1, -1, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+      [2, 1, 0],
+    ]);
+    // (2,-1,0) left unobserved; even as a full cube it cannot support the foot at x=1.5.
+
+    const result = evaluateWalkStep(
+      map,
+      stepQuery({ body: bodyAt(0.9, 0, 0.5, 0.4, 1.8) }),
+      fakeProvider,
+      2000,
+    );
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_support');
+    expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 });
+  });
 });

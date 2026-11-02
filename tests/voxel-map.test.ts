@@ -465,3 +465,37 @@ describe('read-only queries', () => {
     expect(sectionAt(map, 'overworld', 0, 0, 0).lastObservedAt).toBe(lastObservedBefore);
   });
 });
+
+describe('conflicting and invalid observations', () => {
+  it('a same-timestamp conflicting observation invalidates the old conclusion', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: air, pos: { x: 0, y: 0, z: 0 } }));
+
+    const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000, sequence: 2 }));
+
+    expect(report.sections).toHaveLength(1);
+    expect(report.sections[0]!.invalidated).toBe(true);
+    expect(report.sections[0]!.cells[0]!.kind).toBe('staled');
+
+    const evidence = evidenceAt(map, 'overworld', 0, 0, 0);
+    expect(evidence.freshness).toBe('STALE');
+    expect(evidence.staleReason).toBe('conflict');
+    expect(evidence.observation.state).toEqual(air); // last-confirmed kept, but no longer trusted
+  });
+
+  it('a same-timestamp duplicate with identical content is a no-op', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    const before = evidenceAt(map, 'overworld', 0, 0, 0);
+
+    const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000, sequence: 2 }));
+
+    expect(report.sections).toEqual([]);
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe(before.freshness);
+  });
+
+  it('rejects a non-finite observedAt', () => {
+    const map = new VoxelMap('world');
+    expect(() => map.observe(obs({ observedAt: Number.NaN }))).toThrow(/finite/);
+  });
+});
