@@ -124,6 +124,9 @@ interface RegisteredRoute {
 
 const DEFAULT_MAX_ROUTE_LENGTH = 1024;
 
+/** Tolerance for treating a floating-point delta as exactly one cell. */
+const EPS = 1e-9;
+
 /** Overall-severity order over single-step statuses; mirrors the single-step evaluator's precedence. */
 const STATUS_PRIORITY: Record<StepStatus, number> = {
   OPEN: 0,
@@ -197,12 +200,10 @@ export class RouteVerifier {
       throw new Error(`body.feet ${fmt(body.feet)} must equal the first route point ${fmt(points[0]!)}`);
     }
     const constraints = snapshotConstraints(request.constraints);
-    // Snapshot the rule context so a later mutation of the caller's provider
-    // cannot split one route across two rule versions.
-    const shapeProvider: CollisionShapeProvider = {
-      version: request.shapeProvider.version,
-      resolve: request.shapeProvider.resolve,
-    };
+    // Keep the caller's provider object so a class method's `this` receiver is
+    // preserved. Rule identity is carried by `version` and reconciled when it
+    // changes (see `reconcileRuleVersion`); we never copy or bind the function.
+    const shapeProvider = request.shapeProvider;
     // Validate the clock before replacing state, so a broken clock cannot leave a
     // half-registered route.
     this.currentNow();
@@ -245,7 +246,9 @@ export class RouteVerifier {
 
   /** Read-only snapshot of the current verification state; `null` before any route is registered. */
   status(): RouteStatus | null {
-    return this.route === null ? null : this.snapshot();
+    if (this.route === null) return null;
+    this.reconcileRuleVersion();
+    return this.snapshot();
   }
 
   /**
@@ -254,6 +257,7 @@ export class RouteVerifier {
    */
   advance(budget: number): RouteStatus {
     this.requireRoute();
+    this.reconcileRuleVersion();
     this.expireStale(this.currentNow());
     this.runPending(budget);
     return this.snapshot();
@@ -273,6 +277,7 @@ export class RouteVerifier {
       this.cache.invalidate(report);
       return null;
     }
+    this.reconcileRuleVersion();
     this.expireStale(this.currentNow());
     this.invalidateByReport(report);
     this.cache.invalidate(report);
@@ -300,6 +305,22 @@ export class RouteVerifier {
       throw new Error(`now() must return a finite number: ${now}`);
     }
     return now;
+  }
+
+  /**
+   * When the collision-shape provider's `version` changes after registration, the
+   * previously verified steps were computed under the old rules and can no longer
+   * be reused. Drop all results and re-queue every step under the new version.
+   */
+  private reconcileRuleVersion(): void {
+    const route = this.route;
+    if (route === null) return;
+    if (route.shapeProvider.version === route.ruleVersion) return;
+    route.ruleVersion = route.shapeProvider.version;
+    this.results.clear();
+    this.pending.clear();
+    this.sectionToSteps.clear();
+    for (let i = 0; i < route.queries.length; i++) this.pending.set(i, 'unprocessed');
   }
 
   private runPending(budget: number): void {
@@ -336,11 +357,19 @@ export class RouteVerifier {
 
   private invalidateByReport(report: ChangeReport): void {
     for (const section of report.sections) {
-      if (!section.invalidated) continue;
       const key = sectionKeyString(section.key);
       const steps = this.sectionToSteps.get(key);
       if (steps === undefined) continue;
-      for (const i of [...steps]) this.invalidateStep(i);
+      for (const i of [...steps]) {
+        if (section.invalidated) {
+          this.invalidateStep(i);
+        } else {
+          // Refresh-only: content is unchanged but validity was extended. Only a
+          // stale diagnosis can recover from that, so re-queue it locally.
+          const result = this.results.get(i);
+          if (result !== undefined && result.status === 'STALE') this.invalidateStep(i);
+        }
+      }
     }
   }
 
@@ -359,15 +388,15 @@ export class RouteVerifier {
   }
 
   /**
-   * Move a verified step back to pending only when its evidence expired *after*
-   * it was computed. A step already re-verified as STALE on expired evidence
-   * (`computedAt > validUntil`) is a current conclusion and is kept, so it does
-   * not repeatedly consume budget. Never touches map state.
+   * Move a verified step back to pending when the live evidence its conclusion
+   * rests on has expired. A STALE diagnosis is a current conclusion ("evidence is
+   * missing/stale") and is kept until new evidence arrives, so it does not
+   * repeatedly consume budget. Never touches map state.
    */
   private expireStale(now: number): void {
     const expired: number[] = [];
     for (const [i, result] of this.results) {
-      if (now > result.validUntil && result.computedAt <= result.validUntil) expired.push(i);
+      if (result.status !== 'STALE' && now > result.validUntil) expired.push(i);
     }
     for (const i of expired) this.invalidateStep(i);
   }
@@ -480,33 +509,32 @@ function buildQueries(
 }
 
 /**
- * Classify a consecutive pair as a walk direction. Compares the target against
- * the start plus/minus one cell (matching how `evaluateWalkStep` generates its
- * target), so normal fractional coordinates such as `1.3 → 2.3` are accepted
- * despite floating-point subtraction error. Nothing is rounded or rewritten.
+ * Classify a consecutive pair as a walk direction. A unit move is detected by
+ * comparing the delta against ±1 within a small tolerance, so both directions of
+ * a fractional coordinate (e.g. `1.3 → 2.3` and `2.3 → 1.3`) are accepted despite
+ * floating-point subtraction error. Nothing is rounded or rewritten.
  */
 function classifyDirection(from: Vec3Like, to: Vec3Like, i: number): StepDirection {
   if (to.y !== from.y) {
     throw new Error(`step ${i} changes height (Δy=${to.y - from.y}); only same-height walk steps are supported`);
   }
-  if (to.x === from.x + 1 && to.z === from.z) return { axis: 'x', sign: 1 };
-  if (to.x === from.x - 1 && to.z === from.z) return { axis: 'x', sign: -1 };
-  if (to.z === from.z + 1 && to.x === from.x) return { axis: 'z', sign: 1 };
-  if (to.z === from.z - 1 && to.x === from.x) return { axis: 'z', sign: -1 };
-
   const dx = to.x - from.x;
   const dz = to.z - from.z;
-  const xSame = to.x === from.x;
-  const zSame = to.z === from.z;
-  if (xSame && zSame) {
+  const xZero = Math.abs(dx) < EPS;
+  const zZero = Math.abs(dz) < EPS;
+  const xUnit = Math.abs(Math.abs(dx) - 1) < EPS;
+  const zUnit = Math.abs(Math.abs(dz) - 1) < EPS;
+
+  if (xUnit && zZero) return { axis: 'x', sign: dx > 0 ? 1 : -1 };
+  if (zUnit && xZero) return { axis: 'z', sign: dz > 0 ? 1 : -1 };
+
+  if (xZero && zZero) {
     throw new Error(`step ${i} must move exactly one cell along X or Z (duplicate point)`);
   }
-  const xUnit = to.x === from.x + 1 || to.x === from.x - 1;
-  const zUnit = to.z === from.z + 1 || to.z === from.z - 1;
   if (xUnit && zUnit) {
     throw new Error(`step ${i} must move exactly one cell along X or Z (got Δx=${dx}, Δz=${dz})`);
   }
-  if (xSame) {
+  if (xZero) {
     throw new Error(`step ${i} must be ±1 cell (got Δz=${dz})`);
   }
   throw new Error(`step ${i} must be ±1 cell (got Δx=${dx})`);

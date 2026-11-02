@@ -87,7 +87,7 @@ export interface StepEvaluation {
   dependencies: { key: SectionKey; revision: number }[];
   sessionId: string;
   computedAt: number;
-  /** min validUntil over all evidence read; Infinity only when no evidence was read. */
+  /** min validUntil over evidence still valid at evaluation time; Infinity when no such evidence was read. */
   validUntil: number;
 }
 
@@ -154,11 +154,11 @@ function unionAabb(a: Aabb, b: Aabb): Aabb {
 
 /** Integer grid cells overlapping a continuous AABB. */
 function cellsInAabb(aabb: Aabb): Vec3Like[] {
-  const minBX = Math.floor(aabb.minX);
+  const minBX = Math.floor(aabb.minX + EPS);
   const maxBX = Math.floor(aabb.maxX - EPS);
-  const minBY = Math.floor(aabb.minY);
+  const minBY = Math.floor(aabb.minY + EPS);
   const maxBY = Math.floor(aabb.maxY - EPS);
-  const minBZ = Math.floor(aabb.minZ);
+  const minBZ = Math.floor(aabb.minZ + EPS);
   const maxBZ = Math.floor(aabb.maxZ - EPS);
   const cells: Vec3Like[] = [];
   for (let x = minBX; x <= maxBX; x++) {
@@ -343,7 +343,6 @@ export function evaluateWalkStep(
     if (evidence === undefined) {
       return { kind: 'missing', sectionKey, sectionRevision: section.revision };
     }
-    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
     if (evidence.freshness === 'STALE') {
       return { kind: 'stale', sectionKey, sectionRevision: section.revision };
     }
@@ -353,6 +352,11 @@ export function evaluateWalkStep(
     if (now > evidence.validUntil) {
       return { kind: 'expired', sectionKey, sectionRevision: section.revision };
     }
+    // Only evidence that is still valid at evaluation time bounds the conclusion's
+    // validity. Already-stale/expired/session cells are reflected in a STALE result
+    // (or are irrelevant to an OPEN/BLOCKED conclusion) and must not drag `validUntil`
+    // into the past.
+    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
     if (!evidence.observation.stateComplete) {
       return { kind: 'incomplete', sectionKey, sectionRevision: section.revision };
     }
@@ -492,9 +496,9 @@ export function evaluateWalkStep(
     const floorY = Math.floor(fy);
     const supportY = Number.isInteger(fy) ? floorY - 1 : floorY;
 
-    const aCellMin = Math.floor(sweepAMin);
+    const aCellMin = Math.floor(sweepAMin + EPS);
     const aCellMax = Math.floor(sweepAMax - EPS);
-    const pCellMin = Math.floor(perpMin);
+    const pCellMin = Math.floor(perpMin + EPS);
     const pCellMax = Math.floor(perpMax - EPS);
 
     const observedIntervals: Array<[number, number]> = [];

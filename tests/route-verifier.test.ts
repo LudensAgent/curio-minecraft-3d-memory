@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { RouteVerifier, VoxelMap } from '../src/index.js';
 import type { BlockState, Vec3Like } from '../src/types.js';
-import type { CollisionShapeProvider } from '../src/traversability/collision-shape.js';
+import type { CollisionShapeProvider, NeighborRead, ShapeResolution } from '../src/traversability/collision-shape.js';
 import type { RouteRequest, RouteStatus } from '../src/traversability/route.js';
 import { AIR, bodyAt, EMPTY, fakeProvider, FULL_CUBE, obs, STONE } from './fakes.js';
 
@@ -674,7 +674,25 @@ describe('RouteVerifier — regression fixes', () => {
     expect(s2.steps[1]!.kind === 'verified' && s2.steps[1]!.result.status).toBe('STALE');
   });
 
-  it('freezes the rule context at registration', () => {
+  it('preserves the receiver of a class-based shape provider', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+
+    class ClassProvider implements CollisionShapeProvider {
+      readonly version = 'cls-1';
+      resolve(state: BlockState, cell: Vec3Like, read: NeighborRead): ShapeResolution {
+        // Reads `this` — must not lose its receiver when the route evaluates.
+        if (this.version !== 'cls-1') throw new Error('lost receiver');
+        return fakeProvider.resolve(state, cell, read);
+      }
+    }
+
+    verifier.register(routeRequest(points, { shapeProvider: new ClassProvider() }));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+  });
+
+  it('a rule-version change invalidates old results and re-verifies under the new version', () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 3); // 2 steps
     const verifier = new RouteVerifier(map, { now: () => 2000 });
@@ -686,17 +704,18 @@ describe('RouteVerifier — regression fixes', () => {
       },
     };
     verifier.register(routeRequest(points, { shapeProvider: provider }));
-    verifier.advance(1); // step 0 under v1 → OPEN
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+    expect(status(verifier).ruleVersion).toBe('v1');
 
     // Mutate the same provider object after registration: v2 makes nothing solid.
     provider.version = 'v2';
     provider.resolve = () => ({ kind: 'shape', shape: { boxes: [], supportFaces: [] } });
 
-    const s = verifier.advance(10);
-    expect(s.ruleVersion).toBe('v1');
-    expect(s.verdict).toBe('OPEN');
-    expect(s.steps[0]!.kind === 'verified' && s.steps[0]!.result.status).toBe('OPEN');
-    expect(s.steps[1]!.kind === 'verified' && s.steps[1]!.result.status).toBe('OPEN');
+    const s = verifier.advance(10); // reconcile → re-verify everything under v2
+    expect(s.ruleVersion).toBe('v2');
+    expect(s.verdict).toBe('BLOCKED');
+    expect(s.steps[0]!.kind === 'verified' && s.steps[0]!.result.status).toBe('BLOCKED');
+    expect(s.steps[1]!.kind === 'verified' && s.steps[1]!.result.status).toBe('BLOCKED');
   });
 
   it('accepts normal fractional coordinates without rounding', () => {
@@ -781,5 +800,96 @@ describe('RouteVerifier — regression fixes', () => {
     const points = openRouteMap(map, 2);
     const verifier = new RouteVerifier(map, { now: () => Number.NaN });
     expect(() => verifier.register(routeRequest(points))).toThrow(/finite/);
+  });
+
+  it('a non-STALE conclusion still expires when its live evidence does', () => {
+    let clock = 70_000;
+    const map = new VoxelMap('world', { now: () => clock });
+    // (1,0,0) is a fresh obstacle; (0,0,0) is old air, already expired at 70_000.
+    map.observe(obs(STONE, { x: 0, y: -1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 1000 }));
+    map.observe(obs(AIR, { x: 0, y: 1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 1, y: 1, z: 0 }, { observedAt: 70_000 }));
+
+    const verifier = new RouteVerifier(map, { now: () => clock });
+    verifier.register(routeRequest([
+      { x: 0.5, y: 0, z: 0.5 },
+      { x: 1.5, y: 0, z: 0.5 },
+    ]));
+    expect(verifier.advance(10).verdict).toBe('BLOCKED');
+
+    clock = 140_000; // every piece of evidence has now expired
+    expect(verifier.advance(10).verdict).toBe('STALE');
+  });
+
+  it('a STALE route recovers when the same state is re-observed', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const verifier = new RouteVerifier(map, { now: () => clock });
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+
+    clock = 70_000;
+    expect(verifier.advance(10).verdict).toBe('STALE');
+
+    clock = 71_000;
+    const report = map.observeBatch({
+      observations: [
+        obs(STONE, { x: 0, y: -1, z: 0 }, { observedAt: 71_000, sequence: 2 }),
+        obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 71_000, sequence: 3 }),
+        obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 71_000, sequence: 4 }),
+        obs(AIR, { x: 0, y: 1, z: 0 }, { observedAt: 71_000, sequence: 5 }),
+        obs(AIR, { x: 1, y: 0, z: 0 }, { observedAt: 71_000, sequence: 6 }),
+        obs(AIR, { x: 1, y: 1, z: 0 }, { observedAt: 71_000, sequence: 7 }),
+      ],
+      unobserved: [],
+    });
+    expect(verifier.apply(report, 10)?.verdict).toBe('OPEN');
+  });
+
+  it('accepts fractional coordinates in the reverse direction', () => {
+    const map = new VoxelMap('world');
+    // Reverse: 2.3 → 1.3, where 1.3 − 2.3 = −0.9999999999999998.
+    const points: Vec3Like[] = [
+      { x: 2.3, y: 0, z: 0.5 },
+      { x: 1.3, y: 0, z: 0.5 },
+    ];
+    fill(map, STONE, [
+      [1, -1, 0],
+      [2, -1, 0],
+    ]);
+    fill(map, AIR, [
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+      [2, 1, 0],
+    ]);
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+    verifier.register(routeRequest(points));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+  });
+
+  it('accepts fractional coordinates along Z in both directions', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [0, -1, 1],
+      [0, -1, 2],
+    ]);
+    fill(map, AIR, [
+      [0, 0, 1],
+      [0, 1, 1],
+      [0, 0, 2],
+      [0, 1, 2],
+    ]);
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+
+    verifier.register(routeRequest([{ x: 0.5, y: 0, z: 1.3 }, { x: 0.5, y: 0, z: 2.3 }]));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
+
+    verifier.register(routeRequest([{ x: 0.5, y: 0, z: 2.3 }, { x: 0.5, y: 0, z: 1.3 }]));
+    expect(verifier.advance(10).verdict).toBe('OPEN');
   });
 });

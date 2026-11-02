@@ -75,17 +75,27 @@ export class TraversabilityCache {
 
   /**
    * Invalidate entries that depended on any section whose revision advanced.
-   * Refresh-only (`invalidated: false`) changes do not invalidate: they only
-   * extend evidence validity, which the time-based `validUntil` check already
-   * handles on the next read.
+   * Refresh-only (`invalidated: false`) changes invalidate only STALE entries:
+   * they extend evidence validity, which the time-based `validUntil` check
+   * handles for non-STALE entries, but a STALE entry has no forward validity to
+   * expire against and can only recover when the refreshing report drops it.
    */
   invalidate(report: ChangeReport): void {
     const toDelete = new Set<string>();
     for (const section of report.sections) {
-      if (!section.invalidated) continue;
       const keys = this.bySection.get(sectionKeyString(section.key));
       if (keys === undefined) continue;
-      for (const key of keys) toDelete.add(key);
+      for (const key of keys) {
+        if (section.invalidated) {
+          toDelete.add(key);
+        } else {
+          // Refresh-only: content is unchanged, but evidence validity was extended.
+          // A STALE entry has no forward validity to expire against, so it can only
+          // recover when the refreshing report drops it explicitly.
+          const entry = this.entries.get(key);
+          if (entry !== undefined && entry.evaluation.status === 'STALE') toDelete.add(key);
+        }
+      }
     }
     for (const key of toDelete) this.removeEntry(key);
   }
