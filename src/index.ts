@@ -46,7 +46,7 @@ export type {
 } from './voxel/index.js';
 
 // Traversability
-export { evaluateWalkStep, TraversabilityCache } from './traversability/index.js';
+export { evaluateWalkStep, TraversabilityCache, RouteVerifier } from './traversability/index.js';
 export type {
   CollisionShape,
   CollisionShapeProvider,
@@ -71,6 +71,14 @@ export type {
   ObstacleEvidence,
   Traversability,
   TraversabilityEntry,
+} from './traversability/index.js';
+export type {
+  PendingReason,
+  RouteRequest,
+  RouteStatus,
+  RouteStepState,
+  RouteVerdict,
+  RouteVerifierOptions,
 } from './traversability/index.js';
 
 // Topology

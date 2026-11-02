@@ -1,0 +1,542 @@
+/**
+ * Read-only route verification (design §7 `inspect_route`, phase 3 first step).
+ *
+ * `RouteVerifier` composes the existing single-step walk evaluator and
+ * `TraversabilityCache` over an *already-selected, ordered* route. It answers
+ * which segments are currently passable, which are blocked, and which lack
+ * evidence — it never searches a route, moves the body, digs, places, or
+ * generates a navigation strategy.
+ *
+ * The verifier manages one route at a time. `register` snapshots the caller's
+ * points/body/constraints and decomposes the polyline into the one-cell,
+ * same-height, ±1-along-X-or-Z steps `evaluateWalkStep` supports; it does not
+ * round coordinates, insert points, or skip duplicates — a malformed step is
+ * rejected at the boundary. Verification is bounded: `advance` processes at most
+ * `budget` pending steps per call, and the remaining work is left to the next
+ * call. On a `ChangeReport`, `apply` re-runs the cache invalidation, drops the
+ * affected steps' results through a Section→step reverse index, and re-verifies
+ * within the same budget.
+ *
+ * "Active route" here means only "a route being tracked for verification"; it
+ * does not mean execution has started, and no `ARRIVED` / movement-success
+ * record is ever produced. A read (`status`, `advance`, `apply`) never mutates
+ * the map's evidence, time, version or freshness: it only reads snapshots and
+ * updates the derived verification state.
+ */
+
+import type { Observation } from '../observation/types.js';
+import type { MoveMode, Vec3Like } from '../types.js';
+import { sectionKeyString } from '../voxel/section.js';
+import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
+import { TraversabilityCache } from './cache.js';
+import type { CollisionShapeProvider } from './collision-shape.js';
+import type {
+  BodyContext,
+  StepConstraints,
+  StepDirection,
+  StepEvaluation,
+  StepProblem,
+  StepQuery,
+  StepStatus,
+} from './step.js';
+
+/** Route-level verdict. `INCOMPLETE` means "not yet fully verified", never a terrain fact. */
+export type RouteVerdict = 'OPEN' | 'BLOCKED' | 'UNKNOWN' | 'STALE' | 'UNSUPPORTED' | 'INCOMPLETE';
+
+/** Why a single step is not (yet) verified. */
+export type PendingReason = 'unprocessed' | 'invalidated';
+
+/** Per-step verification state. */
+export type RouteStepState =
+  | { kind: 'verified'; result: StepEvaluation }
+  | { kind: 'pending'; reason: PendingReason };
+
+/** Input describing one route plus the fixed context under which it is verified. */
+export interface RouteRequest {
+  worldId: string;
+  dim: string;
+  sessionId: string;
+  mode: MoveMode;
+  /** Fixed body size/pose; `feet` must equal the first route point. */
+  body: BodyContext;
+  constraints?: StepConstraints;
+  shapeProvider: CollisionShapeProvider;
+  /** Ordered, consecutive foot positions (≥ 2). Snapshot on registration. */
+  points: readonly Vec3Like[];
+}
+
+/** Read-only route-verification snapshot; never aliases internal state. */
+export interface RouteStatus {
+  worldId: string;
+  dim: string;
+  sessionId: string;
+  mode: MoveMode;
+  body: BodyContext;
+  /** Collision-shape rule version that produced these conclusions. */
+  ruleVersion: string;
+  /** Original route points (snapshot copy). */
+  points: Vec3Like[];
+  /** Number of walk steps (points.length − 1); 0 for an unsupported route. */
+  stepCount: number;
+  /** True only when every step has a current verified conclusion. */
+  complete: boolean;
+  /** Route verdict: OPEN only when every step is currently OPEN. */
+  verdict: RouteVerdict;
+  reason?: string;
+  /** Leading consecutive OPEN steps from the start. */
+  openPrefix: number;
+  /** Sorted indices of currently verified steps (the "processed range"). */
+  verifiedStepIndexes: number[];
+  /** Sorted indices awaiting verification (the "pending range"). */
+  pendingStepIndexes: number[];
+  /** Number of pending steps whose previous result was invalidated/expired. */
+  invalidatedCount: number;
+  /** Earliest verified non-OPEN step, when any. */
+  earliestProblem: { stepIndex: number; status: StepStatus; problem?: StepProblem } | null;
+  /** Per-step state, indexed by step index. */
+  steps: RouteStepState[];
+  /** min validUntil over verified steps; never later than any single step's. */
+  validUntil: number;
+  computedAt: number;
+}
+
+export interface RouteVerifierOptions {
+  /** Clock for TTL expiry; must return values comparable to observation times. Defaults to `Date.now`. */
+  now?: () => number;
+  /** Maximum number of points (inclusive). Exceeding it is rejected, not truncated. Defaults to 1024. */
+  maxRouteLength?: number;
+}
+
+interface RegisteredRoute {
+  worldId: string;
+  dim: string;
+  sessionId: string;
+  mode: MoveMode;
+  body: BodyContext;
+  constraints: StepConstraints | undefined;
+  shapeProvider: CollisionShapeProvider;
+  ruleVersion: string;
+  points: Vec3Like[];
+  /** Set when `mode` is outside the walk evaluator's range: no steps are decomposed. */
+  unsupportedReason?: string;
+  queries: StepQuery[];
+}
+
+const DEFAULT_MAX_ROUTE_LENGTH = 1024;
+
+/**
+ * @example Full call order (observe → ChangeReport → invalidate → bounded re-verify → read):
+ * ```ts
+ * const map = new VoxelMap('world', { now });
+ * const verifier = new RouteVerifier(map, { now });
+ *
+ * verifier.register({
+ *   worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk',
+ *   body: { feet: { x: 0.5, y: 0, z: 0.5 }, width: 0.6, height: 1.8, pose: 'standing' },
+ *   shapeProvider,
+ *   points: [{ x: 0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }],
+ * });
+ *
+ * let status = verifier.advance(2);            // bounded verification round
+ * const report = map.observe(observation);     // caller writes the real observation first
+ * status = verifier.apply(report, 2);          // invalidate affected steps, re-verify within budget
+ * const current = verifier.status();           // read-only snapshot, never mutates the map
+ * ```
+ */
+export class RouteVerifier {
+  private readonly map: VoxelMap;
+  private readonly cache: TraversabilityCache;
+  private readonly now: () => number;
+  private readonly maxRouteLength: number;
+
+  private route: RegisteredRoute | null = null;
+  /** Verified step index → cloned evaluation (the "processed" range). */
+  private readonly results = new Map<number, StepEvaluation>();
+  /** Step index → why it still needs verification (the "pending" range). */
+  private readonly pending = new Map<number, PendingReason>();
+  /** Section key → step indices that depend on it (reverse dependency index). */
+  private readonly sectionToSteps = new Map<string, Set<number>>();
+
+  constructor(map: VoxelMap, options: RouteVerifierOptions = {}) {
+    this.map = map;
+    this.now = options.now ?? Date.now;
+    const maxRouteLength = options.maxRouteLength ?? DEFAULT_MAX_ROUTE_LENGTH;
+    if (!Number.isInteger(maxRouteLength) || maxRouteLength < 2) {
+      throw new Error(`maxRouteLength must be an integer ≥ 2: ${maxRouteLength}`);
+    }
+    this.maxRouteLength = maxRouteLength;
+    this.cache = new TraversabilityCache(map, { now: this.now });
+  }
+
+  /**
+   * Register (or replace) the tracked route. Snapshots the request and returns
+   * the initial status with every walk step pending. Replacing clears the
+   * previous route's results and reverse index; it never clears the shared
+   * single-step cache.
+   */
+  register(request: RouteRequest): RouteStatus {
+    if (request.worldId !== this.map.worldId) {
+      throw new Error(`request worldId "${request.worldId}" does not match map worldId "${this.map.worldId}"`);
+    }
+    const points = snapshotPoints(request.points);
+    if (points.length > this.maxRouteLength) {
+      throw new Error(`route has ${points.length} points, exceeding the limit of ${this.maxRouteLength}`);
+    }
+    const body = snapshotBody(request.body);
+    validateBody(body);
+    if (!pointsEqual(body.feet, points[0]!)) {
+      throw new Error(`body.feet ${fmt(body.feet)} must equal the first route point ${fmt(points[0]!)}`);
+    }
+    const constraints = snapshotConstraints(request.constraints);
+
+    this.route = null;
+    this.results.clear();
+    this.pending.clear();
+    this.sectionToSteps.clear();
+
+    if (request.mode !== 'walk') {
+      this.route = {
+        worldId: request.worldId,
+        dim: request.dim,
+        sessionId: request.sessionId,
+        mode: request.mode,
+        body,
+        constraints,
+        shapeProvider: request.shapeProvider,
+        ruleVersion: request.shapeProvider.version,
+        points,
+        unsupportedReason: `mode "${request.mode}" is outside the walk route verifier's range`,
+        queries: [],
+      };
+      return this.snapshot();
+    }
+
+    const queries = buildQueries(request.worldId, request.dim, request.sessionId, body, constraints, points);
+
+    this.route = {
+      worldId: request.worldId,
+      dim: request.dim,
+      sessionId: request.sessionId,
+      mode: 'walk',
+      body,
+      constraints,
+      shapeProvider: request.shapeProvider,
+      ruleVersion: request.shapeProvider.version,
+      points,
+      queries,
+    };
+
+    for (let i = 0; i < queries.length; i++) this.pending.set(i, 'unprocessed');
+    return this.snapshot();
+  }
+
+  /** Read-only snapshot of the current verification state; `null` before any route is registered. */
+  status(): RouteStatus | null {
+    this.expireStale();
+    return this.route === null ? null : this.snapshot();
+  }
+
+  /**
+   * Verify up to `budget` pending steps, in step order. Already-valid steps are
+   * not recomputed; their results are preserved.
+   */
+  advance(budget: number): RouteStatus {
+    this.requireRoute();
+    this.expireStale();
+    this.runPending(budget);
+    return this.snapshot();
+  }
+
+  /**
+   * Consume a `ChangeReport`: invalidate the single-step cache, drop every step
+   * result that depended on a changed section (via the reverse index), then
+   * re-verify within `budget`. Unaffected steps keep their current results.
+   */
+  apply(report: ChangeReport, budget: number): RouteStatus {
+    this.requireRoute();
+    this.expireStale();
+    this.invalidateByReport(report);
+    this.cache.invalidate(report);
+    this.runPending(budget);
+    return this.snapshot();
+  }
+
+  /** Drop the tracked route and all its results/dependencies. The shared cache is left intact. */
+  clear(): void {
+    this.route = null;
+    this.results.clear();
+    this.pending.clear();
+    this.sectionToSteps.clear();
+  }
+
+  // --- internals ---
+
+  private requireRoute(): void {
+    if (this.route === null) throw new Error('no route registered');
+  }
+
+  private runPending(budget: number): void {
+    validateBudget(budget);
+    const route = this.route;
+    if (route === null || route.unsupportedReason !== undefined) return;
+    const indices = [...this.pending.keys()].sort((a, b) => a - b);
+    let processed = 0;
+    for (const i of indices) {
+      if (processed >= budget) break;
+      this.verifyStep(i);
+      processed += 1;
+    }
+  }
+
+  private verifyStep(i: number): void {
+    const route = this.route;
+    if (route === null) return;
+    const query = route.queries[i];
+    if (query === undefined) return;
+    const evaluation = this.cache.get(query, route.shapeProvider);
+    this.results.set(i, evaluation);
+    this.pending.delete(i);
+    for (const dep of evaluation.dependencies) {
+      const key = sectionKeyString(dep.key);
+      let set = this.sectionToSteps.get(key);
+      if (set === undefined) {
+        set = new Set();
+        this.sectionToSteps.set(key, set);
+      }
+      set.add(i);
+    }
+  }
+
+  private invalidateByReport(report: ChangeReport): void {
+    for (const section of report.sections) {
+      if (!section.invalidated) continue;
+      const key = sectionKeyString(section.key);
+      const steps = this.sectionToSteps.get(key);
+      if (steps === undefined) continue;
+      for (const i of [...steps]) this.invalidateStep(i);
+    }
+  }
+
+  private invalidateStep(i: number): void {
+    this.pending.set(i, 'invalidated');
+    const result = this.results.get(i);
+    if (result === undefined) return;
+    this.results.delete(i);
+    for (const dep of result.dependencies) {
+      const key = sectionKeyString(dep.key);
+      const set = this.sectionToSteps.get(key);
+      if (set === undefined) continue;
+      set.delete(i);
+      if (set.size === 0) this.sectionToSteps.delete(key);
+    }
+  }
+
+  /** Move any verified step whose evidence has expired back to pending. Never touches map state. */
+  private expireStale(): void {
+    const now = this.now();
+    if (!Number.isFinite(now)) {
+      throw new Error(`now() must return a finite number: ${now}`);
+    }
+    const expired: number[] = [];
+    for (const [i, result] of this.results) {
+      if (now > result.validUntil) expired.push(i);
+    }
+    for (const i of expired) this.invalidateStep(i);
+  }
+
+  private snapshot(): RouteStatus {
+    const route = this.route;
+    if (route === null) throw new Error('no route registered');
+    const now = this.now();
+
+    const steps: RouteStepState[] = [];
+    const verifiedStepIndexes: number[] = [];
+    const pendingStepIndexes: number[] = [];
+    let openPrefix = 0;
+    let invalidatedCount = 0;
+    let validUntil = Number.POSITIVE_INFINITY;
+    let earliestProblem: RouteStatus['earliestProblem'] = null;
+
+    for (let i = 0; i < route.queries.length; i++) {
+      const result = this.results.get(i);
+      if (result === undefined) {
+        const reason = this.pending.get(i) ?? 'unprocessed';
+        steps.push({ kind: 'pending', reason });
+        pendingStepIndexes.push(i);
+        if (reason === 'invalidated') invalidatedCount += 1;
+      } else {
+        steps.push({ kind: 'verified', result: cloneEvaluation(result) });
+        verifiedStepIndexes.push(i);
+        validUntil = Math.min(validUntil, result.validUntil);
+        if (result.status !== 'OPEN' && earliestProblem === null) {
+          earliestProblem = {
+            stepIndex: i,
+            status: result.status,
+            problem: result.problem === undefined ? undefined : cloneProblem(result.problem),
+          };
+        }
+      }
+    }
+
+    for (let i = 0; i < route.queries.length; i++) {
+      const result = this.results.get(i);
+      if (result !== undefined && result.status === 'OPEN') openPrefix += 1;
+      else break;
+    }
+
+    let verdict: RouteVerdict;
+    if (earliestProblem !== null) {
+      verdict = earliestProblem.status;
+    } else if (route.unsupportedReason !== undefined) {
+      verdict = 'UNSUPPORTED';
+    } else if (pendingStepIndexes.length === 0 && route.queries.length > 0) {
+      verdict = 'OPEN';
+    } else {
+      verdict = 'INCOMPLETE';
+    }
+
+    return {
+      worldId: route.worldId,
+      dim: route.dim,
+      sessionId: route.sessionId,
+      mode: route.mode,
+      body: cloneBody(route.body),
+      ruleVersion: route.ruleVersion,
+      points: route.points.map((p) => ({ ...p })),
+      stepCount: route.queries.length,
+      complete: pendingStepIndexes.length === 0,
+      verdict,
+      reason: route.unsupportedReason,
+      openPrefix,
+      verifiedStepIndexes,
+      pendingStepIndexes,
+      invalidatedCount,
+      earliestProblem,
+      steps,
+      validUntil,
+      computedAt: now,
+    };
+  }
+}
+
+function buildQueries(
+  worldId: string,
+  dim: string,
+  sessionId: string,
+  body: BodyContext,
+  constraints: StepConstraints | undefined,
+  points: Vec3Like[],
+): StepQuery[] {
+  const queries: StepQuery[] = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const from = points[i]!;
+    const to = points[i + 1]!;
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dz = to.z - from.z;
+    const xMove = dx !== 0;
+    const zMove = dz !== 0;
+    if (dy !== 0) {
+      throw new Error(`step ${i} changes height (Δy=${dy}); only same-height walk steps are supported`);
+    }
+    if (xMove === zMove) {
+      throw new Error(`step ${i} must move exactly one cell along X or Z (got Δx=${dx}, Δz=${dz})`);
+    }
+    const delta = xMove ? dx : dz;
+    if (delta !== 1 && delta !== -1) {
+      throw new Error(`step ${i} must be ±1 cell (got Δ=${delta})`);
+    }
+    const direction: StepDirection = { axis: xMove ? 'x' : 'z', sign: delta === 1 ? 1 : -1 };
+    queries.push({
+      worldId,
+      dim,
+      sessionId,
+      mode: 'walk',
+      body: { feet: { ...from }, width: body.width, height: body.height, pose: body.pose },
+      direction,
+      constraints,
+    });
+  }
+  return queries;
+}
+
+function snapshotPoints(points: readonly Vec3Like[]): Vec3Like[] {
+  if (points.length < 2) {
+    throw new Error(`a route needs at least two points, got ${points.length}`);
+  }
+  return points.map((p) => {
+    assertFinite(p.x, 'point.x');
+    assertFinite(p.y, 'point.y');
+    assertFinite(p.z, 'point.z');
+    return { x: p.x, y: p.y, z: p.z };
+  });
+}
+
+function snapshotBody(body: BodyContext): BodyContext {
+  return { feet: { ...body.feet }, width: body.width, height: body.height, pose: body.pose };
+}
+
+function snapshotConstraints(constraints: StepConstraints | undefined): StepConstraints | undefined {
+  if (constraints === undefined) return undefined;
+  return { avoid: (constraints.avoid ?? []).map((p) => ({ x: p.x, y: p.y, z: p.z })) };
+}
+
+function validateBody(body: BodyContext): void {
+  if (
+    !Number.isFinite(body.feet.x) ||
+    !Number.isFinite(body.feet.y) ||
+    !Number.isFinite(body.feet.z) ||
+    !Number.isFinite(body.width) ||
+    !Number.isFinite(body.height)
+  ) {
+    throw new Error('body feet and dimensions must be finite numbers');
+  }
+  if (body.width <= 0 || body.height <= 0) {
+    throw new Error(`body dimensions must be positive: width ${body.width}, height ${body.height}`);
+  }
+}
+
+function validateBudget(budget: number): void {
+  if (!Number.isInteger(budget) || budget <= 0) {
+    throw new Error(`budget must be a positive integer: ${budget}`);
+  }
+}
+
+function assertFinite(value: number, label: string): void {
+  if (!Number.isFinite(value)) throw new Error(`${label} must be a finite number: ${value}`);
+}
+
+function pointsEqual(a: Vec3Like, b: Vec3Like): boolean {
+  return a.x === b.x && a.y === b.y && a.z === b.z;
+}
+
+function fmt(p: Vec3Like): string {
+  return `(${p.x}, ${p.y}, ${p.z})`;
+}
+
+function cloneBody(body: BodyContext): BodyContext {
+  return { feet: { ...body.feet }, width: body.width, height: body.height, pose: body.pose };
+}
+
+function cloneProblem(problem: StepProblem): StepProblem {
+  return { ...problem, cells: problem.cells.map((c) => ({ ...c })) };
+}
+
+function cloneObservation(o: Observation): Observation {
+  return { ...o, pos: { ...o.pos }, state: { name: o.state.name, properties: { ...o.state.properties } } };
+}
+
+function cloneEvaluation(e: StepEvaluation): StepEvaluation {
+  return {
+    ...e,
+    from: { ...e.from },
+    to: { ...e.to },
+    problem: e.problem === undefined ? undefined : cloneProblem(e.problem),
+    obstacles: e.obstacles.map((o) =>
+      o.kind === 'block'
+        ? { kind: 'block', observation: cloneObservation(o.observation) }
+        : { kind: 'contact', pos: { ...o.pos }, observedAt: o.observedAt, sessionId: o.sessionId },
+    ),
+    dependencies: e.dependencies.map((d) => ({ key: { ...d.key }, revision: d.revision })),
+  };
+}
