@@ -8,10 +8,11 @@
  * never clears the cache.
  *
  * An entry is never served past its `validUntil`, which is the minimum
- * validUntil over every evidence cell the evaluation read (including expired,
- * stale, session-mismatched or incomplete cells), so an expired OPEN/UNKNOWN
- * re-evaluates to STALE instead of sticking. Returned evaluations are deep
- * copies: mutating them can never pollute the cache or its reverse index.
+ * validUntil over the evidence that was still valid at evaluation time (observed
+ * or incomplete cells — already-expired, stale, or session-mismatched cells are
+ * excluded), so an expired OPEN/UNKNOWN re-evaluates to STALE instead of
+ * sticking. Returned evaluations are deep copies: mutating them can never
+ * pollute the cache or its reverse index.
  */
 
 import type { Observation } from '../observation/types.js';
