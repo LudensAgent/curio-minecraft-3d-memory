@@ -165,7 +165,7 @@ describe('state identity', () => {
     const before = evidenceAt(map, 'overworld', 0, 0, 0);
 
     const report = map.observe(obs({ state: oakDoorOpen, pos: { x: 0, y: 0, z: 0 }, sequence: 2, observedAt: 2000 }));
-    expect(report.sections[0]!.contentChanged).toBe(true);
+    expect(report.sections[0]!.invalidated).toBe(true);
     expect(report.sections[0]!.cells[0]!.kind).toBe('changed');
 
     const after = evidenceAt(map, 'overworld', 0, 0, 0);
@@ -187,7 +187,7 @@ describe('state identity', () => {
         observedAt: 2000,
       }),
     );
-    expect(report.sections[0]!.contentChanged).toBe(false);
+    expect(report.sections[0]!.invalidated).toBe(false);
     expect(report.sections[0]!.cells[0]!.kind).toBe('refreshed');
 
     const after = evidenceAt(map, 'overworld', 0, 0, 0);
@@ -213,10 +213,10 @@ describe('evidence refresh scope', () => {
 });
 
 describe('ordering and scope isolation', () => {
-  it('ignores a stale same-session observation with a lower sequence', () => {
+  it('rejects an older acquisition even when received later (same session)', () => {
     const map = new VoxelMap('world');
-    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, sequence: 5, observedAt: 100 }));
-    const report = map.observe(obs({ state: dirt, pos: { x: 0, y: 0, z: 0 }, sequence: 3, observedAt: 200 }));
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 200, sequence: 1 }));
+    const report = map.observe(obs({ state: dirt, pos: { x: 0, y: 0, z: 0 }, observedAt: 100, sequence: 2 }));
 
     expect(report.sections).toEqual([]);
     expect(evidenceAt(map, 'overworld', 0, 0, 0).observation.state).toEqual(stone);
@@ -236,16 +236,106 @@ describe('ordering and scope isolation', () => {
     expect(() => map.observe(obs({ worldId: 'other' }))).toThrow(/does not match/);
   });
 
-  it('a new session supersedes an old one, and a late old-session scan cannot overwrite it', () => {
+  it('a new session supersedes the old one and rejects late old-session scans', () => {
     const map = new VoxelMap('world');
+    map.beginSession('A');
     map.observe(obs({ sessionId: 'A', observedAt: 100, sequence: 1, state: stone, pos: { x: 0, y: 0, z: 0 } }));
+
+    const staleReport = map.beginSession('B');
+    expect(staleReport.sections).toHaveLength(1);
+    expect(staleReport.sections[0]!.invalidated).toBe(true);
+    expect(staleReport.sections[0]!.cells[0]!.kind).toBe('staled');
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('STALE');
+
     map.observe(obs({ sessionId: 'B', observedAt: 200, sequence: 1, state: dirt, pos: { x: 0, y: 0, z: 0 } }));
     expect(evidenceAt(map, 'overworld', 0, 0, 0).observation.state).toEqual(dirt);
 
-    // Late-arriving scan from the old session A (acquired before B) must not overwrite B.
-    map.observe(obs({ sessionId: 'A', observedAt: 150, sequence: 999, state: stone, pos: { x: 0, y: 0, z: 0 } }));
-    expect(evidenceAt(map, 'overworld', 0, 0, 0).observation.state).toEqual(dirt);
+    // A late-arriving scan from the old session is rejected even if its observedAt is newer.
+    const lateReport = map.observe(
+      obs({ sessionId: 'A', observedAt: 250, sequence: 999, state: stone, pos: { x: 0, y: 0, z: 0 } }),
+    );
+    expect(lateReport.sections).toEqual([]);
     expect(evidenceAt(map, 'overworld', 0, 0, 0).observation.sessionId).toBe('B');
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).observation.state).toEqual(dirt);
+  });
+});
+
+describe('lifecycle invalidation', () => {
+  it('beginSession with no prior session is a no-op report', () => {
+    const map = new VoxelMap('world');
+    expect(map.beginSession('A').sections).toEqual([]);
+  });
+
+  it('markStale marks cells STALE and reports the validity change', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100 }));
+    const section = sectionAt(map, 'overworld', 0, 0, 0);
+    const revisionBefore = section.revision;
+
+    const report = map.markStale('overworld', 'unloaded');
+    expect(report.sections).toHaveLength(1);
+    expect(report.sections[0]!.invalidated).toBe(true);
+    expect(report.sections[0]!.cells[0]!.kind).toBe('staled');
+
+    const ev = evidenceAt(map, 'overworld', 0, 0, 0);
+    expect(ev.freshness).toBe('STALE');
+    expect(ev.staleReason).toBe('unloaded');
+    expect(ev.revision).toBe(2); // 1 (insert) + 1 (stale)
+    expect(section.revision).toBe(revisionBefore + 1);
+  });
+});
+
+describe('input and read isolation', () => {
+  it('does not alias the caller observation object', () => {
+    const map = new VoxelMap('world');
+    const input = obs({ state: { name: 'minecraft:stone', properties: { a: '1' } }, pos: { x: 0, y: 0, z: 0 } });
+    map.observe(input);
+
+    input.state.name = 'minecraft:air';
+    input.state.properties.a = '2';
+    input.pos.x = 99;
+
+    const ev = evidenceAt(map, 'overworld', 0, 0, 0);
+    expect(ev.observation.state.name).toBe('minecraft:stone');
+    expect(ev.observation.state.properties).toEqual({ a: '1' });
+    expect(ev.observation.pos).toEqual({ x: 0, y: 0, z: 0 });
+
+    expect(sectionAt(map, 'overworld', 0, 0, 0).palette[1]).toBe('minecraft:stone[a=1]');
+  });
+
+  it('cellAt returns a snapshot that cannot mutate the store', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+
+    const view = map.cellAt('overworld', 0, 0, 0);
+    if (!view.observed) throw new Error('expected observed');
+    view.evidence.observation.state.name = 'minecraft:air';
+    view.evidence.revision = 999;
+
+    const again = evidenceAt(map, 'overworld', 0, 0, 0);
+    expect(again.observation.state.name).toBe('minecraft:stone');
+    expect(again.revision).toBe(1);
+  });
+
+  it('rejects non-integer query coordinates', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 1 } }));
+    expect(() => map.cellAt('overworld', 0, 0.0625, 0)).toThrow(/integer/);
+    expect(() => map.sectionAt('overworld', 0, 0.0625, 0)).toThrow(/integer/);
+  });
+});
+
+describe('batch atomicity', () => {
+  it('validates the whole batch before writing anything', () => {
+    const map = new VoxelMap('world');
+    const valid = obs({ state: stone, pos: { x: 0, y: 0, z: 0 } });
+    const badWorld = obs({ worldId: 'other', pos: { x: 1, y: 0, z: 0 } });
+
+    expect(() => map.observeBatch({ observations: [valid, badWorld], unobserved: [] })).toThrow(
+      /does not match/,
+    );
+    expect(map.cellAt('overworld', 0, 0, 0)).toEqual({ observed: false });
+    expect(map.cellAt('overworld', 1, 0, 0)).toEqual({ observed: false });
   });
 });
 

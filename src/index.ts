@@ -41,6 +41,7 @@ export type {
   Section,
   SectionChange,
   SectionKey,
+  StaleReason,
   VoxelMapOptions,
 } from './voxel/index.js';
 

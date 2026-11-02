@@ -18,5 +18,6 @@ export type {
   CellView,
   ChangeReport,
   SectionChange,
+  StaleReason,
   VoxelMapOptions,
 } from './voxel-map.js';

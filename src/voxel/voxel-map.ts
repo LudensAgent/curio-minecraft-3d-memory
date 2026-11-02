@@ -7,6 +7,12 @@
  * invalidate only the affected sections. It is bound to one immutable `worldId`;
  * coordinate queries take an explicit `dim`.
  *
+ * Facts can only change through the controlled update path: observations are
+ * snapshotted on write, `cellAt` returns a snapshot, and the change report never
+ * aliases the store's internal objects. `sectionAt` is the live internal
+ * accessor for the future traversability/topology layers (callers must not
+ * mutate it) — it is not a public read-only query.
+ *
  * This is deliberately *not* the full `SpatialMemoryStore`: routing, topology,
  * frontiers and persistence are composed beside it later, so none of their
  * methods appear here as fake-success stubs.
@@ -19,8 +25,8 @@ import { blockToSection, cellIndex } from './coordinates.js';
 import { bitsRequired, createSection, repack, setBit, writeCell } from './palette.js';
 import type { Section, SectionKey } from './section.js';
 
-/** What one accepted observation did to its cell. */
-export type CellChangeKind = 'inserted' | 'changed' | 'refreshed';
+/** What one accepted update did to its cell. */
+export type CellChangeKind = 'inserted' | 'changed' | 'refreshed' | 'staled';
 
 export interface CellChange {
   pos: Vec3Like;
@@ -31,13 +37,13 @@ export interface SectionChange {
   key: SectionKey;
   /** Section revision after this change. */
   revision: number;
-  /** True when at least one cell was inserted or changed (revision advanced). */
-  contentChanged: boolean;
+  /** True when revision advanced (inserted/changed/staled); false for refresh-only. */
+  invalidated: boolean;
   cells: CellChange[];
 }
 
 export interface ChangeReport {
-  /** Affected sections, in first-touch order. Empty when nothing changed (e.g. stale re-delivery). */
+  /** Affected sections, in first-touch order. Empty when nothing changed. */
   sections: SectionChange[];
 }
 
@@ -56,70 +62,137 @@ export type CellView =
   | { observed: false }
   | { observed: true; evidence: CellEvidence };
 
+/** Reason a cell's evidence was marked stale (lifecycle / interruption). */
+export type StaleReason = NonNullable<CellEvidence['staleReason']>;
+
 const DEFAULT_VALIDITY_WINDOW_MS = 60_000;
 
-type AppliedCell = { section: Section; pos: Vec3Like; kind: CellChangeKind };
+type AppliedCell = { section: Section; kind: CellChangeKind; x: number; y: number; z: number };
 
 export class VoxelMap {
   readonly worldId: string;
   private readonly sections = new Map<string, Map<string, Section>>();
   private readonly validityWindowMs: number;
+  private currentSessionId: string | null = null;
 
   constructor(worldId: string, options: VoxelMapOptions = {}) {
     this.worldId = worldId;
     this.validityWindowMs = options.validityWindowMs ?? DEFAULT_VALIDITY_WINDOW_MS;
   }
 
+  /**
+   * Begin (or switch to) an observation session. Cells last confirmed by a
+   * different session become STALE (validity change → revision bump) and are
+   * reported. Idempotent for the already-active session.
+   */
+  beginSession(sessionId: string): ChangeReport {
+    if (sessionId === this.currentSessionId) return { sections: [] };
+    const previous = this.currentSessionId;
+    this.currentSessionId = sessionId;
+    if (previous === null) return { sections: [] };
+
+    const bySection = new Map<Section, SectionChange>();
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        for (const [index, evidence] of section.evidence) {
+          if (evidence.observation.sessionId === sessionId) continue;
+          if (evidence.freshness === 'STALE') continue;
+          const pos = { ...evidence.observation.pos };
+          section.evidence.set(index, {
+            ...evidence,
+            freshness: 'STALE',
+            staleReason: 'observation_gap',
+            revision: evidence.revision + 1,
+          });
+          section.revision += 1;
+          addChange(bySection, section, { pos, kind: 'staled' });
+        }
+      }
+    }
+    return { sections: [...bySection.values()] };
+  }
+
+  /**
+   * Mark all FRESH cells in a dimension STALE after an interruption (disconnect,
+   * pause, or unload). Per-chunk unload granularity is deferred; this round
+   * invalidates at dimension scope.
+   */
+  markStale(dim: string, reason: StaleReason): ChangeReport {
+    const dimMap = this.sections.get(dim);
+    if (dimMap === undefined) return { sections: [] };
+    const bySection = new Map<Section, SectionChange>();
+    for (const section of dimMap.values()) {
+      for (const [index, evidence] of section.evidence) {
+        if (evidence.freshness === 'STALE') continue;
+        const pos = { ...evidence.observation.pos };
+        section.evidence.set(index, {
+          ...evidence,
+          freshness: 'STALE',
+          staleReason: reason,
+          revision: evidence.revision + 1,
+        });
+        section.revision += 1;
+        addChange(bySection, section, { pos, kind: 'staled' });
+      }
+    }
+    return { sections: [...bySection.values()] };
+  }
+
   /** Accept one confirmed observation and return its localized change (or empty). */
   observe(observation: Observation): ChangeReport {
-    const applied = this.apply(observation);
+    validateObservation(this.worldId, observation);
+    const applied = this.applyValidated(observation);
     if (applied === null) return { sections: [] };
     return {
       sections: [
         {
           key: applied.section.key,
           revision: applied.section.revision,
-          contentChanged: applied.kind !== 'refreshed',
-          cells: [{ pos: applied.pos, kind: applied.kind }],
+          invalidated: applied.kind !== 'refreshed',
+          cells: [{ pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind }],
         },
       ],
     };
   }
 
-  /** Accept a batch; only the confirmed observations are written, gaps are not cells. */
+  /**
+   * Accept a batch; only the confirmed observations are written, gaps are not
+   * cells. The whole batch is validated up front so an invalid observation does
+   * not leave behind a half-applied batch.
+   */
   observeBatch(batch: ObservationBatch): ChangeReport {
+    for (const observation of batch.observations) {
+      validateObservation(this.worldId, observation);
+    }
     const bySection = new Map<Section, SectionChange>();
     for (const observation of batch.observations) {
-      const applied = this.apply(observation);
+      const applied = this.applyValidated(observation);
       if (applied === null) continue;
-      const entry = bySection.get(applied.section);
-      if (entry === undefined) {
-        bySection.set(applied.section, {
-          key: applied.section.key,
-          revision: applied.section.revision,
-          contentChanged: applied.kind !== 'refreshed',
-          cells: [{ pos: applied.pos, kind: applied.kind }],
-        });
-      } else {
-        entry.revision = applied.section.revision;
-        entry.contentChanged = entry.contentChanged || applied.kind !== 'refreshed';
-        entry.cells.push({ pos: applied.pos, kind: applied.kind });
-      }
+      addChange(bySection, applied.section, {
+        pos: { x: applied.x, y: applied.y, z: applied.z },
+        kind: applied.kind,
+      });
     }
     return { sections: [...bySection.values()] };
   }
 
   /** Read the current cell state; never mutates, scans, or refreshes evidence time/version. */
   cellAt(dim: string, x: number, y: number, z: number): CellView {
+    assertIntegerCoords(x, y, z);
     const section = this.lookupSection(dim, x, y, z);
     if (section === undefined) return { observed: false };
     const { lx, ly, lz } = blockToSection(x, y, z);
     const evidence = section.evidence.get(cellIndex(lx, ly, lz));
-    return evidence === undefined ? { observed: false } : { observed: true, evidence };
+    return evidence === undefined ? { observed: false } : { observed: true, evidence: snapshotEvidence(evidence) };
   }
 
-  /** Return the section containing (x,y,z) in `dim`, or null when never allocated. */
+  /**
+   * Live section containing (x,y,z) in `dim`, or null when never allocated.
+   * This is the internal accessor for traversability/topology — callers must not
+   * mutate the returned section; use `cellAt` for a read-only cell snapshot.
+   */
   sectionAt(dim: string, x: number, y: number, z: number): Section | null {
+    assertIntegerCoords(x, y, z);
     return this.lookupSection(dim, x, y, z) ?? null;
   }
 
@@ -130,8 +203,13 @@ export class VoxelMap {
     return this.sections.get(dim)?.get(innerKey(cx, cz, sy));
   }
 
-  private apply(observation: Observation): AppliedCell | null {
-    validateObservation(this.worldId, observation);
+  private applyValidated(observation: Observation): AppliedCell | null {
+    if (this.currentSessionId === null) {
+      this.currentSessionId = observation.sessionId;
+    } else if (observation.sessionId !== this.currentSessionId) {
+      // A foreign or already-superseded session: rejected until `beginSession`.
+      return null;
+    }
 
     const { x, y, z } = observation.pos;
     const { cx, cz, sy, lx, ly, lz } = blockToSection(x, y, z);
@@ -139,8 +217,10 @@ export class VoxelMap {
     const index = cellIndex(lx, ly, lz);
     const existing = section.evidence.get(index);
 
-    if (existing !== undefined && !isNewer(observation, existing.observation)) {
-      // Stale re-delivery or an older session: never let old evidence overwrite new.
+    if (existing !== undefined && observation.observedAt <= existing.observation.observedAt) {
+      // Not strictly newer by acquisition time (same-session out-of-order or
+      // duplicate): never overwrite newer evidence. `sequence` is receive order,
+      // not acquisition order, so it must not decide this.
       return null;
     }
 
@@ -156,19 +236,19 @@ export class VoxelMap {
         // Re-confirmation of the same content: refresh evidence time, keep revision.
         section.evidence.set(index, {
           revision: existing.revision,
-          observation,
+          observation: snapshotObservation(observation),
           freshness: 'FRESH',
           staleReason: undefined,
           validUntil,
         });
         this.touch(section, observation.observedAt);
-        return { section, pos: observation.pos, kind: 'refreshed' };
+        return { section, kind: 'refreshed', x, y, z };
       }
 
       // Content or completeness changed.
       section.evidence.set(index, {
         revision: existing.revision + 1,
-        observation,
+        observation: snapshotObservation(observation),
         freshness: 'FRESH',
         staleReason: undefined,
         validUntil,
@@ -176,13 +256,13 @@ export class VoxelMap {
       section.revision += 1;
       this.writePalette(section, index, serialized);
       this.touch(section, observation.observedAt);
-      return { section, pos: observation.pos, kind: 'changed' };
+      return { section, kind: 'changed', x, y, z };
     }
 
     // First observation of this cell.
     section.evidence.set(index, {
       revision: 1,
-      observation,
+      observation: snapshotObservation(observation),
       freshness: 'FRESH',
       staleReason: undefined,
       validUntil,
@@ -191,7 +271,7 @@ export class VoxelMap {
     setBit(section.explored, index, true);
     this.writePalette(section, index, serialized);
     this.touch(section, observation.observedAt);
-    return { section, pos: observation.pos, kind: 'inserted' };
+    return { section, kind: 'inserted', x, y, z };
   }
 
   private getOrCreateSection(dim: string, cx: number, cz: number, sy: number): Section {
@@ -230,20 +310,44 @@ export class VoxelMap {
   }
 }
 
+function addChange(
+  bySection: Map<Section, SectionChange>,
+  section: Section,
+  cell: CellChange,
+): void {
+  const invalidated = cell.kind !== 'refreshed';
+  const entry = bySection.get(section);
+  if (entry === undefined) {
+    bySection.set(section, {
+      key: section.key,
+      revision: section.revision,
+      invalidated,
+      cells: [cell],
+    });
+  } else {
+    entry.revision = section.revision;
+    entry.invalidated = entry.invalidated || invalidated;
+    entry.cells.push(cell);
+  }
+}
+
 /** Key for a section inside one dimension; integers make commas an unambiguous separator. */
 function innerKey(cx: number, cz: number, sy: number): string {
   return `${cx},${cz},${sy}`;
 }
 
-/** True when `next` supersedes `current` for the same cell. */
-function isNewer(next: Observation, current: Observation): boolean {
-  if (next.sessionId === current.sessionId) {
-    // Same session: the boundary's receive sequence is authoritative.
-    return next.sequence > current.sequence;
-  }
-  // Different session: real acquisition time orders them (real time is monotonic
-  // across sessions; a clock going backwards would be a host bug).
-  return next.observedAt >= current.observedAt;
+/** Deep-copy an observation so the store never aliases caller-owned objects. */
+function snapshotObservation(observation: Observation): Observation {
+  return {
+    ...observation,
+    pos: { x: observation.pos.x, y: observation.pos.y, z: observation.pos.z },
+    state: { name: observation.state.name, properties: { ...observation.state.properties } },
+  };
+}
+
+/** Deep-copy evidence so a read view cannot mutate the store. */
+function snapshotEvidence(evidence: CellEvidence): CellEvidence {
+  return { ...evidence, observation: snapshotObservation(evidence.observation) };
 }
 
 function validateObservation(worldId: string, observation: Observation): void {
@@ -252,8 +356,11 @@ function validateObservation(worldId: string, observation: Observation): void {
       `observation worldId "${observation.worldId}" does not match map worldId "${worldId}"`,
     );
   }
-  const { x, y, z } = observation.pos;
+  assertIntegerCoords(observation.pos.x, observation.pos.y, observation.pos.z);
+}
+
+function assertIntegerCoords(x: number, y: number, z: number): void {
   if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
-    throw new Error(`observation position must be integer grid coordinates: (${x}, ${y}, ${z})`);
+    throw new Error(`coordinates must be integer grid coordinates: (${x}, ${y}, ${z})`);
   }
 }
