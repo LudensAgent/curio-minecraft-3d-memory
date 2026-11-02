@@ -1,0 +1,42 @@
+{
+  "name": "curio-minecraft-3d-memory",
+  "version": "0.1.0",
+  "description": "Spatial memory and navigation library for a Minecraft Java 1.20.1 agent — historical geometry, recent observation state, derived traversability, and composable navigation helpers for land walking and surface-water movement.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/index.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "minecraft",
+    "mineflayer",
+    "spatial-memory",
+    "navigation",
+    "voxel"
+  ],
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.2",
+    "vitest": "^2.1.0"
+  }
+}
