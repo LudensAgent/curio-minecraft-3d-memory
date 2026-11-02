@@ -326,12 +326,18 @@ export class RouteVerifier {
     if (route === null) return;
     if (route.shapeProvider.version === route.ruleVersion) return;
     route.ruleVersion = route.shapeProvider.version;
-    const previouslyVerified = new Set(this.results.keys());
+    // Preserve the invalidated mark from both currently-verified results and steps
+    // already pending as invalidated, so consecutive version switches do not reset
+    // a step that has not yet been re-verified back to unprocessed.
+    const invalidated = new Set(this.results.keys());
+    for (const [i, reason] of this.pending) {
+      if (reason === 'invalidated') invalidated.add(i);
+    }
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
     for (let i = 0; i < route.queries.length; i++) {
-      this.pending.set(i, previouslyVerified.has(i) ? 'invalidated' : 'unprocessed');
+      this.pending.set(i, invalidated.has(i) ? 'invalidated' : 'unprocessed');
     }
   }
 

@@ -971,4 +971,31 @@ describe('RouteVerifier — regression fixes', () => {
     expect(s.steps[1]).toEqual({ kind: 'pending', reason: 'unprocessed' }); // never verified
     expect(s.invalidatedCount).toBe(1);
   });
+
+  it('preserves invalidated marks across consecutive rule-version changes', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 3); // 2 steps
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+
+    const provider: CollisionShapeProvider = {
+      version: 'v1',
+      resolve(state, cell, read) {
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    verifier.register(routeRequest(points, { shapeProvider: provider }));
+    verifier.advance(1); // verify only step 0; step 1 stays unprocessed
+
+    provider.version = 'v2';
+    provider.resolve = () => ({ kind: 'shape', shape: { boxes: [], supportFaces: [] } });
+    expect(status(verifier).invalidatedCount).toBe(1);
+
+    // Switch again before re-verifying: the invalidated mark must survive.
+    provider.version = 'v3';
+    const s = status(verifier);
+    expect(s.ruleVersion).toBe('v3');
+    expect(s.steps[0]).toEqual({ kind: 'pending', reason: 'invalidated' });
+    expect(s.steps[1]).toEqual({ kind: 'pending', reason: 'unprocessed' });
+    expect(s.invalidatedCount).toBe(1);
+  });
 });
