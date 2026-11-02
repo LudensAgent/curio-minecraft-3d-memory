@@ -75,10 +75,11 @@ export class TraversabilityCache {
 
   /**
    * Invalidate entries that depended on any section whose revision advanced.
-   * Refresh-only (`invalidated: false`) changes invalidate only STALE entries:
-   * they extend evidence validity, which the time-based `validUntil` check
-   * handles for non-STALE entries, but a STALE entry has no forward validity to
-   * expire against and can only recover when the refreshing report drops it.
+   * Refresh-only (`invalidated: false`) changes invalidate only STALE or
+   * UNSUPPORTED entries: they extend evidence validity, which the time-based
+   * `validUntil` check handles for OPEN/BLOCKED/UNKNOWN, but a STALE/UNSUPPORTED
+   * entry may have been limited by expired evidence and can only recover when the
+   * refreshing report drops it.
    */
   invalidate(report: ChangeReport): void {
     const toDelete = new Set<string>();
@@ -90,10 +91,15 @@ export class TraversabilityCache {
           toDelete.add(key);
         } else {
           // Refresh-only: content is unchanged, but evidence validity was extended.
-          // A STALE entry has no forward validity to expire against, so it can only
-          // recover when the refreshing report drops it explicitly.
+          // A STALE or UNSUPPORTED entry can have been limited by expired evidence
+          // and only recover when the refreshing report drops it explicitly.
           const entry = this.entries.get(key);
-          if (entry !== undefined && entry.evaluation.status === 'STALE') toDelete.add(key);
+          if (
+            entry !== undefined &&
+            (entry.evaluation.status === 'STALE' || entry.evaluation.status === 'UNSUPPORTED')
+          ) {
+            toDelete.add(key);
+          }
         }
       }
     }

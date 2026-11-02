@@ -137,6 +137,15 @@ const STATUS_PRIORITY: Record<StepStatus, number> = {
 };
 
 /**
+ * True when a result can change once a depended-on section is refreshed. STALE
+ * and UNSUPPORTED are the only statuses that can be caused by expired evidence;
+ * OPEN/BLOCKED/UNKNOWN are not recoverable by a same-content refresh.
+ */
+function refreshRecoverable(status: StepStatus): boolean {
+  return status === 'STALE' || status === 'UNSUPPORTED';
+}
+
+/**
  * @example Full call order (observe → ChangeReport → invalidate → bounded re-verify → read):
  * ```ts
  * const map = new VoxelMap('world', { now });
@@ -317,10 +326,13 @@ export class RouteVerifier {
     if (route === null) return;
     if (route.shapeProvider.version === route.ruleVersion) return;
     route.ruleVersion = route.shapeProvider.version;
+    const previouslyVerified = new Set(this.results.keys());
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
-    for (let i = 0; i < route.queries.length; i++) this.pending.set(i, 'unprocessed');
+    for (let i = 0; i < route.queries.length; i++) {
+      this.pending.set(i, previouslyVerified.has(i) ? 'invalidated' : 'unprocessed');
+    }
   }
 
   private runPending(budget: number): void {
@@ -364,10 +376,11 @@ export class RouteVerifier {
         if (section.invalidated) {
           this.invalidateStep(i);
         } else {
-          // Refresh-only: content is unchanged but validity was extended. Only a
-          // stale diagnosis can recover from that, so re-queue it locally.
+          // Refresh-only: content is unchanged but validity was extended. A result
+          // whose conclusion was limited by expired evidence (STALE or UNSUPPORTED)
+          // can recover, so re-queue it locally.
           const result = this.results.get(i);
-          if (result !== undefined && result.status === 'STALE') this.invalidateStep(i);
+          if (result !== undefined && refreshRecoverable(result.status)) this.invalidateStep(i);
         }
       }
     }

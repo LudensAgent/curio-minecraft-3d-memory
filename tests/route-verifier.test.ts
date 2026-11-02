@@ -892,4 +892,83 @@ describe('RouteVerifier — regression fixes', () => {
     verifier.register(routeRequest([{ x: 0.5, y: 0, z: 2.3 }, { x: 0.5, y: 0, z: 1.3 }]));
     expect(verifier.advance(10).verdict).toBe('OPEN');
   });
+
+  it('a refreshed neighbour recovers an UNSUPPORTED result to OPEN', () => {
+    // A "trigger" block resolves by reading the cell above it. When that neighbour
+    // is expired the rule reports unsupported_shape (UNSUPPORTED); once re-observed
+    // as air it becomes passable (OPEN).
+    const triggerProvider: CollisionShapeProvider = {
+      version: 'trigger-1',
+      resolve(state, cell, read) {
+        if (state.name !== 'minecraft:trigger') return fakeProvider.resolve(state, cell, read);
+        const above = read.cell(cell.x, cell.y + 1, cell.z);
+        if (above.kind === 'observed') {
+          return above.state.name === 'minecraft:air'
+            ? { kind: 'shape', shape: EMPTY }
+            : { kind: 'shape', shape: FULL_CUBE };
+        }
+        return { kind: 'unsupported_shape', block: 'minecraft:trigger', detail: 'requires above neighbour' };
+      },
+    };
+
+    let clock = 70_000;
+    const map = new VoxelMap('world', { now: () => clock });
+    map.observe(obs(STONE, { x: 0, y: -1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 0, y: 1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs({ name: 'minecraft:trigger', properties: {} }, { x: 1, y: 0, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 1, y: 1, z: 0 }, { observedAt: 1000 })); // expired neighbour
+
+    const verifier = new RouteVerifier(map, { now: () => clock });
+    verifier.register(routeRequest([{ x: 0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }], { shapeProvider: triggerProvider }));
+    expect(verifier.advance(10).verdict).toBe('UNSUPPORTED');
+
+    clock = 71_000;
+    const report = map.observe(obs(AIR, { x: 1, y: 1, z: 0 }, { observedAt: 71_000, sequence: 2 }));
+    expect(verifier.apply(report, 10)?.verdict).toBe('OPEN');
+  });
+
+  it('a refreshed stone wall recovers an UNSUPPORTED result to BLOCKED', () => {
+    let clock = 70_000;
+    const map = new VoxelMap('world', { now: () => clock });
+    map.observe(obs(STONE, { x: 0, y: -1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(AIR, { x: 0, y: 1, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs({ name: 'minecraft:chest', properties: {} }, { x: 1, y: 0, z: 0 }, { observedAt: 70_000 }));
+    map.observe(obs(STONE, { x: 1, y: 1, z: 0 }, { observedAt: 1000 })); // expired wall
+
+    const verifier = new RouteVerifier(map, { now: () => clock });
+    verifier.register(routeRequest([{ x: 0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }]));
+    expect(verifier.advance(10).verdict).toBe('UNSUPPORTED');
+
+    clock = 71_000;
+    const report = map.observe(obs(STONE, { x: 1, y: 1, z: 0 }, { observedAt: 71_000, sequence: 2 }));
+    expect(verifier.apply(report, 10)?.verdict).toBe('BLOCKED');
+  });
+
+  it('marks previously-verified steps as invalidated after a rule-version change', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 3); // 2 steps
+    const verifier = new RouteVerifier(map, { now: () => 2000 });
+
+    const provider: CollisionShapeProvider = {
+      version: 'v1',
+      resolve(state, cell, read) {
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    verifier.register(routeRequest(points, { shapeProvider: provider }));
+    verifier.advance(1); // verify only step 0; step 1 stays unprocessed
+
+    provider.version = 'v2';
+    provider.resolve = () => ({ kind: 'shape', shape: { boxes: [], supportFaces: [] } });
+
+    const s = status(verifier);
+    expect(s.ruleVersion).toBe('v2');
+    expect(s.steps[0]).toEqual({ kind: 'pending', reason: 'invalidated' }); // had a result
+    expect(s.steps[1]).toEqual({ kind: 'pending', reason: 'unprocessed' }); // never verified
+    expect(s.invalidatedCount).toBe(1);
+  });
 });
