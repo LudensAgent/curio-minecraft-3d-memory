@@ -7,11 +7,9 @@
  * invalidate only the affected sections. It is bound to one immutable `worldId`;
  * coordinate queries take an explicit `dim`.
  *
- * Facts can only change through the controlled update path: observations are
- * snapshotted on write, `cellAt` returns a snapshot, and the change report never
- * aliases the store's internal objects. `sectionAt` is the live internal
- * accessor for the future traversability/topology layers (callers must not
- * mutate it) — it is not a public read-only query.
+ * Facts can only change through the controlled update path. Observations are
+ * snapshotted on write, `cellAt` and `sectionAt` return snapshots, and change
+ * reports never alias the store's internal objects (including the section key).
  *
  * This is deliberately *not* the full `SpatialMemoryStore`: routing, topology,
  * frontiers and persistence are composed beside it later, so none of their
@@ -26,7 +24,7 @@ import { bitsRequired, createSection, repack, setBit, writeCell } from './palett
 import type { Section, SectionKey } from './section.js';
 
 /** What one accepted update did to its cell. */
-export type CellChangeKind = 'inserted' | 'changed' | 'refreshed' | 'staled';
+export type CellChangeKind = 'inserted' | 'changed' | 'refreshed' | 'staled' | 'restored';
 
 export interface CellChange {
   pos: Vec3Like;
@@ -37,7 +35,7 @@ export interface SectionChange {
   key: SectionKey;
   /** Section revision after this change. */
   revision: number;
-  /** True when revision advanced (inserted/changed/staled); false for refresh-only. */
+  /** True when revision advanced (inserted/changed/staled/restored); false for refresh-only. */
   invalidated: boolean;
   cells: CellChange[];
 }
@@ -55,6 +53,11 @@ export interface VoxelMapOptions {
    * fit the host's perception cadence.
    */
   validityWindowMs?: number;
+  /**
+   * Clock used to stamp interruption boundaries. Must return values comparable to
+   * an observation's `observedAt`. Defaults to `Date.now`.
+   */
+  now?: () => number;
 }
 
 /** Read-only view of one cell. `observed: false` means never observed (UNKNOWN). */
@@ -73,17 +76,20 @@ export class VoxelMap {
   readonly worldId: string;
   private readonly sections = new Map<string, Map<string, Section>>();
   private readonly validityWindowMs: number;
+  private readonly now: () => number;
+  private readonly staleBoundaries = new Map<string, number>();
   private currentSessionId: string | null = null;
 
   constructor(worldId: string, options: VoxelMapOptions = {}) {
     this.worldId = worldId;
     this.validityWindowMs = options.validityWindowMs ?? DEFAULT_VALIDITY_WINDOW_MS;
+    this.now = options.now ?? Date.now;
   }
 
   /**
    * Begin (or switch to) an observation session. Cells last confirmed by a
-   * different session become STALE (validity change → revision bump) and are
-   * reported. Idempotent for the already-active session.
+   * different session become STALE (validity change → revision bump + stale bit)
+   * and are reported. Idempotent for the already-active session.
    */
   beginSession(sessionId: string): ChangeReport {
     if (sessionId === this.currentSessionId) return { sections: [] };
@@ -94,19 +100,12 @@ export class VoxelMap {
     const bySection = new Map<Section, SectionChange>();
     for (const dimMap of this.sections.values()) {
       for (const section of dimMap.values()) {
-        for (const [index, evidence] of section.evidence) {
-          if (evidence.observation.sessionId === sessionId) continue;
-          if (evidence.freshness === 'STALE') continue;
-          const pos = { ...evidence.observation.pos };
-          section.evidence.set(index, {
-            ...evidence,
-            freshness: 'STALE',
-            staleReason: 'observation_gap',
-            revision: evidence.revision + 1,
-          });
-          section.revision += 1;
-          addChange(bySection, section, { pos, kind: 'staled' });
-        }
+        this.markSectionCellsStale(
+          section,
+          (evidence) => evidence.observation.sessionId !== sessionId,
+          'observation_gap',
+          bySection,
+        );
       }
     }
     return { sections: [...bySection.values()] };
@@ -114,26 +113,18 @@ export class VoxelMap {
 
   /**
    * Mark all FRESH cells in a dimension STALE after an interruption (disconnect,
-   * pause, or unload). Per-chunk unload granularity is deferred; this round
-   * invalidates at dimension scope.
+   * pause, or unload). Records an interruption boundary so that only evidence
+   * acquired after it can restore the cells. Per-chunk unload granularity is
+   * deferred; this round invalidates at dimension scope.
    */
   markStale(dim: string, reason: StaleReason): ChangeReport {
     const dimMap = this.sections.get(dim);
     if (dimMap === undefined) return { sections: [] };
+    this.staleBoundaries.set(dim, this.now());
+
     const bySection = new Map<Section, SectionChange>();
     for (const section of dimMap.values()) {
-      for (const [index, evidence] of section.evidence) {
-        if (evidence.freshness === 'STALE') continue;
-        const pos = { ...evidence.observation.pos };
-        section.evidence.set(index, {
-          ...evidence,
-          freshness: 'STALE',
-          staleReason: reason,
-          revision: evidence.revision + 1,
-        });
-        section.revision += 1;
-        addChange(bySection, section, { pos, kind: 'staled' });
-      }
+      this.markSectionCellsStale(section, () => true, reason, bySection);
     }
     return { sections: [...bySection.values()] };
   }
@@ -146,7 +137,7 @@ export class VoxelMap {
     return {
       sections: [
         {
-          key: applied.section.key,
+          key: { ...applied.section.key },
           revision: applied.section.revision,
           invalidated: applied.kind !== 'refreshed',
           cells: [{ pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind }],
@@ -187,13 +178,15 @@ export class VoxelMap {
   }
 
   /**
-   * Live section containing (x,y,z) in `dim`, or null when never allocated.
-   * This is the internal accessor for traversability/topology — callers must not
-   * mutate the returned section; use `cellAt` for a read-only cell snapshot.
+   * Snapshot of the section containing (x,y,z) in `dim`, or null when never
+   * allocated. The returned section is a copy; mutating it never changes the
+   * store. (The future traversability/topology layers read the live sections
+   * through internal, non-public access when they land.)
    */
   sectionAt(dim: string, x: number, y: number, z: number): Section | null {
     assertIntegerCoords(x, y, z);
-    return this.lookupSection(dim, x, y, z) ?? null;
+    const section = this.lookupSection(dim, x, y, z);
+    return section === undefined ? null : snapshotSection(section);
   }
 
   // --- internals ---
@@ -201,6 +194,28 @@ export class VoxelMap {
   private lookupSection(dim: string, x: number, y: number, z: number): Section | undefined {
     const { cx, cz, sy } = blockToSection(x, y, z);
     return this.sections.get(dim)?.get(innerKey(cx, cz, sy));
+  }
+
+  private markSectionCellsStale(
+    section: Section,
+    shouldStale: (evidence: CellEvidence) => boolean,
+    reason: StaleReason,
+    bySection: Map<Section, SectionChange>,
+  ): void {
+    for (const [index, evidence] of section.evidence) {
+      if (evidence.freshness === 'STALE') continue;
+      if (!shouldStale(evidence)) continue;
+      const pos = { ...evidence.observation.pos };
+      section.evidence.set(index, {
+        ...evidence,
+        freshness: 'STALE',
+        staleReason: reason,
+        revision: evidence.revision + 1,
+      });
+      section.revision += 1;
+      setBit(section.stale, index, true);
+      addChange(bySection, section, { pos, kind: 'staled' });
+    }
   }
 
   private applyValidated(observation: Observation): AppliedCell | null {
@@ -217,11 +232,18 @@ export class VoxelMap {
     const index = cellIndex(lx, ly, lz);
     const existing = section.evidence.get(index);
 
-    if (existing !== undefined && observation.observedAt <= existing.observation.observedAt) {
-      // Not strictly newer by acquisition time (same-session out-of-order or
-      // duplicate): never overwrite newer evidence. `sequence` is receive order,
-      // not acquisition order, so it must not decide this.
-      return null;
+    if (existing !== undefined) {
+      if (observation.observedAt <= existing.observation.observedAt) {
+        // Not strictly newer by acquisition time (same-session out-of-order or
+        // duplicate): never overwrite newer evidence. `sequence` is receive
+        // order, not acquisition order, so it must not decide this.
+        return null;
+      }
+      if (existing.freshness === 'STALE' && observation.observedAt <= this.boundaryFor(observation.dim)) {
+        // Acquired before the interruption that made this cell stale: it cannot
+        // restore staleness; only post-interruption evidence can.
+        return null;
+      }
     }
 
     const validUntil = observation.observedAt + this.validityWindowMs;
@@ -232,8 +254,8 @@ export class VoxelMap {
         serializeBlockState(existing.observation.state) === serialized &&
         existing.observation.stateComplete === observation.stateComplete;
 
-      if (sameContent) {
-        // Re-confirmation of the same content: refresh evidence time, keep revision.
+      if (sameContent && existing.freshness === 'FRESH') {
+        // Re-confirmation of the same content while still fresh: refresh only.
         section.evidence.set(index, {
           revision: existing.revision,
           observation: snapshotObservation(observation),
@@ -245,7 +267,8 @@ export class VoxelMap {
         return { section, kind: 'refreshed', x, y, z };
       }
 
-      // Content or completeness changed.
+      // Content changed, or recovering from STALE — both advance validity.
+      const kind = sameContent ? 'restored' : 'changed';
       section.evidence.set(index, {
         revision: existing.revision + 1,
         observation: snapshotObservation(observation),
@@ -254,9 +277,12 @@ export class VoxelMap {
         validUntil,
       });
       section.revision += 1;
-      this.writePalette(section, index, serialized);
+      setBit(section.stale, index, false);
+      if (!sameContent) {
+        this.writePalette(section, index, serialized);
+      }
       this.touch(section, observation.observedAt);
-      return { section, kind: 'changed', x, y, z };
+      return { section, kind, x, y, z };
     }
 
     // First observation of this cell.
@@ -272,6 +298,10 @@ export class VoxelMap {
     this.writePalette(section, index, serialized);
     this.touch(section, observation.observedAt);
     return { section, kind: 'inserted', x, y, z };
+  }
+
+  private boundaryFor(dim: string): number {
+    return this.staleBoundaries.get(dim) ?? Number.NEGATIVE_INFINITY;
   }
 
   private getOrCreateSection(dim: string, cx: number, cz: number, sy: number): Section {
@@ -319,7 +349,7 @@ function addChange(
   const entry = bySection.get(section);
   if (entry === undefined) {
     bySection.set(section, {
-      key: section.key,
+      key: { ...section.key },
       revision: section.revision,
       invalidated,
       cells: [cell],
@@ -348,6 +378,26 @@ function snapshotObservation(observation: Observation): Observation {
 /** Deep-copy evidence so a read view cannot mutate the store. */
 function snapshotEvidence(evidence: CellEvidence): CellEvidence {
   return { ...evidence, observation: snapshotObservation(evidence.observation) };
+}
+
+/** Deep-copy a section so a public read cannot mutate the store. */
+function snapshotSection(section: Section): Section {
+  return {
+    key: { ...section.key },
+    palette: [...section.palette],
+    cells: section.cells.slice(),
+    bits: section.bits,
+    explored: section.explored.slice(),
+    traversed: section.traversed.slice(),
+    stale: section.stale.slice(),
+    risk: section.risk.slice(),
+    modified: section.modified.slice(),
+    evidence: new Map(
+      [...section.evidence].map(([index, evidence]) => [index, snapshotEvidence(evidence)]),
+    ),
+    revision: section.revision,
+    lastObservedAt: section.lastObservedAt,
+  };
 }
 
 function validateObservation(worldId: string, observation: Observation): void {

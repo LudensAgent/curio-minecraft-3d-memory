@@ -10,7 +10,7 @@ import {
   VoxelMap,
 } from '../src/index.js';
 import type { Section } from '../src/index.js';
-import { bitsRequired, readCell, repack, writeCell } from '../src/voxel/palette.js';
+import { bitsRequired, getBit, readCell, repack, writeCell } from '../src/voxel/palette.js';
 
 const air = { name: 'minecraft:air', properties: {} };
 const stone = { name: 'minecraft:stone', properties: {} };
@@ -267,10 +267,9 @@ describe('lifecycle invalidation', () => {
   });
 
   it('markStale marks cells STALE and reports the validity change', () => {
-    const map = new VoxelMap('world');
+    const map = new VoxelMap('world', { now: () => 160 });
     map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100 }));
-    const section = sectionAt(map, 'overworld', 0, 0, 0);
-    const revisionBefore = section.revision;
+    const revisionBefore = sectionAt(map, 'overworld', 0, 0, 0).revision;
 
     const report = map.markStale('overworld', 'unloaded');
     expect(report.sections).toHaveLength(1);
@@ -281,7 +280,48 @@ describe('lifecycle invalidation', () => {
     expect(ev.freshness).toBe('STALE');
     expect(ev.staleReason).toBe('unloaded');
     expect(ev.revision).toBe(2); // 1 (insert) + 1 (stale)
-    expect(section.revision).toBe(revisionBefore + 1);
+    expect(sectionAt(map, 'overworld', 0, 0, 0).revision).toBe(revisionBefore + 1);
+  });
+
+  it('recovering from stale advances version and reports restored', () => {
+    const map = new VoxelMap('world', { now: () => 160 });
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100 }));
+    map.markStale('overworld', 'unloaded');
+    const revisionAfterStale = sectionAt(map, 'overworld', 0, 0, 0).revision;
+
+    const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 200, sequence: 2 }));
+    expect(report.sections[0]!.invalidated).toBe(true);
+    expect(report.sections[0]!.cells[0]!.kind).toBe('restored');
+
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).revision).toBe(3); // insert + stale + restore
+    expect(sectionAt(map, 'overworld', 0, 0, 0).revision).toBe(revisionAfterStale + 1);
+  });
+
+  it('keeps the stale bitmap in sync with validity transitions', () => {
+    const map = new VoxelMap('world', { now: () => 160 });
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100 }));
+    expect(getBit(sectionAt(map, 'overworld', 0, 0, 0).stale, cellIndex(0, 0, 0))).toBe(false);
+
+    map.markStale('overworld', 'unloaded');
+    expect(getBit(sectionAt(map, 'overworld', 0, 0, 0).stale, cellIndex(0, 0, 0))).toBe(true);
+
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 200, sequence: 2 }));
+    expect(getBit(sectionAt(map, 'overworld', 0, 0, 0).stale, cellIndex(0, 0, 0))).toBe(false);
+  });
+
+  it('rejects observations acquired before an interruption from restoring staleness', () => {
+    const map = new VoxelMap('world', { now: () => 160 });
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100 }));
+    map.markStale('overworld', 'unloaded');
+
+    const pre = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 150, sequence: 2 }));
+    expect(pre.sections).toEqual([]);
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('STALE');
+
+    const post = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 165, sequence: 3 }));
+    expect(post.sections[0]!.invalidated).toBe(true);
+    expect(post.sections[0]!.cells[0]!.kind).toBe('restored');
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('FRESH');
   });
 });
 
@@ -317,6 +357,34 @@ describe('input and read isolation', () => {
     expect(again.revision).toBe(1);
   });
 
+  it('sectionAt returns a snapshot that cannot mutate the store', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+
+    const section = map.sectionAt('overworld', 0, 0, 0)!;
+    section.evidence.clear();
+    section.palette.length = 0;
+    section.key.dim = 'the_nether';
+
+    expect(map.cellAt('overworld', 0, 0, 0).observed).toBe(true);
+    const fresh = map.sectionAt('overworld', 0, 0, 0)!;
+    expect(fresh.evidence.size).toBe(1);
+    expect(fresh.palette.length).toBe(2);
+    expect(fresh.key.dim).toBe('overworld');
+  });
+
+  it('change report key is isolated from the store', () => {
+    const map = new VoxelMap('world');
+    const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    report.sections[0]!.key.dim = 'the_nether';
+
+    expect(map.cellAt('overworld', 0, 0, 0).observed).toBe(true);
+    expect(map.cellAt('the_nether', 0, 0, 0).observed).toBe(false);
+
+    const second = map.observe(obs({ state: dirt, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
+    expect(second.sections[0]!.key.dim).toBe('overworld');
+  });
+
   it('rejects non-integer query coordinates', () => {
     const map = new VoxelMap('world');
     map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 1 } }));
@@ -345,13 +413,12 @@ describe('localized change reports', () => {
     map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
     map.observe(obs({ state: stone, pos: { x: 100, y: 0, z: 0 } })); // section cx=6
 
-    const other = sectionAt(map, 'overworld', 100, 0, 0);
-    const otherRevision = other.revision;
+    const otherRevision = sectionAt(map, 'overworld', 100, 0, 0).revision;
 
     const report = map.observe(obs({ state: dirt, pos: { x: 0, y: 0, z: 0 }, sequence: 2, observedAt: 2000 }));
     expect(report.sections).toHaveLength(1);
     expect(report.sections[0]!.key.cx).toBe(0);
-    expect(other.revision).toBe(otherRevision); // untouched
+    expect(sectionAt(map, 'overworld', 100, 0, 0).revision).toBe(otherRevision); // untouched
   });
 });
 
@@ -359,9 +426,8 @@ describe('read-only queries', () => {
   it('querying does not change evidence time or version', () => {
     const map = new VoxelMap('world');
     map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 100, sequence: 1 }));
-    const section = sectionAt(map, 'overworld', 0, 0, 0);
-    const revisionBefore = section.revision;
-    const lastObservedBefore = section.lastObservedAt;
+    const revisionBefore = sectionAt(map, 'overworld', 0, 0, 0).revision;
+    const lastObservedBefore = sectionAt(map, 'overworld', 0, 0, 0).lastObservedAt;
 
     map.cellAt('overworld', 0, 0, 0);
     map.sectionAt('overworld', 0, 0, 0);
@@ -369,7 +435,7 @@ describe('read-only queries', () => {
 
     expect(evidence.observation.observedAt).toBe(100);
     expect(evidence.revision).toBe(1);
-    expect(section.revision).toBe(revisionBefore);
-    expect(section.lastObservedAt).toBe(lastObservedBefore);
+    expect(sectionAt(map, 'overworld', 0, 0, 0).revision).toBe(revisionBefore);
+    expect(sectionAt(map, 'overworld', 0, 0, 0).lastObservedAt).toBe(lastObservedBefore);
   });
 });
