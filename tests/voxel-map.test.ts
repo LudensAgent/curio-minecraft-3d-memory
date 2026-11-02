@@ -498,4 +498,24 @@ describe('conflicting and invalid observations', () => {
     const map = new VoxelMap('world');
     expect(() => map.observe(obs({ observedAt: Number.NaN }))).toThrow(/finite/);
   });
+
+  it('does not re-invalidate when the same conflict is re-submitted', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: air, pos: { x: 0, y: 0, z: 0 } }));
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000, sequence: 2 }));
+    const revisionAfterConflict = evidenceAt(map, 'overworld', 0, 0, 0).revision;
+
+    const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000, sequence: 3 }));
+    expect(report.sections).toEqual([]);
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).revision).toBe(revisionAfterConflict);
+  });
+
+  it('rejects a non-finite validityWindowMs', () => {
+    expect(() => new VoxelMap('world', { validityWindowMs: Number.NaN })).toThrow(/finite/);
+  });
+
+  it('rejects a non-finite interruption clock', () => {
+    const map = new VoxelMap('world', { now: () => Number.NaN });
+    expect(() => map.markStale('overworld', 'unloaded')).toThrow(/finite/);
+  });
 });

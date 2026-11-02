@@ -477,4 +477,29 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     expect(result.problem?.kind).toBe('missing_support');
     expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 });
   });
+
+  it('an unsupported candidate that cannot cover the gap does not mask the real one', () => {
+    const map = new VoxelMap('world');
+    const body = bodyAt(0, 0, 0.5, 2.0, 1.0); // wide body: single-point gap at centre x=1.0
+    // Collision cells (y=0) are air; support cells (y=-1):
+    //   x=-1 stone (observed support), x=0 air, x=1 unobserved (the real gap),
+    //   x=2 chest (unsupported, only edge-touches the foot at the gap point).
+    for (let z = -1; z <= 1; z++) {
+      fill(map, AIR, [
+        [-1, 0, z],
+        [0, 0, z],
+        [1, 0, z],
+        [2, 0, z],
+      ]);
+      map.observe(obs(STONE, { x: -1, y: -1, z }));
+      map.observe(obs(AIR, { x: 0, y: -1, z }));
+      map.observe(obs({ name: 'minecraft:chest', properties: {} }, { x: 2, y: -1, z }));
+    }
+
+    const result = evaluateWalkStep(map, stepQuery({ body }), fakeProvider, 2000);
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.problem?.kind).toBe('unobserved');
+    expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 });
+    expect(result.problem?.cells).not.toContainEqual({ x: 2, y: -1, z: 0 });
+  });
 });

@@ -333,4 +333,17 @@ describe('TraversabilityCache', () => {
     expect(cache.size).toBe(0);
     expect(cache.dependencyIndexSize).toBe(0);
   });
+
+  it('rejects a non-finite clock on both cache hit and miss', () => {
+    const map = openMap();
+    let clock = 2000;
+    const cache = new TraversabilityCache(map, { now: () => clock });
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('OPEN');
+
+    clock = Number.NEGATIVE_INFINITY;
+    expect(() => cache.get(stepQuery(), fakeProvider)).toThrow(/finite/);
+
+    const fresh = new TraversabilityCache(map, { now: () => Number.NEGATIVE_INFINITY });
+    expect(() => fresh.get(stepQuery(), fakeProvider)).toThrow(/finite/);
+  });
 });

@@ -82,7 +82,11 @@ export class VoxelMap {
 
   constructor(worldId: string, options: VoxelMapOptions = {}) {
     this.worldId = worldId;
-    this.validityWindowMs = options.validityWindowMs ?? DEFAULT_VALIDITY_WINDOW_MS;
+    const validityWindowMs = options.validityWindowMs ?? DEFAULT_VALIDITY_WINDOW_MS;
+    if (!Number.isFinite(validityWindowMs)) {
+      throw new Error(`validityWindowMs must be a finite number: ${validityWindowMs}`);
+    }
+    this.validityWindowMs = validityWindowMs;
     this.now = options.now ?? Date.now;
   }
 
@@ -118,9 +122,13 @@ export class VoxelMap {
    * deferred; this round invalidates at dimension scope.
    */
   markStale(dim: string, reason: StaleReason): ChangeReport {
+    const boundary = this.now();
+    if (!Number.isFinite(boundary)) {
+      throw new Error(`now() must return a finite number: ${boundary}`);
+    }
     // Record the boundary even when the dimension has no sections yet, so a
     // delayed pre-interruption observation of a still-unknown cell is rejected.
-    this.staleBoundaries.set(dim, this.now());
+    this.staleBoundaries.set(dim, boundary);
     const dimMap = this.sections.get(dim);
     if (dimMap === undefined) return { sections: [] };
 
@@ -254,8 +262,10 @@ export class VoxelMap {
       const sameContent =
         serializeBlockState(existing.observation.state) === serialized &&
         existing.observation.stateComplete === observation.stateComplete;
-      if (sameContent) {
-        // Exact duplicate at the same timestamp — nothing changed.
+      if (sameContent || existing.freshness === 'STALE') {
+        // Exact duplicate at the same timestamp, or the cell is already invalid —
+        // nothing further to change. Avoids repeated revision bumps for a conflict
+        // that has already been recorded.
         return null;
       }
       // Same timestamp, conflicting content: the timestamp carries no uniqueness

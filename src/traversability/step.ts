@@ -123,6 +123,13 @@ interface Accumulator {
   unknownCells: Vec3Like[];
 }
 
+type SupportCandidate = {
+  kind: 'unsupported' | 'stale' | 'unknown';
+  cell: Vec3Like;
+  /** Best-case (full-cell) support interval, or null when the cell cannot reach the footprint. */
+  interval: [number, number] | null;
+};
+
 function bodyAabb(feet: Vec3Like, half: number, height: number): Aabb {
   return {
     minX: feet.x - half,
@@ -218,6 +225,14 @@ function uncoveredGaps(
   }
   if (cursor <= segMax) gaps.push([cursor, segMax]);
   return gaps;
+}
+
+/** True when an interval has positive overlap with any of the given gaps. */
+function overlapsAnyGap(
+  interval: readonly [number, number],
+  gaps: ReadonlyArray<readonly [number, number]>,
+): boolean {
+  return gaps.some(([gapLo, gapHi]) => interval[1] > gapLo && interval[0] < gapHi);
 }
 
 /**
@@ -483,17 +498,14 @@ export function evaluateWalkStep(
     const pCellMax = Math.floor(perpMax - EPS);
 
     const observedIntervals: Array<[number, number]> = [];
-    const potentialIntervals: Array<[number, number]> = [];
-    const unsupportedCells: Vec3Like[] = [];
-    const staleCellsHere: Vec3Like[] = [];
-    const unknownCellsHere: Vec3Like[] = [];
+    const candidates: SupportCandidate[] = [];
 
     // Best-case support a still-unknown cell could provide: a full-cell top face.
-    const addPotential = (x: number, z: number): void => {
+    const potentialInterval = (x: number, z: number): [number, number] | null => {
       const perpCellMin = axis === 'x' ? z : x;
-      if (!overlaps(perpCellMin, perpCellMin + 1, perpMin, perpMax)) return;
+      if (!overlaps(perpCellMin, perpCellMin + 1, perpMin, perpMax)) return null;
       const alongCell = axis === 'x' ? x : z;
-      potentialIntervals.push([alongCell - half, alongCell + 1 + half]);
+      return [alongCell - half, alongCell + 1 + half];
     };
 
     for (let a = aCellMin; a <= aCellMax; a++) {
@@ -505,14 +517,15 @@ export function evaluateWalkStep(
         if (read.kind === 'observed') {
           const shape = resolveShape(read.evidence, cell);
           if (shape.kind === 'unsupported') {
-            unsupportedCells.push(cell);
-            addPotential(x, z);
+            candidates.push({ kind: 'unsupported', cell, interval: potentialInterval(x, z) });
             continue;
           }
           if (shape.kind === 'gap') {
-            if (shape.view.kind === 'stale') staleCellsHere.push(shape.view.pos);
-            else unknownCellsHere.push(shape.view.pos);
-            addPotential(x, z);
+            candidates.push({
+              kind: shape.view.kind === 'stale' ? 'stale' : 'unknown',
+              cell: shape.view.pos,
+              interval: potentialInterval(x, z),
+            });
             continue;
           }
           for (const face of shape.shape.supportFaces) {
@@ -525,12 +538,10 @@ export function evaluateWalkStep(
             observedIntervals.push([alongFaceMin - half, alongFaceMax + half]);
           }
         } else if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
-          staleCellsHere.push(cell);
-          addPotential(x, z);
+          candidates.push({ kind: 'stale', cell, interval: potentialInterval(x, z) });
         } else {
           // missing or incomplete
-          unknownCellsHere.push(cell);
-          addPotential(x, z);
+          candidates.push({ kind: 'unknown', cell, interval: potentialInterval(x, z) });
         }
       }
     }
@@ -539,24 +550,34 @@ export function evaluateWalkStep(
     if (observedGaps.length === 0) return; // confirmed support covers the sweep
 
     // A gap is only BLOCKED when it remains uncovered even if every unknown,
-    // stale or unsupported candidate were a full cube. Otherwise those
-    // candidates could fill it and the result stays UNKNOWN/STALE/UNSUPPORTED.
+    // stale or unsupported candidate were a full cube.
+    const potentialIntervals = candidates
+      .map((c) => c.interval)
+      .filter((i): i is [number, number] => i !== null);
     const confirmedGaps = uncoveredGaps([...observedIntervals, ...potentialIntervals], segMin, segMax);
     if (confirmedGaps.length === 0) {
-      if (unsupportedCells.length > 0) {
+      // The gap could be filled — report only the candidates whose potential
+      // actually overlaps the uncovered gap, not unrelated ones.
+      const relevant = candidates.filter(
+        (c) => c.interval !== null && overlapsAnyGap(c.interval, observedGaps),
+      );
+      const unsupported = relevant.filter((c) => c.kind === 'unsupported');
+      const stale = relevant.filter((c) => c.kind === 'stale');
+      const unknown = relevant.filter((c) => c.kind === 'unknown');
+      if (unsupported.length > 0) {
         if (acc.unsupported === null) {
           acc.unsupported = {
-            problem: { kind: 'unsupported_shape', cells: unsupportedCells, detail: 'support depends on an unresolvable shape' },
+            problem: { kind: 'unsupported_shape', cells: unsupported.map((c) => c.cell), detail: 'support depends on an unresolvable shape' },
           };
         }
         return;
       }
-      if (staleCellsHere.length > 0) {
-        acc.staleCells.push(...staleCellsHere);
+      if (stale.length > 0) {
+        acc.staleCells.push(...stale.map((c) => c.cell));
         return;
       }
-      if (unknownCellsHere.length > 0) {
-        acc.unknownCells.push(...unknownCellsHere);
+      if (unknown.length > 0) {
+        acc.unknownCells.push(...unknown.map((c) => c.cell));
         return;
       }
       return;

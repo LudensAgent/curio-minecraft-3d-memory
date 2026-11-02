@@ -59,12 +59,16 @@ export class TraversabilityCache {
     if (query.worldId !== this.map.worldId) {
       throw new Error(`query worldId "${query.worldId}" does not match cache map worldId "${this.map.worldId}"`);
     }
+    const now = this.now();
+    if (!Number.isFinite(now)) {
+      throw new Error(`now() must return a finite number: ${now}`);
+    }
     const key = stepKey(query, shapeProvider.version);
     const entry = this.entries.get(key);
-    if (entry !== undefined && this.now() <= entry.validUntil) {
+    if (entry !== undefined && now <= entry.validUntil) {
       return cloneEvaluation(entry.evaluation);
     }
-    const evaluation = evaluateWalkStep(this.map, query, shapeProvider, this.now());
+    const evaluation = evaluateWalkStep(this.map, query, shapeProvider, now);
     this.store(key, evaluation);
     return cloneEvaluation(evaluation);
   }
