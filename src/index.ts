@@ -21,8 +21,28 @@ export type {
   ObservationSource,
 } from './observation/index.js';
 
-// Voxel
-export type { Section, SectionKey } from './voxel/index.js';
+// Voxel — sparse in-memory observation map (coordinate math, palette, `VoxelMap`)
+export {
+  AIR_BLOCK_NAME,
+  VoxelMap,
+  blockToSection,
+  cellIndex,
+  isAirState,
+  localCoord,
+  sectionCoord,
+  serializeBlockState,
+} from './voxel/index.js';
+export type {
+  BlockSectionCoords,
+  CellChange,
+  CellChangeKind,
+  CellView,
+  ChangeReport,
+  Section,
+  SectionChange,
+  SectionKey,
+  VoxelMapOptions,
+} from './voxel/index.js';
 
 // Traversability
 export type {
