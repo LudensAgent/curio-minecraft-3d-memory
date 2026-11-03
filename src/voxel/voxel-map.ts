@@ -22,6 +22,15 @@ import { serializeBlockState } from './blockstate.js';
 import { blockToSection, cellIndex } from './coordinates.js';
 import { bitsRequired, createSection, repack, setBit, writeCell } from './palette.js';
 import type { Section, SectionKey } from './section.js';
+import {
+  cloneCellEvidence,
+  cloneObservation,
+  estimateVoxelSectionBytes,
+  restoreVoxelSection,
+  snapshotVoxelSection,
+  voxelSectionLowerBound,
+} from './snapshot.js';
+import type { VoxelCheckpointMeasure, VoxelCheckpointSnapshot } from './snapshot.js';
 
 /** What one accepted update did to its cell. */
 export type CellChangeKind = 'inserted' | 'changed' | 'refreshed' | 'staled' | 'restored';
@@ -79,6 +88,13 @@ export class VoxelMap {
   private readonly now: () => number;
   private readonly staleBoundaries = new Map<string, number>();
   private currentSessionId: string | null = null;
+  /**
+   * Session-local persistence revision, bumped by every accepted update that
+   * changes a fact the next checkpoint would persist — including refresh-only
+   * updates that advance evidence time/validity without bumping `Section.revision`.
+   * Not a time, observation number, or traversal count.
+   */
+  private saveRevisionCount = 0;
 
   constructor(worldId: string, options: VoxelMapOptions = {}) {
     this.worldId = worldId;
@@ -88,6 +104,11 @@ export class VoxelMap {
     }
     this.validityWindowMs = validityWindowMs;
     this.now = options.now ?? Date.now;
+  }
+
+  /** Current persistence revision (see `saveRevisionCount`). */
+  get saveRevision(): number {
+    return this.saveRevisionCount;
   }
 
   /**
@@ -144,6 +165,7 @@ export class VoxelMap {
     validateObservation(this.worldId, observation);
     const applied = this.applyValidated(observation);
     if (applied === null) return { sections: [] };
+    this.saveRevisionCount += 1;
     return {
       sections: [
         {
@@ -166,14 +188,17 @@ export class VoxelMap {
       validateObservation(this.worldId, observation);
     }
     const bySection = new Map<Section, SectionChange>();
+    let changed = 0;
     for (const observation of batch.observations) {
       const applied = this.applyValidated(observation);
       if (applied === null) continue;
+      changed += 1;
       addChange(bySection, applied.section, {
         pos: { x: applied.x, y: applied.y, z: applied.z },
         kind: applied.kind,
       });
     }
+    if (changed > 0) this.saveRevisionCount += changed;
     return { sections: [...bySection.values()] };
   }
 
@@ -184,7 +209,7 @@ export class VoxelMap {
     if (section === undefined) return { observed: false };
     const { lx, ly, lz } = blockToSection(x, y, z);
     const evidence = section.evidence.get(cellIndex(lx, ly, lz));
-    return evidence === undefined ? { observed: false } : { observed: true, evidence: snapshotEvidence(evidence) };
+    return evidence === undefined ? { observed: false } : { observed: true, evidence: cloneCellEvidence(evidence) };
   }
 
   /**
@@ -197,6 +222,104 @@ export class VoxelMap {
     assertIntegerCoords(x, y, z);
     const section = this.lookupSection(dim, x, y, z);
     return section === undefined ? null : snapshotSection(section);
+  }
+
+  // --- checkpoint support (phase 5B): bounded export + validated restore ---
+
+  /**
+   * Size of the map's full observed state, used by the checkpoint pre-flight to
+   * reject over-capacity saves before any copy or message pass. `maxBytes` bounds
+   * the work: a cheap lower bound (string `.length`) rejects obviously-over-limit
+   * input first, then a full escaped-byte estimate runs with early termination.
+   * Read-only; never refreshes evidence time or version.
+   */
+  checkpointMeasure(maxBytes = Number.POSITIVE_INFINITY): VoxelCheckpointMeasure {
+    let sections = 0;
+    let observedCells = 0;
+    let paletteEntries = 0;
+    const all: Section[] = [];
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        sections += 1;
+        observedCells += section.evidence.size;
+        paletteEntries += section.palette.length;
+        all.push(section);
+      }
+    }
+
+    let lowerBound = 0;
+    for (const section of all) lowerBound += voxelSectionLowerBound(section);
+    if (lowerBound > maxBytes) {
+      return { sections, observedCells, paletteEntries, bytes: lowerBound };
+    }
+
+    let bytes = 0;
+    for (const section of all) {
+      bytes += estimateVoxelSectionBytes(section);
+      if (bytes > maxBytes) break;
+    }
+    return { sections, observedCells, paletteEntries, bytes };
+  }
+
+  /**
+   * Deep-copied snapshot of the map's full observed state for a checkpoint. The
+   * caller owns the returned objects; mutating them never reaches the store.
+   */
+  checkpointSnapshot(): VoxelCheckpointSnapshot {
+    const out: VoxelCheckpointSnapshot['sections'] = [];
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        out.push(snapshotVoxelSection(section));
+      }
+    }
+    return { worldId: this.worldId, sections: out };
+  }
+
+  /**
+   * Narrow, validated restore entry (phase 5B). Rebuilds the map from a previously
+   * captured snapshot, re-marking saved `FRESH` evidence as `STALE`. It only
+   * accepts a map that has not yet observed anything, so it is the initialization
+   * path — never a runtime full-overwrite of an active map. It never replays
+   * `observe`, never refreshes observation time, and never fabricates a current
+   * observation session.
+   */
+  restoreSnapshot(snapshot: VoxelCheckpointSnapshot): void {
+    if (snapshot === null || typeof snapshot !== 'object') {
+      throw new Error('voxel checkpoint snapshot must be an object');
+    }
+    if (snapshot.worldId !== this.worldId) {
+      throw new Error(`snapshot worldId "${snapshot.worldId}" does not match map worldId "${this.worldId}"`);
+    }
+    if (this.sections.size !== 0) {
+      throw new Error('restoreSnapshot requires an empty VoxelMap (it is the initialization path, not a runtime overwrite)');
+    }
+    if (!Array.isArray(snapshot.sections)) {
+      throw new Error('voxel checkpoint snapshot sections must be an array');
+    }
+
+    const restored = new Map<string, Map<string, Section>>();
+    for (const raw of snapshot.sections) {
+      const section = restoreVoxelSection(this.worldId, raw);
+      let dimMap = restored.get(raw.dim);
+      if (dimMap === undefined) {
+        dimMap = new Map();
+        restored.set(raw.dim, dimMap);
+      }
+      const keyString = innerKey(raw.cx, raw.cz, raw.sy);
+      if (dimMap.has(keyString)) {
+        throw new Error(`duplicate voxel section (${raw.dim}, ${raw.cx}, ${raw.cz}, ${raw.sy}) in snapshot`);
+      }
+      dimMap.set(keyString, section);
+    }
+
+    this.sections.clear();
+    for (const [dim, dimMap] of restored) this.sections.set(dim, dimMap);
+    this.currentSessionId = null;
+    this.staleBoundaries.clear();
+    // Restore is a baseline-establishing mutation (mirrors FragmentStore): only a
+    // session initializer, which then sets the confirmed baseline to the
+    // post-restore revision, treats it as clean.
+    this.saveRevisionCount += 1;
   }
 
   // --- internals ---
@@ -224,6 +347,7 @@ export class VoxelMap {
       });
       section.revision += 1;
       setBit(section.stale, index, true);
+      this.saveRevisionCount += 1;
       addChange(bySection, section, { pos, kind: 'staled' });
     }
   }
@@ -291,7 +415,7 @@ export class VoxelMap {
         // Re-confirmation of the same content while still fresh: refresh only.
         section.evidence.set(index, {
           revision: existing.revision,
-          observation: snapshotObservation(observation),
+          observation: cloneObservation(observation),
           freshness: 'FRESH',
           staleReason: undefined,
           validUntil,
@@ -304,7 +428,7 @@ export class VoxelMap {
       const kind = sameContent ? 'restored' : 'changed';
       section.evidence.set(index, {
         revision: existing.revision + 1,
-        observation: snapshotObservation(observation),
+        observation: cloneObservation(observation),
         freshness: 'FRESH',
         staleReason: undefined,
         validUntil,
@@ -321,7 +445,7 @@ export class VoxelMap {
     // First observation of this cell.
     section.evidence.set(index, {
       revision: 1,
-      observation: snapshotObservation(observation),
+      observation: cloneObservation(observation),
       freshness: 'FRESH',
       staleReason: undefined,
       validUntil,
@@ -399,20 +523,6 @@ function innerKey(cx: number, cz: number, sy: number): string {
   return `${cx},${cz},${sy}`;
 }
 
-/** Deep-copy an observation so the store never aliases caller-owned objects. */
-function snapshotObservation(observation: Observation): Observation {
-  return {
-    ...observation,
-    pos: { x: observation.pos.x, y: observation.pos.y, z: observation.pos.z },
-    state: { name: observation.state.name, properties: { ...observation.state.properties } },
-  };
-}
-
-/** Deep-copy evidence so a read view cannot mutate the store. */
-function snapshotEvidence(evidence: CellEvidence): CellEvidence {
-  return { ...evidence, observation: snapshotObservation(evidence.observation) };
-}
-
 /** Deep-copy a section so a public read cannot mutate the store. */
 function snapshotSection(section: Section): Section {
   return {
@@ -426,7 +536,7 @@ function snapshotSection(section: Section): Section {
     risk: section.risk.slice(),
     modified: section.modified.slice(),
     evidence: new Map(
-      [...section.evidence].map(([index, evidence]) => [index, snapshotEvidence(evidence)]),
+      [...section.evidence].map(([index, evidence]) => [index, cloneCellEvidence(evidence)]),
     ),
     revision: section.revision,
     lastObservedAt: section.lastObservedAt,

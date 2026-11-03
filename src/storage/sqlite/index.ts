@@ -37,12 +37,17 @@ export type {
   HistorySession,
   HistorySnapshot,
   OpenHistorySessionOptions,
+  OpenSpatialSessionOptions,
   PersistenceErrorKind,
   PersistenceState,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   SnapshotLimits,
+  SpatialCheckpointResult,
+  SpatialPersistenceState,
+  SpatialSession,
 } from './types.js';
+export { openSpatialSession } from './spatial.js';
 
 interface PendingRequest {
   kind: 'open' | 'checkpoint' | 'close';
@@ -228,6 +233,9 @@ class HistorySessionImpl implements HistorySession {
         fragmentRevision,
         topologyRevision,
         snapshot,
+        hasVoxel: false,
+        voxelRevision: 0,
+        voxelSnapshot: { worldId: this.worldId, sections: [] },
       } satisfies WorkerRequest);
     });
     this.inFlight = { checkpointId, promise };
@@ -351,6 +359,7 @@ class HistorySessionImpl implements HistorySession {
         databasePath: this.databasePath,
         worldId: this.worldId,
         limits: this.limits,
+        kind: 'history',
       } satisfies WorkerRequest);
     });
   }

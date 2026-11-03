@@ -1,26 +1,29 @@
 /**
- * SQLite persistence worker thread (phase 5A).
+ * SQLite persistence worker thread (phase 5A → 5B).
  *
  * One worker owns one `better-sqlite3` connection and serializes load, checkpoint
  * transactions and JSON encode/decode. Its synchronous SQL API runs here, never on
  * the control thread. The worker never reads mineflayer, never judges what the
- * agent saw, and never controls the body — it only persists and restores the four
- * historical facts handed to it, with their original binding snapshots.
+ * agent saw, and never controls the body — it only persists and restores the
+ * historical facts and voxel sections handed to it, with their original binding
+ * snapshots and observation metadata.
  */
 
 import { parentPort } from 'node:worker_threads';
+import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
-import { SNAPSHOT_FRAME_BYTES } from './types.js';
+import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from './types.js';
 import type {
   HistorySnapshot,
   ResolvedSnapshotLimits,
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
+import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
-const KNOWN_TABLES = new Set([
+const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
   'checkpoints',
   'path_fragments',
@@ -29,8 +32,10 @@ const KNOWN_TABLES = new Set([
   'spatial_edges',
 ]);
 
-/** Required columns + the SQLite type affinity the read/write logic relies on. */
-const REQUIRED_COLUMNS: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+const KNOWN_TABLES_V2 = new Set([...KNOWN_TABLES_V1, 'spatial_sections']);
+
+/** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
+const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
   schema_meta: { key: 'TEXT', value: 'TEXT' },
   checkpoints: {
     checkpoint_id: 'TEXT',
@@ -45,6 +50,21 @@ const REQUIRED_COLUMNS: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
   spatial_edges: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
 };
 
+/** Required columns for the v2 schema (adds voxel columns and the sections table). */
+const REQUIRED_COLUMNS_V2: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V1,
+  checkpoints: {
+    checkpoint_id: 'TEXT',
+    world_id: 'TEXT',
+    fragment_revision: 'INTEGER',
+    topology_revision: 'INTEGER',
+    voxel_revision: 'INTEGER',
+    has_voxel: 'INTEGER',
+    seq: 'INTEGER',
+  },
+  spatial_sections: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -56,6 +76,8 @@ CREATE TABLE checkpoints (
   world_id TEXT NOT NULL,
   fragment_revision INTEGER NOT NULL,
   topology_revision INTEGER NOT NULL,
+  voxel_revision INTEGER NOT NULL DEFAULT 0,
+  has_voxel INTEGER NOT NULL DEFAULT 0,
   seq INTEGER NOT NULL
 );
 CREATE INDEX checkpoints_world_seq ON checkpoints (world_id, seq);
@@ -91,6 +113,14 @@ CREATE TABLE spatial_edges (
   payload TEXT NOT NULL,
   PRIMARY KEY (world_id, id)
 );
+
+CREATE TABLE spatial_sections (
+  world_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (world_id, id)
+);
 `;
 
 interface PreparedSnapshot {
@@ -105,6 +135,11 @@ interface PreparedSnapshot {
   bytes: number;
 }
 
+interface PreparedVoxelSnapshot {
+  sections: { id: string; payload: string }[];
+  bytes: number;
+}
+
 let db: Database.Database | null = null;
 let worldId: string | null = null;
 let limits: ResolvedSnapshotLimits | null = null;
@@ -113,7 +148,7 @@ function respond(msg: WorkerResponse): void {
   parentPort!.postMessage(msg);
 }
 
-/** Open (or validate) the database, returning a connection ready for the session's world. */
+/** Open (or validate / upgrade) the database, returning a connection ready for the session's world. */
 function openDatabase(databasePath: string): Database.Database {
   const connection = new Database(databasePath);
   connection.pragma('journal_mode = WAL');
@@ -140,26 +175,70 @@ function openDatabase(databasePath: string): Database.Database {
     throw new Error('database has existing tables but no schema metadata');
   }
   const version = Number(versionRow.value);
-  if (!Number.isInteger(version) || version !== SCHEMA_VERSION) {
+  if (!Number.isInteger(version) || version < 1 || version > SCHEMA_VERSION) {
     connection.close();
     throw new Error(`unsupported schema version "${versionRow.value}"`);
   }
+
+  if (version === 1) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V1);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V1)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV1ToV2(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (2)
+  validateKnownTables(connection, names, KNOWN_TABLES_V2);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V2)) {
+    assertRequiredColumns(connection, table, columns);
+  }
+  return connection;
+}
+
+function validateKnownTables(
+  connection: Database.Database,
+  names: Set<string>,
+  known: Set<string>,
+): void {
   for (const name of names) {
-    if (!KNOWN_TABLES.has(name)) {
+    if (!known.has(name)) {
       connection.close();
       throw new Error(`unknown table "${name}" in database`);
     }
   }
-  for (const required of KNOWN_TABLES) {
+  for (const required of known) {
     if (!names.has(required)) {
       connection.close();
       throw new Error(`missing required table "${required}"`);
     }
   }
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
-    assertRequiredColumns(connection, table, columns);
-  }
-  return connection;
+}
+
+/**
+ * Upgrade a validated v1 database in place: write a consistent backup (including
+ * WAL-committed data) first, then add the voxel columns and table and bump the
+ * version inside one transaction so a failure rolls back to a still-v1 database.
+ */
+function upgradeV1ToV2(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v2-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.exec('ALTER TABLE checkpoints ADD COLUMN has_voxel INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE checkpoints ADD COLUMN voxel_revision INTEGER NOT NULL DEFAULT 0');
+    connection.exec(`
+      CREATE TABLE spatial_sections (
+        world_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (world_id, id)
+      )
+    `);
+    connection.prepare("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'").run();
+  });
+  tx();
 }
 
 /** Reject a table missing a required column, or whose column has the wrong type affinity. */
@@ -235,11 +314,40 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
     prepared.bytes += Buffer.byteLength(payload, 'utf8');
     prepared.edgeEvidenceRefs += e.refs.length;
   }
-  // The outer snapshot envelope (worldId + framing) is part of `maxBytes`: count the
-  // fixed frame, the inter-record array commas, and the JSON-escaped worldId exactly,
-  // so the worker never underestimates the real serialized size.
   prepared.bytes += snapshotEnvelopeBytes(snapshot);
   return prepared;
+}
+
+/** Encode a voxel section into its versioned JSON payload. */
+function encodeVoxelSection(section: VoxelSectionSnapshot): string {
+  return JSON.stringify({
+    v: 1,
+    dim: section.dim,
+    cx: section.cx,
+    cz: section.cz,
+    sy: section.sy,
+    palette: section.palette,
+    bits: section.bits,
+    cells: Buffer.from(section.cells).toString('base64'),
+    evidence: section.evidence.map((cell) => ({ i: cell.index, e: cell.evidence })),
+    revision: section.revision,
+  });
+}
+
+/** Stable id for one voxel section row. */
+function voxelSectionId(section: VoxelSectionSnapshot): string {
+  return JSON.stringify([section.dim, section.cx, section.cz, section.sy]);
+}
+
+function prepareVoxelSnapshot(snapshot: VoxelCheckpointSnapshot): PreparedVoxelSnapshot {
+  const sections = snapshot.sections.map((section) => {
+    const payload = encodeVoxelSection(section);
+    return { id: voxelSectionId(section), payload };
+  });
+  let bytes = VOXEL_FRAME_BYTES + Buffer.byteLength(JSON.stringify(snapshot.worldId), 'utf8');
+  bytes += Math.max(0, sections.length - 1);
+  for (const section of sections) bytes += Buffer.byteLength(section.payload, 'utf8');
+  return { sections, bytes };
 }
 
 /** Exact outer-envelope bytes: fixed frame + inter-record commas + JSON-escaped worldId. */
@@ -324,6 +432,7 @@ function writeCheckpoint(
   fragmentRevision: number,
   topologyRevision: number,
   prepared: PreparedSnapshot,
+  voxel: { hasVoxel: boolean; voxelRevision: number; sections: { id: string; payload: string }[] },
 ): void {
   const tx = connection.transaction(() => {
     const nextSeqRow = connection
@@ -354,11 +463,29 @@ function writeCheckpoint(
     prepared.nodes.forEach((n, i) => insertNode.run(wId, i, n.id, n.payload));
     prepared.edges.forEach((e, i) => insertEdge.run(wId, i, e.id, e.payload));
 
+    // A history-only checkpoint never touches spatial_sections, so an existing
+    // voxel baseline survives; a combined checkpoint replaces it entirely.
+    if (voxel.hasVoxel) {
+      connection.prepare('DELETE FROM spatial_sections WHERE world_id = ?').run(wId);
+      const insertSection = connection.prepare(
+        'INSERT INTO spatial_sections (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
+      );
+      voxel.sections.forEach((s, i) => insertSection.run(wId, i, s.id, s.payload));
+    }
+
     connection
       .prepare(
-        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, seq) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, seq) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(checkpointId, wId, fragmentRevision, topologyRevision, nextSeq);
+      .run(
+        checkpointId,
+        wId,
+        fragmentRevision,
+        topologyRevision,
+        voxel.hasVoxel ? voxel.voxelRevision : 0,
+        voxel.hasVoxel ? 1 : 0,
+        nextSeq,
+      );
   });
   tx();
 }
@@ -413,7 +540,9 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
               OR typeof(fragment_revision) != 'integer' OR fragment_revision < 0
               OR typeof(topology_revision) != 'integer' OR topology_revision < 0
               OR typeof(checkpoint_id) != 'text'
-              OR checkpoint_id = '')`,
+              OR checkpoint_id = ''
+              OR typeof(has_voxel) != 'integer' OR (has_voxel != 0 AND has_voxel != 1)
+              OR typeof(voxel_revision) != 'integer' OR voxel_revision < 0)`,
     )
     .get(wId) as { n: number };
   if (bad.n > 0) {
@@ -425,18 +554,13 @@ function loadWorld(
   connection: Database.Database,
   wId: string,
   resolved: ResolvedSnapshotLimits,
-): { baselineCheckpointId: string | null; snapshot: HistorySnapshot | null } {
-  // Validate checkpoint metadata *before* using `seq` to pick the baseline and
-  // before `MAX(seq)` computes the next sequence, so a corrupt `seq`/id/revision
-  // cannot desynchronize the restored facts from the reported baseline id.
+): { baselineCheckpointId: string | null; snapshot: HistorySnapshot | null; bytes: number } {
   assertValidCheckpointMetadata(connection, wId);
 
   const cp = connection
     .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
     .get(wId) as { checkpoint_id: string } | undefined;
   if (cp === undefined) {
-    // Corruption guard: fact rows without checkpoint metadata must not read as an
-    // empty world (the next empty checkpoint would otherwise silently erase them).
     const orphans =
       countRows(connection, 'path_fragments', wId) +
       countRows(connection, 'traversal_evidence', wId) +
@@ -445,12 +569,9 @@ function loadWorld(
     if (orphans > 0) {
       throw new Error('world has fact rows but no checkpoint metadata');
     }
-    return { baselineCheckpointId: null, snapshot: null };
+    return { baselineCheckpointId: null, snapshot: null, bytes: 0 };
   }
 
-  // Bounded pre-check *before* reading/decoding any records: enforce record counts
-  // and the real UTF-8 byte total against the limits, so an oversized database is
-  // rejected without materializing and re-encoding it on the worker.
   const fragments = countRows(connection, 'path_fragments', wId);
   const traversals = countRows(connection, 'traversal_evidence', wId);
   const nodes = countRows(connection, 'spatial_nodes', wId);
@@ -473,7 +594,114 @@ function loadWorld(
     edges: readAll(connection, 'spatial_edges', wId) as HistorySnapshot['edges'],
   };
   assertDerivedWithinLimits(computeDerivedCounts(snapshot), resolved);
-  return { baselineCheckpointId: cp.checkpoint_id, snapshot };
+  return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes };
+}
+
+/** Decode one voxel section payload, validating structure during decode. */
+function decodeVoxelSection(payload: string): VoxelSectionSnapshot {
+  const raw = JSON.parse(payload) as {
+    v?: unknown;
+    dim?: unknown;
+    cx?: unknown;
+    cz?: unknown;
+    sy?: unknown;
+    palette?: unknown;
+    bits?: unknown;
+    cells?: unknown;
+    evidence?: unknown;
+    revision?: unknown;
+  };
+  if (raw === null || typeof raw !== 'object' || raw.v !== 1) {
+    throw new Error('corrupt voxel section payload');
+  }
+  if (typeof raw.dim !== 'string' || raw.dim.length === 0) {
+    throw new Error('corrupt voxel section dim');
+  }
+  if (!Number.isInteger(raw.cx) || !Number.isInteger(raw.cz) || !Number.isInteger(raw.sy)) {
+    throw new Error('corrupt voxel section coordinates');
+  }
+  if (!Array.isArray(raw.palette) || raw.palette.length === 0) {
+    throw new Error('corrupt voxel section palette');
+  }
+  if (typeof raw.bits !== 'number') {
+    throw new Error('corrupt voxel section bits');
+  }
+  if (typeof raw.cells !== 'string') {
+    throw new Error('corrupt voxel section cells');
+  }
+  if (!Array.isArray(raw.evidence)) {
+    throw new Error('corrupt voxel section evidence');
+  }
+  const cells = new Uint8Array(Buffer.from(raw.cells, 'base64'));
+  const evidence = raw.evidence.map((cell) => {
+    const c = cell as { i?: unknown; e?: unknown };
+    if (!Number.isInteger(c.i) || c.e === undefined) {
+      throw new Error('corrupt voxel section evidence record');
+    }
+    return { index: c.i as number, evidence: c.e as VoxelSectionSnapshot['evidence'][number]['evidence'] };
+  });
+  return {
+    dim: raw.dim,
+    cx: raw.cx as number,
+    cz: raw.cz as number,
+    sy: raw.sy as number,
+    palette: raw.palette as string[],
+    bits: raw.bits as number,
+    cells,
+    evidence,
+    revision: raw.revision as number,
+  };
+}
+
+function loadVoxel(
+  connection: Database.Database,
+  wId: string,
+  resolved: ResolvedSnapshotLimits,
+): { voxelBaselineCheckpointId: string | null; voxelSnapshot: VoxelCheckpointSnapshot | null; bytes: number } {
+  const cp = connection
+    .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_voxel = 1 ORDER BY seq DESC LIMIT 1')
+    .get(wId) as { checkpoint_id: string } | undefined;
+  if (cp === undefined) {
+    // Corruption guard: voxel rows without a voxel checkpoint must not read as
+    // "never saved" (the next empty combined checkpoint would otherwise erase them).
+    if (countRows(connection, 'spatial_sections', wId) > 0) {
+      throw new Error('world has voxel rows but no voxel checkpoint metadata');
+    }
+    return { voxelBaselineCheckpointId: null, voxelSnapshot: null, bytes: 0 };
+  }
+
+  const sections = countRows(connection, 'spatial_sections', wId);
+  const bytes =
+    sumPayloadBytes(connection, 'spatial_sections', wId) +
+    VOXEL_FRAME_BYTES +
+    Buffer.byteLength(JSON.stringify(wId), 'utf8') +
+    Math.max(0, sections - 1);
+  if (sections > resolved.maxVoxelSections) {
+    throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
+  }
+  if (bytes > resolved.maxBytes) {
+    throw new Error(`snapshot exceeds maxBytes (${bytes})`);
+  }
+
+  const rows = connection
+    .prepare('SELECT payload FROM spatial_sections WHERE world_id = ? ORDER BY seq')
+    .all(wId) as { payload: string }[];
+  const decoded: VoxelSectionSnapshot[] = [];
+  let observedCells = 0;
+  let paletteEntries = 0;
+  for (const row of rows) {
+    const section = decodeVoxelSection(row.payload);
+    observedCells += section.evidence.length;
+    paletteEntries += section.palette.length;
+    if (observedCells > resolved.maxObservedCells) {
+      throw new Error(`snapshot exceeds maxObservedCells (${observedCells})`);
+    }
+    if (paletteEntries > resolved.maxPaletteEntries) {
+      throw new Error(`snapshot exceeds maxPaletteEntries (${paletteEntries})`);
+    }
+    decoded.push(section);
+  }
+  return { voxelBaselineCheckpointId: cp.checkpoint_id, voxelSnapshot: { worldId: wId, sections: decoded }, bytes };
 }
 
 function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
@@ -482,11 +710,29 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   worldId = msg.worldId;
   limits = msg.limits;
   try {
-    const { baselineCheckpointId, snapshot } = loadWorld(connection, msg.worldId, msg.limits);
-    respond({ type: 'open_ok', requestId: msg.requestId, baselineCheckpointId, snapshot });
+    const world = loadWorld(connection, msg.worldId, msg.limits);
+    let voxelBaselineCheckpointId: string | null = null;
+    let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
+    if (msg.kind === 'spatial') {
+      const voxel = loadVoxel(connection, msg.worldId, msg.limits);
+      voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
+      voxelSnapshot = voxel.voxelSnapshot;
+      // Combined byte budget: each domain already checked individually, but the
+      // two must also fit a single shared budget — never "sum of two full quotas".
+      const totalBytes = world.bytes + voxel.bytes;
+      if (totalBytes > msg.limits.maxBytes) {
+        throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
+      }
+    }
+    respond({
+      type: 'open_ok',
+      requestId: msg.requestId,
+      baselineCheckpointId: world.baselineCheckpointId,
+      snapshot: world.snapshot,
+      voxelBaselineCheckpointId,
+      voxelSnapshot,
+    });
   } catch (err) {
-    // A failed load must release the connection before the session tears the
-    // worker down, so the database file is not left locked on the host OS.
     db = null;
     worldId = null;
     limits = null;
@@ -511,9 +757,23 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     return;
   }
   let prepared: PreparedSnapshot;
+  let preparedVoxel: PreparedVoxelSnapshot | null = null;
   try {
     prepared = prepareSnapshot(msg.snapshot);
     assertWithinLimits(prepared, limits);
+    if (msg.hasVoxel) {
+      if (msg.voxelSnapshot.worldId !== worldId) {
+        throw new Error('voxel snapshot worldId does not match session worldId');
+      }
+      preparedVoxel = prepareVoxelSnapshot(msg.voxelSnapshot);
+      if (preparedVoxel.sections.length > limits.maxVoxelSections) {
+        throw new Error(`snapshot exceeds maxVoxelSections (${preparedVoxel.sections.length})`);
+      }
+      const totalBytes = prepared.bytes + preparedVoxel.bytes;
+      if (totalBytes > limits.maxBytes) {
+        throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
+      }
+    }
   } catch (err) {
     respond({
       type: 'error',
@@ -524,7 +784,11 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     return;
   }
   try {
-    writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, prepared);
+    writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, prepared, {
+      hasVoxel: msg.hasVoxel,
+      voxelRevision: msg.voxelRevision,
+      sections: preparedVoxel?.sections ?? [],
+    });
   } catch (err) {
     respond({ type: 'error', requestId: msg.requestId, kind: 'sql', message: (err as Error).message });
     return;

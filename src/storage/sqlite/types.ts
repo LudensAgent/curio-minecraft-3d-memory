@@ -17,6 +17,8 @@ import type {
   TopologyEdgeSnapshot,
   TraversalEvidence,
 } from '../../topology/index.js';
+import type { VoxelCheckpointSnapshot } from '../../voxel/snapshot.js';
+import type { VoxelMap, VoxelMapOptions } from '../../voxel/voxel-map.js';
 
 /** Lifecycle of a history session. */
 export type SessionLifecycle = 'open' | 'closing' | 'closed';
@@ -64,6 +66,12 @@ export interface SnapshotLimits {
   maxLinks?: number;
   /** Maximum total edge evidence refs (binding snapshots). Default 50_000. */
   maxEdgeEvidenceRefs?: number;
+  /** Maximum voxel sections captured in one checkpoint. Default 10000. */
+  maxVoxelSections?: number;
+  /** Maximum observed voxel cells (evidence entries) captured in one checkpoint. Default 1_000_000. */
+  maxObservedCells?: number;
+  /** Maximum total palette entries across all voxel sections. Default 200_000. */
+  maxPaletteEntries?: number;
   /** Maximum total serialized snapshot size in bytes (string + nested data). Default 64 MiB. */
   maxBytes?: number;
 }
@@ -78,6 +86,9 @@ export interface ResolvedSnapshotLimits {
   maxEntrancePoints: number;
   maxLinks: number;
   maxEdgeEvidenceRefs: number;
+  maxVoxelSections: number;
+  maxObservedCells: number;
+  maxPaletteEntries: number;
   maxBytes: number;
 }
 
@@ -90,6 +101,9 @@ export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
   maxEntrancePoints: 100_000,
   maxLinks: 2_000_000,
   maxEdgeEvidenceRefs: 50_000,
+  maxVoxelSections: 10_000,
+  maxObservedCells: 1_000_000,
+  maxPaletteEntries: 200_000,
   maxBytes: 64 * 1024 * 1024,
 };
 
@@ -103,6 +117,16 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
  * inter-record commas (both counted separately, since they grow with content).
  */
 export const SNAPSHOT_FRAME_BYTES = 65;
+
+/**
+ * Fixed byte cost of the outer voxel snapshot envelope (`{"worldId":…,"sections":[
+ * …]}` — field names, braces, colons and the `[`/`]` brackets), *excluding* the
+ * JSON-escaped `worldId` value and inter-section commas (counted separately, since
+ * they grow with content). The worldId is counted twice across the history and
+ * voxel envelopes in a combined snapshot — a conservative over-count, never an
+ * under-estimate.
+ */
+export const VOXEL_FRAME_BYTES = 30;
 
 /**
  * The full four-fact snapshot sent to and returned from the worker. This is the
@@ -199,6 +223,74 @@ export interface HistorySession {
   close(): Promise<CloseResult>;
 }
 
+/** Options for `openSpatialSession`. */
+export interface OpenSpatialSessionOptions {
+  /** Absolute path to the SQLite database file. Required. */
+  databasePath: string;
+  /** The world this session persists. Required. */
+  worldId: string;
+  voxelOptions?: VoxelMapOptions;
+  fragmentOptions?: FragmentStoreOptions;
+  topologyOptions?: TopologyStoreOptions;
+  snapshotLimits?: SnapshotLimits;
+  /** Bound for worker open/checkpoint/close/flush waits. Default 30000 ms. */
+  timeoutMs?: number;
+}
+
+/** Result of a successful combined spatial checkpoint. */
+export interface SpatialCheckpointResult {
+  checkpointId: string;
+  worldId: string;
+  voxelRevision: number;
+  fragmentRevision: number;
+  topologyRevision: number;
+}
+
+/**
+ * Snapshot of a combined spatial session's persistence state. Each domain reports
+ * its own current and confirmed revisions and its own restore baseline, so a
+ * history-only checkpoint can never be read as a voxel save confirmation.
+ */
+export interface SpatialPersistenceState {
+  lifecycle: SessionLifecycle;
+  voxelRevision: number;
+  fragmentRevision: number;
+  topologyRevision: number;
+  confirmedVoxelRevision: number;
+  confirmedFragmentRevision: number;
+  confirmedTopologyRevision: number;
+  /** True when any domain's current revision leads its confirmed revision. */
+  dirty: boolean;
+  /** History/topology restore baseline checkpoint id (null when the DB had no committed state). */
+  baselineCheckpointId: string | null;
+  /** Voxel restore baseline checkpoint id (null when voxel has never been saved). */
+  voxelBaselineCheckpointId: string | null;
+  /** Last checkpoint id confirmed this session (null until the first one). */
+  lastConfirmedCheckpointId: string | null;
+  /** Checkpoint id currently in flight (null when none). */
+  inFlightCheckpointId: string | null;
+  /** Checkpoint id whose commit confirmation was lost (timeout/unconfirmed), if any. */
+  unconfirmedCheckpointId: string | null;
+  lastError: PersistenceError | null;
+}
+
+/** The combined spatial persistence session handed to the caller by `openSpatialSession`. */
+export interface SpatialSession {
+  readonly voxel: VoxelMap;
+  readonly history: FragmentStore;
+  readonly topology: TopologyStore;
+  /** Capture and commit history + topology + voxel in one transaction. */
+  checkpoint(): Promise<SpatialCheckpointResult>;
+  getPersistenceState(): SpatialPersistenceState;
+  /** Wait only for an already-accepted checkpoint; never captures new memory changes. */
+  flush(): Promise<FlushResult>;
+  /** Stop accepting writes and shut the persistence channel down within a bounded time. */
+  close(): Promise<CloseResult>;
+}
+
+/** Which facts a worker session persists (history-only vs combined spatial). */
+export type WorkerSessionKind = 'history' | 'spatial';
+
 /** Wire request messages sent from the session to the worker. */
 export type WorkerRequest =
   | {
@@ -207,6 +299,7 @@ export type WorkerRequest =
       databasePath: string;
       worldId: string;
       limits: ResolvedSnapshotLimits;
+      kind: WorkerSessionKind;
     }
   | {
       type: 'checkpoint';
@@ -216,6 +309,10 @@ export type WorkerRequest =
       fragmentRevision: number;
       topologyRevision: number;
       snapshot: HistorySnapshot;
+      /** Whether this checkpoint includes voxel state (even an empty set). */
+      hasVoxel: boolean;
+      voxelRevision: number;
+      voxelSnapshot: VoxelCheckpointSnapshot;
     }
   | { type: 'close'; requestId: number };
 
@@ -226,6 +323,9 @@ export type WorkerResponse =
       requestId: number;
       baselineCheckpointId: string | null;
       snapshot: HistorySnapshot | null;
+      /** Voxel baseline checkpoint id, or null when voxel has never been saved. */
+      voxelBaselineCheckpointId: string | null;
+      voxelSnapshot: VoxelCheckpointSnapshot | null;
     }
   | { type: 'checkpoint_ok'; requestId: number; checkpointId: string }
   | { type: 'closed'; requestId: number }
@@ -244,6 +344,9 @@ export function resolveSnapshotLimits(options: SnapshotLimits | undefined): Reso
     'maxEntrancePoints',
     'maxLinks',
     'maxEdgeEvidenceRefs',
+    'maxVoxelSections',
+    'maxObservedCells',
+    'maxPaletteEntries',
     'maxBytes',
   ] as const;
   for (const key of keys) {

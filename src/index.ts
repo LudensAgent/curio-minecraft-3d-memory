@@ -42,7 +42,11 @@ export type {
   SectionChange,
   SectionKey,
   StaleReason,
+  VoxelCellSnapshot,
+  VoxelCheckpointMeasure,
+  VoxelCheckpointSnapshot,
   VoxelMapOptions,
+  VoxelSectionSnapshot,
 } from './voxel/index.js';
 
 // Traversability

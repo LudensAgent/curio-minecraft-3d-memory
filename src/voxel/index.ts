@@ -11,6 +11,12 @@ export {
   writeCell,
 } from './palette.js';
 export type { Section, SectionKey } from './section.js';
+export type {
+  VoxelCellSnapshot,
+  VoxelCheckpointMeasure,
+  VoxelCheckpointSnapshot,
+  VoxelSectionSnapshot,
+} from './snapshot.js';
 export { VoxelMap } from './voxel-map.js';
 export type {
   CellChange,

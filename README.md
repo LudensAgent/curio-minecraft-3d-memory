@@ -22,8 +22,9 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 - **Bounded historical graph queries** (`topology/`, phase 4C): `TopologyStore` adds bounded, read-only `adjacency`, `reachable`, and `route` queries over the recorded topology — finite work budgets, mode filtering, lightweight history reads, and precise `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` results — still never a current-traversability or executable-route claim.
 - **Bounded historical anchor queries** (`topology/`, phase 4D): `TopologyStore.historicalAnchorCandidates` finds the recorded, evidence-resolved anchors reachable from a node (filtered by source/tag/kind, sorted by `bfs`/`highest`/`deepest`, limited), with shared proof segments — never a current-passability, target-selection, or executable-route claim.
 - **Explicit history checkpoint persistence** (`storage/`, phase 5A): `openHistorySession` from the `curio-minecraft-3d-memory/storage/sqlite` subpath persists the four historical facts (`PathFragment`, `TraversalEvidence`, `SpatialNode`, topology edges with their original binding snapshots) through a single SQLite worker. `checkpoint()` is the only explicit save trigger; `flush()`/`close()` never implicitly save new memory changes. See `docs/phase-5a-history-checkpoint-acceptance.md`.
+- **Explicit combined spatial checkpoint persistence** (`storage/`, phase 5B): `openSpatialSession` from the same subpath persists the recent-observation map (`VoxelMap`) together with the historical facts through one SQLite worker and one transaction. On startup the full observed state is restored and uniformly re-marked `STALE`; a new observation refreshes only the actually-observed cell. See `docs/phase-5b-spatial-checkpoint-acceptance.md`.
 
-The in-memory layers are validated **with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`); the checkpoint layer is validated against **real SQLite + a real worker** (see `tests/storage-checkpoint.test.ts` and `examples/history-checkpoint.ts`). They do **not** yet wire a real mineflayer/Curio body or pathfinding.
+The in-memory layers are validated **with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`); the checkpoint layer is validated against **real SQLite + a real worker** (see `tests/storage-checkpoint.test.ts`, `tests/spatial-checkpoint.test.ts`, `examples/history-checkpoint.ts`, and `examples/spatial-checkpoint.ts`). They do **not** yet wire a real mineflayer/Curio body or pathfinding.
 
 ## Historical path store
 
@@ -189,6 +190,36 @@ Behavior:
 
 The native driver (`better-sqlite3` `^12`) is an **optional peer dependency**: the core `curio-minecraft-3d-memory` entry loads no native driver and works on Node `>=18`, while the SQLite subpath additionally requires `better-sqlite3` (Node `>=20`). See [`docs/phase-5a-history-checkpoint-acceptance.md`](docs/phase-5a-history-checkpoint-acceptance.md).
 
+## Combined spatial checkpoint persistence
+
+`openSpatialSession` (phase 5B, `curio-minecraft-3d-memory/storage/sqlite` subpath) persists the recent-observation map (`VoxelMap`) alongside the four historical facts through the same single SQLite worker. `checkpoint()` remains the *only* explicit save trigger and captures all three stores in one transaction.
+
+```ts
+import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
+
+const session = await openSpatialSession({ databasePath, worldId: 'world' });
+
+session.voxel.beginSession('session-a');          // host names the current observation session
+session.voxel.observe({ /* … confirmed Observation … */ });
+session.history.saveFragment({ /* … */ });
+
+await session.checkpoint();                        // voxel + history in one transaction
+await session.close();
+
+const reopened = await openSpatialSession({ databasePath, worldId: 'world' });
+reopened.voxel.cellAt('overworld', x, y, z);       // committed facts, re-marked STALE
+```
+
+Behavior:
+
+- **Explicit save.** Memory writes are queryable immediately; only `checkpoint()` persists them. There is no auto-save, incremental log, or background retry.
+- **Startup restore, not replay.** Restored facts keep their original `observedAt`/`sessionId`/source/attribution, but saved `FRESH` becomes `STALE` — the host names a new observation session and re-observes cells to re-establish freshness; a re-observation refreshes only the observed cell.
+- **Bounded, atomic.** One checkpoint replaces the world's history and voxel in a single transaction under a shared byte budget and finite voxel limits (`maxVoxelSections`, `maxObservedCells`, `maxPaletteEntries`, `maxBytes`). Over-capacity saves are rejected before any copy.
+- **Schema upgrade.** Schema v1 databases are upgraded to v2 (adding `spatial_sections` and voxel checkpoint columns) with a consistent backup and transactional rollback; existing history, ids, order, and bindings are preserved. A history-only `openHistorySession` write replaces only history and never touches voxel.
+- **Lifecycle.** `checkpoint()` rejects `busy`/`closing`/`closed`; `flush()` waits only for an accepted checkpoint; `close()` reports the last confirmed checkpoint, unsaved changes, and unconfirmed requests.
+
+See [`docs/phase-5b-spatial-checkpoint-acceptance.md`](docs/phase-5b-spatial-checkpoint-acceptance.md).
+
 ## Project structure
 
 ```
@@ -213,7 +244,8 @@ examples/
 ├── topology-facts.ts               # runnable Fake demo of explicit topology facts vs current blockage
 ├── historical-topology-query.ts    # runnable Fake demo of bounded historical graph queries
 ├── historical-anchor-query.ts      # runnable Fake demo of bounded historical anchor queries
-└── history-checkpoint.ts           # runnable demo of the SQLite checkpoint lifecycle
+├── history-checkpoint.ts           # runnable demo of the SQLite history checkpoint lifecycle
+└── spatial-checkpoint.ts           # runnable demo of the combined spatial checkpoint lifecycle
 ```
 
 ## Development
@@ -229,6 +261,7 @@ npx tsx examples/topology-facts.ts          # run the Fake explicit-topology dem
 npx tsx examples/historical-topology-query.ts # run the Fake bounded-query demo
 npx tsx examples/historical-anchor-query.ts   # run the Fake bounded-anchor-query demo
 npx tsx examples/history-checkpoint.ts        # run the SQLite checkpoint-lifecycle demo
+npx tsx examples/spatial-checkpoint.ts        # run the combined spatial checkpoint-lifecycle demo
 ```
 
 > `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, `examples/historical-anchor-query.ts`, and `examples/history-checkpoint.ts` import the built package by its public name (`curio-minecraft-3d-memory`, with `history-checkpoint.ts` using the `curio-minecraft-3d-memory/storage/sqlite` subpath) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.

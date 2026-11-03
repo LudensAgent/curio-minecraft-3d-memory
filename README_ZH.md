@@ -22,8 +22,9 @@
 - **有界历史图查询**（`topology/`，阶段 4C）：`TopologyStore` 新增有界、只读的 `adjacency` / `reachable` / `route` 查询 —— 有限工作预算、模式筛选、轻量历史读取，以及精确的 `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` 结果 —— 仍不声称当前可通行、不生成可执行路线。
 - **有界历史锚点查询**（`topology/`，阶段 4D）：`TopologyStore.historicalAnchorCandidates` 查询从节点出发、沿证据解析的历史连接可达且满足筛选（source/tag/kind）的锚点，按 `bfs`/`highest`/`deepest` 排序限流，附带共享证明 —— 不声称当前可通行、不选择行动目标、不生成可执行路线。
 - **显式历史 checkpoint 持久化**（`storage/`，阶段 5A）：通过 `curio-minecraft-3d-memory/storage/sqlite` 子路径的 `openHistorySession`，用单个 SQLite Worker 持久化四类历史事实（`PathFragment`、`TraversalEvidence`、`SpatialNode` 及带原始绑定快照的拓扑边）。`checkpoint()` 是唯一显式保存触发点；`flush()`/`close()` 不隐式保存新内存变化。见 `docs/phase-5a-history-checkpoint-acceptance.md`。
+- **显式组合空间 checkpoint 持久化**（`storage/`，阶段 5B）：通过同一子路径的 `openSpatialSession`，用单个 SQLite Worker 与单个事务把最近观测地图（`VoxelMap`）与历史事实一起持久化。启动时恢复完整观测状态并统一转 `STALE`；新观测只刷新实际观察到的格。见 `docs/phase-5b-spatial-checkpoint-acceptance.md`。
 
-内存层以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与 `examples/walk-route-execution.ts`）；checkpoint 层以**真实 SQLite + 真实 Worker**验证（见 `tests/storage-checkpoint.test.ts` 与 `examples/history-checkpoint.ts`）。**尚未**接入真实 mineflayer/Curio 身体或寻路。
+内存层以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与 `examples/walk-route-execution.ts`）；checkpoint 层以**真实 SQLite + 真实 Worker**验证（见 `tests/storage-checkpoint.test.ts`、`tests/spatial-checkpoint.test.ts`、`examples/history-checkpoint.ts` 与 `examples/spatial-checkpoint.ts`）。**尚未**接入真实 mineflayer/Curio 身体或寻路。
 
 ## 历史路径存储
 
@@ -214,6 +215,42 @@ reopened.history.fragments(); // 已提交状态恢复
 不加载原生驱动、支持 Node `>=18`；SQLite 子路径额外要求 `better-sqlite3`（Node `>=20`）。见
 [`docs/phase-5a-history-checkpoint-acceptance.md`](docs/phase-5a-history-checkpoint-acceptance.md)。
 
+## 组合空间 checkpoint 持久化
+
+`openSpatialSession`（阶段 5B，子路径 `curio-minecraft-3d-memory/storage/sqlite`）通过同一个 SQLite
+Worker 把最近观测地图（`VoxelMap`）与四类历史事实一起持久化。`checkpoint()` 仍是**唯一**的显式保存
+触发点，并在一个事务内捕获三个 Store。
+
+```ts
+import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
+
+const session = await openSpatialSession({ databasePath, worldId: 'world' });
+
+session.voxel.beginSession('session-a');   // 宿主命名本次观测会话
+session.voxel.observe({ /* … 已确认 Observation … */ });
+session.history.saveFragment({ /* … */ });
+
+await session.checkpoint();                 // 体素 + 历史在一个事务内提交
+await session.close();
+
+const reopened = await openSpatialSession({ databasePath, worldId: 'world' });
+reopened.voxel.cellAt('overworld', x, y, z); // 已提交事实，统一转 STALE
+```
+
+行为：
+
+- **显式保存**：内存写入立即可查询，只有 `checkpoint()` 才会落盘；不自动保存、不做增量日志、不后台重试。
+- **启动恢复而非重放**：恢复的事实保留原 `observedAt`/`sessionId`/来源/归属，但已保存的 `FRESH` 转为
+  `STALE` —— 宿主命名新观测会话并重新观察以恢复新鲜度；重观察只刷新被观察的那一格。
+- **有界且原子**：一次 checkpoint 在单个事务内、在统一字节预算与有限体素上限（`maxVoxelSections`、
+  `maxObservedCells`、`maxPaletteEntries`、`maxBytes`）下替换该世界的体素与历史；超限在复制前拒绝。
+- **schema 升级**：v1 数据库升级到 v2（新增 `spatial_sections` 与体素 checkpoint 列），带一致备份与事务
+  回滚；既有历史、ID、顺序与绑定被保留。历史入口 `openHistorySession` 的写入只替换历史，不触碰体素。
+- **生命周期**：`checkpoint()` 在 `busy`/`closing`/`closed` 时拒绝；`flush()` 只等待已接受的 checkpoint；
+  `close()` 报告最后确认的 checkpoint、未保存变化与未确认请求。
+
+见 [`docs/phase-5b-spatial-checkpoint-acceptance.md`](docs/phase-5b-spatial-checkpoint-acceptance.md)。
+
 ## 目录结构
 
 ```
@@ -238,7 +275,8 @@ examples/
 ├── topology-facts.ts               # 可运行的 Fake 显式拓扑事实与当前阻塞对照示例
 ├── historical-topology-query.ts    # 可运行的 Fake 有界历史图查询示例
 ├── historical-anchor-query.ts      # 可运行的 Fake 有界历史锚点查询示例
-└── history-checkpoint.ts           # 可运行的 SQLite checkpoint 生命周期示例
+├── history-checkpoint.ts           # 可运行的 SQLite 历史 checkpoint 生命周期示例
+└── spatial-checkpoint.ts           # 可运行的组合空间 checkpoint 生命周期示例
 ```
 
 ## 开发
@@ -254,6 +292,7 @@ npx tsx examples/topology-facts.ts          # 运行 Fake 显式拓扑示例
 npx tsx examples/historical-topology-query.ts # 运行 Fake 有界历史图查询示例
 npx tsx examples/historical-anchor-query.ts   # 运行 Fake 有界历史锚点查询示例
 npx tsx examples/history-checkpoint.ts        # 运行 SQLite checkpoint 生命周期示例
+npx tsx examples/spatial-checkpoint.ts        # 运行组合空间 checkpoint 生命周期示例
 ```
 
 > `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts`、`examples/historical-anchor-query.ts` 与 `examples/history-checkpoint.ts` 以公开包名（`curio-minecraft-3d-memory`，其中 `history-checkpoint.ts` 使用 `curio-minecraft-3d-memory/storage/sqlite` 子路径）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
