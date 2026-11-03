@@ -24,3 +24,33 @@ export interface PathFragment {
   lastUsedAt: number;
   uses: number;
 }
+
+/**
+ * Confirmed traversal evidence — an actually-walked, continuous passage between
+ * two positions, submitted explicitly by the caller (design §3.1, phase 4A).
+ *
+ * This is a *separate* record from `PathFragment` geometry:
+ * - saving a fragment never proves a traversal happened;
+ * - a traversal record never proves the route is currently passable.
+ *
+ * A record is directional (`from` → `to`): confirming A→B never implies B→A,
+ * and two distinct real traversals that happen to share coordinates are kept as
+ * separate records — identity is the caller-supplied `id`, not the coordinates.
+ */
+export interface TraversalEvidence {
+  /** Stable identity; re-delivering the same id is idempotent, a different id is a distinct traversal. */
+  id: string;
+  /** Fragment this traversal belongs to. */
+  fragmentId: string;
+  /** Confirmed continuous passage from → to. */
+  from: Vec3Like;
+  to: Vec3Like;
+  worldId: string;
+  dim: string;
+  /** Session the traversal actually happened in; null = unknown (never fabricated). */
+  sessionId: string | null;
+  /** Original acquisition time; null = unknown (never `Date.now()`, receive order, or `0`). */
+  observedAt: number | null;
+  /** Caller-supplied provenance label (e.g. `"confirmed_walk"`); opaque to the library. */
+  source: string;
+}

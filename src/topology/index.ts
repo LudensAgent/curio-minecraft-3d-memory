@@ -1,4 +1,4 @@
-export type { PathFragment } from './path-fragment.js';
+export type { PathFragment, TraversalEvidence } from './path-fragment.js';
 export type {
   ConnectionType,
   LandmarkTag,
@@ -7,3 +7,14 @@ export type {
   SpatialEdge,
   SpatialNode,
 } from './graph.js';
+export { FragmentStore } from './fragment-store.js';
+export type {
+  FragmentChanges,
+  FragmentPage,
+  FragmentQuery,
+  FragmentStoreOptions,
+  SaveResult,
+  SaveStatus,
+  TraversalPage,
+  TraversalQuery,
+} from './fragment-store.js';

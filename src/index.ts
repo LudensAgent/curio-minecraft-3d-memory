@@ -81,15 +81,25 @@ export type {
   RouteVerifierOptions,
 } from './traversability/index.js';
 
-// Topology
+// Topology — historical geometry + confirmed traversal evidence (phase 4A)
+export { FragmentStore } from './topology/index.js';
 export type {
   ConnectionType,
+  FragmentChanges,
+  FragmentPage,
+  FragmentQuery,
+  FragmentStoreOptions,
   LandmarkTag,
   NodeKind,
   NodeSource,
   PathFragment,
+  SaveResult,
+  SaveStatus,
   SpatialEdge,
   SpatialNode,
+  TraversalEvidence,
+  TraversalPage,
+  TraversalQuery,
 } from './topology/index.js';
 
 // Adapter
