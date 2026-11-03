@@ -186,6 +186,15 @@ describe('VoxelMap pending-section tracking', () => {
     map.beginSession('other-session'); // FRESH s1 cell → STALE
     expect(map.captureDirtySections().length).toBe(1);
   });
+
+  it('sealInitialization forbids a later restore even when the map is empty', () => {
+    const map = new VoxelMap(WORLD);
+    map.sealInitialization();
+
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(() => map.restoreSnapshot(source.checkpointSnapshot())).toThrow(/initialization/);
+  });
 });
 
 // ==============================================================================
@@ -482,5 +491,91 @@ describe('SQLite incremental voxel checkpoint', () => {
     await s2.close();
 
     expect(voxelRowCount(dbPath)).toBe(1); // the failed increment was rolled back
+  });
+
+  it('rejects restoreSnapshot on a delivered map after an empty baseline is saved', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    await session.checkpoint(); // empty voxel baseline
+
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(() => session.voxel.restoreSnapshot(source.checkpointSnapshot())).toThrow(/initialization/);
+    await session.close();
+  });
+
+  it('rejects restoreSnapshot after reopening an empty baseline', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    await s1.checkpoint(); // empty voxel baseline
+    await s1.close();
+
+    const s2 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(() => s2.voxel.restoreSnapshot(source.checkpointSnapshot())).toThrow(/initialization/);
+    await s2.close();
+  });
+
+  it('preserves stable section order when updating a later section', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s1.voxel.beginSession('s1');
+    s1.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })); // cx 0
+    s1.voxel.observe(obs({ state: stone, pos: { x: 16, y: 0, z: 0 } })); // cx 1
+    s1.voxel.observe(obs({ state: stone, pos: { x: 32, y: 0, z: 0 } })); // cx 2
+    await s1.checkpoint();
+    await s1.close();
+
+    const s2 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s2.voxel.beginSession('s2');
+    s2.voxel.observe(obs({ sessionId: 's2', state: dirt, pos: { x: 32, y: 0, z: 0 }, observedAt: 2000, sequence: 1 }));
+    await s2.checkpoint();
+    await s2.close();
+
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.prepare('SELECT id, seq FROM spatial_sections WHERE world_id = ? ORDER BY seq').all(WORLD) as {
+      id: string;
+      seq: number;
+    }[];
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual([sectionId(DIM, 0, 0, 0), sectionId(DIM, 1, 0, 0), sectionId(DIM, 2, 0, 0)]);
+    expect(new Set(rows.map((r) => r.seq)).size).toBe(rows.length); // no duplicate seq
+
+    const s3 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(evidence(s3.voxel, 32, 0, 0).observation.state).toEqual(dirt);
+    expect(evidence(s3.voxel, 0, 0, 0).observation.state).toEqual(stone);
+    await s3.close();
+  });
+
+  it('appends new sections after the max seq in a mixed update+insert batch', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s1.voxel.beginSession('s1');
+    s1.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })); // cx 0
+    s1.voxel.observe(obs({ state: stone, pos: { x: 16, y: 0, z: 0 } })); // cx 1
+    await s1.checkpoint();
+    await s1.close();
+
+    const s2 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s2.voxel.beginSession('s2');
+    s2.voxel.observe(obs({ sessionId: 's2', state: dirt, pos: { x: 16, y: 0, z: 0 }, observedAt: 2000, sequence: 1 })); // update cx 1
+    s2.voxel.observe(obs({ sessionId: 's2', state: stone, pos: { x: 32, y: 0, z: 0 }, observedAt: 2000, sequence: 2 })); // new cx 2
+    await s2.checkpoint();
+    await s2.close();
+
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.prepare('SELECT id, seq FROM spatial_sections WHERE world_id = ? ORDER BY seq').all(WORLD) as {
+      id: string;
+      seq: number;
+    }[];
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual([sectionId(DIM, 0, 0, 0), sectionId(DIM, 1, 0, 0), sectionId(DIM, 2, 0, 0)]);
+    expect(new Set(rows.map((r) => r.seq)).size).toBe(rows.length); // no duplicate seq
+
+    const s3 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(evidence(s3.voxel, 16, 0, 0).observation.state).toEqual(dirt); // updated
+    expect(evidence(s3.voxel, 32, 0, 0).observation.state).toEqual(stone); // new
+    await s3.close();
   });
 });

@@ -109,7 +109,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 451 passed（15 个测试文件；新增 18 项 spatial-checkpoint-incremental 测试）
+npm test           → 456 passed（15 个测试文件；新增 23 项 spatial-checkpoint-incremental 测试）
 npx tsx examples/spatial-checkpoint-incremental.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过
 ```
@@ -144,3 +144,16 @@ git diff --check   → 通过
 
 本轮仍是有界全量启动恢复；增量只针对体素保存的复制/传输/SQL 写入，不宣称已完成大世界按需缓存。未进行
 真实 mineflayer/Curio 游戏验收。
+
+## 评审修正（P1/P2）
+
+- **P1 空基线后再次恢复会漏存**：`restoreSnapshot` 原本只按「无 Section / 无会话 / 无中断边界」判断
+  pristine，已交付但尚未激活的空地图仍可再次恢复，其恢复清空待保存集合却不 dirty，导致内存有数据、dirty
+  为真、待保存集合为空，`checkpoint()` 以空增量「成功」却漏存。现新增 `VoxelMap.initialized` 与
+  `sealInitialization()`，组合会话在初始化完成后调用，交付后的地图（含空基线交付）一律拒绝再次
+  `restoreSnapshot`（报 `only available during initialization`）。新增同会话空基线、重开空基线、纯
+  `sealInitialization` 三项回归测试。
+- **P2 增量更新改写 Section 稳定顺序**：增量 `upsert` 原先用每批局部索引回写 `seq`，已有行被覆盖，导致
+  「仅更新后段 Section 后重开顺序改变、数据库出现重复序号」。现改为已有行只更新 `payload`、保留原 `seq`；
+  新 Section 从该世界现有 `MAX(seq)+1` 起按批内顺序分配。新增「更新后段 Section 顺序不变」「新增＋更新
+  混合批次追加到最大序号之后」两项回归测试（直接断言 `ORDER BY seq` 的 id 序列与 seq 无重复）。

@@ -118,6 +118,13 @@ export class VoxelMap {
    * revision (and thus the pending entry) without advancing the section revision.
    */
   private readonly pendingSections = new Map<Section, number>();
+  /**
+   * True once the owning session has finished initialization and handed the map to
+   * the caller. `restoreSnapshot` is the initialization path only: after this flag
+   * is set it is rejected, so a delivered (even still-empty) map can never have its
+   * facts silently replaced by a second restore.
+   */
+  private initialized = false;
 
   constructor(worldId: string, options: VoxelMapOptions = {}) {
     this.worldId = worldId;
@@ -353,12 +360,22 @@ export class VoxelMap {
   }
 
   /**
+   * Mark the map as delivered: called by the owning session once initialization is
+   * complete. After this, `restoreSnapshot` is rejected — the initialize-then-
+   * clean-baseline rule is confined to that controlled phase, and a still-empty
+   * delivered map can no longer have its facts silently replaced.
+   */
+  sealInitialization(): void {
+    this.initialized = true;
+  }
+
+  /**
    * Narrow, validated restore entry (phase 5B). Rebuilds the map from a previously
    * captured snapshot, re-marking saved `FRESH` evidence as `STALE`. It only
-   * accepts a map that has not yet observed anything, so it is the initialization
-   * path — never a runtime full-overwrite of an active map. It never replays
-   * `observe`, never refreshes observation time, and never fabricates a current
-   * observation session.
+   * accepts a map that has not yet been delivered (initialization is still open) and
+   * has not yet observed anything, so it is the initialization path — never a runtime
+   * full-overwrite of an active map. It never replays `observe`, never refreshes
+   * observation time, and never fabricates a current observation session.
    */
   restoreSnapshot(snapshot: VoxelCheckpointSnapshot): void {
     if (snapshot === null || typeof snapshot !== 'object') {
@@ -368,8 +385,12 @@ export class VoxelMap {
       throw new Error(`snapshot worldId "${snapshot.worldId}" does not match map worldId "${this.worldId}"`);
     }
     // Restore is the initialization path only: reject a map that has already been
-    // activated (a session started) or that recorded an interruption boundary, even
-    // when it has no sections yet. "No sections" alone is not proof it is pristine.
+    // delivered (even if still empty), activated (a session started), or that
+    // recorded an interruption boundary. "No sections" alone is not proof it is
+    // pristine, and "empty" alone is not proof it is still initializing.
+    if (this.initialized) {
+      throw new Error('restoreSnapshot is only available during initialization');
+    }
     if (this.sections.size !== 0 || this.currentSessionId !== null || this.staleBoundaries.size !== 0) {
       throw new Error('restoreSnapshot requires a pristine VoxelMap (never activated or observed)');
     }

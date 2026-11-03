@@ -475,11 +475,18 @@ function writeCheckpoint(
       );
       voxel.sections.forEach((s, i) => insertSection.run(wId, i, s.id, s.payload));
     } else if (voxel.mode === 'incremental') {
+      // Existing rows keep their `seq` (stable order); new rows are appended after
+      // the current max seq, in batch order. Only an existing row's payload changes,
+      // so the on-disk order never moves and seq never duplicates.
+      const maxSeqRow = connection
+        .prepare('SELECT COALESCE(MAX(seq), 0) AS n FROM spatial_sections WHERE world_id = ?')
+        .get(wId) as { n: number };
+      const baseSeq = maxSeqRow.n;
       const upsertSection = connection.prepare(
         'INSERT INTO spatial_sections (world_id, seq, id, payload) VALUES (?, ?, ?, ?) ' +
-          'ON CONFLICT(world_id, id) DO UPDATE SET seq = excluded.seq, payload = excluded.payload',
+          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload',
       );
-      voxel.sections.forEach((s, i) => upsertSection.run(wId, i, s.id, s.payload));
+      voxel.sections.forEach((s, i) => upsertSection.run(wId, baseSeq + i + 1, s.id, s.payload));
       // The resulting full set must still re-open under the same limits: reject
       // (and roll back) before commit if the increments accumulate past capacity.
       assertVoxelFullSetWithinLimits(connection, wId, prepared.bytes, resolved);

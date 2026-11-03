@@ -174,6 +174,9 @@ class SpatialSessionImpl implements SpatialSession {
     this.confirmedFragmentRevision = this.history.revision;
     this.confirmedTopologyRevision = this.topology.revision;
     this.confirmedVoxelRevision = this.voxel.saveRevision;
+    // Once initialization is complete the map is live: a second `restoreSnapshot`
+    // must never silently replace its facts (see `sealInitialization`).
+    this.voxel.sealInitialization();
   }
 
   async checkpoint(): Promise<SpatialCheckpointResult> {

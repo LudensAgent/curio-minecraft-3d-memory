@@ -244,7 +244,8 @@ reopened.voxel.cellAt('overworld', x, y, z); // 已提交事实，统一转 STAL
 - **启动恢复而非重放**：恢复的事实保留原 `observedAt`/`sessionId`/来源/归属，但已保存的 `FRESH` 转为
   `STALE` —— 宿主命名新观测会话并重新观察以恢复新鲜度；重观察只刷新被观察的那一格。
 - **有界且原子**：一次 checkpoint 在单个事务内、在统一字节预算与有限体素上限（`maxVoxelSections`、
-  `maxObservedCells`、`maxPaletteEntries`、`maxBytes`）下替换该世界的体素与历史；超限在复制前拒绝。
+  `maxObservedCells`、`maxPaletteEntries`、`maxBytes`）下替换该世界的体素与历史。主线程先对本次批次做预检、
+  超限在复制前拒绝；Worker 另在事务内复核增量后的完整集合、超限整批回滚。
 - **基线后增量（5C）**：首次 `checkpoint()` 写完整体素集合；之后只复制、编码并写入发生变化的
   Section（`voxelMode: 'incremental'`），未变化的 Section payload 保持字节级不变。历史本轮仍为完整快照。
 - **schema 升级**：v1 数据库升级到 v2（新增 `spatial_sections` 与体素 checkpoint 列），带一致备份与事务
