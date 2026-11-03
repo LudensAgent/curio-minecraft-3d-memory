@@ -1117,7 +1117,8 @@ describe('WalkRouteExecutor — newer sample and release ordering', () => {
     await tick();
 
     const status = loop.status()!;
-    expect(status.result).toBeNull(); // not ARRIVED by the stale sample
+    expect(status.result?.outcome).toBe('FAILED'); // not ARRIVED by the stale sample
+    expect(status.result?.problem?.kind).toBe('unconfirmed_arrival'); // structured gap, not re-schedulable
     expect(status.nextPointIndex).toBe(1); // not advanced
     expect(status.lastPosition).toEqual({ x: 0.5, y: 0, z: 0.5 }); // newer sample retained
   });
@@ -1142,5 +1143,77 @@ describe('WalkRouteExecutor — newer sample and release ordering', () => {
     const status = loop.status()!;
     expect(status.result?.outcome).toBe('CANCELLED'); // not FAILED/deviation
     expect(status.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
+  });
+});
+
+describe('WalkRouteExecutor — unified completion across release', () => {
+  it('a released-time sample at the target yields arrival, not deviation', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 3, observedAt: 2300 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
+  });
+
+  it('a released-time correction to the start yields a gap, not a retry', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 0.5, y: 0, z: 0.5 }, { sequence: 3, observedAt: 2300 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    const status = loop.status()!;
+    expect(status.result?.outcome).toBe('FAILED');
+    expect(status.result?.problem?.kind).toBe('unconfirmed_arrival');
+    expect(status.lastPosition).toEqual({ x: 0.5, y: 0, z: 0.5 });
+
+    // A further advance must not silently retry the same step.
+    loop.advance(10);
+    expect(loop.status()!.activeStepIndex).toBeNull();
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+  });
+
+  it('a released-time partial displacement preserves cancel semantics', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 0.5, y: 0, z: 0.5 }, { sequence: 3, observedAt: 2300 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({
+      sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }),
+      failure: { kind: 'cancelled' },
+    });
+    await tick();
+
+    const status = loop.status()!;
+    expect(status.result?.outcome).toBe('CANCELLED');
+    expect(status.result?.lastPosition).toEqual({ x: 0.5, y: 0, z: 0.5 });
   });
 });

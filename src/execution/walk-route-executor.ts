@@ -285,6 +285,10 @@ export class WalkRouteExecutor {
 
     if (!usable) return this.snapshot();
 
+    // During control release, accept the trusted position but defer ordinary arrival
+    // and step-deviation determination to the completing flow.
+    if (this.releasing > 0) return this.snapshot();
+
     if (this.activeStepIndex !== null) {
       const target = this.points[this.nextPointIndex];
       if (target !== undefined && positionsEqual(sample.pos, target)) {
@@ -606,7 +610,12 @@ export class WalkRouteExecutor {
       this.applyMoveFailure(failure);
       return;
     }
-    if (sampleStale) return; // the move's sample is obsolete; a newer sample already handled it
+    // The move's sample was superseded by a newer sample; determine completion from
+    // the latest evidence (arrival if at target, otherwise a structured gap).
+    if (sampleStale && this.lastSample !== null) {
+      this.confirmArrival(this.lastSample);
+      return;
+    }
     this.result = this.buildFailure('FAILED', 'the move returned without a usable confirming body sample', {
       kind: 'unconfirmed_arrival',
       expected: { ...this.points[this.nextPointIndex]! },
@@ -653,6 +662,22 @@ export class WalkRouteExecutor {
     this.stopActive(); // measured arrival and control release are separate confirmations
     if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
 
+    // A newer sample accepted during the stop supersedes this one; confirm against it.
+    const effective =
+      sample.sequence < this.lastSampleSequence && this.lastSample !== null ? this.lastSample : sample;
+    const target = this.points[this.nextPointIndex];
+    if (target === undefined || !positionsEqual(effective.pos, target)) {
+      this.result = this.buildFailure('FAILED', 'the move returned without a usable confirming body sample', {
+        kind: 'unconfirmed_arrival',
+        expected: target !== undefined ? { ...target } : { ...this.points[this.points.length - 1]! },
+      });
+      return;
+    }
+    this.recordArrival(effective);
+  }
+
+  /** Record the confirmed arrival at the next point and advance; may produce ARRIVED. */
+  private recordArrival(sample: BodySample): void {
     const pos = { ...sample.pos };
     this.lastPosition = pos;
     this.lastSample = snapshotSample(sample);
