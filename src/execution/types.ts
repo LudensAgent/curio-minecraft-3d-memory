@@ -69,6 +69,21 @@ export interface GroundedArrival {
   stableMs: number;
 }
 
+/**
+ * Defaults for same-height dry walking on Java 1.20.1, verified against
+ * prismarine-physics. Units: tolerances are blocks; speeds are blocks per
+ * physics tick (20 Hz). The vertical limit must absorb the grounded gravity
+ * velocity (-0.0784 b/tick = -1.568 b/s) -- a body standing still is never at
+ * vertical velocity 0 -- while still rejecting a real jump (~ +0.42 b/tick).
+ */
+export const GROUNDED_ARRIVAL_DEFAULTS: GroundedArrival = {
+  horizontalTolerance: 0.12,
+  feetTolerance: 0.05,
+  maxHorizontalSpeed: 0.003,
+  maxVerticalSpeed: 0.1,
+  stableMs: 150,
+};
+
 /** One authorized single-step move, owned by the current execution. */
 export interface ExecutableMove {
   /** Execution identity; a late result keyed to an old id must be ignored. */
