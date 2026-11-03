@@ -27,6 +27,7 @@ import {
   cloneObservation,
   estimateObservationResidentGrowth,
   estimateVoxelSectionBytes,
+  estimateVoxelSectionSnapshotBytes,
   restoreVoxelSection,
   snapshotVoxelSection,
   voxelSectionLowerBound,
@@ -145,6 +146,14 @@ export class VoxelMap {
   private residentSectionCount = 0;
   private directoryInstalled = false;
   private nextPinToken = 1;
+  /**
+   * Per-section residency generation, bumped on every unload/install. A residency
+   * change does not advance `Section.revision`, so consumers (traversability cache,
+   * route verifier) snapshot this generation per dependency and re-evaluate when it
+   * moves, so an unload never keeps an old OPEN and a reload never keeps a pre-load
+   * UNKNOWN.
+   */
+  private readonly residencyGenerations = new Map<string, number>();
   private readonly staleBoundaries = new Map<string, number>();
   private currentSessionId: string | null = null;
   /**
@@ -557,6 +566,20 @@ export class VoxelMap {
     return { residency: 'no_record' };
   }
 
+  /**
+   * Monotonic residency generation for one section. Advances on every unload and
+   * every install, never on an observation, so consumers can detect a residency
+   * change independently of `Section.revision`.
+   */
+  residencyGeneration(dim: string, cx: number, cz: number, sy: number): number {
+    return this.residencyGenerations.get(dirKey(dim, cx, cz, sy)) ?? 0;
+  }
+
+  /** Conservative resident working-set size (section count + estimated bytes), for observability. */
+  residentSize(): { sections: number; bytes: number } {
+    return { sections: this.residentSectionCount, bytes: this.residentBytes };
+  }
+
   /** Mark sections as having a load in flight (the session drives this around the worker round-trip). */
   markLoading(keys: readonly SectionKey[]): void {
     for (const key of keys) {
@@ -605,7 +628,19 @@ export class VoxelMap {
       built.push(section);
     }
 
-    const fresh = built.filter((s) => !this.hasSectionKey(s.key.dim, s.key.cx, s.key.cz, s.key.sy));
+    // Whole-batch pre-check: never overwrite a section that is already resident.
+    // Loading is the "install a non-resident section" path only; overwriting a
+    // resident section would silently replace its (possibly unsaved) facts and
+    // leave `pendingSections` pointing at the replaced object.
+    for (const section of built) {
+      if (this.hasSectionKey(section.key.dim, section.key.cx, section.key.cz, section.key.sy)) {
+        throw new Error(
+          `section (${section.key.dim}, ${section.key.cx}, ${section.key.cz}, ${section.key.sy}) is already resident; load must not overwrite runtime facts`,
+        );
+      }
+    }
+
+    const fresh = built;
     const addedBytes = fresh.reduce((sum, s) => sum + estimateVoxelSectionBytes(s), 0);
     if (this.residentSectionCount + fresh.length > this.residentLimits.maxResidentSections) {
       throw new Error(
@@ -618,7 +653,10 @@ export class VoxelMap {
       );
     }
 
-    for (const section of built) this.setSection(section);
+    for (const section of built) {
+      this.setSection(section);
+      this.bumpResidencyGeneration(section.key.dim, section.key.cx, section.key.cz, section.key.sy);
+    }
     this.residentSectionCount += fresh.length;
     this.residentBytes += addedBytes;
     for (const section of built) {
@@ -659,6 +697,7 @@ export class VoxelMap {
       if (dimMap.size === 0) this.sections.delete(key.dim);
       this.residentBytes -= estimateVoxelSectionBytes(section);
       this.residentSectionCount -= 1;
+      this.bumpResidencyGeneration(key.dim, key.cx, key.cz, key.sy);
       result.unloaded.push({ ...key });
     }
     return result;
@@ -674,6 +713,9 @@ export class VoxelMap {
     if (!this.manualResidency) {
       throw new Error('pinSections requires manual residency mode');
     }
+    // Validate every key (scope, dim, integer coords) before any state change, so
+    // a foreign-world key can never build a protection under this map's coords.
+    for (const key of keys) assertSectionKey(this.worldId, key);
     const deduped = dedupeKeys(keys);
     if (deduped.length > this.residentLimits.maxLoadBatchSections) {
       throw new Error(`pin request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residentLimits.maxLoadBatchSections})`);
@@ -722,6 +764,32 @@ export class VoxelMap {
     }
   }
 
+  /**
+   * Update the committed directory from a *captured* checkpoint snapshot, so the
+   * on-disk metadata (cell/palette/revision/byte counts) reflects exactly what the
+   * worker committed — never the ACK-time in-memory state, which may have advanced
+   * past the captured revision. `full` replaces the directory; `incremental`
+   * upserts only the captured (dirty) sections and leaves other directory entries
+   * untouched.
+   */
+  commitDirectory(mode: 'full' | 'incremental', sections: readonly VoxelSectionSnapshot[]): void {
+    if (!this.manualResidency) return;
+    if (mode === 'full') this.directory.clear();
+    let nextSeq = this.directory.size === 0 ? 0 : Math.max(...[...this.directory.values()].map((e) => e.seq)) + 1;
+    for (const raw of sections) {
+      const key = dirKey(raw.dim, raw.cx, raw.cz, raw.sy);
+      const existing = this.directory.get(key);
+      this.directory.set(key, {
+        key: { worldId: this.worldId, dim: raw.dim, cx: raw.cx, cz: raw.cz, sy: raw.sy },
+        seq: existing?.seq ?? nextSeq++,
+        bytes: estimateVoxelSectionSnapshotBytes(raw),
+        observedCells: raw.evidence.length,
+        paletteEntries: raw.palette.length,
+        revision: raw.revision,
+      });
+    }
+  }
+
   // --- internals ---
 
   private lookupSection(dim: string, x: number, y: number, z: number): Section | undefined {
@@ -735,6 +803,7 @@ export class VoxelMap {
     reason: StaleReason,
     bySection: Map<Section, SectionChange>,
   ): void {
+    const before = this.manualResidency ? estimateVoxelSectionBytes(section) : 0;
     for (const [index, evidence] of section.evidence) {
       if (evidence.freshness === 'STALE') continue;
       if (!shouldStale(evidence)) continue;
@@ -750,6 +819,9 @@ export class VoxelMap {
       this.recordSaveChange(section);
       addChange(bySection, section, { pos, kind: 'staled' });
     }
+    // StaleReason is a new per-cell field: account its resident-byte growth so
+    // repeated markStale/beginSession cannot silently inflate the working set.
+    if (this.manualResidency) this.residentBytes += estimateVoxelSectionBytes(section) - before;
   }
 
   private applyValidated(observation: Observation): AppliedCell | null {
@@ -946,6 +1018,11 @@ export class VoxelMap {
       this.sections.set(section.key.dim, dimMap);
     }
     dimMap.set(innerKey(section.key.cx, section.key.cz, section.key.sy), section);
+  }
+
+  private bumpResidencyGeneration(dim: string, cx: number, cz: number, sy: number): void {
+    const key = dirKey(dim, cx, cz, sy);
+    this.residencyGenerations.set(key, (this.residencyGenerations.get(key) ?? 0) + 1);
   }
 
   /**

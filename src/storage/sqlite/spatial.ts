@@ -63,6 +63,10 @@ interface PendingRequest {
   voxelRevision?: number;
   fragmentRevision?: number;
   topologyRevision?: number;
+  /** How this checkpoint persisted voxel state, for the directory update on ACK. */
+  voxelMode?: VoxelSaveMode;
+  /** The captured (committed) voxel sections, for the directory update on ACK. */
+  voxelSections?: VoxelSectionSnapshot[];
 }
 
 interface InFlightCheckpoint {
@@ -330,6 +334,8 @@ class SpatialSessionImpl implements SpatialSession {
         voxelRevision,
         fragmentRevision,
         topologyRevision,
+        voxelMode,
+        voxelSections: voxelSnapshot.sections,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -680,6 +686,12 @@ class SpatialSessionImpl implements SpatialSession {
       // Clear only pending sections captured at (or before) this revision; a
       // section re-dirtied during the save keeps its newer pending entry.
       this.voxel.confirmSections(entry.voxelRevision!);
+      // Update the committed directory from the *captured* snapshot (not the
+      // ACK-time memory state), so a confirmed save is reflected as committed and
+      // its committed metadata matches what the worker actually wrote.
+      if (entry.voxelMode !== undefined && entry.voxelMode !== 'none') {
+        this.voxel.commitDirectory(entry.voxelMode, entry.voxelSections ?? []);
+      }
       this.voxelBaselineEstablished = true;
       this.confirmedVoxelRevision = entry.voxelRevision!;
       this.confirmedFragmentRevision = entry.fragmentRevision!;
@@ -726,11 +738,16 @@ class SpatialSessionImpl implements SpatialSession {
       return;
     }
     if (entry.kind === 'load') {
-      // A read timeout is distinct from an unconfirmed save: the session stays
-      // usable, but the requested sections read as failed-not-resident.
+      // A read timeout is distinct from an unconfirmed save (no checkpoint id is
+      // fabricated), but the worker may still be running the slow read — so the
+      // session must not accept new requests that would queue behind it. Poison and
+      // terminate, exactly like a checkpoint timeout, to avoid an unbounded queue.
       const error = new PersistenceError('timeout', 'section load did not complete within timeout');
       this.lastError = error;
+      this.lifecycle = 'closed';
+      this.failAllPending(error);
       entry.reject(error);
+      void this.terminateWorker();
       return;
     }
     this.lifecycle = 'closed';

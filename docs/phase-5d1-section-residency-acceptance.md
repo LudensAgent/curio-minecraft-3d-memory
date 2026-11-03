@@ -107,7 +107,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 476 passed（16 个测试文件；新增 20 项 spatial-voxel-residency 测试）
+npm test           → 484 passed（16 个测试文件；新增 28 项 spatial-voxel-residency 测试）
 npx tsx examples/spatial-residency.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过（见提交前检查）
 ```
@@ -139,3 +139,31 @@ git diff --check   → 通过（见提交前检查）
 - 当前通行结果或执行任务的持久化。
 
 本轮是手动按需加载与安全驻留机制，不宣称已完成大世界自动缓存或真实游戏验收。
+
+## 评审修正（P1/P2/P3）
+
+针对一轮代码评审的问题做了修正，并各加回归测试：
+
+- **P1 装入旧快照覆盖未保存新观测**：`installLoadedSections` 现整批预检，拒绝装入任何「已驻留」的 Section
+  （加载是安装非驻留 Section 的窄入口，覆盖会替换运行时事实并使 `pendingSections` 指向被替换对象）。回归测试
+  「installLoadedSections refuses to overwrite a resident section」。
+- **P2 驻留变化未接入缓存/路线**：`VoxelMap` 增加每 Section 驻留代次（卸载/装入各 +1，观察不变）。
+  `TraversabilityCache` 与 `RouteVerifier` 按依赖代次自动失效，无需显式 `invalidateSections`——卸载支撑 Section
+  后评估为 `UNKNOWN`（不再返回旧 `OPEN`），回载后评估为 `STALE`（不再卡在此前 `UNKNOWN`），无关 Section 不受影响。
+  回归测试覆盖缓存与路线验证的自动失效，以及「按路线实际依赖取得 Pin、释放后可卸载」。
+- **P2 保存 ACK 未更新目录**：`checkpoint()` 捕获待提交 Section 快照与模式，ACK 到达时 `commitDirectory` 用捕获
+  快照更新目录（`full` 替换 / `incremental` upsert），不读 ACK 时最新内存。新 Section 保存成功后卸载不再报
+  `not_committed`，已有 Section 更新后目录格数/palette/版本/字节数同步。回归测试「a confirmed checkpoint updates
+  the directory」与「an incremental checkpoint refreshes the committed metadata」。
+- **P2 驻留字节预算漏计与漂移**：`estimateObservationResidentGrowth` 改为合成单格 Section 的完整
+  `estimateVoxelSectionBytes`（保守上界，不再低估）；`markStale`/`beginSession` 经 `markSectionCellsStale` 统一
+  增减账（staleReason 增长计入）。新增 `VoxelMap.residentSize()` 供观测，回归测试「markStale accounts for
+  resident byte growth」。
+- **P2 v2→v3 迁移无界读取全部 payload**：`openDatabase` 接收 limits，`upgradeV2ToV3` 先做 `COUNT`/`octet_length`
+  元数据预检（超限在解码前拒绝），再用稳定 `rowid` 游标分批解码/回填并逐批校验 observed-cells/palette 上限，
+  事务回滚保留。
+- **P2 读取超时释放单在途限制但旧任务仍在 Worker**：`load` 超时改为毒化会话（`lifecycle='closed'` + 终止
+  Worker + 拒绝全部 pending），不伪造未确认 checkpoint，也不允许超时重试形成无界队列；继续以 `timeout`（读取）
+  区分 `timeout_unconfirmed`（保存结果未知）。
+- **P3 Pin 作用域校验缺口**：`pinSections` 在任何状态修改前对全部 key 做 `assertSectionKey`（worldId/dim/整数
+  坐标），异世界 key 不能按当前地图坐标建立保护。回归测试「pinSections rejects a key from another world」。

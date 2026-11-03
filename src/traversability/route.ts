@@ -178,6 +178,8 @@ export class RouteVerifier {
   private readonly pending = new Map<number, PendingReason>();
   /** Section key → step indices that depend on it (reverse dependency index). */
   private readonly sectionToSteps = new Map<string, Set<number>>();
+  /** Step index → dependency sections with the residency generation at verification time. */
+  private readonly stepResidency = new Map<number, { key: SectionKey; generation: number }[]>();
 
   constructor(map: VoxelMap, options: RouteVerifierOptions = {}) {
     this.map = map;
@@ -250,6 +252,7 @@ export class RouteVerifier {
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
+    this.stepResidency.clear();
     for (let i = 0; i < candidate.queries.length; i++) this.pending.set(i, 'unprocessed');
     return this.snapshot();
   }
@@ -332,6 +335,7 @@ export class RouteVerifier {
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
+    this.stepResidency.clear();
   }
 
   // --- internals ---
@@ -368,6 +372,7 @@ export class RouteVerifier {
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
+    this.stepResidency.clear();
     for (let i = 0; i < route.queries.length; i++) {
       this.pending.set(i, invalidated.has(i) ? 'invalidated' : 'unprocessed');
     }
@@ -394,6 +399,13 @@ export class RouteVerifier {
     const evaluation = this.cache.get(query, route.shapeProvider);
     this.results.set(i, evaluation);
     this.pending.delete(i);
+    this.stepResidency.set(
+      i,
+      evaluation.dependencies.map((dep) => ({
+        key: { ...dep.key },
+        generation: this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy),
+      })),
+    );
     for (const dep of evaluation.dependencies) {
       const key = sectionKeyString(dep.key);
       let set = this.sectionToSteps.get(key);
@@ -429,6 +441,7 @@ export class RouteVerifier {
     const result = this.results.get(i);
     if (result === undefined) return;
     this.results.delete(i);
+    this.stepResidency.delete(i);
     for (const dep of result.dependencies) {
       const key = sectionKeyString(dep.key);
       const set = this.sectionToSteps.get(key);
@@ -452,11 +465,29 @@ export class RouteVerifier {
     for (const i of expired) this.invalidateStep(i);
   }
 
+  /**
+   * Re-queue any verified step whose dependency section changed residency (unload
+   * or reload) since it was verified. A residency change does not advance
+   * `Section.revision`, so it must be detected by generation here — not by the
+   * report-driven `invalidate`.
+   */
+  private invalidateByResidency(): void {
+    for (const [i, deps] of this.stepResidency) {
+      for (const dep of deps) {
+        if (this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy) !== dep.generation) {
+          this.invalidateStep(i);
+          break;
+        }
+      }
+    }
+  }
+
   private snapshot(): RouteStatus {
     const route = this.route;
     if (route === null) throw new Error('no route registered');
     const now = this.currentNow();
     this.expireStale(now);
+    this.invalidateByResidency();
 
     const steps: RouteStepState[] = [];
     const verifiedStepIndexes: number[] = [];

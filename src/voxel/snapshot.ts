@@ -422,20 +422,60 @@ export function voxelSectionLowerBound(section: Section): number {
 
 /**
  * Conservative upper bound on the resident-byte growth one observation can add to
- * a section — whether the section is brand-new or already resident. It covers the
- * worst case of a fresh section (fixed overhead + one palette entry + one packed
- * cell) plus one evidence entry, and the worst case of a palette-width re-pack
- * (cells grows by at most one 4096-bit row). It is an over-estimate by design: the
- * exact `residentBytes` counter is maintained from before/after section estimates,
- * and this bound is only used to reject an over-capacity write *before* mutation.
+ * a section — whether the section is brand-new or already resident. It is the full
+ * `estimateVoxelSectionBytes` of a synthetic single-cell section containing that
+ * observation (fixed overhead + one palette entry + one packed cell + one evidence
+ * entry), which is always ≥ the true marginal growth: a brand-new section costs
+ * exactly this, and adding a cell to an existing section costs at most the same
+ * marginal evidence/palette/cells terms. Using the same estimator guarantees the
+ * pre-flight never under-estimates the exact `residentBytes` maintained before/after.
  */
 export function estimateObservationResidentGrowth(observation: Observation): number {
+  const section: Section = {
+    key: { worldId: observation.worldId, dim: observation.dim, cx: 0, cz: 0, sy: 0 },
+    palette: [AIR_BLOCK_NAME, serializeBlockState(observation.state)],
+    cells: new Uint8Array(Math.ceil((SECTION_CELL_COUNT * 1) / 8)),
+    bits: 1,
+    explored: new Uint8Array(0),
+    traversed: new Uint8Array(0),
+    stale: new Uint8Array(0),
+    risk: new Uint8Array(0),
+    modified: new Uint8Array(0),
+    evidence: new Map([
+      [
+        0,
+        {
+          observation: cloneObservation(observation),
+          revision: 1,
+          freshness: 'FRESH',
+          staleReason: undefined,
+          validUntil: observation.observedAt + 1,
+        },
+      ],
+    ]),
+    revision: 1,
+  };
+  return estimateVoxelSectionBytes(section);
+}
+
+/**
+ * Conservative escaped-byte estimate of one persisted section snapshot (the form
+ * the worker decodes/encodes). Used to update the committed directory's byte count
+ * on save confirmation without re-serializing on the main thread.
+ */
+export function estimateVoxelSectionSnapshotBytes(raw: VoxelSectionSnapshot): number {
   const cost = jsonEscapedByteLength;
-  let bytes = SECTION_FIXED_BYTES + CELL_FIXED_BYTES;
-  bytes += observationBytes(observation, cost);
-  bytes += BYTES_PER_NUMBER; // evidence index
-  bytes += STRING_QUOTES + cost(serializeBlockState(observation.state)); // one palette entry
-  bytes += base64Length(SECTION_CELL_COUNT / 8); // one 4096-bit row: new cell or re-pack growth
-  bytes += 4 * BYTES_PER_NUMBER; // dim + cx/cz/sy + bits + revision
+  let bytes = SECTION_FIXED_BYTES;
+  bytes += cost(raw.dim) + STRING_QUOTES;
+  bytes += 3 * BYTES_PER_NUMBER; // cx cz sy
+  bytes += BYTES_PER_NUMBER; // bits
+  bytes += BYTES_PER_NUMBER; // revision
+  let paletteBytes = Math.max(0, raw.palette.length - 1);
+  for (const entry of raw.palette) paletteBytes += cost(entry) + STRING_QUOTES;
+  bytes += paletteBytes;
+  bytes += STRING_QUOTES + base64Length(raw.cells.length);
+  let evidenceBytes = Math.max(0, raw.evidence.length - 1);
+  for (const cell of raw.evidence) evidenceBytes += BYTES_PER_NUMBER + cellEvidenceBytes(cell.evidence, cost);
+  bytes += evidenceBytes;
   return bytes;
 }

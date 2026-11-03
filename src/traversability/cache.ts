@@ -31,6 +31,8 @@ export interface TraversabilityCacheOptions {
 interface CacheEntry {
   evaluation: StepEvaluation;
   validUntil: number;
+  /** Section key string → residency generation at store time, for each dependency. */
+  residency: Map<string, number>;
 }
 
 export class TraversabilityCache {
@@ -67,7 +69,7 @@ export class TraversabilityCache {
     }
     const key = stepKey(query, shapeProvider.version);
     const entry = this.entries.get(key);
-    if (entry !== undefined && now <= entry.validUntil) {
+    if (entry !== undefined && now <= entry.validUntil && this.residencyCurrent(entry)) {
       return cloneEvaluation(entry.evaluation);
     }
     const evaluation = evaluateWalkStep(this.map, query, shapeProvider, now);
@@ -110,7 +112,14 @@ export class TraversabilityCache {
 
   private store(key: string, evaluation: StepEvaluation): void {
     this.removeEntry(key);
-    this.entries.set(key, { evaluation, validUntil: evaluation.validUntil });
+    const residency = new Map<string, number>();
+    for (const dep of evaluation.dependencies) {
+      residency.set(
+        sectionKeyString(dep.key),
+        this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy),
+      );
+    }
+    this.entries.set(key, { evaluation, validUntil: evaluation.validUntil, residency });
     for (const dep of evaluation.dependencies) {
       const depKey = sectionKeyString(dep.key);
       let set = this.bySection.get(depKey);
@@ -120,6 +129,15 @@ export class TraversabilityCache {
       }
       set.add(key);
     }
+  }
+
+  /** True when no dependency section changed residency since this entry was stored. */
+  private residencyCurrent(entry: CacheEntry): boolean {
+    for (const dep of entry.evaluation.dependencies) {
+      const current = this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy);
+      if (entry.residency.get(sectionKeyString(dep.key)) !== current) return false;
+    }
+    return true;
   }
 
   /**
