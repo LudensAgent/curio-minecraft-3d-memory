@@ -1217,3 +1217,103 @@ describe('WalkRouteExecutor — unified completion across release', () => {
     expect(status.result?.lastPosition).toEqual({ x: 0.5, y: 0, z: 0.5 });
   });
 });
+
+describe('WalkRouteExecutor — unified final commit across entries', () => {
+  it('a released-time target sample overrides an execution_error', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 3, observedAt: 2300 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({ failure: { kind: 'execution_error', detail: 'boom' } });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
+  });
+
+  it('a released-time target sample overrides an empty result', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 3, observedAt: 2300 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({});
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
+  });
+
+  it('cancel reflects a displacement accepted during release', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    const result = loop.cancel('agent', 'stop');
+
+    expect(result.outcome).toBe('CANCELLED');
+    expect(result.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
+    expect(result.lastObservation?.observedAt).toBe(2200);
+  });
+
+  it('the external sample path re-checks the deadline after release', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      clock = 4000; // stop takes the clock past the deadline
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    const delegationId = begin(loop, points, { deadlineMs: 3000 });
+    loop.advance(10); // step 0 in flight
+    clock = 2500; // receive target at 2500
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2, observedAt: 2500 }));
+
+    expect(loop.status()!.result?.outcome).toBe('TIMEOUT');
+  });
+
+  it('the arrival path re-checks TTL after release', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2); // observedAt 1000, validUntil 61000
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      clock = 70000; // cross TTL during the stop
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    const delegationId = begin(loop, points, { timeoutMs: 100_000 });
+    loop.advance(10); // step 0 in flight
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2, observedAt: 2500 }));
+
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
+  });
+});

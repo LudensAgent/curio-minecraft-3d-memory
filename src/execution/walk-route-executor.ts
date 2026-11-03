@@ -324,13 +324,14 @@ export class WalkRouteExecutor {
     const generation = this.generation;
     const message = `cancelled by ${by}${reason ? `: ${reason}` : ''}`;
     const problem: NavProblem = { kind: 'cancelled', by, reason };
-    // Build the cancellation snapshot before releasing, so a re-entrant start()
-    // cannot replace the displacement this cancellation reports.
+    // Build the cancellation snapshot before releasing: a re-entrant start() must
+    // not replace the displacement this cancellation reports.
     const cancelled = this.buildFailure('CANCELLED', message, problem);
     this.stopActive();
     if (generation !== this.generation) return cancelled; // superseded; return the old snapshot
     if (this.result !== null) return cloneResult(this.result); // a re-entrant callback already terminated it
-    this.result = cancelled;
+    // Rebuild after release so the cancellation reflects the latest trusted evidence.
+    this.result = this.buildFailure('CANCELLED', message, problem);
     return cloneResult(this.result);
   }
 
@@ -374,18 +375,34 @@ export class WalkRouteExecutor {
 
   /** Compute a terminal reason (deadline / per-move timeout / basis invalidation) without writing state. */
   private terminalReason(): TerminalReason | null {
+    return this.recheckTerminal(this.activeStartedAt, this.activeValidUntil, this.activeRuleVersion);
+  }
+
+  /**
+   * Re-check the terminal conditions against a saved action context (start time,
+   * validity ceiling and rule version), so a stop/abort callback that advanced the
+   * clock or changed the rules cannot be missed after the fact.
+   */
+  private recheckTerminal(startedAt: number | null, validUntil: number, ruleVersion: string | null): TerminalReason | null {
     const now = this.currentNow();
     if (now >= this.request!.deadlineMs) {
       return { outcome: 'TIMEOUT', message: 'delegation deadline exceeded', problem: { kind: 'timeout' } };
     }
-    if (this.activeStepIndex !== null && this.activeStartedAt !== null && now - this.activeStartedAt >= this.request!.timeoutMs) {
+    if (startedAt !== null && now - startedAt >= this.request!.timeoutMs) {
       return { outcome: 'TIMEOUT', message: 'move timed out', problem: { kind: 'timeout' } };
     }
-    if (this.activeStepIndex !== null && this.activeBasisInvalidated()) {
+    if (ruleVersion !== null && this.verifierStatus().ruleVersion !== ruleVersion) {
       return {
         outcome: 'FAILED',
         message: 'the in-flight segment lost its OPEN verification basis',
-        problem: { kind: 'route_invalidated', detail: 'rule-version or TTL invalidation revoked the in-flight step' },
+        problem: { kind: 'route_invalidated', detail: 'rule-version invalidation revoked the in-flight step' },
+      };
+    }
+    if (now > validUntil) {
+      return {
+        outcome: 'FAILED',
+        message: 'the in-flight segment lost its OPEN verification basis',
+        problem: { kind: 'route_invalidated', detail: 'TTL invalidation revoked the in-flight step' },
       };
     }
     return null;
@@ -431,14 +448,6 @@ export class WalkRouteExecutor {
     );
   }
 
-  /** True when the in-flight move's saved verification basis changed (rule version or TTL). */
-  private activeBasisInvalidated(): boolean {
-    if (this.activeStepIndex === null) return false;
-    const now = this.currentNow();
-    if (this.activeRuleVersion !== null && this.verifierStatus().ruleVersion !== this.activeRuleVersion) return true;
-    if (now > this.activeValidUntil) return true;
-    return false;
-  }
 
   /** Re-read the latest step status and start the move only if it is still OPEN. */
   private startMove(stepIndex: number): void {
@@ -506,7 +515,8 @@ export class WalkRouteExecutor {
 
     // Capture the terminal-relevant basis before releasing control (which clears it).
     const moveStartedAt = this.activeStartedAt;
-    const basisInvalidated = this.activeBasisInvalidated();
+    const activeValidUntil = this.activeValidUntil;
+    const activeRuleVersion = this.activeRuleVersion;
 
     const sample = result.sample;
     const failure = result.failure;
@@ -560,21 +570,10 @@ export class WalkRouteExecutor {
       return;
     }
 
-    // Decide terminal (deadline / per-move timeout / basis), preserving the recorded displacement.
-    const now = this.currentNow();
-    if (now >= this.request!.deadlineMs) {
-      this.result = this.buildFailure('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
-      return;
-    }
-    if (moveStartedAt !== null && now - moveStartedAt >= this.request!.timeoutMs) {
-      this.result = this.buildFailure('TIMEOUT', 'move timed out', { kind: 'timeout' });
-      return;
-    }
-    if (basisInvalidated) {
-      this.result = this.buildFailure('FAILED', 'the in-flight segment lost its OPEN verification basis', {
-        kind: 'route_invalidated',
-        detail: 'rule-version or TTL invalidation revoked the in-flight step',
-      });
+    // Re-check the terminal conditions after release, preserving the recorded displacement.
+    const reason = this.recheckTerminal(moveStartedAt, activeValidUntil, activeRuleVersion);
+    if (reason !== null) {
+      this.result = this.buildFailure(reason.outcome, reason.message, reason.problem);
       return;
     }
 
@@ -592,12 +591,14 @@ export class WalkRouteExecutor {
       return;
     }
 
+    // Arrival: from the latest accepted evidence, which may have superseded the move's sample.
+    const target = this.points[this.nextPointIndex];
+    if (target !== undefined && this.lastPosition !== null && positionsEqual(this.lastPosition, target) && this.lastSample !== null) {
+      this.recordArrival(this.lastSample);
+      return;
+    }
+    // Deviation: the move's own sample is off-route.
     if (usable !== null) {
-      const target = this.points[this.nextPointIndex];
-      if (target !== undefined && positionsEqual(usable.pos, target)) {
-        this.confirmArrival(usable);
-        return;
-      }
       this.result = this.buildFailure('FAILED', 'the body deviated from the route', {
         kind: 'deviation',
         expected: target !== undefined ? { ...target } : { ...this.points[this.points.length - 1]! },
@@ -605,20 +606,14 @@ export class WalkRouteExecutor {
       });
       return;
     }
-
+    // General error or empty result.
     if (failure !== undefined) {
       this.applyMoveFailure(failure);
       return;
     }
-    // The move's sample was superseded by a newer sample; determine completion from
-    // the latest evidence (arrival if at target, otherwise a structured gap).
-    if (sampleStale && this.lastSample !== null) {
-      this.confirmArrival(this.lastSample);
-      return;
-    }
     this.result = this.buildFailure('FAILED', 'the move returned without a usable confirming body sample', {
       kind: 'unconfirmed_arrival',
-      expected: { ...this.points[this.nextPointIndex]! },
+      expected: target !== undefined ? { ...target } : { ...this.points[this.points.length - 1]! },
     });
   }
 
@@ -659,8 +654,18 @@ export class WalkRouteExecutor {
   /** Confirm arrival at the next point. Releases the old move's control before advancing. */
   private confirmArrival(sample: BodySample): void {
     const generation = this.generation;
+    const startedAt = this.activeStartedAt;
+    const validUntil = this.activeValidUntil;
+    const ruleVersion = this.activeRuleVersion;
     this.stopActive(); // measured arrival and control release are separate confirmations
     if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
+
+    // Re-check the terminal conditions after release before committing arrival.
+    const reason = this.recheckTerminal(startedAt, validUntil, ruleVersion);
+    if (reason !== null) {
+      this.result = this.buildFailure(reason.outcome, reason.message, reason.problem);
+      return;
+    }
 
     // A newer sample accepted during the stop supersedes this one; confirm against it.
     const effective =
