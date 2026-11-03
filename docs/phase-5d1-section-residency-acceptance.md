@@ -107,7 +107,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 490 passed（16 个测试文件；新增 31 项 spatial-voxel-residency 测试）
+npm test           → 493 passed（17 个测试文件；新增 31 项 spatial-voxel-residency 测试）
 npx tsx examples/spatial-residency.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过（见提交前检查）
 ```
@@ -197,3 +197,7 @@ git diff --check   → 通过（见提交前检查）
   前校验单条（`MIGRATION_MAX_SECTION_BYTES`，16 MiB）与批次（`MIGRATION_BATCH_BYTES`，64 MiB）字节数，再通过稳定
   `rowid` 游标分批读取、解码、回填，保留事务回滚；这些迁移预算独立于单世界 `maxBytes`。回归测试「migration is not
   constrained by a small per-world maxBytes」。
+- **P2 批次超过字节预算时拒绝整个迁移**：`selectMigrationBatch` 改为按字节预算**缩小**子批次（每批取尽量多的行、
+  不超过 `MIGRATION_BATCH_BYTES`），而不是超预算即报错；超过预算的大但合法的数据库分多批完成迁移。纯函数抽到
+  `src/storage/sqlite/migration.ts`，回归测试「shrinks a batch to fit the byte budget instead of rejecting」用 55 段
+  × ~1.25 MB（合计 > 64 MiB）复现。

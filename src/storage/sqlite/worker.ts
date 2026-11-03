@@ -22,19 +22,15 @@ import type {
 } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelDirectoryEntry } from '../../voxel/residency.js';
+import {
+  MIGRATION_BATCH_BYTES,
+  MIGRATION_BATCH_ROWS,
+  MIGRATION_MAX_SECTION_BYTES,
+  selectMigrationBatch,
+} from './migration.js';
+import type { MigrationRowMeta } from './migration.js';
 
 const SCHEMA_VERSION = 3;
-
-/**
- * Migration-only processing bounds, independent of the per-world `SnapshotLimits`
- * (which are enforced later, per world, when a specific world is opened). These
- * bound the *peak* decode work of the v2→v3 backfill — one section at a time and
- * one batch at a time — so a single pathologically large payload cannot be decoded
- * unboundedly, without ever treating the whole-database total as a per-world limit.
- */
-const MIGRATION_BATCH_ROWS = 100;
-const MIGRATION_MAX_SECTION_BYTES = 16 * 1024 * 1024; // 16 MiB per section payload
-const MIGRATION_BATCH_BYTES = 64 * 1024 * 1024; // 64 MiB decoded per batch
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -315,29 +311,22 @@ function upgradeV2ToV3(connection: Database.Database, databasePath: string): voi
     for (;;) {
       // Read only metadata (rowid + octet_length) first, so the byte budget is
       // checked before any payload is materialized or decoded.
-      const rows = meta.all(cursor, MIGRATION_BATCH_ROWS) as {
-        rowid: number;
-        world_id: string;
-        id: string;
-        bytes: number;
-      }[];
-      if (rows.length === 0) break;
-      let batchBytes = 0;
-      for (const row of rows) {
-        if (row.bytes > MIGRATION_MAX_SECTION_BYTES) {
-          throw new Error(`section payload exceeds the migration byte limit (${row.bytes})`);
+      const window = meta.all(cursor, MIGRATION_BATCH_ROWS) as MigrationRowMeta[];
+      if (window.length === 0) break;
+      // A window that exceeds the byte budget is shrunk, not rejected, so a large
+      // but valid database (many sections totalling over the batch budget) is
+      // backfilled in multiple passes.
+      let offset = 0;
+      while (offset < window.length) {
+        const batch = selectMigrationBatch(window.slice(offset), MIGRATION_MAX_SECTION_BYTES, MIGRATION_BATCH_BYTES);
+        for (const row of batch) {
+          const payload = (load.get(row.rowid) as { payload: string }).payload;
+          const section = decodeVoxelSection(payload);
+          update.run(section.evidence.length, section.palette.length, section.revision, row.world_id, row.id);
         }
-        batchBytes += row.bytes;
+        offset += batch.length;
       }
-      if (batchBytes > MIGRATION_BATCH_BYTES) {
-        throw new Error(`migration batch exceeds the byte budget (${batchBytes})`);
-      }
-      for (const row of rows) {
-        const payload = (load.get(row.rowid) as { payload: string }).payload;
-        const section = decodeVoxelSection(payload);
-        update.run(section.evidence.length, section.palette.length, section.revision, row.world_id, row.id);
-      }
-      cursor = rows[rows.length - 1]!.rowid;
+      cursor = window[window.length - 1]!.rowid;
     }
 
     connection.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
