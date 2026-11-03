@@ -245,6 +245,28 @@ export function evaluateWalkStep(
   shapeProvider: CollisionShapeProvider,
   now: number,
 ): StepEvaluation {
+  return evaluateWalkGeometry(map, query, shapeProvider, now);
+}
+
+/** Internal continuous correction corridor for measured route execution, not route search. */
+export function evaluateGroundedWalkSegment(
+  map: VoxelMap,
+  query: StepQuery,
+  to: Vec3Like,
+  shapeProvider: CollisionShapeProvider,
+  now: number,
+  feetTolerance: number,
+): StepEvaluation {
+  return evaluateWalkGeometry(map, query, shapeProvider, now, { to, feetTolerance });
+}
+
+function evaluateWalkGeometry(
+  map: VoxelMap,
+  query: StepQuery,
+  shapeProvider: CollisionShapeProvider,
+  now: number,
+  measured?: { to: Vec3Like; feetTolerance: number },
+): StepEvaluation {
   if (query.worldId !== map.worldId) {
     throw new Error(`query worldId "${query.worldId}" does not match map worldId "${map.worldId}"`);
   }
@@ -300,10 +322,10 @@ export function evaluateWalkStep(
     };
   }
 
-  const to: Vec3Like =
+  const to: Vec3Like = measured?.to ?? (
     direction.axis === 'x'
       ? { x: body.feet.x + direction.sign, y: body.feet.y, z: body.feet.z }
-      : { x: body.feet.x, y: body.feet.y, z: body.feet.z + direction.sign };
+      : { x: body.feet.x, y: body.feet.y, z: body.feet.z + direction.sign });
   base.to = to;
 
   const half = body.width / 2;
@@ -476,80 +498,54 @@ export function evaluateWalkStep(
 
   function evaluateSupport(from: Vec3Like, to: Vec3Like): void {
     const fy = from.y;
-    const axis = direction.axis;
-
-    // Perpendicular extent is fixed for the whole step.
-    const perpCoord = axis === 'x' ? from.z : from.x;
-    const perpMin = perpCoord - half;
-    const perpMax = perpCoord + half;
-
-    // Along-axis swept extent and the center segment that must stay supported.
-    const fromA = axis === 'x' ? from.x : from.z;
-    const toA = axis === 'x' ? to.x : to.z;
-    const segMin = Math.min(fromA, toA);
-    const segMax = Math.max(fromA, toA);
-    const sweepAMin = segMin - half;
-    const sweepAMax = segMax + half;
-
-    // The only cell level whose top can equal the feet height: the block below
-    // integer feet, or the slab level under fractional feet.
-    const floorY = Math.floor(fy);
-    const supportY = Number.isInteger(fy) ? floorY - 1 : floorY;
-
-    const aCellMin = Math.floor(sweepAMin + EPS);
-    const aCellMax = Math.floor(sweepAMax - EPS);
-    const pCellMin = Math.floor(perpMin + EPS);
-    const pCellMax = Math.floor(perpMax - EPS);
-
+    const tolerance = measured?.feetTolerance ?? 0;
     const observedIntervals: Array<[number, number]> = [];
     const candidates: SupportCandidate[] = [];
-
-    // Best-case support a still-unknown cell could provide: a full-cell top face.
-    const potentialInterval = (x: number, z: number): [number, number] | null => {
-      const perpCellMin = axis === 'x' ? z : x;
-      if (!overlaps(perpCellMin, perpCellMin + 1, perpMin, perpMax)) return null;
-      const alongCell = axis === 'x' ? x : z;
-      return [alongCell - half, alongCell + 1 + half];
-    };
-
-    for (let a = aCellMin; a <= aCellMax; a++) {
-      for (let p = pCellMin; p <= pCellMax; p++) {
-        const x = axis === 'x' ? a : p;
-        const z = axis === 'x' ? p : a;
-        const cell: Vec3Like = { x, y: supportY, z };
-        const read = readCell(x, supportY, z);
-        if (read.kind === 'observed') {
-          const shape = resolveShape(read.evidence, cell);
-          if (shape.kind === 'unsupported') {
-            candidates.push({ kind: 'unsupported', cell, interval: potentialInterval(x, z) });
-            continue;
-          }
-          if (shape.kind === 'gap') {
-            candidates.push({
-              kind: shape.view.kind === 'stale' ? 'stale' : 'unknown',
-              cell: shape.view.pos,
-              interval: potentialInterval(x, z),
-            });
-            continue;
-          }
-          for (const face of shape.shape.supportFaces) {
-            if (Math.abs(supportY + face.top - fy) >= EPS) continue;
-            const [perpFaceMin, perpFaceMax] =
-              axis === 'x' ? [z + face.minZ, z + face.maxZ] : [x + face.minX, x + face.maxX];
-            if (!overlaps(perpFaceMin, perpFaceMax, perpMin, perpMax)) continue;
-            const [alongFaceMin, alongFaceMax] =
-              axis === 'x' ? [x + face.minX, x + face.maxX] : [z + face.minZ, z + face.maxZ];
-            observedIntervals.push([alongFaceMin - half, alongFaceMax + half]);
-          }
-        } else if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
-          candidates.push({ kind: 'stale', cell, interval: potentialInterval(x, z) });
+    // Exact interval of positive-area overlap with a support face along the
+    // measured XZ segment. Intersect both axes, including small turn corrections.
+    const intervalFor = (minX: number, maxX: number, minZ: number, maxZ: number): [number, number] | null => {
+      let lo = Number.NEGATIVE_INFINITY, hi = Number.POSITIVE_INFINITY;
+      for (const [start, end, min, max] of [[from.x, to.x, minX - half, maxX + half], [from.z, to.z, minZ - half, maxZ + half]]) {
+        const delta = end! - start!;
+        if (Math.abs(delta) < EPS) {
+          if (start! <= min! || start! >= max!) return null;
         } else {
-          // missing or incomplete
-          candidates.push({ kind: 'unknown', cell, interval: potentialInterval(x, z) });
+          const a = (min! - start!) / delta, b = (max! - start!) / delta;
+          lo = Math.max(lo, Math.min(a, b));
+          hi = Math.min(hi, Math.max(a, b));
         }
       }
+      return lo < hi ? [lo, hi] : null;
+    };
+    const minY = Math.floor(Math.min(from.y, to.y) - tolerance - EPS);
+    const maxY = Math.floor(Math.max(from.y, to.y) + tolerance - EPS);
+    const supportSweep = { ...sweep, minY, maxY: maxY + 1 };
+    for (const cell of cellsInAabb(supportSweep)) {
+      const { x, y, z } = cell;
+      const read = readCell(x, y, z);
+      const potential = intervalFor(x, x + 1, z, z + 1);
+      if (read.kind === 'observed') {
+        const shape = resolveShape(read.evidence, cell);
+        if (shape.kind === 'unsupported') {
+          candidates.push({ kind: 'unsupported', cell, interval: potential });
+          continue;
+        }
+        if (shape.kind === 'gap') {
+          candidates.push({ kind: shape.view.kind === 'stale' ? 'stale' : 'unknown', cell: shape.view.pos, interval: potential });
+          continue;
+        }
+        for (const face of shape.shape.supportFaces) {
+          if (Math.abs(y + face.top - from.y) > tolerance + EPS || Math.abs(y + face.top - to.y) > tolerance + EPS) continue;
+          const interval = intervalFor(x + face.minX, x + face.maxX, z + face.minZ, z + face.maxZ);
+          if (interval !== null) observedIntervals.push(interval);
+        }
+      } else if (read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session') {
+        candidates.push({ kind: 'stale', cell, interval: potential });
+      } else {
+        candidates.push({ kind: 'unknown', cell, interval: potential });
+      }
     }
-
+    const segMin = 0, segMax = 1;
     const observedGaps = uncoveredGaps(observedIntervals, segMin, segMax);
     if (observedGaps.length === 0) return; // confirmed support covers the sweep
 
@@ -590,11 +586,8 @@ export function evaluateWalkStep(
     // Report the support cell under each confirmed gap, not the move start.
     if (acc.blocked === null) {
       const gapCells = confirmedGaps.map(([gapLo, gapHi]) => {
-        const along = Math.floor((gapLo + gapHi) / 2);
-        const perp = Math.floor(perpCoord);
-        return axis === 'x'
-          ? { x: along, y: supportY, z: perp }
-          : { x: perp, y: supportY, z: along };
+        const t = (gapLo + gapHi) / 2;
+        return { x: Math.floor(from.x + (to.x - from.x) * t), y: Math.ceil(fy) - 1, z: Math.floor(from.z + (to.z - from.z) * t) };
       });
       acc.blocked = {
         reason: `no support under the move at feet height ${fy}`,

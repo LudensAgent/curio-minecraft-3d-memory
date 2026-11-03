@@ -10,7 +10,7 @@
  * - The next step is only started after the previous step's arrival has been
  *   confirmed by a measured body sample.
  * - An `ARRIVED` result requires the measured position to satisfy the original
- *   `exact` completion condition (including Y) under the delegation's
+ *   completion condition (strict by default; explicit grounded tolerances opt in) under the delegation's
  *   world/dim/session — never a bare promise resolve or a route whose steps are
  *   all OPEN.
  *
@@ -33,6 +33,7 @@ import type { SectionKey } from '../voxel/section.js';
 import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import { RouteVerifier } from '../traversability/route.js';
 import type { RouteStatus } from '../traversability/route.js';
+import { evaluateGroundedWalkSegment } from '../traversability/step.js';
 import type { StepEvaluation } from '../traversability/step.js';
 import type { ObstacleEvidence } from '../traversability/types.js';
 import type { Vec3Like } from '../types.js';
@@ -91,6 +92,11 @@ export class WalkRouteExecutor {
   private nextPointIndex = 1;
   private lastPosition: Vec3Like | null = null;
   private lastSample: BodySample | null = null;
+  private settledSince: number | null = null;
+  private settledSamples = 0;
+  private settledPoint = -1;
+  /** Actual origin of the current/recent segment, retained across control release. */
+  private measuredFrom: Vec3Like | null = null;
   /** Per-delegation handover snapshot, bound to the replaced delegation's identity. */
   private handovers = new Map<number, HandoverSnapshot>();
   /** Section dependencies of the action being released, kept until the final commit. */
@@ -135,6 +141,14 @@ export class WalkRouteExecutor {
     if (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0) {
       throw new Error(`timeoutMs must be a positive finite number: ${request.timeoutMs}`);
     }
+    if (request.bodyArrival !== undefined) {
+      const a = request.bodyArrival;
+      if (![a.horizontalTolerance, a.feetTolerance, a.maxHorizontalSpeed, a.maxVerticalSpeed, a.stableMs].every((v) => Number.isFinite(v) && v >= 0)
+        || a.horizontalTolerance <= 0 || a.horizontalTolerance >= 0.5
+        || a.feetTolerance >= 0.5 || a.stableMs <= 0) {
+        throw new Error('bodyArrival requires finite nonnegative limits, horizontalTolerance in (0, 0.5), feetTolerance < 0.5, and positive stableMs');
+      }
+    }
     const points = snapshotPoints(request.points);
     const body = snapshotBody(request.body);
 
@@ -177,6 +191,10 @@ export class WalkRouteExecutor {
     this.nextPointIndex = 1;
     this.lastPosition = null;
     this.lastSample = null;
+    this.settledSince = null;
+    this.settledSamples = 0;
+    this.settledPoint = -1;
+    this.measuredFrom = null;
     this.trace = [];
     this.result = null;
     this.releasedDependencies = null;
@@ -237,7 +255,7 @@ export class WalkRouteExecutor {
       });
       return this.snapshot();
     }
-    if (!positionsEqual(this.lastPosition, from)) {
+    if (!this.positionMatches(this.lastPosition, from)) {
       this.result = this.buildFailure('FAILED', 'the body deviated from the route', {
         kind: 'deviation',
         expected: { ...from },
@@ -246,6 +264,7 @@ export class WalkRouteExecutor {
       return this.snapshot();
     }
 
+    if (this.request!.bodyArrival !== undefined && (this.lastSample === null || !this.arrivalReady(this.lastSample, stepIndex))) return this.snapshot();
     this.startMove(stepIndex);
     return this.snapshot();
   }
@@ -265,18 +284,32 @@ export class WalkRouteExecutor {
       const touched = report.sections.some(
         (section) => section.invalidated && this.releasedDependencies!.has(sectionKeyString(section.key)),
       );
-      if (touched) this.releasedInvalidated = true;
+      const target = this.points[this.nextPointIndex];
+      if (touched && (this.request!.bodyArrival === undefined || (this.releasing > 0 && target !== undefined
+        && (this.measuredFrom === null || this.evaluateMeasured(this.measuredFrom, target).status !== 'OPEN')))) this.releasedInvalidated = true;
     }
+
+    // Refresh-only observations do not bump a section revision. Recompute from
+    // their original per-cell timestamps before the TTL guard; observing one
+    // cell cannot extend the lifetime of any other required cell.
+    const measuredEvaluation = this.request!.bodyArrival !== undefined && this.activeStepIndex !== null
+      && this.measuredFrom !== null && this.reportTouchesActiveStep(report)
+      ? this.evaluateMeasured(this.measuredFrom, this.points[this.nextPointIndex]!) : null;
+    if (measuredEvaluation?.status === 'OPEN') this.updateMeasuredBasis(measuredEvaluation);
 
     this.guard(); // may re-enter start() via the stop/abort callback
 
     // Judge the report against the active step only if this call still owns the
     // delegation; a re-entrant start() would have replaced the active dependencies.
     if (generation === this.generation && this.result === null && this.activeStepIndex !== null && this.reportTouchesActiveStep(report)) {
-      this.terminate('FAILED', 'the in-flight segment was invalidated by an observed world change', {
-        kind: 'route_invalidated',
-        detail: 'a required section changed while the segment was executing',
-      });
+      // A Section can contain unrelated/newly perceived cells or later route
+      // segments. Revoke only when THIS measured corridor lost its basis.
+      if (measuredEvaluation?.status !== 'OPEN') {
+        this.terminate('FAILED', 'the in-flight segment was invalidated by an observed world change', {
+          kind: 'route_invalidated',
+          detail: 'the current segment is no longer verified OPEN after observation',
+        });
+      }
     }
 
     // Re-verify (bounded) after the affected action has been revoked.
@@ -327,13 +360,13 @@ export class WalkRouteExecutor {
 
     if (this.activeStepIndex !== null) {
       const target = this.points[this.nextPointIndex];
-      if (target !== undefined && positionsEqual(sample.pos, target)) {
+      if (target !== undefined && this.arrivalReady(sample, this.nextPointIndex)) {
         this.confirmArrival(sample);
       }
       // else: intermediate progress, already recorded.
     } else {
       const expected = this.points[this.nextPointIndex - 1]!;
-      if (!positionsEqual(sample.pos, expected)) {
+      if (!this.positionMatches(sample.pos, expected)) {
         this.result = this.buildFailure('FAILED', 'the body deviated from the route', {
           kind: 'deviation',
           expected: { ...expected },
@@ -408,6 +441,47 @@ export class WalkRouteExecutor {
     return status;
   }
 
+  private positionMatches(pos: Vec3Like, target: Vec3Like): boolean {
+    const arrival = this.request!.bodyArrival;
+    return arrival === undefined ? positionsEqual(pos, target)
+      : Math.hypot(pos.x - target.x, pos.z - target.z) <= arrival.horizontalTolerance
+        && Math.abs(pos.y - target.y) <= arrival.feetTolerance;
+  }
+
+  private grounded(sample: BodySample, target: Vec3Like): boolean {
+    const arrival = this.request!.bodyArrival!;
+    const velocity = sample.velocity;
+    return this.positionMatches(sample.pos, target) && sample.onGround && !sample.inWater
+      && velocity !== undefined && Math.hypot(velocity.x, velocity.z) <= arrival.maxHorizontalSpeed
+      && Math.abs(velocity.y) <= arrival.maxVerticalSpeed;
+  }
+
+  private arrivalReady(sample: BodySample, pointIndex: number): boolean {
+    const target = this.points[pointIndex]!;
+    const arrival = this.request!.bodyArrival;
+    if (arrival === undefined) return positionsEqual(sample.pos, target);
+    return this.grounded(sample, target) && this.settledPoint === pointIndex
+      && this.settledSince !== null && this.settledSamples >= 2
+      && sample.observedAt - this.settledSince >= arrival.stableMs;
+  }
+
+  private updateMeasuredBasis(evaluation: StepEvaluation): void {
+    this.activeDependencies = new Set(evaluation.dependencies.map((d) => sectionKeyString(d.key)));
+    this.activeDependencyResidency = evaluation.dependencies.map((d) => ({
+      key: { ...d.key }, generation: this.map.residencyGeneration(d.key.dim, d.key.cx, d.key.cz, d.key.sy),
+    }));
+    this.activeValidUntil = evaluation.validUntil;
+  }
+
+  private evaluateMeasured(from: Vec3Like, to: Vec3Like): StepEvaluation {
+    const req = this.request!;
+    return evaluateGroundedWalkSegment(this.map, {
+      worldId: req.worldId, dim: req.dim, sessionId: req.sessionId, mode: req.mode,
+      body: { ...req.body, feet: { ...from } },
+      direction: { axis: 'x', sign: 1 }, constraints: req.constraints,
+    }, to, req.shapeProvider, this.currentNow(), req.bodyArrival!.feetTolerance);
+  }
+
   /** True when the sample's numeric fields are finite; non-finite input never enters evidence. */
   private sampleFinite(sample: BodySample): boolean {
     return (
@@ -461,6 +535,11 @@ export class WalkRouteExecutor {
 
   /** A failure result when the given step is no longer verified OPEN, or null when it is still passable. */
   private stepNotOpenResult(stepIndex: number): NavResult | null {
+    if (this.request!.bodyArrival !== undefined && this.measuredFrom !== null && this.lastPosition !== null) {
+      const corridor = this.evaluateMeasured(this.measuredFrom, this.lastPosition);
+      if (corridor.status !== 'OPEN') return this.failForStep(stepIndex, corridor);
+      return null;
+    }
     const step = this.verifierStatus().steps[stepIndex];
     if (step !== undefined && step.kind === 'verified') {
       return step.result.status === 'OPEN' ? null : this.failForStep(stepIndex, step.result);
@@ -522,7 +601,7 @@ export class WalkRouteExecutor {
   private reportTouchesActiveStep(report: ChangeReport): boolean {
     if (this.activeDependencies === null) return false;
     return report.sections.some(
-      (section) => section.invalidated && this.activeDependencies!.has(sectionKeyString(section.key)),
+      (section) => (section.invalidated || this.request!.bodyArrival !== undefined) && this.activeDependencies!.has(sectionKeyString(section.key)),
     );
   }
 
@@ -537,7 +616,15 @@ export class WalkRouteExecutor {
       return;
     }
 
-    const evaluation = step.result;
+    let evaluation = step.result;
+    if (this.request!.bodyArrival !== undefined) {
+      evaluation = this.evaluateMeasured(this.lastPosition!, this.points[stepIndex + 1]!);
+      if (evaluation.status !== 'OPEN') {
+        this.result = this.failForStep(stepIndex, evaluation);
+        return;
+      }
+    }
+    this.measuredFrom = { ...this.lastPosition! };
     const target = this.points[stepIndex + 1]!;
     const executionId = `${this.delegationId}-step-${stepIndex}`;
     const abort = new AbortController();
@@ -560,13 +647,8 @@ export class WalkRouteExecutor {
     this.activeStepIndex = stepIndex;
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
-    this.activeDependencies = new Set(evaluation.dependencies.map((d) => sectionKeyString(d.key)));
-    this.activeDependencyResidency = evaluation.dependencies.map((d) => ({
-      key: { ...d.key },
-      generation: this.map.residencyGeneration(d.key.dim, d.key.cx, d.key.cz, d.key.sy),
-    }));
+    this.updateMeasuredBasis(evaluation);
     this.activeRuleVersion = route.ruleVersion;
-    this.activeValidUntil = evaluation.validUntil;
     this.activeStartedAt = startedAt;
 
     const generation = this.generation;
@@ -576,7 +658,9 @@ export class WalkRouteExecutor {
         worldId: this.request!.worldId,
         dim: this.request!.dim,
         sessionId: this.request!.sessionId,
+        from: { ...this.lastPosition! },
         to: { ...target },
+        ...(this.request!.bodyArrival === undefined ? {} : { bodyArrival: { ...this.request!.bodyArrival } }),
         deadlineMs: this.request!.deadlineMs,
         timeoutMs: this.request!.timeoutMs,
         signal: abort.signal,
@@ -695,8 +779,14 @@ export class WalkRouteExecutor {
 
     // Arrival: from the latest accepted evidence, which may have superseded the move's sample.
     const target = this.points[this.nextPointIndex];
-    if (target !== undefined && this.lastPosition !== null && positionsEqual(this.lastPosition, target) && this.lastSample !== null) {
+    if (target !== undefined && this.lastSample !== null && this.arrivalReady(this.lastSample, this.nextPointIndex)) {
       this.recordArrival(this.lastSample);
+      return;
+    }
+    if (usable !== null && target !== undefined && this.positionMatches(usable.pos, target)) {
+      this.result = this.buildFailure('FAILED', 'the move returned before grounded stable arrival was confirmed', {
+        kind: 'unconfirmed_arrival', expected: { ...target },
+      });
       return;
     }
     // Deviation: the move's own sample is off-route.
@@ -793,7 +883,7 @@ export class WalkRouteExecutor {
     const effective =
       sample.sequence < this.lastSampleSequence && this.lastSample !== null ? this.lastSample : sample;
     const target = this.points[this.nextPointIndex];
-    if (target === undefined || !positionsEqual(effective.pos, target)) {
+    if (target === undefined || !this.arrivalReady(effective, this.nextPointIndex)) {
       this.result = this.buildFailure('FAILED', 'the move returned without a usable confirming body sample', {
         kind: 'unconfirmed_arrival',
         expected: target !== undefined ? { ...target } : { ...this.points[this.points.length - 1]! },
@@ -826,6 +916,26 @@ export class WalkRouteExecutor {
   }
 
   private recordSamplePosition(sample: BodySample): void {
+    const arrival = this.request!.bodyArrival;
+    if (arrival !== undefined) {
+      const point = this.activeStepIndex !== null || this.releasing > 0 ? this.nextPointIndex : this.nextPointIndex - 1;
+      const previous = this.lastSample;
+      const ticks = previous === null ? 0 : Math.max(0, sample.observedAt - previous.observedAt) / 50;
+      const continuous = previous !== null && this.settledPoint === point
+        && sample.observedAt - previous.observedAt <= Math.max(50, arrival.stableMs)
+        && Math.hypot(sample.pos.x - previous.pos.x, sample.pos.z - previous.pos.z) <= arrival.maxHorizontalSpeed * ticks + POS_EPS
+        && Math.abs(sample.pos.y - previous.pos.y) <= arrival.maxVerticalSpeed * ticks + POS_EPS;
+      if (!this.grounded(sample, this.points[point]!)) {
+        this.settledSince = null;
+        this.settledSamples = 0;
+      } else if (!continuous || this.settledSince === null) {
+        this.settledSince = sample.observedAt;
+        this.settledSamples = 1;
+      } else {
+        this.settledSamples += 1;
+      }
+      this.settledPoint = point;
+    }
     this.lastPosition = { ...sample.pos };
     this.lastSample = snapshotSample(sample);
     this.lastSampleObservedAt = sample.observedAt;
@@ -954,6 +1064,7 @@ function snapshotRequest(
     body,
     points,
     arrival: { ...request.arrival },
+    ...(request.bodyArrival === undefined ? {} : { bodyArrival: { ...request.bodyArrival } }),
     constraints: request.constraints === undefined ? undefined : snapshotConstraints(request.constraints),
     shapeProvider: request.shapeProvider,
     deadlineMs: request.deadlineMs,
@@ -962,7 +1073,7 @@ function snapshotRequest(
 }
 
 function snapshotSample(sample: BodySample): BodySample {
-  return { ...sample, pos: { ...sample.pos } };
+  return { ...sample, pos: { ...sample.pos }, ...(sample.velocity === undefined ? {} : { velocity: { ...sample.velocity } }) };
 }
 
 function sampleToObservation(sample: BodySample): LastObservation {

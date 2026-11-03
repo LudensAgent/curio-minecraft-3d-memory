@@ -192,8 +192,10 @@ export type {
 
 // Execution — controlled walk-route execution loop (design §7 first step, phase 3)
 export { WalkRouteExecutor } from './execution/index.js';
+export { GROUNDED_ARRIVAL_DEFAULTS } from './execution/index.js';
 export type {
   BodySample,
+  GroundedArrival,
   ExecutableMove,
   ExecutableMoveResult,
   MoveExecutor,

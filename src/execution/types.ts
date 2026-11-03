@@ -25,6 +25,8 @@ export interface BodySample {
   pos: Vec3Like;
   /** Real timestamp the sample was captured (never the receive time). */
   observedAt: number;
+  /** Measured velocity in blocks per physics tick; required by bodyArrival. */
+  velocity?: Vec3Like;
   alive: boolean;
   connected: boolean;
   observationReady: boolean;
@@ -53,6 +55,35 @@ export type MoveFailure =
   | { kind: 'timed_out' }
   | { kind: 'execution_error'; detail: string };
 
+/** Opt-in physical completion contract; absent keeps exact legacy comparisons. */
+export interface GroundedArrival {
+  /** Radius in blocks around each nominal waypoint; must be < 0.5. */
+  horizontalTolerance: number;
+  /** Vertical tolerance in blocks, additionally requiring observed support geometry. */
+  feetTolerance: number;
+  /** Speed limits in blocks per physics tick (20 Hz). */
+  maxHorizontalSpeed: number;
+  /** Include the host physics engine's grounded gravity velocity when selecting this limit. */
+  maxVerticalSpeed: number;
+  /** Two or more ordered samples must remain settled for this many ms. */
+  stableMs: number;
+}
+
+/**
+ * Defaults for same-height dry walking on Java 1.20.1, verified against
+ * prismarine-physics. Units: tolerances are blocks; speeds are blocks per
+ * physics tick (20 Hz). The vertical limit must absorb the grounded gravity
+ * velocity (-0.0784 b/tick = -1.568 b/s) -- a body standing still is never at
+ * vertical velocity 0 -- while still rejecting a real jump (~ +0.42 b/tick).
+ */
+export const GROUNDED_ARRIVAL_DEFAULTS: GroundedArrival = {
+  horizontalTolerance: 0.12,
+  feetTolerance: 0.05,
+  maxHorizontalSpeed: 0.003,
+  maxVerticalSpeed: 0.1,
+  stableMs: 150,
+};
+
 /** One authorized single-step move, owned by the current execution. */
 export interface ExecutableMove {
   /** Execution identity; a late result keyed to an old id must be ignored. */
@@ -60,6 +91,9 @@ export interface ExecutableMove {
   worldId: string;
   dim: string;
   sessionId: string;
+  /** Last measured position, never replaced with the nominal route point. */
+  from: Vec3Like;
+  bodyArrival?: GroundedArrival;
   /** The single authorized target feet position (one step). */
   to: Vec3Like;
   /** Delegation deadline (epoch ms); never reset per move. */
@@ -102,6 +136,8 @@ export interface WalkRouteRequest {
   points: readonly Vec3Like[];
   /** Completion condition; only `{ kind: 'exact' }` is supported this round. */
   arrival: ArrivalSpec;
+  /** Require grounded, dry, stable measured arrival within these explicit tolerances. */
+  bodyArrival?: GroundedArrival;
   constraints?: StepConstraints;
   shapeProvider: CollisionShapeProvider;
   /** Original delegation deadline (epoch ms). */
