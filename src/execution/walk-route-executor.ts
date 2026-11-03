@@ -223,9 +223,12 @@ export class WalkRouteExecutor {
   observe(report: ChangeReport, budget: number): WalkRouteStatus {
     this.requireRequest();
     validateBudget(budget);
-    this.guard();
+    const generation = this.generation;
+    this.guard(); // may re-enter start() via the stop/abort callback
 
-    if (this.result === null && this.activeStepIndex !== null && this.reportTouchesActiveStep(report)) {
+    // Judge the report against the active step only if this call still owns the
+    // delegation; a re-entrant start() would have replaced the active dependencies.
+    if (generation === this.generation && this.result === null && this.activeStepIndex !== null && this.reportTouchesActiveStep(report)) {
       this.terminate('FAILED', 'the in-flight segment was invalidated by an observed world change', {
         kind: 'route_invalidated',
         detail: 'a required section changed while the segment was executing',
@@ -245,18 +248,21 @@ export class WalkRouteExecutor {
     this.requireRequest();
     if (this.result !== null) return this.snapshot();
 
-    if (!this.sampleFinite(sample)) return this.snapshot(); // non-finite input never enters state
-    if (sample.executionId !== this.delegationId) return this.snapshot(); // foreign/stale delegation
-    if (!this.sampleOrdered(sample)) return this.snapshot(); // replayed or out-of-order
+    // A sample may update evidence only when finite, belonging to this delegation
+    // and in order. Invalid samples never update evidence, but the terminal check
+    // below still runs.
+    const usable =
+      this.sampleFinite(sample) && sample.executionId === this.delegationId && this.sampleOrdered(sample);
 
-    if (!this.scopeMatches(sample)) {
+    if (usable && !this.scopeMatches(sample)) {
       this.terminate('FAILED', 'the body left the delegation scope before arrival', {
         kind: 'scope_changed',
         detail: 'sample world/dim/session does not match the delegation',
       });
       return this.snapshot();
     }
-    if (this.lifecycleBroken(sample)) {
+    if (usable && this.lifecycleBroken(sample)) {
+      this.recordSamplePosition(sample); // preserve the latest trusted position before terminating
       this.terminate('FAILED', 'the body became unavailable before arrival', {
         kind: 'unavailable',
         detail: `alive=${sample.alive} connected=${sample.connected} observationReady=${sample.observationReady}`,
@@ -264,11 +270,13 @@ export class WalkRouteExecutor {
       return this.snapshot();
     }
 
-    // Record the trusted displacement before deciding the terminal state, so a
-    // timeout/invalidation preserves the measured partial effect.
-    this.recordSamplePosition(sample);
+    if (usable) this.recordSamplePosition(sample);
 
-    if (this.guard()) return this.snapshot(); // deadline / per-move timeout / basis
+    // Always run the terminal check: an invalid sample must not bypass a deadline
+    // or TTL that has already been crossed.
+    if (this.guard()) return this.snapshot();
+
+    if (!usable) return this.snapshot();
 
     if (this.activeStepIndex !== null) {
       const target = this.points[this.nextPointIndex];
@@ -310,6 +318,7 @@ export class WalkRouteExecutor {
     const cancelled = this.buildFailure('CANCELLED', message, problem);
     this.stopActive();
     if (generation !== this.generation) return cancelled; // superseded; return the old snapshot
+    if (this.result !== null) return cloneResult(this.result); // a re-entrant callback already terminated it
     this.result = cancelled;
     return cloneResult(this.result);
   }
@@ -382,11 +391,16 @@ export class WalkRouteExecutor {
     return false;
   }
 
+  /** True when this flow may still write state: same delegation and not yet terminal. */
+  private ownsDelegation(generation: number): boolean {
+    return generation === this.generation && this.result === null;
+  }
+
   /** Stop the active move and, if the delegation is unchanged, record a terminal result. */
   private terminate(outcome: FailureOutcome, message: string, problem: NavProblem): void {
     const generation = this.generation;
     this.stopActive();
-    if (generation !== this.generation) return; // re-entrant start() replaced the delegation
+    if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
     this.result = this.buildFailure(outcome, message, problem);
   }
 
@@ -429,13 +443,29 @@ export class WalkRouteExecutor {
     const target = this.points[stepIndex + 1]!;
     const executionId = `${this.delegationId}-step-${stepIndex}`;
     const abort = new AbortController();
+    const startedAt = this.currentNow();
+
+    // Final validation with the just-captured start time: a deadline or TTL crossed
+    // in the instant before scheduling must not still launch a move.
+    if (startedAt >= this.request!.deadlineMs) {
+      this.result = this.buildFailure('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
+      return;
+    }
+    if (startedAt > evaluation.validUntil) {
+      this.result = this.buildFailure('FAILED', 'the step expired before it could start', {
+        kind: 'route_invalidated',
+        detail: 'evidence expired before the move was scheduled',
+      });
+      return;
+    }
+
     this.activeStepIndex = stepIndex;
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
     this.activeDependencies = new Set(evaluation.dependencies.map((d) => sectionKeyString(d.key)));
     this.activeRuleVersion = route.ruleVersion;
     this.activeValidUntil = evaluation.validUntil;
-    this.activeStartedAt = this.currentNow();
+    this.activeStartedAt = startedAt;
 
     const generation = this.generation;
     void this.executor
@@ -468,17 +498,20 @@ export class WalkRouteExecutor {
     const basisInvalidated = this.activeBasisInvalidated();
 
     this.stopActive();
-    if (generation !== this.generation) return; // re-entrant start() replaced the delegation
+    if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
 
     const sample = result.sample;
     const failure = result.failure;
 
-    // Validate the sample, checking execution association BEFORE scope/lifecycle so
-    // a foreign sample cannot override an explicit cancel/timeout reason.
+    // Validate the sample: filter execution identity and ordering first, then
+    // interpret scope/lifecycle, so a foreign or replayed sample cannot override an
+    // explicit cancel/timeout reason or trigger a spurious scope/lifecycle verdict.
     let usable: BodySample | null = null;
     if (sample !== undefined && this.sampleFinite(sample)) {
       if (sample.executionId !== executionId) {
         // Foreign sample: ignore it, do not interpret its scope/lifecycle.
+      } else if (!this.sampleOrdered(sample)) {
+        // Replayed/out-of-order sample: ignore it, do not interpret its scope/lifecycle.
       } else if (!this.scopeMatches(sample)) {
         this.result = this.buildFailure('FAILED', 'the body left the delegation scope during execution', {
           kind: 'scope_changed',
@@ -486,12 +519,13 @@ export class WalkRouteExecutor {
         });
         return;
       } else if (this.lifecycleBroken(sample)) {
+        this.recordSamplePosition(sample); // preserve the latest trusted position before terminating
         this.result = this.buildFailure('FAILED', 'the body became unavailable during execution', {
           kind: 'unavailable',
           detail: `alive=${sample.alive} connected=${sample.connected} observationReady=${sample.observationReady}`,
         });
         return;
-      } else if (this.sampleOrdered(sample)) {
+      } else {
         usable = sample;
         this.recordSamplePosition(sample);
       }
@@ -591,7 +625,7 @@ export class WalkRouteExecutor {
   private confirmArrival(sample: BodySample): void {
     const generation = this.generation;
     this.stopActive(); // measured arrival and control release are separate confirmations
-    if (generation !== this.generation) return; // re-entrant start() replaced the delegation
+    if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
 
     const pos = { ...sample.pos };
     this.lastPosition = pos;

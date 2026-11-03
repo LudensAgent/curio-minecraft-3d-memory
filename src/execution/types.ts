@@ -37,9 +37,10 @@ export interface BodySample {
    */
   executionId: string;
   /**
-   * Monotonic per-delegation receive order. Strictly increasing across accepted
+   * Monotonic per-delegation sample number. Strictly increasing across accepted
    * samples, so a replayed same-millisecond sample is rejected without relying on
-   * a strictly-increasing `observedAt`.
+   * a strictly-increasing `observedAt`. A re-delivery of the same sample keeps the
+   * same number — this is a sample identity, not a per-delivery receive counter.
    */
   sequence: number;
 }
