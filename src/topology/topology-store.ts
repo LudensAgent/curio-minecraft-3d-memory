@@ -33,8 +33,8 @@ import type { PathFragment, TraversalEvidence } from './path-fragment.js';
 import {
   assertValidMode,
   cloneTraversalEvidence,
+  jsonEscapedByteLength,
   traversalEvidenceEqual,
-  utf8ByteLength,
 } from './path-fragment.js';
 import type { FragmentScope, SaveResult } from './fragment-store.js';
 import { estimateTraversalBytes, snapshotEvidence } from './fragment-store.js';
@@ -1987,36 +1987,37 @@ function restoreEvidenceRef(
   return { evidenceId, snapshot: validated };
 }
 
-const BYTES_PER_POINT = 48;
+const BYTES_PER_POINT = 96;
+const BYTES_PER_NUMBER = 24;
+const STRING_QUOTES = 2;
 
 function estimateNodeBytes(n: SpatialNode): number {
-  let bytes = 48;
-  bytes +=
-    utf8ByteLength(n.id) +
-    utf8ByteLength(n.worldId) +
-    utf8ByteLength(n.dim) +
-    utf8ByteLength(n.kind) +
-    utf8ByteLength(n.source);
-  bytes += n.tag === undefined ? 0 : utf8ByteLength(n.tag);
-  bytes += n.label === undefined ? 0 : utf8ByteLength(n.label);
-  bytes += n.location.kind === 'exact' ? BYTES_PER_POINT : BYTES_PER_POINT + 16;
+  let bytes = 160;
+  bytes += jsonEscapedByteLength(n.id) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(n.worldId) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(n.dim) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(n.kind) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(n.source) + STRING_QUOTES;
+  bytes += n.tag === undefined ? 0 : jsonEscapedByteLength(n.tag) + STRING_QUOTES;
+  bytes += n.label === undefined ? 0 : jsonEscapedByteLength(n.label) + STRING_QUOTES;
+  // exact: `{"kind":"exact","pos":{…}}`; region adds `"center":{…}` and `"radius":…`.
+  bytes += n.location.kind === 'exact' ? BYTES_PER_POINT + 24 : BYTES_PER_POINT + BYTES_PER_NUMBER + 48;
   return bytes;
 }
 
 function estimateEdgeBytes(e: StoredEdge): number {
-  let bytes = 64;
-  bytes +=
-    utf8ByteLength(e.id) +
-    utf8ByteLength(e.from) +
-    utf8ByteLength(e.to) +
-    utf8ByteLength(e.type) +
-    utf8ByteLength(e.basis);
-  bytes += e.fragmentId === undefined ? 0 : utf8ByteLength(e.fragmentId);
-  bytes += e.source === undefined ? 0 : utf8ByteLength(e.source);
+  let bytes = 160;
+  bytes += jsonEscapedByteLength(e.id) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.from) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.to) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.type) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.basis) + STRING_QUOTES;
+  bytes += e.fragmentId === undefined ? 0 : jsonEscapedByteLength(e.fragmentId) + STRING_QUOTES;
+  bytes += e.source === undefined ? 0 : jsonEscapedByteLength(e.source) + STRING_QUOTES;
   // Each binding carries a full immutable traversal snapshot — count its real
-  // string/point cost, not a fixed per-ref constant.
+  // escaped string/point cost, not a fixed per-ref constant.
   for (const ref of e.refs) {
-    bytes += utf8ByteLength(ref.evidenceId) + estimateTraversalBytes(ref.snapshot);
+    bytes += jsonEscapedByteLength(ref.evidenceId) + STRING_QUOTES + estimateTraversalBytes(ref.snapshot);
   }
   return bytes;
 }

@@ -96,7 +96,8 @@ await session.close();         // 停止接受写入并有界关闭 Worker
 - 成功且实际改变事实时递增；幂等 `unchanged`、失败写入、删除不存在记录、只读查询均不递增；删除
   片段及其经过证据的级联效果计入变化。
 - `revision` 不是时间、观测编号或经过次数；不扩展成通行图版本系统或跨进程协调。`restoreSnapshot`
-  会把 revision 重置为 0（恢复基线），修订计数在新会话重新建立，不伪装成跨重启的观测时间。
+  把恢复当作一次变更递增 revision；会话 `initialize` 在恢复后把确认基线设为恢复后的 revision，因此
+  恢复基线是「恢复后的 revision」而非固定 0，修订计数在新会话重新建立，不伪装成跨重启的观测时间。
 
 `getPersistenceState()` 区分：当前内存修订（`fragmentRevision` / `topologyRevision`）、当前会话已
 确认的修订（恢复基线或最近确认的 checkpoint）、`dirty`、在途 checkpoint、生命周期、最近保存错误；
@@ -171,7 +172,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过（pretypecheck 先 build）
 npm run build      → 通过（产出 dist/storage/sqlite/index.js + worker.js）
-npm test           → 392 passed（13 个测试文件；新增 40 项 storage-checkpoint 测试，
+npm test           → 395 passed（13 个测试文件；新增 43 项 storage-checkpoint 测试，
                       既有 topology / fragment / voxel / traversability 等全部保持通过）
 npx tsx examples/history-checkpoint.ts → 正常运行（以公开包名与子路径导入，先 build）
 npm pack 后独立临时消费者安装        → 见下方「包接入验证」
@@ -202,3 +203,20 @@ git diff --check   → 通过
   `fragmentId === snapshot.fragmentId`，同时继续允许权威证据缺失/变更（不重绑）。
 - **P2 损坏库被当成空库**：`openDatabase` 校验全部必需表；`loadWorld` 在无 checkpoint 时确认该世界
   确无事实行，否则报告损坏；open 失败时关闭连接并等待 Worker 退出，避免遗留文件锁。
+
+## 第二轮评审修正（P2）
+
+- **关闭期限耗尽遗留 Worker**：`close()` 在剩余时间为零时仍 `terminateWorker()`，不再因跳过关闭操作
+  而遗留运行中的 Worker；继续报告非正常关闭，同时保留已收到的提交确认。
+- **字节预检未覆盖 JSON 转义**：把 `utf8ByteLength` 换成 `jsonEscapedByteLength`（计入 `"`/`\`/控制
+  字符/代理对的转义膨胀），并提高每条记录与点/链接的固定开销、显式计入数值字段；Worker 仍用真实
+  `Buffer.byteLength` 精确复核，不把完整 `JSON.stringify` 移回主线程。
+- **损坏的 checkpoint 序号**：`loadWorld` 在按 `seq` 选取基线与计算下一序号前，用 `typeof(...)` 校验
+  checkpoint 的 `seq`/`fragment_revision`/`topology_revision`/`checkpoint_id`，损坏时明确拒绝打开。
+- **schema 校验未检查必需列**：`openDatabase` 用 `PRAGMA table_info` 核对每张表的必需列，结构不完整
+  的同名表返回 schema 错误，不交付无法使用的会话。
+- **flush() 把「提交未确认」混同为 dirty**：`flush()` 所有分支统一用 `isDirty()`；「提交未确认」继续
+  由 `completed: false` 与错误独立表达，不再硬编码 `dirty: true`。
+
+回归测试新增：JSON 转义字节边界、损坏 checkpoint 元数据、缺失必需列。关闭期限与未确认提交的具体
+故障注入复现（延迟 ACK / 丢弃确认）未通过公开 API 暴露测试开关，按「故障注入放内部接缝」处理。

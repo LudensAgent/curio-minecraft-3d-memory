@@ -25,8 +25,8 @@ import type { PathFragment, TraversalEvidence } from './path-fragment.js';
 import {
   assertValidMode,
   cloneTraversalEvidence,
+  jsonEscapedByteLength,
   traversalEvidenceEqual,
-  utf8ByteLength,
 } from './path-fragment.js';
 import type { Vec3Like } from '../types.js';
 
@@ -686,19 +686,26 @@ function firstIndexAfter(sortedIds: string[], after: string): number {
   return i;
 }
 
-// --- checkpoint byte estimation (conservative; no full copy or stringify) ---
+// --- checkpoint byte estimation (conservative upper bound; no full copy or stringify) ---
 
-const BYTES_PER_POINT = 48; // {x:±d.ddd,y:±d.ddd,z:±d.ddd} plus separators, worst-case double width
-const BYTES_PER_LINK = 96; // two points plus {a:{...},b:{...}} framing
+// A point `{"x":…,"y":…,"z":…}`: ~16 structural bytes + 3 doubles (~24 worst-case each).
+const BYTES_PER_POINT = 96;
+// A link `{"a":{…},"b":{…}}`: two points plus ~8 framing bytes.
+const BYTES_PER_LINK = BYTES_PER_POINT * 2 + 8;
+// Worst-case JSON decimal for a JS double (`-1.2345678901234567e+300`-style).
+const BYTES_PER_NUMBER = 24;
+// Surrounding quotes added to every string value in the JSON object.
+const STRING_QUOTES = 2;
 
 function estimateFragmentBytes(f: PathFragment): number {
-  let bytes = 64;
-  bytes +=
-    utf8ByteLength(f.id) +
-    utf8ByteLength(f.worldId) +
-    utf8ByteLength(f.dim) +
-    utf8ByteLength(f.kind) +
-    utf8ByteLength(f.geometrySource);
+  // Field names + `{`/`}`/commas, conservatively.
+  let bytes = 192;
+  bytes += jsonEscapedByteLength(f.id) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(f.worldId) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(f.dim) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(f.kind) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(f.geometrySource) + STRING_QUOTES;
+  bytes += 4 * BYTES_PER_NUMBER; // deepestY, createdAt, lastUsedAt, uses
   bytes += f.polyline.length * BYTES_PER_POINT;
   bytes += f.entrances.length * BYTES_PER_POINT;
   bytes += (f.links?.length ?? 0) * BYTES_PER_LINK;
@@ -706,17 +713,17 @@ function estimateFragmentBytes(f: PathFragment): number {
 }
 
 export function estimateTraversalBytes(e: TraversalEvidence): number {
-  let bytes = 48;
-  bytes +=
-    utf8ByteLength(e.id) +
-    utf8ByteLength(e.fragmentId) +
-    utf8ByteLength(e.worldId) +
-    utf8ByteLength(e.dim) +
-    utf8ByteLength(e.source);
-  bytes += e.sessionId === null ? 0 : utf8ByteLength(e.sessionId);
-  bytes += e.executionId === undefined ? 0 : utf8ByteLength(e.executionId);
-  bytes += e.actionId === undefined ? 0 : utf8ByteLength(e.actionId);
-  bytes += e.mode === undefined ? 0 : utf8ByteLength(e.mode);
-  bytes += 2 * BYTES_PER_POINT;
+  let bytes = 160;
+  bytes += jsonEscapedByteLength(e.id) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.fragmentId) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.worldId) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.dim) + STRING_QUOTES;
+  bytes += jsonEscapedByteLength(e.source) + STRING_QUOTES;
+  bytes += e.sessionId === null ? 4 : jsonEscapedByteLength(e.sessionId) + STRING_QUOTES; // null → "null"
+  bytes += e.observedAt === null ? 4 : BYTES_PER_NUMBER;
+  bytes += e.executionId === undefined ? 0 : jsonEscapedByteLength(e.executionId) + STRING_QUOTES;
+  bytes += e.actionId === undefined ? 0 : jsonEscapedByteLength(e.actionId) + STRING_QUOTES;
+  bytes += e.mode === undefined ? 0 : jsonEscapedByteLength(e.mode) + STRING_QUOTES;
+  bytes += 2 * BYTES_PER_POINT; // from, to
   return bytes;
 }

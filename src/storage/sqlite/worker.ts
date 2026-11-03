@@ -28,6 +28,16 @@ const KNOWN_TABLES = new Set([
   'spatial_edges',
 ]);
 
+/** Required columns per table; a structurally incomplete same-named table is rejected. */
+const REQUIRED_COLUMNS: Record<string, string[]> = {
+  schema_meta: ['key', 'value'],
+  checkpoints: ['checkpoint_id', 'world_id', 'fragment_revision', 'topology_revision', 'seq'],
+  path_fragments: ['world_id', 'seq', 'id', 'payload'],
+  traversal_evidence: ['world_id', 'seq', 'id', 'payload'],
+  spatial_nodes: ['world_id', 'seq', 'id', 'payload'],
+  spatial_edges: ['world_id', 'seq', 'id', 'payload'],
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -139,7 +149,22 @@ function openDatabase(databasePath: string): Database.Database {
       throw new Error(`missing required table "${required}"`);
     }
   }
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
+    assertRequiredColumns(connection, table, columns);
+  }
   return connection;
+}
+
+/** Reject a table that is missing any column the schema relies on. */
+function assertRequiredColumns(connection: Database.Database, table: string, required: string[]): void {
+  const cols = connection.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  const names = new Set(cols.map((c) => c.name));
+  for (const column of required) {
+    if (!names.has(column)) {
+      connection.close();
+      throw new Error(`table "${table}" is missing required column "${column}"`);
+    }
+  }
 }
 
 function stringifyRecord(record: unknown): string {
@@ -322,11 +347,34 @@ function computeDerivedCounts(snapshot: HistorySnapshot): {
   return { polylinePoints, entrancePoints, linkPairs, edgeEvidenceRefs };
 }
 
+/** Reject checkpoint rows whose ordering/identity/revision metadata is corrupt. */
+function assertValidCheckpointMetadata(connection: Database.Database, wId: string): void {
+  const bad = connection
+    .prepare(
+      `SELECT COUNT(*) AS n FROM checkpoints
+       WHERE world_id = ?
+         AND (typeof(seq) != 'integer'
+              OR typeof(fragment_revision) != 'integer'
+              OR typeof(topology_revision) != 'integer'
+              OR typeof(checkpoint_id) != 'text'
+              OR checkpoint_id = '')`,
+    )
+    .get(wId) as { n: number };
+  if (bad.n > 0) {
+    throw new Error('corrupt checkpoint metadata');
+  }
+}
+
 function loadWorld(
   connection: Database.Database,
   wId: string,
   resolved: ResolvedSnapshotLimits,
 ): { baselineCheckpointId: string | null; snapshot: HistorySnapshot | null } {
+  // Validate checkpoint metadata *before* using `seq` to pick the baseline and
+  // before `MAX(seq)` computes the next sequence, so a corrupt `seq`/id/revision
+  // cannot desynchronize the restored facts from the reported baseline id.
+  assertValidCheckpointMetadata(connection, wId);
+
   const cp = connection
     .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
     .get(wId) as { checkpoint_id: string } | undefined;

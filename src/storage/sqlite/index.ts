@@ -233,16 +233,18 @@ class HistorySessionImpl implements HistorySession {
       } catch (err) {
         const error =
           err instanceof PersistenceError ? err : new PersistenceError('worker_communication', String(err));
-        return { pending: true, completed: false, dirty: true, error };
+        return { pending: true, completed: false, dirty: this.isDirty(), error };
       }
     }
     // No in-flight request, but an earlier commit was never confirmed: report it
-    // rather than claiming success.
+    // rather than claiming success. `dirty` stays a pure `isDirty()` judgment —
+    // "unconfirmed commit" is expressed by `completed: false` + `error`, not by
+    // conflating it with unsaved memory changes.
     if (this.unconfirmedCheckpointId !== null) {
       return {
         pending: true,
         completed: false,
-        dirty: true,
+        dirty: this.isDirty(),
         error:
           this.lastError ?? new PersistenceError('timeout_unconfirmed', 'a checkpoint commit was not confirmed'),
       };
@@ -279,7 +281,16 @@ class HistorySessionImpl implements HistorySession {
     }
 
     const remaining = deadline - Date.now();
-    const closed = remaining > 0 ? await this.shutdownWorker(remaining) : false;
+    let closed: boolean;
+    if (remaining > 0) {
+      closed = await this.shutdownWorker(remaining);
+    } else {
+      // Deadline exhausted: still terminate the worker so it never leaks. A
+      // non-clean close is reported, but any commit already confirmed remains
+      // reflected via `lastConfirmedCheckpointId` / `cleanlyClosed`.
+      await this.terminateWorker();
+      closed = false;
+    }
     this.cleanlyClosed = closed;
     this.lifecycle = 'closed';
     if (!closed && closeError === null) {

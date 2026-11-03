@@ -799,4 +799,47 @@ describe('P1/P2 regression', () => {
     await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
     await session.close();
   });
+
+  it('bounds JSON-escaped byte size before copying', async () => {
+    const session = await openHistorySession({
+      databasePath: makeDbPath(),
+      worldId: WORLD,
+      snapshotLimits: { maxBytes: 1500 },
+    });
+    // 1024 double-quote chars: 1024 raw bytes, but 2048 once JSON-escaped (`\"`).
+    session.topology.saveNode(node('n', 0, 0, 0, { label: '"'.repeat(1024) }));
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
+    await session.close();
+  });
+
+  it('rejects a database with corrupt checkpoint metadata', async () => {
+    const dbPath = makeDbPath();
+    const session = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    session.history.saveFragment(frag());
+    await session.checkpoint();
+    await session.close();
+
+    const db = new Database(dbPath);
+    db.prepare("UPDATE checkpoints SET seq = 'broken'").run();
+    db.close();
+
+    await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toBeInstanceOf(
+      PersistenceError,
+    );
+  });
+
+  it('rejects a database missing a required column', async () => {
+    const dbPath = makeDbPath();
+    const session = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    await session.checkpoint();
+    await session.close();
+
+    const db = new Database(dbPath);
+    db.exec('ALTER TABLE spatial_edges DROP COLUMN payload');
+    db.close();
+
+    await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toMatchObject({
+      kind: 'schema',
+    });
+  });
 });
