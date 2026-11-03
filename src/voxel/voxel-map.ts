@@ -582,6 +582,21 @@ export class VoxelMap {
     return keys;
   }
 
+  /**
+   * Exact resident working-set cost of the given resident sections (0 for any key
+   * that is not currently resident). Read-only; never loads, evicts, saves, or
+   * refreshes evidence. Used by the working-set manager to soundly pre-check that a
+   * request's own footprint fits the byte budget before evicting anything.
+   */
+  residentBytesOf(keys: readonly SectionKey[]): number {
+    let total = 0;
+    for (const key of keys) {
+      const section = this.residentSection(key);
+      if (section !== undefined) total += estimateVoxelSectionResidentBytes(section);
+    }
+    return total;
+  }
+
   /** Read-only pin accounting: how many leases and distinct pinned sections exist now. */
   pinState(): { leases: number; pinnedSections: number } {
     return { leases: this.pins.size, pinnedSections: this.pinCounts.size };

@@ -127,7 +127,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 533 passed（18 个测试文件；新增 40 项 working-set 测试）
+npm test           → 552 passed（19 个测试文件；working-set 测试 42 项，另有并行合入的 grounded-walk-route 测试）
 npx tsx examples/working-set.ts → 正常运行（以公开包名与子路径导入，Fake 路线 ARRIVED）
 git diff --check   → 通过
 ```
@@ -202,6 +202,19 @@ task protection」（迟到释放）用例。
 路线生命周期验收缺口补齐：新增 `HangingExecutor`（可暂停的 Fake 移动）。「protects clean deps under cache pressure during
 execution」在**执行中**施加缓存压力（干净依赖被 Pin 阻止淘汰）后触发 `cancel`，验证取消后释放租约可淘汰；「a replaced task
 whose lease is released late」用真实执行器验证任务替换与旧任务迟到释放不解除新任务保护。
+
+## 评审修正（三轮，2 项 P2 + 替换测试验收残留）
+
+- **P2 公开安装接口允许旧快照覆盖较新事实**：`installSections` 新增生命周期门禁（closed/closing 拒绝）与陈旧快照拒绝
+  （快照 `revision` 与已提交目录 `revision` 不一致时抛 `data`），避免把旧测量装回已推进的已保存事实。回归测试
+  「installSections rejects a stale snapshot and a closed session」。
+- **P2 已测出无法容纳仍先淘汰缓存**：`prepare` 在测量后、淘汰前用 `VoxelMap.residentBytesOf`（请求中已驻留段精确成本）+
+  待安装成本做字节预检，请求自身超 `maxResidentBytes` 时直接 `byte_capacity`，不先淘汰已有缓存。回归测试
+  「rejects a request that cannot fit before evicting the existing cache」。
+- **替换测试验收残留**：修复替换测试——补齐整条路线的新观测（不再只刷新一格），使用**单一** `WalkRouteExecutor` 与单一
+  `HangingExecutor`，断言旧动作确实在途（`activeStepIndex===0`）、`start` 触发替换后旧移动被 `stop`、新移动在途，再模拟旧
+  任务迟到释放验证新租约仍有效。回归测试「a replaced task whose lease is released late does not drop the newer task
+  protection」。
 
 ## 本轮未实现
 

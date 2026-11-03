@@ -619,6 +619,59 @@ describe('WorkingSetManager', () => {
     expect(r.capacity?.kind).toBe('count_capacity'); // not byte_capacity
     await session.close();
   });
+
+  it('rejects a request that cannot fit before evicting the existing cache', async () => {
+    const dbPath = makeDbPath();
+    // Seed A (1 cell, cx 0) and B (4 cells, cx 1).
+    const setup = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    setup.voxel.beginSession('s1');
+    setup.voxel.observe(voxelObs({ pos: { x: 0, y: 64, z: 0 } }));
+    for (let i = 0; i < 4; i++) {
+      setup.voxel.observe(voxelObs({ pos: { x: 16, y: 64, z: i }, observedAt: 1000, sequence: 2 + i }));
+    }
+    await setup.checkpoint();
+    await setup.close();
+
+    // Measure A's exact resident bytes to set a budget A fits but B (4 cells) does not.
+    const probe = await manualSession(dbPath);
+    const pa = await probe.manager.prepare([keyAt(0)]);
+    const aBytes = probe.session.voxel.residentSize().bytes;
+    await probe.session.close();
+
+    const { session, manager } = await manualSession(dbPath, {
+      residencyLimits: { maxResidentSections: 10, maxResidentBytes: aBytes },
+    });
+    const la = await manager.prepare([keyAt(0)]);
+    session.releasePins([la.lease.token]);
+
+    const r = await manager.prepare([keyAt(1)]); // B's measured cost (4 cells) exceeds the budget
+    expect(r.status).toBe('failed');
+    expect(r.capacity?.kind).toBe('byte_capacity');
+    expect(r.evicted).toEqual([]); // A was NOT evicted
+    expect(session.sectionResidency(keyAt(0)).residency).toBe('resident');
+    await session.close();
+  });
+
+  it('installSections rejects a stale snapshot and a closed session', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 1);
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+
+    // Measure A (revision 1, stone@1000), install it, then advance and commit dirt@2000.
+    const measured = await session.measureSections([keyAt(0)]);
+    session.installSections(measured.sections);
+    session.voxel.beginSession('live');
+    session.voxel.observe(voxelObs({ sessionId: 'live', state: { name: 'minecraft:dirt', properties: {} }, pos: { x: 0, y: 64, z: 0 }, observedAt: 2000, sequence: 1 }));
+    await session.checkpoint();
+    session.unloadSections([keyAt(0)]);
+
+    // The old snapshot (revision 1) no longer matches the committed revision (2).
+    expect(() => session.installSections(measured.sections)).toThrow(/stale/);
+
+    // Installing after close is rejected.
+    await session.close();
+    expect(() => session.installSections(measured.sections)).toThrow(/closed/);
+  });
 });
 
 // ==============================================================================
@@ -918,7 +971,11 @@ describe('working-set + Fake walk-route lifecycle', () => {
     const initial = await manager.prepare([supportKey, airKey]);
     session.releasePins([initial.lease.token]);
     session.voxel.beginSession('live');
-    session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x: 0, y: -1, z: 0 } });
+    for (let x = 0; x <= 1; x++) {
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x, y: -1, z: 0 } });
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 2, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 0, z: 0 } });
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 3, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 1, z: 0 } });
+    }
     await session.checkpoint();
 
     const points: Vec3Like[] = [
@@ -926,19 +983,23 @@ describe('working-set + Fake walk-route lifecycle', () => {
       { x: 1.5, y: 0, z: 0.5 },
     ];
 
-    // Task 1 pins the deps and starts a hanging execution.
+    // Task 1 pins the deps and starts a hanging execution on ONE loop.
     const first = await manager.prepare([supportKey, airKey]);
-    const loop1 = new WalkRouteExecutor(session.voxel, new HangingExecutor(), { now: () => 2000 });
-    const s1 = loop1.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
-    loop1.onSample(sampleAt(WORLD, DIM, 'live', s1.delegationId, points[0]!, 1));
-    loop1.advance(10);
+    const executor = new HangingExecutor();
+    const loop = new WalkRouteExecutor(session.voxel, executor, { now: () => 2000 });
+    const s1 = loop.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
+    loop.onSample(sampleAt(WORLD, DIM, 'live', s1.delegationId, points[0]!, 1));
+    loop.advance(10);
+    expect(loop.status()!.activeStepIndex).toBe(0); // task 1's move is actually in flight
 
-    // Task 2 replaces task 1 and pins the same deps.
+    // Task 2 pins the same deps and replaces task 1 on the SAME loop.
     const second = await manager.prepare([supportKey, airKey]);
-    const loop2 = new WalkRouteExecutor(session.voxel, new HangingExecutor(), { now: () => 2000 });
-    const s2 = loop2.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
-    loop2.onSample(sampleAt(WORLD, DIM, 'live', s2.delegationId, points[0]!, 1));
-    loop2.advance(10);
+    const s2 = loop.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
+    // Replacement stops task 1's in-flight move and starts task 2's.
+    expect(executor.stopped).toContain(`${s1.delegationId}-step-0`);
+    loop.onSample(sampleAt(WORLD, DIM, 'live', s2.delegationId, points[0]!, 2));
+    loop.advance(10);
+    expect(loop.status()!.activeStepIndex).toBe(0); // task 2's move is now in flight
 
     // Task 1's late release must not drop task 2's protection.
     session.releasePins([first.lease.token]);

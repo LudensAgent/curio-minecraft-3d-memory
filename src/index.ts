@@ -27,6 +27,7 @@ export {
   DEFAULT_RESIDENCY_LIMITS,
   LruOrder,
   estimateVoxelSectionResidentBytesFromCommitted,
+  estimateVoxelSectionResidentBytesFromSnapshot,
   resolveResidencyLimits,
   VoxelMap,
   VoxelResidencyError,

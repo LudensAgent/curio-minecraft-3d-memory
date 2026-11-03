@@ -459,6 +459,23 @@ class SpatialSessionImpl implements SpatialSession {
 
   /** Install already-measured snapshots; marks them load_failed and wraps a capacity refusal. */
   installSections(sections: readonly VoxelSectionSnapshot[]): SectionKey[] {
+    if (this.lifecycleField === 'closing') {
+      throw new PersistenceError('closing', 'session is closing; installs are not accepted');
+    }
+    if (this.lifecycleField === 'closed') {
+      throw new PersistenceError('closed', 'session is closed; installs are not accepted');
+    }
+    // Reject a stale snapshot whose revision no longer matches the committed record,
+    // so a caller cannot install an old measure over a newer saved fact.
+    for (const raw of sections) {
+      const committed = this.voxel.sectionResidency({ worldId: this.worldId, dim: raw.dim, cx: raw.cx, cz: raw.cz, sy: raw.sy }).committed;
+      if (committed !== undefined && committed.revision !== raw.revision) {
+        throw new PersistenceError(
+          'data',
+          `stale section snapshot (${raw.dim}, ${raw.cx}, ${raw.cz}, ${raw.sy}): revision ${raw.revision} does not match committed revision ${committed.revision}`,
+        );
+      }
+    }
     try {
       return this.voxel.installLoadedSections(sections);
     } catch (err) {
