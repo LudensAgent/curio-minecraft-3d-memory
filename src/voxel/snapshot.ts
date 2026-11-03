@@ -391,8 +391,13 @@ function cellEvidenceBytes(evidence: CellEvidence, cost: StringCost, forceStaleR
   bytes += observationBytes(evidence.observation, cost);
   bytes += BYTES_PER_NUMBER; // revision
   bytes += cost(evidence.freshness) + STRING_QUOTES;
-  if (forceStaleReason || evidence.staleReason !== undefined) {
-    bytes += cost(evidence.staleReason ?? WORST_CASE_STALE_REASON) + STRING_QUOTES;
+  if (forceStaleReason) {
+    // Resident billing always reserves the longest stale reason, regardless of the
+    // cell's actual (shorter) reason, so a freshness transition can never leave a
+    // billing residue on unload.
+    bytes += cost(WORST_CASE_STALE_REASON) + STRING_QUOTES;
+  } else if (evidence.staleReason !== undefined) {
+    bytes += cost(evidence.staleReason) + STRING_QUOTES;
   }
   bytes += BYTES_PER_NUMBER; // validUntil
   return bytes;

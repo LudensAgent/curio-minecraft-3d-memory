@@ -107,7 +107,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 488 passed（16 个测试文件；新增 30 项 spatial-voxel-residency 测试）
+npm test           → 490 passed（16 个测试文件；新增 31 项 spatial-voxel-residency 测试）
 npx tsx examples/spatial-residency.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过（见提交前检查）
 ```
@@ -186,3 +186,14 @@ git diff --check   → 通过（见提交前检查）
   `rowid` 游标与事务回滚。回归测试「does not apply single-world limits across the whole database」。
 - **P2 批量观测平方级同步开销**：`observeBatch` 改为按受影响 Section 合并核算（每 Section 一次 before/after 估算，
   而非逐观测各两次），使整 Section 批量写入保持 O(section)；同时 `markStale` 不再做整段重估（统一计费下增量恒为零）。
+
+## 评审修正（第三轮）
+
+- **P2 较短失效原因造成卸载后计费残留**：`cellEvidenceBytes` 在强制预留模式（`forceStaleReason`）下不再优先采用
+  实际（较短）`staleReason`，而是一律按最长原因 `observation_gap` 计费；持久化估算仍用实际原因。因此 FRESH 预留、
+  markStale 转 `unloaded`/`expired` 等短原因、卸载扣减三者一致，全卸载后计费归零。回归测试「resident billing zeroes
+  out after unload for every stale reason」循环覆盖全部失效原因。
+- **P2 迁移只有行数限制、无 payload 字节上限**：v2→v3 迁移改为先读取 `rowid + octet_length` 元数据，在读取 payload
+  前校验单条（`MIGRATION_MAX_SECTION_BYTES`，16 MiB）与批次（`MIGRATION_BATCH_BYTES`，64 MiB）字节数，再通过稳定
+  `rowid` 游标分批读取、解码、回填，保留事务回滚；这些迁移预算独立于单世界 `maxBytes`。回归测试「migration is not
+  constrained by a small per-world maxBytes」。

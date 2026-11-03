@@ -812,4 +812,46 @@ describe('v2 → v3 migration scope', () => {
     expect(reopened.voxel.checkpointCounts().sections).toBe(1);
     await reopened.close();
   });
+
+  it('migration is not constrained by a small per-world maxBytes', async () => {
+    const dbPath = makeDbPath();
+    const a = await openSpatialSession({ databasePath: dbPath, worldId: 'worldA' });
+    a.voxel.beginSession('s1');
+    a.voxel.observe(obs({ worldId: 'worldA', pos: { x: 0, y: 0, z: 0 } }));
+    await a.checkpoint();
+    await a.close();
+    const b = await openSpatialSession({ databasePath: dbPath, worldId: 'worldB' });
+    b.voxel.beginSession('s1');
+    b.voxel.observe(obs({ worldId: 'worldB', pos: { x: 0, y: 0, z: 0 } }));
+    await b.checkpoint();
+    await b.close();
+
+    const db = new Database(dbPath);
+    db.exec('ALTER TABLE spatial_sections DROP COLUMN observed_cells');
+    db.exec('ALTER TABLE spatial_sections DROP COLUMN palette_entries');
+    db.exec('ALTER TABLE spatial_sections DROP COLUMN revision');
+    db.exec("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'");
+    db.close();
+
+    const probe = new Database(dbPath, { readonly: true });
+    const worldABytes = (
+      probe.prepare('SELECT COALESCE(SUM(octet_length(payload)), 0) AS n FROM spatial_sections WHERE world_id = ?').get('worldA') as { n: number }
+    ).n;
+    const totalBytes = (
+      probe.prepare('SELECT COALESCE(SUM(octet_length(payload)), 0) AS n FROM spatial_sections').get() as { n: number }
+    ).n;
+    probe.close();
+    expect(totalBytes).toBeGreaterThan(worldABytes); // whole DB spans both worlds
+
+    // Exactly enough to reopen worldA (empty history + its one voxel section), but
+    // less than the whole-database payload total — so the migration must not treat
+    // the per-world maxBytes as a database-wide cap.
+    const worldIdBytes = Buffer.byteLength(JSON.stringify('worldA'), 'utf8');
+    const maxBytes = SNAPSHOT_FRAME_BYTES + VOXEL_FRAME_BYTES + 2 * worldIdBytes + worldABytes;
+    expect(totalBytes).toBeGreaterThan(maxBytes);
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: 'worldA', snapshotLimits: { maxBytes } });
+    expect(reopened.voxel.checkpointCounts().sections).toBe(1);
+    await reopened.close();
+  });
 });

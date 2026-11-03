@@ -253,6 +253,23 @@ describe('VoxelMap manual residency (pure core)', () => {
     map.beginSession('s1');
     expect(() => map.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 } }))).toThrow(/maxResidentBytes/);
   });
+
+  it('resident billing zeroes out after unload for every stale reason', () => {
+    const reasons = ['unloaded', 'observation_gap', 'expired', 'pending_effect', 'conflict'] as const;
+    for (const reason of reasons) {
+      const map = manualMap();
+      map.installDirectory([directoryEntry(DIM, 0, 0, 0)]);
+      map.beginSession('s1');
+      const source = new VoxelMap(WORLD);
+      source.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 } }));
+      map.installLoadedSections(source.checkpointSnapshot().sections); // resident + committed
+      map.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 })); // refresh → FRESH
+      map.markStale(DIM, reason); // STALE with this (possibly shorter) reason
+      map.confirmSections(map.saveRevision); // clean
+      map.unloadSections([sectionKey(DIM, 0, 0, 0)]);
+      expect(map.residentSize()).toEqual({ sections: 0, bytes: 0 }); // no billing residue
+    }
+  });
 });
 
 // ==============================================================================
