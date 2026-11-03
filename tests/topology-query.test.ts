@@ -269,12 +269,57 @@ describe('TopologyStore — route query', () => {
 
   it('keeps FOUND even when other explored branches hold gaps', () => {
     const { history, store } = setupChain();
-    store.saveEdge(candidateEdge('e-bd', 'b', 'd'));
+    store.saveEdge(candidateEdge('e-ad', 'a', 'd')); // explored before the target is reached
     const r = store.route('a', 'c');
     expect(r.status).toBe('FOUND');
     expect(r.nodeIds).toEqual(['a', 'b', 'c']);
     // The candidate branch was explored but does not negate the found route.
     expect(r.gaps).toContain('candidate');
+  });
+
+  it('stops as soon as the target is confirmed and does not read unrelated branch evidence', () => {
+    class FlakyHistory implements TopologyHistorySource {
+      readonly worldId = WORLD;
+      readonly failIds = new Set<string>();
+      private readonly traversals = new Map<string, TraversalEvidence>();
+      private readonly fragments = new Map<string, PathFragment>();
+
+      addFragment(f: PathFragment): void {
+        this.fragments.set(f.id, f);
+      }
+
+      addTraversal(e: TraversalEvidence): void {
+        this.traversals.set(e.id, e);
+      }
+
+      getFragment(id: string): PathFragment | null {
+        return this.fragments.get(id) ?? null;
+      }
+
+      getTraversal(id: string): TraversalEvidence | null {
+        if (this.failIds.has(id)) throw new Error('history read failed');
+        return this.traversals.get(id) ?? null;
+      }
+    }
+
+    const history = new FlakyHistory();
+    history.addFragment(makeFragment('frag-ag'));
+    history.addTraversal(makeEvidence('ev-ag', 'frag-ag', A, B)); // a → goal (b)
+    history.addFragment(makeFragment('frag-ao'));
+    history.addTraversal(makeEvidence('ev-ao', 'frag-ao', A, C)); // a → other (c)
+    const store = new TopologyStore(history);
+    store.saveNode(makeNode('a', A));
+    store.saveNode(makeNode('b', B));
+    store.saveNode(makeNode('c', C));
+    store.saveEdge(traversedEdge('e-ag', 'a', 'b', ['ev-ag']));
+    store.saveEdge(traversedEdge('e-ao', 'a', 'c', ['ev-ao']));
+
+    // The goal edge (e-ag) is examined first; the unrelated branch (e-ao) must
+    // never be read because the target is already confirmed.
+    history.failIds.add('ev-ao');
+    const r = store.route('a', 'b');
+    expect(r.status).toBe('FOUND');
+    expect(r.edgeIds).toEqual(['e-ag']);
   });
 
   it('does not let gaps in unvisited regions or in-edges affect the conclusion', () => {
@@ -684,5 +729,66 @@ describe('TopologyStore — history read counting and lightweight scope reads', 
     expect(r.stats.historyReads).toBe(2);
     expect(history.getTraversalCalls).toBe(1);
     expect(history.getFragmentCalls).toBe(1); // fallback scope read
+  });
+});
+
+describe('TopologyStore — regression: zero-hop validation and budget-gap preservation', () => {
+  it('does not report FOUND for a zero-hop whose endpoint cannot be validated', () => {
+    const { store } = setup();
+    // Zero budget: the endpoint is never read, so ID equality must not yield FOUND.
+    const zero = store.route('ghost', 'ghost', { maxNodes: 0 });
+    expect(zero.status).toBe('BUDGET_EXHAUSTED');
+    expect(zero.nodeIds).toEqual([]);
+    expect(zero.stats.nodesRead).toBe(0);
+
+    // Nonexistent endpoint with a normal budget is an explicit error, not FOUND.
+    expect(() => store.route('ghost', 'ghost')).toThrow(/unknown node/);
+
+    // Region endpoint is still rejected for a zero-hop.
+    const region = setup();
+    region.store.saveNode(makeNode('r', pt(0, 64, 0), { location: { kind: 'region', center: pt(0, 64, 0), radius: 2 } }));
+    expect(() => region.store.route('r', 'r')).toThrow(/not an exact location/);
+    expect(region.store.route('r', 'r', { maxNodes: 0 }).status).toBe('BUDGET_EXHAUSTED');
+  });
+
+  it('preserves a confirmed missing gap when the history budget runs out mid-edge', () => {
+    const { history, store } = setup();
+    history.saveFragment(makeFragment('frag-1'));
+    history.addTraversal(makeEvidence('ev-1', 'frag-1', A, B));
+    history.saveFragment(makeFragment('frag-2'));
+    history.addTraversal(makeEvidence('ev-2', 'frag-2', A, B));
+    store.saveEdge(traversedEdge('e-ab', 'a', 'b', ['ev-1', 'ev-2']));
+
+    // First ref (ev-1) reads missing; the second is unread because the next read
+    // would exceed the budget.
+    history.forgetFragment('frag-1');
+
+    const r = store.route('a', 'b', { maxHistoryReads: 1 });
+    expect(r.status).toBe('BUDGET_EXHAUSTED');
+    expect(r.exhausted).toBe('maxHistoryReads');
+    expect(r.gaps).toEqual(['missing']);
+    expect(r.diagnostics).toHaveLength(1);
+    expect(r.diagnostics[0]!.kind).toBe('missing');
+    expect(r.diagnostics[0]!.evidenceIds).toEqual(['ev-1']);
+  });
+
+  it('preserves a confirmed mismatch gap when the history budget runs out mid-edge', () => {
+    const { history, store } = setup();
+    history.saveFragment(makeFragment('frag-1'));
+    history.addTraversal(makeEvidence('ev-1', 'frag-1', A, B, { observedAt: 1000 }));
+    history.saveFragment(makeFragment('frag-2'));
+    history.addTraversal(makeEvidence('ev-2', 'frag-2', A, B));
+    store.saveEdge(traversedEdge('e-ab', 'a', 'b', ['ev-1', 'ev-2']));
+
+    // Re-import ev-1 with different content → first ref mismatch; second unread.
+    history.forgetFragment('frag-1');
+    history.saveFragment(makeFragment('frag-1'));
+    history.addTraversal(makeEvidence('ev-1', 'frag-1', A, B, { observedAt: 2000 }));
+
+    const r = store.route('a', 'b', { maxHistoryReads: 2 });
+    expect(r.status).toBe('BUDGET_EXHAUSTED');
+    expect(r.exhausted).toBe('maxHistoryReads');
+    expect(r.gaps).toEqual(['mismatch']);
+    expect(r.diagnostics[0]!.kind).toBe('mismatch');
   });
 });

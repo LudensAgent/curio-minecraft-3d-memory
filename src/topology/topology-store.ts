@@ -637,7 +637,7 @@ export class TopologyStore {
    */
   route(fromNodeId: string, toNodeId: string, options: TopologyQueryOptions = {}): RouteQueryResult {
     const out = this.runSearch(fromNodeId, toNodeId, options);
-    const found = fromNodeId === toNodeId || out.parent.has(toNodeId);
+    const found = out.foundTarget;
     const status: RouteQueryStatus = found
       ? 'FOUND'
       : out.exhausted !== undefined
@@ -696,6 +696,7 @@ export class TopologyStore {
     const parent = new Map<string, ParentEntry>();
     const gaps = new Set<SearchGapKind>();
     const diagnostics: SearchDiagnostic[] = [];
+    let foundTarget = false;
 
     const readNode = (id: string): SpatialNode | null => {
       if (nodeCache.has(id)) return nodeCache.get(id)!;
@@ -727,6 +728,7 @@ export class TopologyStore {
     const finish = (): SearchOutput => ({
       from: fromNodeId,
       to: toNodeId,
+      foundTarget,
       order,
       parent,
       gaps: [...gaps],
@@ -754,6 +756,9 @@ export class TopologyStore {
       if (to.location.kind !== 'exact') throw new Error(`node "${toNodeId}" is not an exact location`);
       if (to.dim !== from.dim) throw new Error(`nodes span dimensions "${from.dim}" and "${to.dim}"`);
       if (toNodeId === fromNodeId) {
+        // A zero-hop route is only found once both endpoints validated (exist,
+        // exact, same dim). ID equality alone is never enough to report FOUND.
+        foundTarget = true;
         order.push(fromNodeId);
         return finish();
       }
@@ -764,20 +769,25 @@ export class TopologyStore {
     const visited = new Set<string>([fromNodeId]);
     order.push(fromNodeId);
 
-    while (cursor < queue.length && budget.exhausted === null) {
+    while (cursor < queue.length && budget.exhausted === null && !foundTarget) {
       const nodeId = queue[cursor]!;
       cursor += 1;
       budget.nodesExpanded += 1;
       const incident = this.nodeToEdgeIds.get(nodeId);
       if (incident === undefined) continue;
       for (const edgeId of incident) {
-        if (budget.exhausted !== null) break;
+        if (budget.exhausted !== null || foundTarget) break;
         if (!budget.tryEdge()) break;
         const edge = this.edgeMap.get(edgeId);
         if (edge === undefined) continue;
         if (edge.from !== nodeId) continue;
         const resolved = resolveSearchEdge(edge, this.worldId, options.mode, budget, readTraversal, readFragmentScope);
-        if (resolved.budgetExhausted) break;
+        if (resolved.budgetExhausted) {
+          // Preserve gaps confirmed before the budget ran out; the unread
+          // references are never marked missing, and the edge is not traversed.
+          if (resolved.gap !== undefined) recordGap(resolved.gap, edge, resolved.evidenceIds);
+          break;
+        }
         if (resolved.gap !== undefined) {
           recordGap(resolved.gap, edge, resolved.evidenceIds);
           continue;
@@ -792,6 +802,7 @@ export class TopologyStore {
         order.push(neighborId);
         queue.push(neighborId);
         parent.set(neighborId, { viaNode: nodeId, viaEdge: edge, witness: resolved.witness! });
+        if (toNodeId !== undefined && neighborId === toNodeId) foundTarget = true;
       }
     }
 
@@ -1247,6 +1258,8 @@ interface ParentEntry {
 interface SearchOutput {
   from: string;
   to?: string;
+  /** True only when endpoint validation succeeded and the target was confirmed reached. */
+  foundTarget: boolean;
   order: string[];
   parent: Map<string, ParentEntry>;
   gaps: SearchGapKind[];
@@ -1377,7 +1390,9 @@ interface EdgeSearchResult {
  * Resolve one out-edge for the search: `candidate` edges are a gap; `traversed`
  * edges must resolve every reference (reusing `classifyReference`) and then pass
  * the mode filter. A history read that cannot fit the budget stops the whole
- * search — the edge is never read as resolved *or* missing.
+ * search — the edge is never read as resolved, and unread references are never
+ * marked missing — but any gap confirmed *before* the budget ran out is still
+ * reported in `gap`/`evidenceIds` alongside `budgetExhausted: true`.
  */
 function resolveSearchEdge(
   edge: StoredEdge,
@@ -1394,16 +1409,27 @@ function resolveSearchEdge(
   const gapEvidenceIds: string[] = [];
   let anyMissing = false;
   let anyMismatch = false;
+  // A budget-exhausted stop still carries whatever gap was already confirmed,
+  // without treating the still-unread reference as missing.
+  const partial = (): EdgeSearchResult => {
+    const gap: SearchGapKind | undefined = anyMissing ? 'missing' : anyMismatch ? 'mismatch' : undefined;
+    return {
+      budgetExhausted: true,
+      usable: false,
+      gap,
+      evidenceIds: gap === undefined ? undefined : gapEvidenceIds,
+    };
+  };
   for (const ref of edge.refs) {
     const current = readTraversal(ref.evidenceId);
-    if (budget.exhausted !== null) return { budgetExhausted: true, usable: false };
+    if (budget.exhausted !== null) return partial();
     if (current === null) {
       anyMissing = true;
       gapEvidenceIds.push(ref.evidenceId);
       continue;
     }
     const scope = readFragmentScope(current.fragmentId);
-    if (budget.exhausted !== null) return { budgetExhausted: true, usable: false };
+    if (budget.exhausted !== null) return partial();
     const status = classifyReference(worldId, ref.snapshot, current, scope);
     if (status === 'missing') {
       anyMissing = true;
