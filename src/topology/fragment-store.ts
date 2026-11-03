@@ -36,6 +36,17 @@ export interface SaveResult {
   status: SaveStatus;
 }
 
+/**
+ * O(1) read-only scope of a fragment: identity and scope only, no geometry copy.
+ * Used by bounded topology queries to re-check a fragment's world/dim without
+ * copying `polyline` / `entrances` / `links`.
+ */
+export interface FragmentScope {
+  id: string;
+  worldId: string;
+  dim: string;
+}
+
 /** Capacity limits. These are implementation capacities, not game rules. */
 export interface FragmentStoreOptions {
   /** Maximum fragments retained. Defaults to 1000. */
@@ -184,6 +195,18 @@ export class FragmentStore {
   getFragment(id: string): PathFragment | null {
     const fragment = this.fragmentMap.get(id);
     return fragment === undefined ? null : cloneFragment(fragment);
+  }
+
+  /**
+   * O(1) read-only scope read: identity and world/dim only, no copy of
+   * `polyline`/`entrances`/`links`, and no refresh of time, uses or any other
+   * fact. Returns `null` when the fragment is absent.
+   */
+  getFragmentScope(id: string): FragmentScope | null {
+    const fragment = this.fragmentMap.get(id);
+    return fragment === undefined
+      ? null
+      : { id: fragment.id, worldId: fragment.worldId, dim: fragment.dim };
   }
 
   /**

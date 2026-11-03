@@ -12,6 +12,7 @@ export type {
   FragmentChanges,
   FragmentPage,
   FragmentQuery,
+  FragmentScope,
   FragmentStoreOptions,
   SaveResult,
   SaveStatus,
@@ -20,6 +21,8 @@ export type {
 } from './fragment-store.js';
 export { TopologyStore } from './topology-store.js';
 export type {
+  AdjacencyOptions,
+  AdjacencyResult,
   EdgeBasis,
   EdgeChanges,
   EdgePage,
@@ -29,8 +32,19 @@ export type {
   NodeChanges,
   NodePage,
   NodeQuery,
+  QueryBudget,
+  QueryBudgetKey,
+  QueryStats,
+  ReachabilityResult,
   ReferenceStatus,
+  RouteQueryResult,
+  RouteQueryStatus,
+  RouteSegment,
+  SearchDiagnostic,
+  SearchDisposition,
+  SearchGapKind,
   TopologyEdge,
   TopologyHistorySource,
+  TopologyQueryOptions,
   TopologyStoreOptions,
 } from './topology-store.js';

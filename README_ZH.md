@@ -19,6 +19,7 @@
 - **受控 walk 路线执行**（`execution/`）：`WalkRouteExecutor` 把已验证路线连接到可注入的单步 `MoveExecutor` 与实测身体反馈。它只执行调用者提供的点列（同高度、沿 X/Z 单轴一格），无有效 OPEN 证据不启动路段，`ARRIVED` 必须以实测 `exact` 位置为依据，并会在路段证据变化时撤销执行中的控制。
 - **历史路径存储**（`topology/`，阶段 4A）：`FragmentStore` 将历史路径几何（`PathFragment`）与已确认经过证据（`TraversalEvidence`）与当前世界状态严格分离 —— 支持幂等写入、明确更新、删除、分页读取、容量上限与快照隔离。
 - **拓扑事实存储**（`topology/`，阶段 4B）：`TopologyStore` 记录显式空间节点与有向连接（`candidate` 候选 vs 有依据的 `traversed`），保留每条边的证据引用，并报告这些引用当前能否解析 —— 但从不回答当前是否可通行。
+- **有界历史图查询**（`topology/`，阶段 4C）：`TopologyStore` 新增有界、只读的 `adjacency` / `reachable` / `route` 查询 —— 有限工作预算、模式筛选、轻量历史读取，以及精确的 `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` 结果 —— 仍不声称当前可通行、不生成可执行路线。
 
 以上均以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与可运行的 `examples/walk-route-execution.ts`）。**尚未**接入真实 mineflayer/Curio 身体、寻路或 SQLite 持久化。
 
@@ -96,6 +97,49 @@ topology.saveEdge({ id: 'e-ab2', from: 'a', to: 'b', type: 'HORIZONTAL',
 
 仅支持同世界、同维度、精确端点、非 `PORTAL` 的连接；区域节点可保存与查询，但不能作为边端点。见 [`docs/phase-4b-topology-facts-acceptance.md`](docs/phase-4b-topology-facts-acceptance.md)。
 
+## 有界历史图查询
+
+`TopologyStore`（阶段 4C）对**已记录的历史图**提供三个有界、只读、同步查询 —— 从不回答当前
+世界是否可通行，也从不给出可执行的走法：
+
+- **`adjacency(nodeId, options?)`** —— 从 incident 索引按插入顺序读取一个节点的入边/出边。返回
+  的是普通 `TopologyEdge` 快照，此处**不做**引用解析。
+- **`reachable(fromNodeId, options?)`** —— 只沿证据完整解析且通过模式筛选的 `traversed` 出边，
+  返回已确认可达的节点（含深度为零的起点）。
+- **`route(fromNodeId, toNodeId, options?)`** —— 一条最少边数的有向历史连接序列，附带每段见证
+  证据；否则给出精确的未找到原因。
+
+```ts
+import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
+
+const history = new FragmentStore('world');
+const topology = new TopologyStore(history);
+// … 保存节点 a/b/c，保存经过边 e-ab（a→b）与 e-bc（b→c）…
+
+const r = topology.route('a', 'c', { mode: 'walk' });
+if (r.status === 'FOUND') {
+  r.nodeIds;   // ['a', 'b', 'c']
+  r.edgeIds;   // ['e-ab', 'e-bc']
+  r.segments;  // [{ edgeId: 'e-ab', evidenceId: 'ev-ab', evidence: … }, …]
+}
+```
+
+行为：
+
+- **端点**：可达/路线只接受已存在、`exact`、同世界同维度的节点；缺失节点、区域端点、跨维度
+  请求明确失败（不静默替换）。
+- **参与搜索的边**：只有 `basis: 'traversed'` 且每条引用都 `resolved` 的边参与；`candidate` /
+  `missing` / `mismatch` 边被排除并作为缺口报告。方向严格 `from → to`。
+- **模式**：可选 `mode` 筛选要求明确的证据 mode 匹配；mode 未知产生 `mode_unknown` 缺口，已知
+  但不匹配为正常筛除。不指定时保留所采用证据的真实 mode（未知保持未知）。
+- **预算**：`maxNodes` / `maxEdges` / `maxHistoryReads` / `maxDiagnostics` 有限、受 Store 上限
+  钳制、零按字面生效；预算耗尽报告为 `BUDGET_EXHAUSTED`，不与 `NO_RECORDED_ROUTE` 混淆。
+- **结果**：`FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` 语义
+  精确；诊断有界，截断不会丢失缺口分类。
+
+这些查询只返回历史事实，不产生当前 `OPEN`、不声称身体已到达、不生成可执行点列。见
+[`docs/phase-4c-historical-topology-query-acceptance.md`](docs/phase-4c-historical-topology-query-acceptance.md)。
+
 ## 目录结构
 
 ```
@@ -115,9 +159,10 @@ src/
 └── compat/             # 旧 WorldMemory 入口的兼容层（§8、§9.1）
 
 examples/
-├── walk-route-execution.ts   # 可运行的 Fake 执行闭环示例
-├── fragment-store-history.ts # 可运行的 Fake 历史事实与当前阻塞对照示例
-└── topology-facts.ts         # 可运行的 Fake 显式拓扑事实与当前阻塞对照示例
+├── walk-route-execution.ts         # 可运行的 Fake 执行闭环示例
+├── fragment-store-history.ts       # 可运行的 Fake 历史事实与当前阻塞对照示例
+├── topology-facts.ts               # 可运行的 Fake 显式拓扑事实与当前阻塞对照示例
+└── historical-topology-query.ts    # 可运行的 Fake 有界历史图查询示例
 ```
 
 ## 开发
@@ -130,9 +175,10 @@ npm run build       # 产出 dist/（NodeNext ESM + 类型声明）
 npx tsx examples/walk-route-execution.ts    # 运行 Fake 执行示例
 npx tsx examples/fragment-store-history.ts  # 运行 Fake 历史事实示例
 npx tsx examples/topology-facts.ts          # 运行 Fake 显式拓扑示例
+npx tsx examples/historical-topology-query.ts # 运行 Fake 有界历史图查询示例
 ```
 
-> `examples/fragment-store-history.ts` 与 `examples/topology-facts.ts` 以公开包名（`curio-minecraft-3d-memory`）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
+> `examples/fragment-store-history.ts`、`examples/topology-facts.ts` 与 `examples/historical-topology-query.ts` 以公开包名（`curio-minecraft-3d-memory`）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
 
 > 持久化驱动（`better-sqlite3`）按设计 §9.2 在阶段 5 接入，本阶段 `storage/` 仅含接口与 schema 契约，未引入原生依赖。
 

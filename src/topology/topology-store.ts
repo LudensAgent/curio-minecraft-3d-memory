@@ -30,9 +30,9 @@
 
 import type { ConnectionType, LandmarkTag, NodeKind, NodeSource, SpatialNode } from './graph.js';
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
-import { cloneTraversalEvidence, traversalEvidenceEqual } from './path-fragment.js';
-import type { SaveResult } from './fragment-store.js';
-import type { Vec3Like } from '../types.js';
+import { assertValidMode, cloneTraversalEvidence, traversalEvidenceEqual } from './path-fragment.js';
+import type { FragmentScope, SaveResult } from './fragment-store.js';
+import type { MoveMode, Vec3Like } from '../types.js';
 
 /** How a topology edge is justified. */
 export type EdgeBasis = 'candidate' | 'traversed';
@@ -86,6 +86,12 @@ export interface TopologyHistorySource {
   readonly worldId: string;
   getFragment(id: string): PathFragment | null;
   getTraversal(id: string): TraversalEvidence | null;
+  /**
+   * Optional O(1) scope read (id/worldId/dim only, no geometry copy). When
+   * absent, the bounded queries fall back to `getFragment(id)` and read only the
+   * scope fields.
+   */
+  getFragmentScope?(id: string): FragmentScope | null;
 }
 
 /** Capacity limits. These are implementation capacities, not game rules. */
@@ -100,6 +106,14 @@ export interface TopologyStoreOptions {
   maxEdgeEvidenceRefs?: number;
   /** Maximum items returned by one query page. Defaults to 100. */
   maxQueryBatch?: number;
+  /** Ceiling for the per-query `maxNodes` budget. Defaults to 1000. */
+  maxQueryNodes?: number;
+  /** Ceiling for the per-query `maxEdges` budget. Defaults to 10000. */
+  maxQueryEdges?: number;
+  /** Ceiling for the per-query `maxHistoryReads` budget. Defaults to 1000. */
+  maxQueryHistoryReads?: number;
+  /** Ceiling for the per-query `maxDiagnostics` budget. Defaults to 100. */
+  maxQueryDiagnostics?: number;
 }
 
 /** Paginated read filter over nodes. All fields optional and combined by AND. */
@@ -134,6 +148,135 @@ export interface EdgePage {
   items: EdgeView[];
   total: number;
   nextAfter?: string;
+}
+
+// --- bounded historical graph queries (phase 4C) ---
+
+/** Finite per-query work budgets. Zero is honored literally, never defaulted. */
+export interface QueryBudget {
+  /** Distinct node metadata reads (cache misses), including start and target. */
+  maxNodes?: number;
+  /** Incident edges inspected, including ones screened out by direction/condition. */
+  maxEdges?: number;
+  /** Actual history read calls (traversal + fragment scope). */
+  maxHistoryReads?: number;
+  /** Detailed diagnostics retained (truncation does not stop the search). */
+  maxDiagnostics?: number;
+}
+
+/** Options shared by the bounded reachability and route queries. */
+export interface TopologyQueryOptions extends QueryBudget {
+  /** Optional movement-mode filter; absent means "do not filter by mode". */
+  mode?: MoveMode;
+}
+
+/** Options for a bounded adjacency read (edge budget only). */
+export interface AdjacencyOptions {
+  maxEdges?: number;
+}
+
+/** Which budget stopped a bounded search before it finished. */
+export type QueryBudgetKey = 'maxNodes' | 'maxEdges' | 'maxHistoryReads';
+
+/** The kinds of evidence gap a bounded search can observe on its frontier. */
+export type SearchGapKind = 'candidate' | 'missing' | 'mismatch' | 'mode_unknown';
+
+/** A bounded description of one evidence gap encountered during a search. */
+export interface SearchDiagnostic {
+  kind: SearchGapKind;
+  edgeId: string;
+  from: string;
+  to: string;
+  /** Relevant evidence ids for `missing`/`mismatch`/`mode_unknown` gaps. */
+  evidenceIds?: string[];
+}
+
+/** Work actually performed by one bounded query, with each counter defined. */
+export interface QueryStats {
+  /** Distinct node metadata reads performed (cache misses). */
+  nodesRead: number;
+  /** Nodes dequeued/expanded during BFS. */
+  nodesExpanded: number;
+  /** Incident edges inspected, including ones filtered out. */
+  edgesChecked: number;
+  /** History read calls performed (traversal + fragment scope). */
+  historyReads: number;
+  /** Diagnostics entries retained. */
+  diagnostics: number;
+  /** True when gaps were dropped because diagnostics exceeded `maxDiagnostics`. */
+  diagnosticsTruncated: boolean;
+}
+
+/** Why a bounded search stopped, independent of route-finding. */
+export type SearchDisposition = 'complete' | 'evidence_gaps' | 'budget_exhausted';
+
+/** Result of a bounded adjacency read. Edges are snapshots, not reference-resolved. */
+export interface AdjacencyResult {
+  nodeId: string;
+  /** Out-edges (`from === nodeId`), including self-loops (a self-loop is not duplicated into `inEdges`). */
+  outEdges: TopologyEdge[];
+  /** In-edges (`to === nodeId` and `from !== nodeId`). */
+  inEdges: TopologyEdge[];
+  /** Incident edges inspected (counted against `maxEdges`). */
+  edgesChecked: number;
+  /** True when the full incident set was scanned. */
+  complete: boolean;
+  /** Which budget stopped the scan, when `complete` is false. */
+  exhausted?: QueryBudgetKey;
+}
+
+/** Result of a bounded directed reachability query. */
+export interface ReachabilityResult {
+  from: string;
+  /** The requested mode filter (validated), or `undefined` when not specified. */
+  mode?: MoveMode;
+  /** Confirmed reachable node ids in BFS order, including `from` at depth 0. */
+  nodes: string[];
+  disposition: SearchDisposition;
+  /** Deduplicated gap kinds encountered, preserved even when diagnostics are truncated. */
+  gaps: SearchGapKind[];
+  stats: QueryStats;
+  diagnostics: SearchDiagnostic[];
+  exhausted?: QueryBudgetKey;
+}
+
+/** Status of a bounded single historical route query. */
+export type RouteQueryStatus =
+  | 'FOUND'
+  | 'NO_RECORDED_ROUTE'
+  | 'INSUFFICIENT_EVIDENCE'
+  | 'BUDGET_EXHAUSTED';
+
+/** One segment of a found route: an edge plus the witness evidence actually used. */
+export interface RouteSegment {
+  edgeId: string;
+  from: string;
+  to: string;
+  type: ConnectionType;
+  /** The witness evidence actually used (smallest evidenceId among matching resolved refs). */
+  evidenceId: string;
+  /** The witness evidence as read now (authoritative clone), preserving its original meaning. */
+  evidence: TraversalEvidence;
+}
+
+/** Result of a bounded single historical route query. */
+export interface RouteQueryResult {
+  status: RouteQueryStatus;
+  from: string;
+  to: string;
+  /** The requested mode filter (validated), or `undefined` when not specified. */
+  mode?: MoveMode;
+  /** Ordered node ids, populated only when `status === 'FOUND'`. */
+  nodeIds: string[];
+  /** Ordered edge ids, populated only when `status === 'FOUND'`. */
+  edgeIds: string[];
+  /** Per-segment witness details, populated only when `status === 'FOUND'`. */
+  segments: RouteSegment[];
+  /** Deduplicated gap kinds encountered, preserved even when diagnostics are truncated. */
+  gaps: SearchGapKind[];
+  stats: QueryStats;
+  diagnostics: SearchDiagnostic[];
+  exhausted?: QueryBudgetKey;
 }
 
 /**
@@ -185,6 +328,10 @@ interface ResolvedLimits {
   maxEdges: number;
   maxEdgeEvidenceRefs: number;
   maxQueryBatch: number;
+  maxQueryNodes: number;
+  maxQueryEdges: number;
+  maxQueryHistoryReads: number;
+  maxQueryDiagnostics: number;
 }
 
 const DEFAULT_LIMITS: ResolvedLimits = {
@@ -193,6 +340,10 @@ const DEFAULT_LIMITS: ResolvedLimits = {
   maxEdges: 20000,
   maxEdgeEvidenceRefs: 8,
   maxQueryBatch: 100,
+  maxQueryNodes: 1000,
+  maxQueryEdges: 10000,
+  maxQueryHistoryReads: 1000,
+  maxQueryDiagnostics: 100,
 };
 
 const NODE_KINDS: readonly NodeKind[] = ['entrance', 'place', 'branch', 'turn', 'vertical_junction'];
@@ -413,6 +564,240 @@ export class TopologyStore {
     };
   }
 
+  // --- bounded historical graph queries (phase 4C) ---
+
+  /**
+   * Bounded, read-only adjacency read: the recorded in-edges and out-edges of a
+   * node, from the `nodeToEdgeIds` index in insertion order. The returned edges
+   * are plain `TopologyEdge` snapshots — they are *not* reference-resolved here,
+   * so they must not be read as usable routes. A self-loop is reported once, in
+   * `outEdges`. Missing nodes are reported as an error, never as an empty set.
+   */
+  adjacency(nodeId: string, options: AdjacencyOptions = {}): AdjacencyResult {
+    const node = this.nodeMap.get(nodeId);
+    if (node === undefined) {
+      throw new Error(`unknown node "${nodeId}"`);
+    }
+    const maxEdges = resolveQueryBudgetField('maxEdges', options.maxEdges, this.limits.maxQueryEdges);
+    const outEdges: TopologyEdge[] = [];
+    const inEdges: TopologyEdge[] = [];
+    const incident = this.nodeToEdgeIds.get(nodeId);
+    let edgesChecked = 0;
+    let complete = true;
+    let exhausted: QueryBudgetKey | undefined;
+    if (incident !== undefined) {
+      for (const edgeId of incident) {
+        if (edgesChecked >= maxEdges) {
+          complete = false;
+          exhausted = 'maxEdges';
+          break;
+        }
+        edgesChecked += 1;
+        const stored = this.edgeMap.get(edgeId);
+        if (stored === undefined) continue;
+        if (stored.from === nodeId) outEdges.push(toTopologyEdgeSnapshot(stored));
+        else inEdges.push(toTopologyEdgeSnapshot(stored));
+      }
+    }
+    return { nodeId, outEdges, inEdges, edgesChecked, complete, exhausted };
+  }
+
+  /**
+   * Bounded, read-only directed reachability query. Returns the confirmed
+   * reachable node ids (including `from` at depth 0) by walking only
+   * `basis === 'traversed'` out-edges whose evidence fully resolves and whose
+   * mode passes the filter. Never claims current traversability.
+   */
+  reachable(fromNodeId: string, options: TopologyQueryOptions = {}): ReachabilityResult {
+    const out = this.runSearch(fromNodeId, undefined, options);
+    const disposition: SearchDisposition =
+      out.exhausted !== undefined
+        ? 'budget_exhausted'
+        : out.gaps.length > 0
+          ? 'evidence_gaps'
+          : 'complete';
+    return {
+      from: out.from,
+      mode: options.mode,
+      nodes: out.order,
+      disposition,
+      gaps: out.gaps,
+      stats: out.stats,
+      diagnostics: out.diagnostics,
+      exhausted: out.exhausted,
+    };
+  }
+
+  /**
+   * Bounded, read-only single historical route query. Returns one fewest-edges
+   * directed historical connection sequence from `fromNodeId` to `toNodeId`, or
+   * a precise reason it could not. This is a recorded-topology query over node
+   * ids — not current routing, not `SpatialMemoryStore.route`, and never an
+   * executable point list.
+   */
+  route(fromNodeId: string, toNodeId: string, options: TopologyQueryOptions = {}): RouteQueryResult {
+    const out = this.runSearch(fromNodeId, toNodeId, options);
+    const found = fromNodeId === toNodeId || out.parent.has(toNodeId);
+    const status: RouteQueryStatus = found
+      ? 'FOUND'
+      : out.exhausted !== undefined
+        ? 'BUDGET_EXHAUSTED'
+        : out.gaps.length > 0
+          ? 'INSUFFICIENT_EVIDENCE'
+          : 'NO_RECORDED_ROUTE';
+    const nodeIds: string[] = [];
+    const edgeIds: string[] = [];
+    const segments: RouteSegment[] = [];
+    if (found) {
+      let cursor = toNodeId;
+      while (cursor !== fromNodeId) {
+        const entry = out.parent.get(cursor)!;
+        nodeIds.unshift(cursor);
+        edgeIds.unshift(entry.viaEdge.id);
+        segments.unshift({
+          edgeId: entry.viaEdge.id,
+          from: entry.viaEdge.from,
+          to: entry.viaEdge.to,
+          type: entry.viaEdge.type,
+          evidenceId: entry.witness.evidenceId,
+          evidence: cloneTraversalEvidence(entry.witness.evidence),
+        });
+        cursor = entry.viaNode;
+      }
+      nodeIds.unshift(fromNodeId);
+    }
+    return {
+      status,
+      from: fromNodeId,
+      to: toNodeId,
+      mode: options.mode,
+      nodeIds,
+      edgeIds,
+      segments,
+      gaps: out.gaps,
+      stats: out.stats,
+      diagnostics: out.diagnostics,
+      exhausted: out.exhausted,
+    };
+  }
+
+  private runSearch(
+    fromNodeId: string,
+    toNodeId: string | undefined,
+    options: TopologyQueryOptions,
+  ): SearchOutput {
+    assertValidMode(options.mode);
+    const budget = new SearchBudget(resolveQueryBudget(options, this.limits));
+
+    const nodeCache = new Map<string, SpatialNode | null>();
+    const traversalCache = new Map<string, TraversalEvidence | null>();
+    const scopeCache = new Map<string, { worldId: string; dim: string } | null>();
+    const order: string[] = [];
+    const parent = new Map<string, ParentEntry>();
+    const gaps = new Set<SearchGapKind>();
+    const diagnostics: SearchDiagnostic[] = [];
+
+    const readNode = (id: string): SpatialNode | null => {
+      if (nodeCache.has(id)) return nodeCache.get(id)!;
+      if (!budget.tryNode()) return null;
+      const node = this.nodeMap.get(id) ?? null;
+      nodeCache.set(id, node);
+      return node;
+    };
+    const readTraversal = (id: string): TraversalEvidence | null => {
+      if (traversalCache.has(id)) return traversalCache.get(id)!;
+      if (!budget.tryHistoryRead()) return null;
+      const value = this.history.getTraversal(id);
+      traversalCache.set(id, value);
+      return value;
+    };
+    const readFragmentScope = (id: string): { worldId: string; dim: string } | null => {
+      if (scopeCache.has(id)) return scopeCache.get(id)!;
+      if (!budget.tryHistoryRead()) return null;
+      const scope = this.readFragmentScope(id);
+      scopeCache.set(id, scope);
+      return scope;
+    };
+    const recordGap = (kind: SearchGapKind, edge: StoredEdge, evidenceIds?: string[]): void => {
+      gaps.add(kind);
+      if (budget.addDiagnostic()) {
+        diagnostics.push({ kind, edgeId: edge.id, from: edge.from, to: edge.to, evidenceIds });
+      }
+    };
+    const finish = (): SearchOutput => ({
+      from: fromNodeId,
+      to: toNodeId,
+      order,
+      parent,
+      gaps: [...gaps],
+      diagnostics,
+      exhausted: budget.exhausted ?? undefined,
+      stats: {
+        nodesRead: budget.nodesRead,
+        nodesExpanded: budget.nodesExpanded,
+        edgesChecked: budget.edgesChecked,
+        historyReads: budget.historyReads,
+        diagnostics: budget.diagnostics,
+        diagnosticsTruncated: budget.diagnosticsTruncated,
+      },
+    });
+
+    const from = readNode(fromNodeId);
+    if (budget.exhausted !== null) return finish();
+    if (from === null) throw new Error(`unknown node "${fromNodeId}"`);
+    if (from.location.kind !== 'exact') throw new Error(`node "${fromNodeId}" is not an exact location`);
+
+    if (toNodeId !== undefined) {
+      const to = readNode(toNodeId);
+      if (budget.exhausted !== null) return finish();
+      if (to === null) throw new Error(`unknown node "${toNodeId}"`);
+      if (to.location.kind !== 'exact') throw new Error(`node "${toNodeId}" is not an exact location`);
+      if (to.dim !== from.dim) throw new Error(`nodes span dimensions "${from.dim}" and "${to.dim}"`);
+      if (toNodeId === fromNodeId) {
+        order.push(fromNodeId);
+        return finish();
+      }
+    }
+
+    const queue: string[] = [fromNodeId];
+    let cursor = 0;
+    const visited = new Set<string>([fromNodeId]);
+    order.push(fromNodeId);
+
+    while (cursor < queue.length && budget.exhausted === null) {
+      const nodeId = queue[cursor]!;
+      cursor += 1;
+      budget.nodesExpanded += 1;
+      const incident = this.nodeToEdgeIds.get(nodeId);
+      if (incident === undefined) continue;
+      for (const edgeId of incident) {
+        if (budget.exhausted !== null) break;
+        if (!budget.tryEdge()) break;
+        const edge = this.edgeMap.get(edgeId);
+        if (edge === undefined) continue;
+        if (edge.from !== nodeId) continue;
+        const resolved = resolveSearchEdge(edge, this.worldId, options.mode, budget, readTraversal, readFragmentScope);
+        if (resolved.budgetExhausted) break;
+        if (resolved.gap !== undefined) {
+          recordGap(resolved.gap, edge, resolved.evidenceIds);
+          continue;
+        }
+        if (!resolved.usable) continue; // known-mode mismatch is a normal filter, not a gap
+        const neighborId = edge.to;
+        if (visited.has(neighborId)) continue;
+        const neighbor = readNode(neighborId);
+        if (budget.exhausted !== null) break;
+        if (neighbor === null) continue; // defensive; edges guarantee endpoints exist
+        visited.add(neighborId);
+        order.push(neighborId);
+        queue.push(neighborId);
+        parent.set(neighborId, { viaNode: nodeId, viaEdge: edge, witness: resolved.witness! });
+      }
+    }
+
+    return finish();
+  }
+
   // --- internals ---
 
   private countNodes(source: NodeSource): number {
@@ -593,41 +978,27 @@ export class TopologyStore {
 
   private resolveRef(ref: StoredEvidenceRef): EdgeReference {
     const current = this.history.getTraversal(ref.evidenceId);
-    if (current === null) {
-      return {
-        evidenceId: ref.evidenceId,
-        status: 'missing',
-        snapshot: cloneTraversalEvidence(ref.snapshot),
-        current: null,
-      };
-    }
     // Re-check the owning fragment, not just the traversal record: a history source
     // that does not cascade (unlike FragmentStore) may still serve a traversal whose
     // fragment is gone or whose scope has drifted. Either case must not read as resolved.
-    const fragment = this.history.getFragment(current.fragmentId);
-    if (fragment === null) {
-      return {
-        evidenceId: ref.evidenceId,
-        status: 'missing',
-        snapshot: cloneTraversalEvidence(ref.snapshot),
-        current: cloneTraversalEvidence(current),
-      };
-    }
-    if (fragment.worldId !== this.worldId || fragment.dim !== current.dim) {
-      return {
-        evidenceId: ref.evidenceId,
-        status: 'mismatch',
-        snapshot: cloneTraversalEvidence(ref.snapshot),
-        current: cloneTraversalEvidence(current),
-      };
-    }
-    const matches = traversalEvidenceEqual(current, ref.snapshot);
+    const scope = current === null ? null : this.readFragmentScope(current.fragmentId);
+    const status = classifyReference(this.worldId, ref.snapshot, current, scope);
     return {
       evidenceId: ref.evidenceId,
-      status: matches ? 'resolved' : 'mismatch',
+      status,
       snapshot: cloneTraversalEvidence(ref.snapshot),
-      current: cloneTraversalEvidence(current),
+      current: current === null ? null : cloneTraversalEvidence(current),
     };
+  }
+
+  /** Read a fragment's scope via the light entry when available, else `getFragment` (scope only). */
+  private readFragmentScope(fragmentId: string): { worldId: string; dim: string } | null {
+    if (this.history.getFragmentScope !== undefined) {
+      const scope = this.history.getFragmentScope(fragmentId);
+      return scope === null ? null : { worldId: scope.worldId, dim: scope.dim };
+    }
+    const fragment = this.history.getFragment(fragmentId);
+    return fragment === null ? null : { worldId: fragment.worldId, dim: fragment.dim };
   }
 
   private indexEdge(stored: StoredEdge): void {
@@ -822,6 +1193,10 @@ function resolveLimits(options: TopologyStoreOptions): ResolvedLimits {
     'maxEdges',
     'maxEdgeEvidenceRefs',
     'maxQueryBatch',
+    'maxQueryNodes',
+    'maxQueryEdges',
+    'maxQueryHistoryReads',
+    'maxQueryDiagnostics',
   ];
   for (const key of overrides) {
     const value = options[key];
@@ -859,4 +1234,215 @@ function firstIndexAfter(sortedIds: string[], after: string): number {
   let i = 0;
   while (i < sortedIds.length && sortedIds[i]! <= after) i += 1;
   return i;
+}
+
+// --- bounded query internals (phase 4C) ---
+
+interface ParentEntry {
+  viaNode: string;
+  viaEdge: StoredEdge;
+  witness: { evidenceId: string; evidence: TraversalEvidence };
+}
+
+interface SearchOutput {
+  from: string;
+  to?: string;
+  order: string[];
+  parent: Map<string, ParentEntry>;
+  gaps: SearchGapKind[];
+  diagnostics: SearchDiagnostic[];
+  exhausted?: QueryBudgetKey;
+  stats: QueryStats;
+}
+
+/** Resolved per-query budgets: defaults are the ceilings, zero is honored, values are clamped. */
+interface ResolvedQueryBudget {
+  maxNodes: number;
+  maxEdges: number;
+  maxHistoryReads: number;
+  maxDiagnostics: number;
+}
+
+/** Counts work actually performed during one bounded query, honoring each ceiling. */
+class SearchBudget {
+  nodesRead = 0;
+  nodesExpanded = 0;
+  edgesChecked = 0;
+  historyReads = 0;
+  diagnostics = 0;
+  diagnosticsTruncated = false;
+  exhausted: QueryBudgetKey | null = null;
+
+  constructor(private readonly limits: ResolvedQueryBudget) {}
+
+  tryNode(): boolean {
+    if (this.exhausted !== null) return false;
+    if (this.nodesRead >= this.limits.maxNodes) {
+      this.exhausted = 'maxNodes';
+      return false;
+    }
+    this.nodesRead += 1;
+    return true;
+  }
+
+  tryEdge(): boolean {
+    if (this.exhausted !== null) return false;
+    if (this.edgesChecked >= this.limits.maxEdges) {
+      this.exhausted = 'maxEdges';
+      return false;
+    }
+    this.edgesChecked += 1;
+    return true;
+  }
+
+  tryHistoryRead(): boolean {
+    if (this.exhausted !== null) return false;
+    if (this.historyReads >= this.limits.maxHistoryReads) {
+      this.exhausted = 'maxHistoryReads';
+      return false;
+    }
+    this.historyReads += 1;
+    return true;
+  }
+
+  addDiagnostic(): boolean {
+    if (this.diagnostics >= this.limits.maxDiagnostics) {
+      this.diagnosticsTruncated = true;
+      return false;
+    }
+    this.diagnostics += 1;
+    return true;
+  }
+}
+
+function resolveQueryBudget(requested: QueryBudget | undefined, limits: ResolvedLimits): ResolvedQueryBudget {
+  return {
+    maxNodes: resolveQueryBudgetField('maxNodes', requested?.maxNodes, limits.maxQueryNodes),
+    maxEdges: resolveQueryBudgetField('maxEdges', requested?.maxEdges, limits.maxQueryEdges),
+    maxHistoryReads: resolveQueryBudgetField('maxHistoryReads', requested?.maxHistoryReads, limits.maxQueryHistoryReads),
+    maxDiagnostics: resolveQueryBudgetField('maxDiagnostics', requested?.maxDiagnostics, limits.maxQueryDiagnostics),
+  };
+}
+
+function resolveQueryBudgetField(key: string, value: number | undefined, ceiling: number): number {
+  const v = value === undefined ? ceiling : value;
+  if (!Number.isSafeInteger(v) || v < 0) {
+    throw new Error(`${key} must be a non-negative safe integer: ${String(v)}`);
+  }
+  return Math.min(v, ceiling);
+}
+
+/**
+ * Shared reference classification, reused by both the 4B read projection
+ * (`resolveRef`) and the 4C search (`resolveSearchEdge`), so "resolved" means
+ * the same thing everywhere. `fragmentScope` is the light scope read (or `null`
+ * when the owning fragment is gone).
+ */
+function classifyReference(
+  worldId: string,
+  snapshot: TraversalEvidence,
+  current: TraversalEvidence | null,
+  fragmentScope: { worldId: string; dim: string } | null,
+): ReferenceStatus {
+  if (current === null) return 'missing';
+  if (fragmentScope === null) return 'missing';
+  if (fragmentScope.worldId !== worldId || fragmentScope.dim !== current.dim) return 'mismatch';
+  return traversalEvidenceEqual(current, snapshot) ? 'resolved' : 'mismatch';
+}
+
+/** Project a stored edge to its public `TopologyEdge` snapshot without resolving references. */
+function toTopologyEdgeSnapshot(stored: StoredEdge): TopologyEdge {
+  const edge: TopologyEdge = {
+    id: stored.id,
+    from: stored.from,
+    to: stored.to,
+    type: stored.type,
+    basis: stored.basis,
+    evidenceIds: stored.refs.map((ref) => ref.evidenceId),
+  };
+  if (stored.fragmentId !== undefined) edge.fragmentId = stored.fragmentId;
+  if (stored.source !== undefined) edge.source = stored.source;
+  return edge;
+}
+
+interface EdgeSearchResult {
+  budgetExhausted: boolean;
+  usable: boolean;
+  witness?: { evidenceId: string; evidence: TraversalEvidence };
+  gap?: SearchGapKind;
+  evidenceIds?: string[];
+}
+
+/**
+ * Resolve one out-edge for the search: `candidate` edges are a gap; `traversed`
+ * edges must resolve every reference (reusing `classifyReference`) and then pass
+ * the mode filter. A history read that cannot fit the budget stops the whole
+ * search — the edge is never read as resolved *or* missing.
+ */
+function resolveSearchEdge(
+  edge: StoredEdge,
+  worldId: string,
+  mode: MoveMode | undefined,
+  budget: SearchBudget,
+  readTraversal: (id: string) => TraversalEvidence | null,
+  readFragmentScope: (id: string) => { worldId: string; dim: string } | null,
+): EdgeSearchResult {
+  if (edge.basis === 'candidate') {
+    return { budgetExhausted: false, usable: false, gap: 'candidate' };
+  }
+  const resolved: { evidenceId: string; evidence: TraversalEvidence }[] = [];
+  const gapEvidenceIds: string[] = [];
+  let anyMissing = false;
+  let anyMismatch = false;
+  for (const ref of edge.refs) {
+    const current = readTraversal(ref.evidenceId);
+    if (budget.exhausted !== null) return { budgetExhausted: true, usable: false };
+    if (current === null) {
+      anyMissing = true;
+      gapEvidenceIds.push(ref.evidenceId);
+      continue;
+    }
+    const scope = readFragmentScope(current.fragmentId);
+    if (budget.exhausted !== null) return { budgetExhausted: true, usable: false };
+    const status = classifyReference(worldId, ref.snapshot, current, scope);
+    if (status === 'missing') {
+      anyMissing = true;
+      gapEvidenceIds.push(ref.evidenceId);
+    } else if (status === 'mismatch') {
+      anyMismatch = true;
+      gapEvidenceIds.push(ref.evidenceId);
+    } else {
+      resolved.push({ evidenceId: ref.evidenceId, evidence: current });
+    }
+  }
+  if (anyMissing) return { budgetExhausted: false, usable: false, gap: 'missing', evidenceIds: gapEvidenceIds };
+  if (anyMismatch) return { budgetExhausted: false, usable: false, gap: 'mismatch', evidenceIds: gapEvidenceIds };
+  if (mode === undefined) {
+    return { budgetExhausted: false, usable: true, witness: pickWitness(resolved) };
+  }
+  const matching = resolved.filter((r) => r.evidence.mode === mode);
+  if (matching.length > 0) {
+    return { budgetExhausted: false, usable: true, witness: pickWitness(matching) };
+  }
+  const hasUnknownMode = resolved.some((r) => r.evidence.mode === undefined);
+  if (hasUnknownMode) {
+    return {
+      budgetExhausted: false,
+      usable: false,
+      gap: 'mode_unknown',
+      evidenceIds: resolved.map((r) => r.evidenceId),
+    };
+  }
+  return { budgetExhausted: false, usable: false };
+}
+
+/** Pick the witness with the smallest evidenceId (lexicographic) for a stable, deterministic choice. */
+function pickWitness(
+  candidates: { evidenceId: string; evidence: TraversalEvidence }[],
+): { evidenceId: string; evidence: TraversalEvidence } {
+  let best = candidates[0]!;
+  for (let i = 1; i < candidates.length; i++) {
+    if (candidates[i]!.evidenceId < best.evidenceId) best = candidates[i]!;
+  }
+  return { evidenceId: best.evidenceId, evidence: best.evidence };
 }

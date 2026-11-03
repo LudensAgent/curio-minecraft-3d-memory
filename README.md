@@ -19,6 +19,7 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 - **Controlled walk-route execution** (`execution/`): `WalkRouteExecutor` connects a verified route to an injectable single-step `MoveExecutor` with measured body feedback. It only executes the caller's ordered points (same height, ±1 along X/Z), never starts a step without current OPEN evidence, requires a measured `exact` position for `ARRIVED`, and revokes an in-flight segment when its evidence changes.
 - **Historical path store** (`topology/`, phase 4A): `FragmentStore` keeps historical path geometry (`PathFragment`) and confirmed traversal evidence (`TraversalEvidence`) strictly separated from current world state — with idempotent writes, explicit update, delete, paginated reads, capacity limits, and snapshot isolation.
 - **Topology facts store** (`topology/`, phase 4B): `TopologyStore` records explicit spatial nodes and directional connections (`candidate` vs evidence-backed `traversed`), keeps per-edge evidence references, and reports whether those references still resolve — never whether the path is currently passable.
+- **Bounded historical graph queries** (`topology/`, phase 4C): `TopologyStore` adds bounded, read-only `adjacency`, `reachable`, and `route` queries over the recorded topology — finite work budgets, mode filtering, lightweight history reads, and precise `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` results — still never a current-traversability or executable-route claim.
 
 These are validated **in-memory with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`). They do **not** yet wire a real mineflayer/Curio body, pathfinding, or SQLite persistence.
 
@@ -96,6 +97,39 @@ Behavior:
 
 Only same-world, same-dimension, exact-endpoint, non-`PORTAL` connections are supported; region nodes can be stored and queried but not used as edge endpoints. See [`docs/phase-4b-topology-facts-acceptance.md`](docs/phase-4b-topology-facts-acceptance.md).
 
+## Bounded historical graph queries
+
+`TopologyStore` (phase 4C) answers three bounded, read-only, synchronous queries over the *recorded* history graph — never whether the world is currently passable or how to walk it:
+
+- **`adjacency(nodeId, options?)`** — the recorded in-edges and out-edges of a node, from the incident index in insertion order. The returned edges are plain `TopologyEdge` snapshots and are *not* reference-resolved here.
+- **`reachable(fromNodeId, options?)`** — the confirmed reachable node ids (including the start at depth 0), by walking only `traversed` out-edges whose evidence fully resolves and whose mode passes the filter.
+- **`route(fromNodeId, toNodeId, options?)`** — one fewest-edges directed historical connection sequence, with per-segment witness evidence, or a precise reason it could not.
+
+```ts
+import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
+
+const history = new FragmentStore('world');
+const topology = new TopologyStore(history);
+// … save nodes a/b/c, save traversed edges e-ab (a→b) and e-bc (b→c) …
+
+const r = topology.route('a', 'c', { mode: 'walk' });
+if (r.status === 'FOUND') {
+  r.nodeIds;   // ['a', 'b', 'c']
+  r.edgeIds;   // ['e-ab', 'e-bc']
+  r.segments;  // [{ edgeId: 'e-ab', evidenceId: 'ev-ab', evidence: … }, …]
+}
+```
+
+Behavior:
+
+- **Endpoints.** Reachability/route accept only existing, `exact`, same-world, same-dimension nodes. Missing nodes, region endpoints, and cross-dimension requests fail explicitly (never silently replaced).
+- **Edges that count.** Only `basis: 'traversed'` edges whose every reference resolves (`resolved`) participate; `candidate` / `missing` / `mismatch` edges are excluded (and reported as gaps). Direction is strictly `from → to`.
+- **Mode.** An optional `mode` filter requires a matching explicit evidence mode; unknown-mode evidence yields a `mode_unknown` gap, while known-but-unmatched modes are a normal filter. Without a filter, the adopted evidence's real mode is preserved (unknown stays unknown).
+- **Budgets.** `maxNodes` / `maxEdges` / `maxHistoryReads` / `maxDiagnostics` are finite, clamped to store ceilings, and zero is honored literally. Budget exhaustion is reported as `BUDGET_EXHAUSTED`, never confused with `NO_RECORDED_ROUTE`.
+- **Results.** `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` have precise meanings; diagnostics are bounded and truncation never loses the gap classification.
+
+These queries return historical facts and never produce a current `OPEN`, a body-arrival claim, or an executable point list. See [`docs/phase-4c-historical-topology-query-acceptance.md`](docs/phase-4c-historical-topology-query-acceptance.md).
+
 ## Project structure
 
 ```
@@ -115,9 +149,10 @@ src/
 └── compat/             # legacy WorldMemory entry compatibility layer (§8, §9.1)
 
 examples/
-├── walk-route-execution.ts   # runnable Fake demo of the execution loop
-├── fragment-store-history.ts # runnable Fake demo of historical facts vs current blockage
-└── topology-facts.ts         # runnable Fake demo of explicit topology facts vs current blockage
+├── walk-route-execution.ts         # runnable Fake demo of the execution loop
+├── fragment-store-history.ts       # runnable Fake demo of historical facts vs current blockage
+├── topology-facts.ts               # runnable Fake demo of explicit topology facts vs current blockage
+└── historical-topology-query.ts    # runnable Fake demo of bounded historical graph queries
 ```
 
 ## Development
@@ -130,9 +165,10 @@ npm run build       # emits dist/ (NodeNext ESM + type declarations)
 npx tsx examples/walk-route-execution.ts    # run the Fake execution demo
 npx tsx examples/fragment-store-history.ts  # run the Fake historical-facts demo
 npx tsx examples/topology-facts.ts          # run the Fake explicit-topology demo
+npx tsx examples/historical-topology-query.ts # run the Fake bounded-query demo
 ```
 
-> `examples/fragment-store-history.ts` and `examples/topology-facts.ts` import the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
+> `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, and `examples/historical-topology-query.ts` import the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
 
 > The persistence driver (`better-sqlite3`) is wired in at phase 5 (design §9.2); `storage/` currently holds only the schema contract and worker interface, with no native dependency.
 

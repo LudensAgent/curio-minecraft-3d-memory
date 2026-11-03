@@ -82,9 +82,12 @@ export type {
 } from './traversability/index.js';
 
 // Topology — historical geometry + confirmed traversal evidence (phase 4A),
-// and explicit in-memory topology facts (phase 4B)
+// explicit in-memory topology facts (phase 4B), and bounded historical graph
+// queries (phase 4C)
 export { FragmentStore, TopologyStore } from './topology/index.js';
 export type {
+  AdjacencyOptions,
+  AdjacencyResult,
   ConnectionType,
   EdgeBasis,
   EdgeChanges,
@@ -95,6 +98,7 @@ export type {
   FragmentChanges,
   FragmentPage,
   FragmentQuery,
+  FragmentScope,
   FragmentStoreOptions,
   LandmarkTag,
   NodeChanges,
@@ -103,13 +107,24 @@ export type {
   NodeQuery,
   NodeSource,
   PathFragment,
+  QueryBudget,
+  QueryBudgetKey,
+  QueryStats,
+  ReachabilityResult,
   ReferenceStatus,
+  RouteQueryResult,
+  RouteQueryStatus,
+  RouteSegment,
   SaveResult,
   SaveStatus,
+  SearchDiagnostic,
+  SearchDisposition,
+  SearchGapKind,
   SpatialEdge,
   SpatialNode,
   TopologyEdge,
   TopologyHistorySource,
+  TopologyQueryOptions,
   TopologyStoreOptions,
   TraversalEvidence,
   TraversalPage,
