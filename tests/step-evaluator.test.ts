@@ -561,3 +561,53 @@ describe('evaluateGroundedWalkSegment — swept collision (diagonal correction)'
     expect(result.problem?.kind).toBe('collision');
   });
 });
+
+describe('evaluateGroundedWalkSegment — swept vertical collision', () => {
+  function yMap(): VoxelMap {
+    const map = new VoxelMap('world');
+    for (const x of [-1, 0, 1, 2]) for (const z of [-1, 0, 1, 2]) {
+      fill(map, STONE, [[x, -1, z]]);
+      fill(map, AIR, [[x, 0, z], [x, 1, z]]);
+    }
+    return map;
+  }
+
+  const ceilingProvider: CollisionShapeProvider = {
+    version: 'swept-y-1',
+    resolve(state, cell, read) {
+      if (state.name === 'minecraft:ceiling') {
+        // Ceiling whose bottom is at 1.8125; the rising body's head reaches 1.84.
+        return { kind: 'shape', shape: { boxes: [{ minX: 0, maxX: 1, minY: 0.8125, maxY: 1, minZ: 0, maxZ: 1 }], supportFaces: [] } };
+      }
+      return fakeProvider.resolve(state, cell, read);
+    },
+  };
+  const lateSliverProvider: CollisionShapeProvider = {
+    version: 'swept-y-2',
+    resolve(state, cell, read) {
+      if (state.name === 'minecraft:sliver') {
+        // A sliver the descending body's X reaches only late (t≈[0.9,1]), after its
+        // head has already dropped below the sliver's 1.82 bottom.
+        return { kind: 'shape', shape: { boxes: [{ minX: 0.7, maxX: 0.8, minY: 0.82, maxY: 1, minZ: 0, maxZ: 1 }], supportFaces: [] } };
+      }
+      return fakeProvider.resolve(state, cell, read);
+    },
+  };
+
+  it('detects a rise into a ceiling (head 1.8 → 1.84 over a 1.8125 bottom)', () => {
+    const map = yMap();
+    map.observe(obs({ name: 'minecraft:ceiling', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+    const q = { worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk' as const, body: bodyAt(0.5, 0, 0.5), direction: { axis: 'x' as const, sign: 1 as const } };
+    const r = evaluateGroundedWalkSegment(map, q, { x: 1.5, y: 0.04, z: 0.5 }, ceilingProvider, 2000, 0.05);
+    expect(r.status).toBe('BLOCKED');
+    expect(r.problem?.kind).toBe('collision');
+  });
+
+  it('does not block a descent that clears the obstacle', () => {
+    const map = yMap();
+    map.observe(obs({ name: 'minecraft:sliver', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+    const q = { worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk' as const, body: bodyAt(0.5, 0.04, 0.5), direction: { axis: 'x' as const, sign: 1 as const } };
+    const r = evaluateGroundedWalkSegment(map, q, { x: 1.5, y: 0, z: 0.5 }, lateSliverProvider, 2000, 0.05);
+    expect(r.status).toBe('OPEN');
+  });
+});

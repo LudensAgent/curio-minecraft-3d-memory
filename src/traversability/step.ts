@@ -211,16 +211,20 @@ function boxSweepOverlaps(
   half: number,
   height: number,
 ): boolean {
-  const boxMinY = cy + box.minY;
-  const boxMaxY = cy + box.maxY;
-  if (from.y + height <= boxMinY || boxMaxY <= from.y) return false;
-
+  // The body's Y interval [feet.y, feet.y + height] also moves with the feet, so a
+  // rise/fall (bodyArrival tolerates a foot-height deviation) must be swept too —
+  // a constant start-height check would miss a rise into a ceiling or wrongly block
+  // a descent that clears an obstacle.
   const xTimes = axisSweepOverlapTimes(from.x - half, from.x + half, to.x - from.x, cx + box.minX, cx + box.maxX);
   if (xTimes === null) return false;
+  const yTimes = axisSweepOverlapTimes(from.y, from.y + height, to.y - from.y, cy + box.minY, cy + box.maxY);
+  if (yTimes === null) return false;
   const zTimes = axisSweepOverlapTimes(from.z - half, from.z + half, to.z - from.z, cz + box.minZ, cz + box.maxZ);
   if (zTimes === null) return false;
 
-  return Math.min(xTimes[1], zTimes[1]) > Math.max(xTimes[0], zTimes[0]);
+  const tMin = Math.max(xTimes[0], yTimes[0], zTimes[0]);
+  const tMax = Math.min(xTimes[1], yTimes[1], zTimes[1]);
+  return tMax > tMin;
 }
 
 function overlaps(min1: number, max1: number, min2: number, max2: number): boolean {

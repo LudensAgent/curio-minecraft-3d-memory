@@ -89,6 +89,19 @@ describe('grounded walk arrival (opt-in)', () => {
     expect(h.loop.status()!.result?.outcome).toBe('BLOCKED');
   });
 
+  it('does not arrive when a foot-height rise collides with a ceiling', () => {
+    const h = setup();
+    // Ceiling whose bottom is 1.8125 over the destination cell (1,1,0).
+    const provider = { ...fakeProvider, resolve: (state: Parameters<typeof fakeProvider.resolve>[0], cell: Vec3Like, read: Parameters<typeof fakeProvider.resolve>[2]) => state.name === 'minecraft:ceiling' ? { kind: 'shape' as const, shape: { boxes: [{ minX: 0, maxX: 1, minY: 0.8125, maxY: 1, minZ: 0, maxZ: 1 }], supportFaces: [] } } : fakeProvider.resolve(state, cell, read) };
+    h.map.observe(obs({ name: 'minecraft:ceiling', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 2000, sequence: 2 }));
+    const initial = h.loop.start({ worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, bodyArrival: arrival, shapeProvider: provider, deadlineMs: 20_000, timeoutMs: 3000 });
+    // Feet measured at y=0.04: the correction sweep carries a vertical component whose
+    // head (1.84) crosses the 1.8125 ceiling before reaching the destination.
+    h.settle({ x: 0.5, y: 0.04, z: 0.5 }, { executionId: initial.delegationId }); h.loop.advance(10);
+    expect(h.requests).toHaveLength(0);
+    expect(h.loop.status()!.result?.outcome).toBe('BLOCKED');
+  });
+
   it('keeps the active segment on unrelated/later same-section changes, then refuses the blocked next segment', () => {
     const h = setup(); h.settle(points[0]!); h.loop.advance(10);
     h.loop.observe(h.map.observe(obs(STONE, { x: 4, y: 0, z: 4 }, { observedAt: 2200, sequence: 2 })), 10);
