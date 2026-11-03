@@ -27,7 +27,7 @@ import { LruOrder } from '../../voxel/lru.js';
 import type { ResolvedResidencyLimits, UnloadRejectionReason } from '../../voxel/residency.js';
 import { estimateVoxelSectionResidentBytesFromCommitted } from '../../voxel/snapshot.js';
 import { PersistenceError } from './types.js';
-import type { LoadSectionsResult, SpatialSession } from './types.js';
+import type { SpatialSession } from './types.js';
 
 /** Bounds on the manager's own processing (candidate checks, unloads, diagnostics). */
 export interface WorkingSetLimits {
@@ -69,10 +69,26 @@ export interface EvictionRejection {
   reason: UnloadRejectionReason;
 }
 
+/**
+ * The outcome of a `prepare` request.
+ *
+ * - `ready`: every requested section is resident *and* protected by the returned
+ *   lease; `prepared` is the full request and `capacity` is null.
+ * - `incomplete`: no hard failure, but some requested sections have no committed
+ *   record (`noRecord`) or are not loadable now (`notReady`). The temporary lease
+ *   is released, so `prepared` is empty and `lease` is empty — "prepared" always
+ *   reflects the actual protection state.
+ * - `failed`: a hard failure (a capacity gap, a failed read, or — before any
+ *   mutation — a busy/closed session, which throws instead). The temporary lease is
+ *   released; `prepared` is empty and `lease` is empty.
+ */
+export type PrepareStatus = 'ready' | 'incomplete' | 'failed';
+
 /** Result of `prepare`: an accurate account of what was prepared, evicted, and why. */
 export interface PrepareResult {
   worldId: string;
-  /** Sections now resident *and* protected by the returned lease (alreadyResident ∪ loaded). */
+  status: PrepareStatus;
+  /** The full request when `status === 'ready'`; empty otherwise. */
   prepared: SectionKey[];
   /** Request sections that were already resident before this call. */
   alreadyResident: SectionKey[];
@@ -86,12 +102,12 @@ export interface PrepareResult {
   evicted: SectionKey[];
   /** Candidates kept during eviction, with the map's structured refusal reason. */
   evictionRejected: EvictionRejection[];
-  /** The bounded capacity/failure outcome, or null when the request was fully prepared. */
+  /** The bounded capacity/failure outcome; non-null only when `status === 'failed'`. */
   capacity: CapacityGap | null;
   /**
-   * The protection lease over the prepared sections, handed to the caller. Empty
-   * (`token: ''`) when the request hit a hard failure and the temporary lease was
-   * released. The caller owns release; a late release never drops a newer lease.
+   * The protection lease over the prepared sections, handed to the caller. Valid
+   * (non-empty token) only when `status === 'ready'`; the caller owns release, and a
+   * late release never drops a newer lease.
    */
   lease: { token: string; keys: SectionKey[] };
   diagnostics: string[];
@@ -157,6 +173,8 @@ export class WorkingSetManager {
   private readonly lru = new LruOrder();
   /** Section key string → SectionKey, rebuilt from the resident set on reconcile. */
   private readonly keyIndex = new Map<string, SectionKey>();
+  /** Re-entrancy guard: serializes prepare/free across their (async) duration. */
+  private operationInFlight = false;
 
   constructor(session: SpatialSession, options: WorkingSetLimits = {}) {
     if (session.voxelLoading !== 'manual') {
@@ -172,12 +190,25 @@ export class WorkingSetManager {
    * and return the resident + protected set with a lease. Never observes the world,
    * never fabricates a section for a missing record, and never treats a load as a
    * current observation or an OPEN passability conclusion.
+   *
+   * Throws `PersistenceError` (before any mutation) when the session is busy,
+   * closing or closed, or when another manager operation is in flight.
    */
   async prepare(keys: readonly SectionKey[]): Promise<PrepareResult> {
+    this.acquireGate();
+    try {
+      return await this.prepareGuarded(keys);
+    } finally {
+      this.releaseGate();
+    }
+  }
+
+  private async prepareGuarded(keys: readonly SectionKey[]): Promise<PrepareResult> {
     const worldId = this.session.voxel.worldId;
     const diagnostics = new DiagnosticBuffer(this.bounds.maxDiagnostics);
     const result: PrepareResult = {
       worldId,
+      status: 'failed',
       prepared: [],
       alreadyResident: [],
       loaded: [],
@@ -203,8 +234,7 @@ export class WorkingSetManager {
     const resident: SectionKey[] = [];
     const toLoad: SectionKey[] = [];
     for (const key of deduped) {
-      const info = this.session.sectionResidency(key);
-      switch (info.residency) {
+      switch (this.session.sectionResidency(key).residency) {
         case 'resident':
           resident.push(key);
           break;
@@ -221,18 +251,30 @@ export class WorkingSetManager {
       }
     }
 
-    // Protect the whole request before any eviction, so the manager can never evict
-    // the first half of the request to make room for the second half.
+    // Sound count pre-check: the request alone cannot fit even an empty working set.
+    // Reject before any eviction so an impossible request has no side effects.
+    if (toLoad.length > this.residency.maxResidentSections) {
+      result.capacity = this.gap(
+        'count_capacity',
+        `request has ${toLoad.length} sections to load, exceeding maxResidentSections (${this.residency.maxResidentSections})`,
+      );
+      diagnostics.push(result.capacity.message);
+      return result;
+    }
+
+    result.alreadyResident = resident.map((k) => ({ ...k }));
+
+    // Protect the sections that are (or will be) resident, so the manager can never
+    // evict the first half of the request to make room for the second half. noRecord
+    // and notReady sections are not resident and need no protection.
+    const protectedKeys = [...resident, ...toLoad];
     let lease: { token: string; keys: SectionKey[] };
     try {
-      lease = this.session.pinSections(deduped);
+      lease = this.session.pinSections(protectedKeys);
     } catch (err) {
       // Over the pin budget (maxPins / maxPinnedSections): nothing was evicted yet.
       throw this.toPersistenceError(err);
     }
-
-    result.alreadyResident = resident.map((k) => ({ ...k }));
-    result.prepared.push(...resident.map((k) => ({ ...k })));
 
     let hardFailure = false;
     try {
@@ -240,7 +282,7 @@ export class WorkingSetManager {
       // A successful request hit (an already-resident section) advances its LRU
       // position; a load inserts it at MRU below. Both are runtime cache metadata.
       for (const key of resident) this.lru.touch(sectionKeyString(key));
-      const protectedSet = new Set(deduped.map(sectionKeyString));
+      const protectedSet = new Set(protectedKeys.map(sectionKeyString));
 
       const eviction = this.evictToFit(toLoad, protectedSet, diagnostics);
       result.evicted = eviction.evicted.map((k) => ({ ...k }));
@@ -254,13 +296,8 @@ export class WorkingSetManager {
         try {
           const loaded = await this.session.loadSections(toLoad);
           result.loaded = loaded.loaded.map((k) => ({ ...k }));
-          for (const key of loaded.loaded) {
-            result.prepared.push({ ...key });
-            this.lru.insert(sectionKeyString(key));
-          }
-          for (const missing of loaded.missing) {
-            result.noRecord.push({ ...missing });
-          }
+          for (const key of loaded.loaded) this.lru.insert(sectionKeyString(key));
+          for (const missing of loaded.missing) result.noRecord.push({ ...missing });
           this.reconcile();
         } catch (err) {
           result.capacity = this.mapLoadError(err);
@@ -268,12 +305,24 @@ export class WorkingSetManager {
         }
       }
     } finally {
+      // Status and lease/protection must be consistent: only a fully-prepared,
+      // fully-protected request is "ready" and keeps the lease; anything else releases
+      // the temporary lease and reports `prepared` as empty.
+      const complete = !hardFailure && result.noRecord.length === 0 && result.notReady.length === 0;
       if (hardFailure) {
+        result.status = 'failed';
         this.session.releasePins([lease.token]);
         result.lease = { token: '', keys: [] };
-        // A hard failure after partial eviction/load must not leave a phantom lease.
+        result.prepared = [];
+      } else if (!complete) {
+        result.status = 'incomplete';
+        this.session.releasePins([lease.token]);
+        result.lease = { token: '', keys: [] };
+        result.prepared = [];
       } else {
+        result.status = 'ready';
         result.lease = { token: lease.token, keys: lease.keys.map((k) => ({ ...k })) };
+        result.prepared = deduped.map((k) => ({ ...k }));
       }
     }
 
@@ -287,70 +336,82 @@ export class WorkingSetManager {
    * resident working set is at or under `target.sections` / `target.bytes`, or until
    * no eligible candidate or a bound is exhausted. With no target, it evicts every
    * eligible section within `maxUnloadSections`.
+   *
+   * Throws `PersistenceError` on an invalid (negative/non-integer) target, or when
+   * the session is busy/closing/closed or another manager operation is in flight —
+   * always before any mutation.
    */
   free(target?: { sections?: number; bytes?: number }): FreeResult {
-    const diagnostics = new DiagnosticBuffer(this.bounds.maxDiagnostics);
-    const result: FreeResult = { evicted: [], evictionRejected: [], capacity: null, diagnostics: diagnostics.items };
+    this.acquireGate();
+    try {
+      const diagnostics = new DiagnosticBuffer(this.bounds.maxDiagnostics);
+      const result: FreeResult = { evicted: [], evictionRejected: [], capacity: null, diagnostics: diagnostics.items };
 
-    if (target !== undefined && target.sections !== undefined && !Number.isSafeInteger(target.sections)) {
-      throw new PersistenceError('invalid_argument', `free target.sections must be a safe integer: ${String(target.sections)}`);
-    }
-    if (target !== undefined && target.bytes !== undefined && !Number.isSafeInteger(target.bytes)) {
-      throw new PersistenceError('invalid_argument', `free target.bytes must be a safe integer: ${String(target.bytes)}`);
-    }
-
-    this.reconcile();
-    const checked = new Set<string>();
-    let candidateChecks = 0;
-    let unloadCount = 0;
-
-    for (;;) {
-      // With a target, stop once the working set is at or under it. Without a
-      // target, evict every eligible section until a bound or exhaustion is hit.
-      if (target !== undefined) {
-        const size = this.session.voxel.residentSize();
-        const countOk = target.sections === undefined || size.sections <= target.sections;
-        const bytesOk = target.bytes === undefined || size.bytes <= target.bytes;
-        if (countOk && bytesOk) break;
+      if (target !== undefined && target.sections !== undefined && (!Number.isSafeInteger(target.sections) || target.sections < 0)) {
+        throw new PersistenceError('invalid_argument', `free target.sections must be a non-negative safe integer: ${String(target.sections)}`);
+      }
+      if (target !== undefined && target.bytes !== undefined && (!Number.isSafeInteger(target.bytes) || target.bytes < 0)) {
+        throw new PersistenceError('invalid_argument', `free target.bytes must be a non-negative safe integer: ${String(target.bytes)}`);
       }
 
-      const candidate = this.nextEvictionCandidate(new Set(), checked);
-      if (candidate === null) {
-        result.capacity = this.gap('no_eligible_candidates', 'no eligible section is available to evict');
-        diagnostics.push(result.capacity.message);
-        break;
-      }
-      candidateChecks += 1;
-      if (candidateChecks > this.bounds.maxEvictionCandidates) {
-        result.capacity = this.gap(
-          'candidate_budget_exhausted',
-          `candidate checks exceeded maxEvictionCandidates (${this.bounds.maxEvictionCandidates})`,
-        );
-        diagnostics.push(result.capacity.message);
-        break;
-      }
+      this.reconcile();
+      const candidates = this.lru.oldestFirst();
+      let cursor = 0;
+      let candidateChecks = 0;
+      let unloadCount = 0;
 
-      const res = this.session.unloadSections([candidate]);
-      if (res.unloaded.length === 1) {
-        result.evicted.push({ ...candidate });
-        this.lru.remove(sectionKeyString(candidate));
-        diagnostics.push(`evicted ${fmt(candidate)}`);
-        unloadCount += 1;
-        if (unloadCount > this.bounds.maxUnloadSections) {
+      for (;;) {
+        if (target !== undefined) {
+          const size = this.session.voxel.residentSize();
+          const countOk = target.sections === undefined || size.sections <= target.sections;
+          const bytesOk = target.bytes === undefined || size.bytes <= target.bytes;
+          if (countOk && bytesOk) break;
+        }
+
+        const next = this.nextCandidate(candidates, cursor, EMPTY_SET);
+        if (next === null) {
+          // No target means "evict everything eligible"; exhausting candidates is the
+          // success condition, not a gap. Only a target reports an unreachable gap.
+          if (target !== undefined) {
+            result.capacity = this.gap('no_eligible_candidates', 'no eligible section is available to evict');
+            diagnostics.push(result.capacity.message);
+          }
+          break;
+        }
+        cursor = next.cursor;
+        candidateChecks += 1;
+        if (candidateChecks > this.bounds.maxEvictionCandidates) {
           result.capacity = this.gap(
-            'unload_budget_exhausted',
-            `unloads exceeded maxUnloadSections (${this.bounds.maxUnloadSections})`,
+            'candidate_budget_exhausted',
+            `candidate checks exceeded maxEvictionCandidates (${this.bounds.maxEvictionCandidates})`,
           );
           diagnostics.push(result.capacity.message);
           break;
         }
-      } else {
-        const reason = res.rejected[0]?.reason ?? 'not_committed';
-        result.evictionRejected.push({ key: { ...candidate }, reason });
-        checked.add(sectionKeyString(candidate));
+        if (unloadCount >= this.bounds.maxUnloadSections) {
+          result.capacity = this.gap(
+            'unload_budget_exhausted',
+            `unloads reached maxUnloadSections (${this.bounds.maxUnloadSections})`,
+          );
+          diagnostics.push(result.capacity.message);
+          break;
+        }
+
+        const res = this.session.unloadSections([next.candidate]);
+        if (res.unloaded.length === 1) {
+          result.evicted.push({ ...next.candidate });
+          this.lru.remove(sectionKeyString(next.candidate));
+          diagnostics.push(`evicted ${fmt(next.candidate)}`);
+          unloadCount += 1;
+        } else {
+          const reason = res.rejected[0]?.reason ?? 'not_committed';
+          result.evictionRejected.push({ key: { ...next.candidate }, reason });
+        }
       }
+      return result;
+    } finally {
+      this.releaseGate();
     }
-    return result;
   }
 
   /** Bounded read-only snapshot of the working set (no load/evict/save/world scan). */
@@ -370,6 +431,28 @@ export class WorkingSetManager {
   }
 
   // --- internals ---
+
+  /** Acquire the session-level operation gate before any pin/LRU/unload mutation. */
+  private acquireGate(): void {
+    if (this.operationInFlight) {
+      throw new PersistenceError('busy', 'another working-set operation is in flight');
+    }
+    const lifecycle = this.session.lifecycle;
+    if (lifecycle === 'closing') {
+      throw new PersistenceError('closing', 'session is closing; working-set operations are not accepted');
+    }
+    if (lifecycle === 'closed') {
+      throw new PersistenceError('closed', 'session is closed; working-set operations are not accepted');
+    }
+    if (this.session.busy) {
+      throw new PersistenceError('busy', 'a persistence request is in flight');
+    }
+    this.operationInFlight = true;
+  }
+
+  private releaseGate(): void {
+    this.operationInFlight = false;
+  }
 
   /** Validate every key (scope, dim, integer coords) before any state change. */
   private validateKeys(keys: readonly SectionKey[]): SectionKey[] {
@@ -422,6 +505,13 @@ export class WorkingSetManager {
    * Evict LRU-eligible sections until the to-load sections fit the resident count
    * and byte budgets, or a bound/exhaustion is hit. The final dirty/pin/commit check
    * always goes through `unloadSections` (never a cached eligibility guess).
+   *
+   * The candidate list is snapshotted once and walked with a cursor, so every
+   * candidate is visited at most once (no O(n²) re-scan). A byte-only overflow of
+   * the *conservative* estimate is not treated as a hard capacity gap: the estimate
+   * is an upper bound and may exceed the budget while the exact resident cost fits,
+   * so in that case control falls through to the load, whose exact accounting
+   * (`installLoadedSections`) is authoritative.
    */
   private evictToFit(
     toLoad: SectionKey[],
@@ -430,14 +520,16 @@ export class WorkingSetManager {
   ): { evicted: SectionKey[]; rejected: EvictionRejection[]; gap: CapacityGap | null } {
     const evicted: SectionKey[] = [];
     const rejected: EvictionRejection[] = [];
-    const checked = new Set<string>();
-    let candidateChecks = 0;
-    let unloadCount = 0;
 
     const loadBytesEstimate = toLoad.reduce((sum, key) => {
       const committed = this.session.sectionResidency(key).committed;
       return sum + (committed === undefined ? 0 : estimateVoxelSectionResidentBytesFromCommitted(committed));
     }, 0);
+
+    const candidates = this.lru.oldestFirst();
+    let cursor = 0;
+    let candidateChecks = 0;
+    let unloadCount = 0;
 
     for (;;) {
       const size = this.session.voxel.residentSize();
@@ -445,17 +537,23 @@ export class WorkingSetManager {
       const needBytes = size.bytes + loadBytesEstimate - this.residency.maxResidentBytes;
       if (needCount <= 0 && needBytes <= 0) break;
 
-      const candidate = this.nextEvictionCandidate(protectedSet, checked);
-      if (candidate === null) {
-        return {
-          evicted,
-          rejected,
-          gap: this.gap(
-            needCount > 0 ? 'count_capacity' : 'byte_capacity',
-            `cannot fit the request (${toLoad.length} to load): no eligible candidate to evict`,
-          ),
-        };
+      const next = this.nextCandidate(candidates, cursor, protectedSet);
+      if (next === null) {
+        // Only a genuine count overflow is a hard gap here; a byte-estimate overflow
+        // falls through to the load, whose exact check decides.
+        if (needCount > 0) {
+          return {
+            evicted,
+            rejected,
+            gap: this.gap(
+              'count_capacity',
+              `cannot fit ${toLoad.length} sections to load: no eligible candidate to evict`,
+            ),
+          };
+        }
+        return { evicted, rejected, gap: null };
       }
+      cursor = next.cursor;
       candidateChecks += 1;
       if (candidateChecks > this.bounds.maxEvictionCandidates) {
         return {
@@ -467,49 +565,49 @@ export class WorkingSetManager {
           ),
         };
       }
+      if (unloadCount >= this.bounds.maxUnloadSections) {
+        return {
+          evicted,
+          rejected,
+          gap: this.gap(
+            'unload_budget_exhausted',
+            `unloads reached maxUnloadSections (${this.bounds.maxUnloadSections})`,
+          ),
+        };
+      }
 
-      const res = this.session.unloadSections([candidate]);
+      const res = this.session.unloadSections([next.candidate]);
       if (res.unloaded.length === 1) {
-        evicted.push({ ...candidate });
-        this.lru.remove(sectionKeyString(candidate));
-        diagnostics.push(`evicted ${fmt(candidate)}`);
+        evicted.push({ ...next.candidate });
+        this.lru.remove(sectionKeyString(next.candidate));
+        diagnostics.push(`evicted ${fmt(next.candidate)}`);
         unloadCount += 1;
-        if (unloadCount > this.bounds.maxUnloadSections) {
-          return {
-            evicted,
-            rejected,
-            gap: this.gap(
-              'unload_budget_exhausted',
-              `unloads exceeded maxUnloadSections (${this.bounds.maxUnloadSections})`,
-            ),
-          };
-        }
       } else {
         const reason = res.rejected[0]?.reason ?? 'not_committed';
-        rejected.push({ key: { ...candidate }, reason });
-        checked.add(sectionKeyString(candidate));
+        rejected.push({ key: { ...next.candidate }, reason });
       }
     }
     return { evicted, rejected, gap: null };
   }
 
   /**
-   * The oldest LRU candidate that is resident and not protected/checked. Committed
-   * or not, dirty or clean, pinned or free: the final judgment is left to
-   * `unloadSections`, which reports the structured refusal reason. A resident
-   * section that is not in the LRU index is skipped and marked checked.
+   * The next eligible candidate in a single LRU snapshot, advancing `cursor` past
+   * every key (protected, stale, or non-resident) it skips. Each candidate is
+   * visited at most once, so the whole eviction is linear in the resident set.
    */
-  private nextEvictionCandidate(protectedSet: Set<string>, checked: Set<string>): SectionKey | null {
-    for (const keyStr of this.lru.oldestFirst()) {
-      if (protectedSet.has(keyStr) || checked.has(keyStr)) continue;
+  private nextCandidate(
+    candidates: string[],
+    cursor: number,
+    protectedSet: ReadonlySet<string>,
+  ): { candidate: SectionKey; cursor: number } | null {
+    while (cursor < candidates.length) {
+      const keyStr = candidates[cursor]!;
+      cursor += 1;
+      if (protectedSet.has(keyStr)) continue;
       const key = this.keyIndex.get(keyStr);
-      if (key === undefined) {
-        checked.add(keyStr);
-        continue;
-      }
-      const info = this.session.sectionResidency(key);
-      if (info.residency === 'resident') return key;
-      checked.add(keyStr);
+      if (key === undefined) continue;
+      if (this.session.sectionResidency(key).residency !== 'resident') continue;
+      return { candidate: key, cursor };
     }
     return null;
   }
@@ -517,16 +615,13 @@ export class WorkingSetManager {
   private mapLoadError(err: unknown): CapacityGap {
     if (err instanceof PersistenceError) {
       switch (err.kind) {
+        case 'capacity':
+          return this.gap('byte_capacity', err.message);
         case 'busy':
           return this.gap('busy', err.message);
         case 'closed':
         case 'closing':
           return this.gap('closed', err.message);
-        case 'capacity':
-          return this.gap('byte_capacity', err.message);
-        case 'data':
-        case 'timeout':
-          return this.gap('read_failed', err.message);
         default:
           return this.gap('read_failed', err.message);
       }
@@ -543,6 +638,8 @@ export class WorkingSetManager {
     return { kind, message };
   }
 }
+
+const EMPTY_SET: ReadonlySet<string> = new Set();
 
 /** Bounded diagnostic collector: keeps the first N strings and drops the rest. */
 class DiagnosticBuffer {

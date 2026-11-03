@@ -108,13 +108,21 @@ class SpatialSessionImpl implements SpatialSession {
     return this.residencyLimitsField;
   }
 
+  get lifecycle(): SessionLifecycle {
+    return this.lifecycleField;
+  }
+
+  get busy(): boolean {
+    return this.inFlight !== null || this.loadInFlight;
+  }
+
   private readonly worldId: string;
   private readonly databasePath: string;
   private readonly timeoutMs: number;
   private readonly limits: ResolvedSnapshotLimits;
 
   private worker: Worker | null = null;
-  private lifecycle: SessionLifecycle = 'open';
+  private lifecycleField: SessionLifecycle = 'open';
   private cleanlyClosed = false;
   private nextRequestId = 1;
   private pending = new Map<number, PendingRequest>();
@@ -182,7 +190,7 @@ class SpatialSessionImpl implements SpatialSession {
     try {
       result = await this.requestOpen();
     } catch (err) {
-      this.lifecycle = 'closed';
+      this.lifecycleField = 'closed';
       await this.terminateWorker();
       throw err;
     }
@@ -199,7 +207,7 @@ class SpatialSessionImpl implements SpatialSession {
         this.voxel.restoreSnapshot(result.voxelSnapshot);
       }
     } catch (err) {
-      this.lifecycle = 'closed';
+      this.lifecycleField = 'closed';
       await this.terminateWorker();
       throw new PersistenceError('data', `restore failed: ${(err as Error).message}`);
     }
@@ -215,10 +223,10 @@ class SpatialSessionImpl implements SpatialSession {
   }
 
   async checkpoint(): Promise<SpatialCheckpointResult> {
-    if (this.lifecycle === 'closing') {
+    if (this.lifecycleField === 'closing') {
       throw new PersistenceError('closing', 'session is closing; new checkpoints are not accepted');
     }
-    if (this.lifecycle === 'closed') {
+    if (this.lifecycleField === 'closed') {
       throw new PersistenceError('closed', 'session is closed; new checkpoints are not accepted');
     }
     if (this.inFlight !== null || this.loadInFlight) {
@@ -391,10 +399,10 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.voxelLoadingField !== 'manual') {
       throw new PersistenceError('invalid_argument', 'loadSections requires voxelLoading "manual"');
     }
-    if (this.lifecycle === 'closing') {
+    if (this.lifecycleField === 'closing') {
       throw new PersistenceError('closing', 'session is closing; new loads are not accepted');
     }
-    if (this.lifecycle === 'closed') {
+    if (this.lifecycleField === 'closed') {
       throw new PersistenceError('closed', 'session is closed; new loads are not accepted');
     }
     if (this.inFlight !== null || this.loadInFlight) {
@@ -436,14 +444,16 @@ class SpatialSessionImpl implements SpatialSession {
     } catch (err) {
       this.voxel.markLoadFailed(toFail);
       const message = (err as Error).message;
-      throw new PersistenceError(/exceeds/.test(message) ? 'capacity' : 'data', message);
+      // `installLoadedSections` reports "would exceed maxResidentSections/Bytes"
+      // (first person "exceed"), so match both spellings.
+      throw new PersistenceError(/exceed/.test(message) ? 'capacity' : 'data', message);
     }
     return { loaded: installed, missing };
   }
 
   getPersistenceState(): SpatialPersistenceState {
     return {
-      lifecycle: this.lifecycle,
+      lifecycle: this.lifecycleField,
       voxelRevision: this.voxel.saveRevision,
       fragmentRevision: this.history.revision,
       topologyRevision: this.topology.revision,
@@ -485,7 +495,7 @@ class SpatialSessionImpl implements SpatialSession {
   }
 
   async close(): Promise<CloseResult> {
-    if (this.lifecycle === 'closed') {
+    if (this.lifecycleField === 'closed') {
       return {
         completed: this.cleanlyClosed,
         lastConfirmedCheckpointId: this.lastConfirmedCheckpointId,
@@ -495,7 +505,7 @@ class SpatialSessionImpl implements SpatialSession {
       };
     }
 
-    this.lifecycle = 'closing';
+    this.lifecycleField = 'closing';
     const deadline = Date.now() + this.timeoutMs;
     let unconfirmed = this.unconfirmedCheckpointId !== null;
     let closeError: PersistenceError | null = this.lastError;
@@ -519,7 +529,7 @@ class SpatialSessionImpl implements SpatialSession {
       closed = false;
     }
     this.cleanlyClosed = closed;
-    this.lifecycle = 'closed';
+    this.lifecycleField = 'closed';
     if (!closed && closeError === null) {
       closeError = new PersistenceError('worker_communication', 'persistence worker did not close within the deadline');
     }
@@ -726,7 +736,7 @@ class SpatialSessionImpl implements SpatialSession {
     if (entry.kind === 'open') {
       const error = new PersistenceError('worker_start', 'persistence worker did not respond to open within timeout');
       this.lastError = error;
-      this.lifecycle = 'closed';
+      this.lifecycleField = 'closed';
       void this.terminateWorker();
       entry.reject(error);
       return;
@@ -739,7 +749,7 @@ class SpatialSessionImpl implements SpatialSession {
       this.lastError = error;
       this.inFlight = null;
       this.unconfirmedCheckpointId = entry.checkpointId ?? null;
-      this.lifecycle = 'closed';
+      this.lifecycleField = 'closed';
       this.failAllPending(error);
       entry.reject(error);
       void this.terminateWorker();
@@ -752,13 +762,13 @@ class SpatialSessionImpl implements SpatialSession {
       // terminate, exactly like a checkpoint timeout, to avoid an unbounded queue.
       const error = new PersistenceError('timeout', 'section load did not complete within timeout');
       this.lastError = error;
-      this.lifecycle = 'closed';
+      this.lifecycleField = 'closed';
       this.failAllPending(error);
       entry.reject(error);
       void this.terminateWorker();
       return;
     }
-    this.lifecycle = 'closed';
+    this.lifecycleField = 'closed';
     void this.terminateWorker();
     entry.resolve(false);
   }
@@ -769,7 +779,7 @@ class SpatialSessionImpl implements SpatialSession {
       `persistence worker error (is better-sqlite3 installed?): ${err.message}`,
     );
     this.lastError = error;
-    this.lifecycle = 'closed';
+    this.lifecycleField = 'closed';
     this.failAllPending(error);
     void this.terminateWorker();
   }
@@ -778,7 +788,7 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.pending.size === 0) return;
     const error = new PersistenceError('worker_communication', 'persistence worker exited before responding');
     this.lastError = error;
-    this.lifecycle = 'closed';
+    this.lifecycleField = 'closed';
     this.failAllPending(error);
   }
 

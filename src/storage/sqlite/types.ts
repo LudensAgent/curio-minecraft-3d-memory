@@ -311,6 +311,10 @@ export interface SpatialSession {
   readonly voxelLoading: VoxelLoading;
   /** The resolved working-set bounds used by the manual residency mode. */
   readonly residencyLimits: ResolvedResidencyLimits;
+  /** The session lifecycle (`open` / `closing` / `closed`). */
+  readonly lifecycle: SessionLifecycle;
+  /** True while a checkpoint or section load is in flight (single in-flight I/O). */
+  readonly busy: boolean;
   /** Capture and commit history + topology + voxel in one transaction. */
   checkpoint(): Promise<SpatialCheckpointResult>;
   getPersistenceState(): SpatialPersistenceState;

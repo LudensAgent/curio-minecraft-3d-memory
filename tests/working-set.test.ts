@@ -246,7 +246,7 @@ describe('WorkingSetManager', () => {
     const r = await manager.prepare([keyAt(0)]);
     expect(r.capacity?.kind).toBe('byte_capacity');
     expect(r.loaded).toEqual([]);
-    expect(session.sectionResidency(keyAt(0)).residency).toBe('not_resident');
+    expect(session.sectionResidency(keyAt(0)).residency).toBe('load_failed');
     await session.close();
   });
 
@@ -339,15 +339,16 @@ describe('WorkingSetManager', () => {
     await session.close();
   });
 
-  it('reports busy while a checkpoint is in flight', async () => {
+  it('rejects a prepare while a checkpoint is in flight (gate before any eviction)', async () => {
     const dbPath = makeDbPath();
     await seed(dbPath, 2);
     const { session, manager } = await manualSession(dbPath);
     const l = await manager.prepare([keyAt(0)]);
     session.releasePins([l.lease.token]);
     const p = session.checkpoint();
-    const r = await manager.prepare([keyAt(1)]);
-    expect(r.capacity?.kind).toBe('busy');
+    await expect(manager.prepare([keyAt(1)])).rejects.toMatchObject({ kind: 'busy' });
+    // Nothing was evicted before the gate rejected the request.
+    expect(session.sectionResidency(keyAt(0)).residency).toBe('resident');
     await p;
     await session.close();
   });
@@ -401,6 +402,144 @@ describe('WorkingSetManager', () => {
     expect(stats.residentBytes).toBe(0);
     expect(stats.lruTracked).toBe(0);
     expect(session.voxel.pinState()).toEqual({ leases: 0, pinnedSections: 0 });
+    await session.close();
+  });
+
+  it('rejects prepare and free after the session is closed', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 1);
+    const { session, manager } = await manualSession(dbPath);
+    await session.close();
+    await expect(manager.prepare([keyAt(0)])).rejects.toMatchObject({ kind: 'closed' });
+    expect(() => manager.free()).toThrow(/closed/);
+  });
+
+  it('rejects free while a checkpoint is in flight', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const { session, manager } = await manualSession(dbPath);
+    const l = await manager.prepare([keyAt(0)]);
+    session.releasePins([l.lease.token]);
+    const p = session.checkpoint();
+    expect(() => manager.free()).toThrow(/in flight/);
+    await p;
+    await session.close();
+  });
+
+  it('a capacity-failed prepare leaves no protection (prepared empty, no pin)', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 1 } });
+    const l = await manager.prepare([keyAt(0)]);
+    session.releasePins([l.lease.token]);
+
+    const r = await manager.prepare([keyAt(0), keyAt(1)]); // needs 2, capacity 1
+    expect(r.status).toBe('failed');
+    expect(r.capacity?.kind).toBe('count_capacity');
+    expect(r.prepared).toEqual([]); // A is NOT listed as prepared
+    expect(r.lease.token).toBe(''); // no lease handed out
+    expect(session.voxel.pinState().pinnedSections).toBe(0); // A is not protected
+    expect(manager.free().evicted).toEqual([keyAt(0)]); // A can be evicted now
+    await session.close();
+  });
+
+  it('a no-record request is incomplete, not ready, with no lease', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 1);
+    const { session, manager } = await manualSession(dbPath);
+    const r = await manager.prepare([keyAt(0), keyAt(99)]); // keyAt(99) has no record
+    expect(r.status).toBe('incomplete');
+    expect(r.capacity).toBeNull();
+    expect(r.noRecord).toEqual([keyAt(99)]);
+    expect(r.prepared).toEqual([]);
+    expect(r.lease.token).toBe('');
+    expect(session.voxel.pinState().pinnedSections).toBe(0);
+    await session.close();
+  });
+
+  it('enforces maxUnloadSections before the next unload (free)', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 3);
+    const { session, manager } = await manualSession(
+      dbPath,
+      { residencyLimits: { maxResidentSections: 3 } },
+      { maxUnloadSections: 1 },
+    );
+    const r = await manager.prepare([keyAt(0), keyAt(1), keyAt(2)]);
+    session.releasePins([r.lease.token]);
+    const freed = manager.free();
+    expect(freed.evicted).toHaveLength(1); // exactly the budget, never one over
+    expect(freed.capacity?.kind).toBe('unload_budget_exhausted');
+    await session.close();
+  });
+
+  it('rejects an obviously-unfittable request before evicting existing sections', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 5);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 2 } });
+    const l = await manager.prepare([keyAt(0), keyAt(1)]);
+    session.releasePins([l.lease.token]);
+
+    const r = await manager.prepare([keyAt(2), keyAt(3), keyAt(4)]); // 3 > 2 → impossible
+    expect(r.status).toBe('failed');
+    expect(r.capacity?.kind).toBe('count_capacity');
+    expect(r.evicted).toEqual([]); // existing 0,1 were NOT evicted
+    expect(session.sectionResidency(keyAt(0)).residency).toBe('resident');
+    expect(session.sectionResidency(keyAt(1)).residency).toBe('resident');
+    await session.close();
+  });
+
+  it('does not treat the conservative byte estimate as authoritative', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 1);
+
+    // Measure the actual resident bytes and the conservative planning estimate.
+    const probe = await manualSession(dbPath);
+    const pl = await probe.manager.prepare([keyAt(0)]);
+    const actualBytes = probe.session.voxel.residentSize().bytes;
+    const committed = probe.session.sectionResidency(keyAt(0)).committed!;
+    const estimate = estimateVoxelSectionResidentBytesFromCommitted({ bytes: committed.bytes, observedCells: committed.observedCells });
+    expect(estimate).toBeGreaterThan(actualBytes); // the estimate over-states the cost
+    await probe.session.close();
+
+    // A budget equal to the ACTUAL cost must accept the request, even though the
+    // conservative estimate exceeds it.
+    const { session, manager } = await manualSession(dbPath, {
+      residencyLimits: { maxResidentSections: 100, maxResidentBytes: actualBytes },
+    });
+    const r = await manager.prepare([keyAt(0)]);
+    expect(r.status).toBe('ready');
+    expect(r.capacity).toBeNull();
+    await session.close();
+  });
+
+  it('rejects a negative free target before any unload', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 3);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 3 } });
+    const r = await manager.prepare([keyAt(0), keyAt(1), keyAt(2)]);
+    session.releasePins([r.lease.token]);
+
+    expect(() => manager.free({ sections: -1 })).toThrow(/non-negative/);
+    expect(() => manager.free({ bytes: -1 })).toThrow(/non-negative/);
+    expect(session.voxel.residentSize().sections).toBe(3); // nothing unloaded
+    await session.close();
+  });
+
+  it('visits each candidate once: no duplicate eviction rejections', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 4);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 4 } });
+    const r = await manager.prepare([keyAt(0), keyAt(1), keyAt(2), keyAt(3)]);
+    session.releasePins([r.lease.token]);
+    session.voxel.beginSession('live');
+    for (let i = 0; i < 4; i++) {
+      session.voxel.observe(voxelObs({ sessionId: 'live', state: { name: 'minecraft:dirt', properties: {} }, pos: { x: i * 16, y: 64, z: 0 }, observedAt: 2000, sequence: i + 1 }));
+    }
+    const freed = manager.free({ sections: 0 }); // all 4 dirty → all rejected
+    const keys = freed.evictionRejected.map((e) => e.key.cx);
+    expect(new Set(keys).size).toBe(4); // each candidate rejected exactly once
+    expect(freed.capacity?.kind).toBe('no_eligible_candidates');
     await session.close();
   });
 });
@@ -535,15 +674,70 @@ describe('working-set + Fake walk-route lifecycle', () => {
     await Promise.resolve();
     expect(loop.status()!.result?.outcome).toBe('ARRIVED');
 
-    // 4. While pinned, free cannot evict the dependencies.
-    expect(manager.free().evicted).toEqual([]);
-
-    // 5. Release + checkpoint → the sections become evictable.
-    session.releasePins([lease.lease.token]);
+    // 4. Checkpoint first so the dependencies are CLEAN (committed): now the pin —
+    // not the dirty state — is what blocks eviction.
     await session.checkpoint();
+    expect(manager.free().evicted).toEqual([]); // clean but pinned → pin blocks
+
+    // 5. Release → clean + unpinned → the dependencies are evictable.
+    session.releasePins([lease.lease.token]);
     const freed = manager.free();
     expect(freed.evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
 
+    await session.close();
+  });
+
+  it('releases on cancel: a clean pinned dependency becomes evictable after release', async () => {
+    const dbPath = makeDbPath();
+    await seedWalk(dbPath);
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    const manager = new WorkingSetManager(session);
+
+    const supportKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: -1 };
+    const airKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 0 };
+
+    const initial = await manager.prepare([supportKey, airKey]);
+    session.releasePins([initial.lease.token]);
+    session.voxel.beginSession('live');
+    for (let x = 0; x <= 1; x++) {
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x, y: -1, z: 0 } });
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 2, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 0, z: 0 } });
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 3, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 1, z: 0 } });
+    }
+    await session.checkpoint(); // clean
+
+    const lease = await manager.prepare([supportKey, airKey]); // already resident → pin
+    expect(manager.free().evicted).toEqual([]); // clean but pinned
+
+    // Task cancelled/replaced: the caller releases its own lease.
+    session.releasePins([lease.lease.token]);
+    expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
+    await session.close();
+  });
+
+  it('a late release of an old task does not drop a newer task protection', async () => {
+    const dbPath = makeDbPath();
+    await seedWalk(dbPath);
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    const manager = new WorkingSetManager(session);
+
+    const supportKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: -1 };
+    const airKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 0 };
+
+    const first = await manager.prepare([supportKey, airKey]);
+    session.voxel.beginSession('live');
+    session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x: 0, y: -1, z: 0 } });
+    await session.checkpoint();
+    session.releasePins([first.lease.token]);
+
+    // A newer task pins the same dependencies.
+    const second = await manager.prepare([supportKey, airKey]);
+    // The old task's late release must not drop the newer task's protection.
+    session.releasePins([first.lease.token]); // no-op: already released
+    expect(manager.free().evicted).toEqual([]); // still pinned by the newer task
+
+    session.releasePins([second.lease.token]);
+    expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
     await session.close();
   });
 });

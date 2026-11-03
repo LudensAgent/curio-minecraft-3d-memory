@@ -269,13 +269,14 @@ const session = await openSpatialSession({ databasePath, worldId: 'world', voxel
 const manager = new WorkingSetManager(session);
 
 const result = await manager.prepare([a, b, c]);
-result.prepared;    // sections now resident + protected (alreadyResident ∪ loaded)
+result.status;      // 'ready' | 'incomplete' | 'failed'
+result.prepared;    // the full request when ready; empty otherwise
 result.loaded;      // loaded this call
 result.noRecord;    // no committed record — never fabricated, never observed
 result.notReady;    // loading / load_failed — not prepared now
 result.evicted;     // LRU-eligible sections evicted this call
-result.capacity;    // null on success, or a structured gap (request_too_large / count_capacity / byte_capacity / busy / …)
-result.lease;       // protection lease — the caller owns release
+result.capacity;    // null on success, or a structured gap (request_too_large / count_capacity / byte_capacity / …)
+result.lease;       // valid (non-empty) only when status === 'ready'; the caller owns release
 
 // Make room before accepting new observations, then release when done.
 session.releasePins([result.lease.token]);
@@ -286,9 +287,11 @@ manager.stats();                 // bounded read-only snapshot (no load/evict/sa
 Behavior:
 
 - **Explicit enablement.** Default eager loading is untouched; the caller constructs a `WorkingSetManager` to opt in. It requires a `manual`-residency session.
-- **Deterministic LRU.** A successful `prepare` hit (already-resident) and a successful load both advance a section's LRU position; a fresh section has a deterministic initial position. The LRU is runtime cache metadata only — never persisted, never substitutes for `observedAt`/`sequence`/`revision`/save batch, and never refreshes evidence time.
-- **Safe eviction.** Candidates are chosen oldest-first, skipping the current request set; the final unload always goes through `session.unloadSections`, so dirty, pinned and uncommitted sections are reported as structured rejections (`dirty` / `pinned` / `not_committed`), never guessed from stale metadata. Only committed, clean, unpinned sections are released.
-- **Bounded failure.** `no_record` and `load_failed` are reported separately and never reported as "prepared". A hard failure (busy / closed / read failure / capacity) releases the temporary lease; a partial eviction followed by a failed load is reported accurately, never as a silent rollback, and never deletes database facts or clears unrelated dirty state.
+- **Session gate.** `prepare`/`free` acquire a session-level operation gate before any pin/LRU/unload, so a busy (checkpoint or section load in-flight), closing, closed session, or a concurrent manager operation is rejected up front — never "evict first, then report busy".
+- **Result/lease consistency.** `status` distinguishes `ready` (all resident + protected), `incomplete` (some `noRecord`/`notReady`, no lease), and `failed` (a capacity gap or read failure, no lease). `prepared` always reflects the actual protection state.
+- **Deterministic LRU.** A successful `prepare` hit (already-resident) and a successful load both advance a section's LRU position; a fresh section has a deterministic initial position. The LRU is runtime cache metadata only — never persisted, never substitutes for `observedAt`/`sequence`/`revision`/save batch, and never refreshes evidence time. The eviction loop snapshots the LRU once and walks it with a cursor, so every candidate is visited at most once.
+- **Safe eviction.** Candidates are chosen oldest-first, skipping the current request set; the final unload always goes through `session.unloadSections`, so dirty, pinned and uncommitted sections are reported as structured rejections (`dirty` / `pinned` / `not_committed`), never guessed from stale metadata. Only committed, clean, unpinned sections are released; an obviously-unfittable request is rejected before any eviction.
+- **Bounded failure.** `no_record` and `load_failed` are reported separately and never reported as "prepared". A hard failure (read failure / capacity) releases the temporary lease; a partial eviction followed by a failed load is reported accurately, never as a silent rollback, and never deletes database facts or clears unrelated dirty state.
 - **Consistent index.** After a direct `loadSections` / `unloadSections` / `observe` that bypasses the manager, `stats()` reconciles the LRU index with the real resident set (bounded in-memory enumeration), so the manager never requires the caller to abandon the existing public entries.
 
 The route-pin closed loop is demonstrated in `examples/working-set.ts`: prepare a route's actual dependency sections → restore current evidence → verify → protect the dependencies → execute a Fake walk route → release → free. This phase adds bounded working-set management only — no predictive prefetch, background eviction, automatic checkpoint, observation overlay, new pathfinding, or real mineflayer/Curio wiring.

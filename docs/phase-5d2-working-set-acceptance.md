@@ -39,11 +39,16 @@ const session = await openSpatialSession({ databasePath, worldId, voxelLoading: 
 const manager = new WorkingSetManager(session, { maxEvictionCandidates: 1024, maxUnloadSections: 512, maxDiagnostics: 256 });
 
 const r = await manager.prepare([key]);
+r.status;   // 'ready' | 'incomplete' | 'failed'
 r.prepared / r.alreadyResident / r.loaded / r.noRecord / r.notReady / r.evicted / r.evictionRejected / r.capacity / r.lease / r.diagnostics;
 
 manager.free({ sections: 4 });  // 或 manager.free() 清空全部可淘汰项
 manager.stats();                 // { residentSections, residentBytes, maxResidentSections, maxResidentBytes, lruTracked, pinnedLeases, pinnedSections }
 ```
+
+`PrepareStatus` 三态：`ready`（全部驻留且受保护，`prepared` = 全请求，`capacity` 为 null）、
+`incomplete`（无硬失败但存在 `noRecord`/`notReady`，临时租约已释放，`prepared` 为空、`lease` 为空）、
+`failed`（容量缺口/读取失败，临时租约已释放，`prepared` 为空、`lease` 为空）。
 
 `CapacityGap.kind` 覆盖：`request_too_large` / `no_eligible_candidates` / `candidate_budget_exhausted` /
 `unload_budget_exhausted` / `count_capacity` / `byte_capacity` / `busy` / `closed` / `read_failed`。
@@ -52,12 +57,16 @@ manager.stats();                 // { residentSections, residentBytes, maxReside
 
 - 在修改状态前完成整批校验（worldId/维度/整数坐标）与请求规模检查；`worldId`/坐标不合法直接抛
   `PersistenceError('invalid_argument')`，请求超 `maxLoadBatchSections` 返回 `request_too_large`，两者都不产生部分淘汰或泄漏租约。
+- **会话级门禁**：`prepare`/`free` 在任何 Pin/LRU/卸载前先取得操作门禁；会话 busy（checkpoint 或 section load 在途）、
+  `closing`/`closed`、或另一个管理器操作在途时直接抛 `PersistenceError('busy'|'closing'|'closed')`，绝不先淘汰再报 busy。
+  门禁覆盖整个异步 prepare 流程，`prepare`、`free`、`loadSections`、`checkpoint`、`close` 共享一致的互斥语义。
 - 先 `pinSections` 保护本次请求集合（已驻留 + 待加载），再选择淘汰对象；保护覆盖请求中已驻留与待加载的 Section，
   不会为装后半部分而淘汰前半部分。
-- 成功将临时租约交给调用方；硬失败（busy/closed/读取失败/容量）释放本次临时租约。租约是独立 token，复用/释放
-  他人租约不可能；旧任务迟到释放不影响新任务。
-- 「准备成功」= 请求中的 Section 全部驻留且受返回租约保护；只说明数据可供读取，不说明 FRESH/OPEN/已满足执行条件。
-  `no_record`/`notReady` 分别表达，缺记录绝不报为全部准备成功，也不创建虚构 Section、不填空气、不触发观察。
+- 只有 `status === 'ready'` 才把临时租约交给调用方；`failed`/`incomplete` 都释放临时租约，`prepared` 反映实际保护状态
+  （为空），`lease` 为空。租约是独立 token，复用/释放他人租约不可能；旧任务迟到释放不影响新任务。
+- 「准备成功」= `status === 'ready'`，即请求中的 Section 全部驻留且受返回租约保护；只说明数据可供读取，不说明
+  FRESH/OPEN/已满足执行条件。`no_record`/`notReady` 分别表达并归入 `incomplete`，缺记录绝不报为全部准备成功，
+  也不创建虚构 Section、不填空气、不触发观察。
 
 ## LRU 与淘汰规则
 
@@ -118,7 +127,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 516 passed（18 个测试文件；新增 23 项 working-set 测试）
+npm test           → 527 passed（18 个测试文件；新增 34 项 working-set 测试）
 npx tsx examples/working-set.ts → 正常运行（以公开包名与子路径导入，Fake 路线 ARRIVED）
 git diff --check   → 通过
 ```
@@ -140,6 +149,35 @@ git diff --check   → 通过
 13. 长期循环访问更大已保存集合后段数/计费/Pin/索引无漂移。
 14. 完成/释放后的 Fake 路线租约闭环；受保护依赖不被淘汰。
 15. v2→v3 跨窗口回填与后批失败整体回滚。
+
+## 评审修正（一轮，7 项 P2 + 路线生命周期）
+
+针对一轮代码评审的 7 项问题做了修正，并各加回归测试：
+
+- **P2 缺少覆盖全过程的会话门禁**：`SpatialSession` 新增 `lifecycle`/`busy` 只读 getter；`WorkingSetManager` 在
+  `prepare`/`free` 入口先取得操作门禁（重入保护 + 会话 lifecycle/busy 检查），任何 Pin/LRU/卸载前即拒绝 busy/closed/
+  closing，覆盖整个异步 prepare 流程。回归测试「rejects prepare/free after close」与「rejects free/prepare while a
+  checkpoint is in flight（且不先淘汰）」。
+- **P2 结果与租约保护不一致**：`PrepareResult` 新增 `status: 'ready' | 'incomplete' | 'failed'`。只有 `ready` 才交付
+  租约并把 `prepared` 设为全请求；`failed`（容量/读取失败）与 `incomplete`（存在 `noRecord`/`notReady`）都释放临时租约、
+  `prepared` 为空、`lease` 为空。回归测试「capacity-failed prepare leaves no protection」与「no-record request is
+  incomplete」。
+- **P2 实际卸载次数超过上限**：卸载预算改为在下一次卸载前检查 `unloadCount >= maxUnloadSections`，恰好达到上限即停。
+  回归测试「enforces maxUnloadSections before the next unload」。
+- **P2 明显无法容纳的请求先清空已有缓存**：加载前做数量预检（`toLoad.length > maxResidentSections` 直接 `count_capacity`），
+  无副作用拒绝。回归测试「rejects an obviously-unfittable request before evicting existing sections」。
+- **P2 保守估算被当作确定容量不足**：字节维度不再用保守估算下「容量不足」结论——候选耗尽且仅字节估算超限时放行到
+  `installLoadedSections` 的精确核算，避免估算上界误拒。回归测试「does not treat the conservative byte estimate as
+  authoritative」用真实 SQLite 复现（实际 1665 字节、预算 1665、估算 1855 → 成功）。
+- **P2 候选遍历平方级开销**：候选列表单次快照 + 单向游标，每个候选只访问一次。回归测试「visits each candidate once」
+  （4 个 dirty 候选无一重复拒绝）。`loadSections` 的 `/exceeds/` 容量分类改为 `/exceed/`，匹配 `installLoadedSections`
+  的「would exceed …」措辞。
+- **P2 free 接受负目标**：`free` 目标要求非负安全整数，非法参数在修改任何状态前抛 `invalid_argument`。回归测试
+  「rejects a negative free target before any unload」。
+
+路线生命周期补齐：既有成功用例改为在「Pin 阻止淘汰」断言前先 `checkpoint`（使依赖为**干净**已提交，Pin 单独阻止淘汰，
+而非 dirty 阻止）；新增「releases on cancel」（取消/替换后释放）、「a late release of an old task does not drop a newer
+task protection」（迟到释放）用例。
 
 ## 本轮未实现
 
