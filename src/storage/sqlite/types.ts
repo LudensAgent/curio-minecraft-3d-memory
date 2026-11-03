@@ -20,6 +20,7 @@ import type {
 import type { SectionKey } from '../../voxel/section.js';
 import type {
   ResidencyLimits,
+  ResolvedResidencyLimits,
   SectionResidencyInfo,
   UnloadSectionsResult,
   VoxelDirectoryEntry,
@@ -306,6 +307,10 @@ export interface SpatialSession {
   readonly voxel: VoxelMap;
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
+  /** How voxel sections are loaded at open (`eager` or `manual`). */
+  readonly voxelLoading: VoxelLoading;
+  /** The resolved working-set bounds used by the manual residency mode. */
+  readonly residencyLimits: ResolvedResidencyLimits;
   /** Capture and commit history + topology + voxel in one transaction. */
   checkpoint(): Promise<SpatialCheckpointResult>;
   getPersistenceState(): SpatialPersistenceState;

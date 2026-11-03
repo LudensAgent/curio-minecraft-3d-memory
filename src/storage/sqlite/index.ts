@@ -50,6 +50,17 @@ export type {
   VoxelLoading,
 } from './types.js';
 export { openSpatialSession } from './spatial.js';
+export { WorkingSetManager, resolveWorkingSetLimits } from './working-set.js';
+export type {
+  CapacityGap,
+  CapacityGapKind,
+  EvictionRejection,
+  FreeResult,
+  PrepareResult,
+  ResolvedWorkingSetLimits,
+  WorkingSetLimits,
+  WorkingSetStats,
+} from './working-set.js';
 
 interface PendingRequest {
   kind: 'open' | 'checkpoint' | 'close';

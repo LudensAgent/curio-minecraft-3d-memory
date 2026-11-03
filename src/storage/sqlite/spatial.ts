@@ -100,6 +100,14 @@ class SpatialSessionImpl implements SpatialSession {
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
 
+  get voxelLoading(): VoxelLoading {
+    return this.voxelLoadingField;
+  }
+
+  get residencyLimits(): ResolvedResidencyLimits {
+    return this.residencyLimitsField;
+  }
+
   private readonly worldId: string;
   private readonly databasePath: string;
   private readonly timeoutMs: number;
@@ -112,8 +120,8 @@ class SpatialSessionImpl implements SpatialSession {
   private pending = new Map<number, PendingRequest>();
   private inFlight: InFlightCheckpoint | null = null;
   private loadInFlight = false;
-  private readonly voxelLoading: VoxelLoading;
-  private readonly residencyLimits: ResolvedResidencyLimits;
+  private readonly voxelLoadingField: VoxelLoading;
+  private readonly residencyLimitsField: ResolvedResidencyLimits;
 
   private confirmedVoxelRevision = 0;
   private confirmedFragmentRevision = 0;
@@ -140,8 +148,8 @@ class SpatialSessionImpl implements SpatialSession {
     this.databasePath = options.databasePath;
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
-    this.voxelLoading = options.voxelLoading ?? 'eager';
-    this.residencyLimits = resolveResidencyLimits(options.residencyLimits);
+    this.voxelLoadingField = options.voxelLoading ?? 'eager';
+    this.residencyLimitsField = resolveResidencyLimits(options.residencyLimits);
 
     // Read `validityWindowMs` / `now` explicitly rather than spreading the caller's
     // options object: object spread only copies own enumerable properties, so it
@@ -150,7 +158,7 @@ class SpatialSessionImpl implements SpatialSession {
       validityWindowMs: options.voxelOptions?.validityWindowMs,
       now: options.voxelOptions?.now,
       requireSession: true,
-      manualResidency: this.voxelLoading === 'manual',
+      manualResidency: this.voxelLoadingField === 'manual',
       residencyLimits: options.residencyLimits,
     });
     this.history = new FragmentStore(options.worldId, options.fragmentOptions);
@@ -183,7 +191,7 @@ class SpatialSessionImpl implements SpatialSession {
         this.history.restoreSnapshot(result.snapshot);
         this.topology.restoreSnapshot(result.snapshot);
       }
-      if (this.voxelLoading === 'manual') {
+      if (this.voxelLoadingField === 'manual') {
         if (result.voxelDirectory !== null) {
           this.voxel.installDirectory(result.voxelDirectory);
         }
@@ -380,7 +388,7 @@ class SpatialSessionImpl implements SpatialSession {
    * reads as STALE — it never becomes a fresh observation or a current OPEN.
    */
   async loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult> {
-    if (this.voxelLoading !== 'manual') {
+    if (this.voxelLoadingField !== 'manual') {
       throw new PersistenceError('invalid_argument', 'loadSections requires voxelLoading "manual"');
     }
     if (this.lifecycle === 'closing') {
@@ -394,10 +402,10 @@ class SpatialSessionImpl implements SpatialSession {
     }
 
     const deduped = this.validateAndDedupeKeys(keys);
-    if (deduped.length > this.residencyLimits.maxLoadBatchSections) {
+    if (deduped.length > this.residencyLimitsField.maxLoadBatchSections) {
       throw new PersistenceError(
         'capacity',
-        `load request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residencyLimits.maxLoadBatchSections})`,
+        `load request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residencyLimitsField.maxLoadBatchSections})`,
       );
     }
     const fetch = deduped.filter((k) => this.voxel.sectionResidency(k).residency !== 'resident');
@@ -596,7 +604,7 @@ class SpatialSessionImpl implements SpatialSession {
         worldId: this.worldId,
         limits: this.limits,
         kind: 'spatial',
-        voxelLoading: this.voxelLoading,
+        voxelLoading: this.voxelLoadingField,
       } satisfies WorkerRequest);
     });
   }

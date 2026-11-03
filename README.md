@@ -25,6 +25,7 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 - **Explicit combined spatial checkpoint persistence** (`storage/`, phase 5B): `openSpatialSession` from the same subpath persists the recent-observation map (`VoxelMap`) together with the historical facts through one SQLite worker and one transaction. On startup the full observed state is restored and uniformly re-marked `STALE`; a new observation refreshes only the actually-observed cell. See `docs/phase-5b-spatial-checkpoint-acceptance.md`.
 - **Incremental voxel checkpoint** (`storage/`, phase 5C): once a voxel save baseline exists, `checkpoint()` copies, encodes and writes only the sections whose facts changed since the last confirmed save, instead of replacing the whole section set. The first save still establishes a full baseline; an empty increment never clears voxel data; the worker re-checks the post-increment full set so small increments cannot build an unreopenable database. See `docs/phase-5c-voxel-incremental-checkpoint-acceptance.md`.
 - **Manual on-demand section residency** (`storage/`, phase 5D1): `openSpatialSession({ voxelLoading: 'manual' })` reads only the committed section *directory* at open and requires explicit `loadSections` before a saved section can be observed. Safe `unloadSections`, bounded `pinSections`/`releasePins` leases, a `sectionResidency` query (`no_record` / `not_resident` / `loading` / `resident` / `load_failed`), and residency-driven local invalidation of the traversability cache and route verifier. Unloaded is never "never-observed", reloading never fabricates a fresh observation or a current `OPEN`, and a partial-resident incremental checkpoint never deletes unloaded records. See `docs/phase-5d1-section-residency-acceptance.md`.
+- **Bounded working-set management** (`storage/`, phase 5D2): `WorkingSetManager` composes a manual session into an explicit `prepare` → protect → evict-LRU-eligible → bounded-load loop that returns an accurate result and a protection lease. `free(target?)` evicts least-recently-used eligible sections to make room (or everything eligible), `stats()` reports the bounded working set, and every load/install/unload/pin still goes through the existing single-worker session. The manager never becomes a second authority over facts, dirty state, or save confirmation. See `docs/phase-5d2-working-set-acceptance.md`.
 
 The in-memory layers are validated **with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`); the checkpoint layer is validated against **real SQLite + a real worker** (see `tests/storage-checkpoint.test.ts`, `tests/spatial-checkpoint.test.ts`, `examples/history-checkpoint.ts`, and `examples/spatial-checkpoint.ts`). They do **not** yet wire a real mineflayer/Curio body or pathfinding.
 
@@ -257,6 +258,41 @@ Behavior:
 
 This is the manual on-demand residency mechanism only: no automatic LRU/eviction, prefetch, or observation overlay, and no real mineflayer/Curio route protection wiring.
 
+## Bounded working-set management
+
+`WorkingSetManager` (phase 5D2, `curio-minecraft-3d-memory/storage/sqlite`) is an explicit, caller-enabled composition over a manual session. It turns "submit the sections you need now" into a bounded prepare loop — validate the whole request, protect it with a temporary pin lease, evict least-recently-used *eligible* sections within fixed candidate/unload budgets, load the missing sections through the session's single worker, and return an accurate result plus the protection lease.
+
+```ts
+import { WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
+
+const session = await openSpatialSession({ databasePath, worldId: 'world', voxelLoading: 'manual', residencyLimits: { maxResidentSections: 8 } });
+const manager = new WorkingSetManager(session);
+
+const result = await manager.prepare([a, b, c]);
+result.prepared;    // sections now resident + protected (alreadyResident ∪ loaded)
+result.loaded;      // loaded this call
+result.noRecord;    // no committed record — never fabricated, never observed
+result.notReady;    // loading / load_failed — not prepared now
+result.evicted;     // LRU-eligible sections evicted this call
+result.capacity;    // null on success, or a structured gap (request_too_large / count_capacity / byte_capacity / busy / …)
+result.lease;       // protection lease — the caller owns release
+
+// Make room before accepting new observations, then release when done.
+session.releasePins([result.lease.token]);
+manager.free({ sections: 4 });   // evict LRU-eligible until ≤ 4 resident sections
+manager.stats();                 // bounded read-only snapshot (no load/evict/save/world scan)
+```
+
+Behavior:
+
+- **Explicit enablement.** Default eager loading is untouched; the caller constructs a `WorkingSetManager` to opt in. It requires a `manual`-residency session.
+- **Deterministic LRU.** A successful `prepare` hit (already-resident) and a successful load both advance a section's LRU position; a fresh section has a deterministic initial position. The LRU is runtime cache metadata only — never persisted, never substitutes for `observedAt`/`sequence`/`revision`/save batch, and never refreshes evidence time.
+- **Safe eviction.** Candidates are chosen oldest-first, skipping the current request set; the final unload always goes through `session.unloadSections`, so dirty, pinned and uncommitted sections are reported as structured rejections (`dirty` / `pinned` / `not_committed`), never guessed from stale metadata. Only committed, clean, unpinned sections are released.
+- **Bounded failure.** `no_record` and `load_failed` are reported separately and never reported as "prepared". A hard failure (busy / closed / read failure / capacity) releases the temporary lease; a partial eviction followed by a failed load is reported accurately, never as a silent rollback, and never deletes database facts or clears unrelated dirty state.
+- **Consistent index.** After a direct `loadSections` / `unloadSections` / `observe` that bypasses the manager, `stats()` reconciles the LRU index with the real resident set (bounded in-memory enumeration), so the manager never requires the caller to abandon the existing public entries.
+
+The route-pin closed loop is demonstrated in `examples/working-set.ts`: prepare a route's actual dependency sections → restore current evidence → verify → protect the dependencies → execute a Fake walk route → release → free. This phase adds bounded working-set management only — no predictive prefetch, background eviction, automatic checkpoint, observation overlay, new pathfinding, or real mineflayer/Curio wiring.
+
 ## Project structure
 
 ```
@@ -284,7 +320,8 @@ examples/
 ├── history-checkpoint.ts           # runnable demo of the SQLite history checkpoint lifecycle
 ├── spatial-checkpoint.ts           # runnable demo of the combined spatial checkpoint lifecycle
 ├── spatial-checkpoint-incremental.ts # runnable demo of the incremental voxel checkpoint
-└── spatial-residency.ts            # runnable demo of manual on-demand section residency
+├── spatial-residency.ts            # runnable demo of manual on-demand section residency
+└── working-set.ts                  # runnable demo of bounded working-set management + Fake route
 ```
 
 ## Development

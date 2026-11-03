@@ -25,6 +25,8 @@ export type {
 export {
   AIR_BLOCK_NAME,
   DEFAULT_RESIDENCY_LIMITS,
+  LruOrder,
+  estimateVoxelSectionResidentBytesFromCommitted,
   resolveResidencyLimits,
   VoxelMap,
   VoxelResidencyError,

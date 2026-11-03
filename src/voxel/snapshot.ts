@@ -501,3 +501,44 @@ export function estimateVoxelSectionSnapshotBytes(raw: VoxelSectionSnapshot): nu
   bytes += evidenceBytes;
   return bytes;
 }
+
+/**
+ * Conservative upper bound on the resident working-set cost of a *not-yet-loaded*
+ * committed section, used only for eviction planning (phase 5D2) — never for the
+ * authoritative resident accounting, which stays in `VoxelMap.installLoadedSections`.
+ *
+ * `committed.bytes` is the on-disk `octet_length` of the stored JSON payload, which
+ * already covers the section's actual palette/cells/observation JSON. The resident
+ * billing (`estimateVoxelSectionResidentBytes`) additionally reserves, per section
+ * and per cell, the fixed overheads this file uses (`SECTION_FIXED_BYTES`,
+ * `CELL_FIXED_BYTES`, `OBSERVATION_FIXED_BYTES`, `BYTES_PER_NUMBER`, and the
+ * worst-case `staleReason`), which the compact committed form does not carry. So
+ * `committed.bytes + sectionOverhead + observedCells × cellOverhead` is a safe
+ * over-estimate: it may over-evict slightly, never under-plan a load that then
+ * fails the exact resident-byte check.
+ *
+ * `committed.bytes` and `residentSize().bytes` are different units (persisted
+ * payload vs resident billing); this function is the planning bridge, and the two
+ * are never compared directly.
+ */
+export function estimateVoxelSectionResidentBytesFromCommitted(committed: {
+  bytes: number;
+  observedCells: number;
+}): number {
+  return (
+    committed.bytes +
+    RESIDENT_COMMITTED_SECTION_OVERHEAD +
+    committed.observedCells * RESIDENT_COMMITTED_CELL_OVERHEAD
+  );
+}
+
+/** Fixed per-section delta the resident billing adds over the committed payload. */
+const RESIDENT_COMMITTED_SECTION_OVERHEAD = SECTION_FIXED_BYTES + 2 * BYTES_PER_NUMBER;
+/** Fixed per-cell delta the resident billing adds over the committed payload (a generous upper bound). */
+const RESIDENT_COMMITTED_CELL_OVERHEAD =
+  CELL_FIXED_BYTES +
+  OBSERVATION_FIXED_BYTES +
+  5 * BYTES_PER_NUMBER +
+  2 * STRING_QUOTES +
+  WORST_CASE_STALE_REASON.length +
+  'STALE'.length;

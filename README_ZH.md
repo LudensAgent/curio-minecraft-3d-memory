@@ -25,6 +25,7 @@
 - **显式组合空间 checkpoint 持久化**（`storage/`，阶段 5B）：通过同一子路径的 `openSpatialSession`，用单个 SQLite Worker 与单个事务把最近观测地图（`VoxelMap`）与历史事实一起持久化。启动时恢复完整观测状态并统一转 `STALE`；新观测只刷新实际观察到的格。见 `docs/phase-5b-spatial-checkpoint-acceptance.md`。
 - **体素增量 checkpoint**（`storage/`，阶段 5C）：已有体素保存基线后，`checkpoint()` 只复制、编码并写入自上次确认保存以来事实发生变化的 Section，而不是整份替换。首次保存仍建立完整基线；空增量绝不清库；Worker 复核增量后的完整集合，使连续小增量无法累积出无法重新打开的数据库。见 `docs/phase-5c-voxel-incremental-checkpoint-acceptance.md`。
 - **手动按需 Section 驻留**（`storage/`，阶段 5D1）：`openSpatialSession({ voxelLoading: 'manual' })` 在打开时只读取已提交 Section 目录，并需要显式 `loadSections` 后才能向已保存的 Section 写入。安全 `unloadSections`、有界 `pinSections`/`releasePins` 租约、`sectionResidency` 查询（`no_record` / `not_resident` / `loading` / `resident` / `load_failed`），以及驻留驱动的通行缓存与路线验证局部失效。未驻留不等于从未观察，回载不伪造新观察或当前 `OPEN`，部分驻留的增量 checkpoint 不删除未加载记录。见 `docs/phase-5d1-section-residency-acceptance.md`。
+- **有界工作集管理**（`storage/`，阶段 5D2）：`WorkingSetManager` 把手动会话组合成显式的 `prepare` → 保护 → 淘汰 LRU 可淘汰项 → 有界加载 闭环，返回精确结果与保护租约。`free(target?)` 按 LRU 顺序淘汰可淘汰 Section 腾空间（或清空全部可淘汰项），`stats()` 报告有界工作集；每次加载/装入/卸载/Pin 仍走现有单 Worker 会话。管理器不成为事实、dirty 状态或保存确认的第二权威源。见 `docs/phase-5d2-working-set-acceptance.md`。
 
 内存层以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与 `examples/walk-route-execution.ts`）；checkpoint 层以**真实 SQLite + 真实 Worker**验证（见 `tests/storage-checkpoint.test.ts`、`tests/spatial-checkpoint.test.ts`、`examples/history-checkpoint.ts` 与 `examples/spatial-checkpoint.ts`）。**尚未**接入真实 mineflayer/Curio 身体或寻路。
 
@@ -301,6 +302,41 @@ session.unloadSections([key]);                 // 安全：已提交 + 干净 + 
 
 本轮只是手动按需驻留机制：不含自动 LRU/淘汰、预取、观察 overlay，也未接入真实 mineflayer/Curio 路线保护。
 
+## 有界工作集管理
+
+`WorkingSetManager`（阶段 5D2，`curio-minecraft-3d-memory/storage/sqlite`）是手动会话之上、由调用方显式启用的组合层。它把「提交当前需要的 Section 集合」变成有界的 prepare 循环——先整批校验、用临时 Pin 租约保护、在固定候选/卸载预算内按 LRU 顺序淘汰可淘汰 Section、经单 Worker 加载缺失 Section，最后返回精确结果与保护租约。
+
+```ts
+import { WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
+
+const session = await openSpatialSession({ databasePath, worldId: 'world', voxelLoading: 'manual', residencyLimits: { maxResidentSections: 8 } });
+const manager = new WorkingSetManager(session);
+
+const result = await manager.prepare([a, b, c]);
+result.prepared;    // 现已驻留且受租约保护的 Section（alreadyResident ∪ loaded）
+result.loaded;      // 本次加载
+result.noRecord;    // 无保存记录 —— 不伪造、不观察
+result.notReady;    // loading / load_failed —— 本次未就绪
+result.evicted;     // 本次为腾空间淘汰的可淘汰 Section
+result.capacity;    // 成功为 null，否则结构化缺口（request_too_large / count_capacity / byte_capacity / busy / …）
+result.lease;       // 保护租约 —— 由调用方负责释放
+
+// 接受新观测前先腾空间，用完再释放。
+session.releasePins([result.lease.token]);
+manager.free({ sections: 4 });   // 按 LRU 淘汰可淘汰项，直到驻留 ≤ 4 个 Section
+manager.stats();                 // 有界只读快照（不加载/淘汰/保存/扫世界）
+```
+
+行为：
+
+- **显式启用。** 默认 eager 加载不变；调用方构造 `WorkingSetManager` 才启用，且要求 `manual` 驻留会话。
+- **确定性 LRU。** 成功命中（已驻留）与成功加载都会推进 Section 的 LRU 位置；新 Section 有确定初始位置。LRU 只是运行态缓存元数据——不持久化、不替代 `observedAt`/`sequence`/`revision`/保存批次、不刷新证据时间。
+- **安全淘汰。** 按最旧优先选择候选并跳过本次请求集合；最终卸载始终经 `session.unloadSections`，因此 dirty、被 Pin、未提交的 Section 以结构化原因上报（`dirty` / `pinned` / `not_committed`），绝不凭陈旧元数据猜测。只释放已提交、干净、未被 Pin 的 Section。
+- **有界失败。** `no_record` 与 `load_failed` 分别表达，绝不报为「已就绪」。硬失败（busy / closed / 读取失败 / 容量）会释放临时租约；部分淘汰后加载失败被如实上报，不伪装成回滚，也不删除数据库事实、不清除无关 dirty。
+- **索引一致。** 绕过管理器的直接 `loadSections` / `unloadSections` / `observe` 之后，`stats()` 会把 LRU 索引与真实驻留集合对齐（有界内存枚举），因此管理器不要求调用方放弃既有公开入口。
+
+路线 Pin 闭环见 `examples/working-set.ts`：准备路线实际依赖的 Section → 恢复当前证据 → 验证 → 保护依赖 → 执行 Fake walk 路线 → 释放 → 腾空间。本轮只新增有界工作集管理：不含预测预取、后台淘汰、自动 checkpoint、观察 overlay、新寻路，也未接入真实 mineflayer/Curio。
+
 ## 目录结构
 
 ```
@@ -328,7 +364,8 @@ examples/
 ├── history-checkpoint.ts           # 可运行的 SQLite 历史 checkpoint 生命周期示例
 ├── spatial-checkpoint.ts           # 可运行的组合空间 checkpoint 生命周期示例
 ├── spatial-checkpoint-incremental.ts # 可运行的体素增量 checkpoint 示例
-└── spatial-residency.ts            # 可运行的手动按需 Section 驻留示例
+├── spatial-residency.ts            # 可运行的手动按需 Section 驻留示例
+└── working-set.ts                  # 可运行的有界工作集管理 + Fake 路线示例
 ```
 
 ## 开发
@@ -347,6 +384,7 @@ npx tsx examples/history-checkpoint.ts        # 运行 SQLite checkpoint 生命�
 npx tsx examples/spatial-checkpoint.ts        # 运行组合空间 checkpoint 生命周期示例
 npx tsx examples/spatial-checkpoint-incremental.ts # 运行体素增量 checkpoint 示例
 npx tsx examples/spatial-residency.ts         # 运行手动按需 Section 驻留示例
+npx tsx examples/working-set.ts               # 运行有界工作集管理 + Fake 路线示例
 ```
 
 > `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts`、`examples/historical-anchor-query.ts` 与 `examples/history-checkpoint.ts` 以公开包名（`curio-minecraft-3d-memory`，其中 `history-checkpoint.ts` 使用 `curio-minecraft-3d-memory/storage/sqlite` 子路径）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。

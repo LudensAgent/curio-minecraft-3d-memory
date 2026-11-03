@@ -21,6 +21,7 @@ import type { Vec3Like } from '../types.js';
 import { serializeBlockState } from './blockstate.js';
 import { blockToSection, cellIndex } from './coordinates.js';
 import { bitsRequired, createSection, repack, setBit, writeCell } from './palette.js';
+import { sectionKeyString } from './section.js';
 import type { Section, SectionKey } from './section.js';
 import {
   cloneCellEvidence,
@@ -557,6 +558,33 @@ export class VoxelMap {
   /** Conservative resident working-set size (section count + estimated bytes), for observability. */
   residentSize(): { sections: number; bytes: number } {
     return { sections: this.residentSectionCount, bytes: this.residentBytes };
+  }
+
+  /**
+   * The currently resident section keys, in a deterministic (sorted) order. A
+   * read-only enumeration of the in-memory section set — never a world scan, load,
+   * eviction, save, or evidence refresh. Used by the working-set manager to keep its
+   * LRU index consistent with the real resident set after direct `loadSections` /
+   * `unloadSections` / `observe` calls. Bounded by `maxResidentSections`.
+   */
+  residentSectionKeys(): SectionKey[] {
+    const keys: SectionKey[] = [];
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        keys.push({ ...section.key });
+      }
+    }
+    keys.sort((a, b) => {
+      const sa = sectionKeyString(a);
+      const sb = sectionKeyString(b);
+      return sa < sb ? -1 : sa > sb ? 1 : 0;
+    });
+    return keys;
+  }
+
+  /** Read-only pin accounting: how many leases and distinct pinned sections exist now. */
+  pinState(): { leases: number; pinnedSections: number } {
+    return { leases: this.pins.size, pinnedSections: this.pinCounts.size };
   }
 
   /** Mark sections as having a load in flight (the session drives this around the worker round-trip). */

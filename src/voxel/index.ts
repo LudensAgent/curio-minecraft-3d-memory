@@ -11,6 +11,7 @@ export {
   writeCell,
 } from './palette.js';
 export type { Section, SectionKey } from './section.js';
+export { LruOrder } from './lru.js';
 export {
   DEFAULT_RESIDENCY_LIMITS,
   resolveResidencyLimits,
@@ -36,6 +37,7 @@ export type {
   VoxelDirtyMeasure,
   VoxelSectionSnapshot,
 } from './snapshot.js';
+export { estimateVoxelSectionResidentBytesFromCommitted } from './snapshot.js';
 export { VoxelMap } from './voxel-map.js';
 export type {
   CellChange,
