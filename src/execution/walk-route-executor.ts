@@ -185,6 +185,7 @@ export class WalkRouteExecutor {
   advance(budget: number): WalkRouteStatus {
     this.requireRequest();
     validateBudget(budget);
+    if (this.releasing > 0) return this.snapshot(); // releasing control: defer step advancement
     if (this.guard()) return this.snapshot();
 
     // Bounded re-verify.
@@ -465,10 +466,6 @@ export class WalkRouteExecutor {
       return;
     }
 
-    // Forbid re-scheduling while a stop/abort callback is unwinding, so a re-entrant
-    // advance() cannot orphan a move right before a terminal result is written.
-    if (this.releasing > 0) return;
-
     this.activeStepIndex = stepIndex;
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
@@ -533,6 +530,15 @@ export class WalkRouteExecutor {
 
     this.stopActive();
     if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
+
+    // A newer sample may have been accepted during the stop (via a re-entrant
+    // onSample); this move's sample is then stale and must not update position,
+    // advance the step, or confirm arrival.
+    const sampleStale = sample !== undefined && sample.sequence < this.lastSampleSequence;
+    if (sampleStale) {
+      usable = null;
+      sampleVerdict = null;
+    }
 
     if (sampleVerdict === 'scope_changed') {
       this.result = this.buildFailure('FAILED', 'the body left the delegation scope during execution', {
@@ -600,6 +606,7 @@ export class WalkRouteExecutor {
       this.applyMoveFailure(failure);
       return;
     }
+    if (sampleStale) return; // the move's sample is obsolete; a newer sample already handled it
     this.result = this.buildFailure('FAILED', 'the move returned without a usable confirming body sample', {
       kind: 'unconfirmed_arrival',
       expected: { ...this.points[this.nextPointIndex]! },

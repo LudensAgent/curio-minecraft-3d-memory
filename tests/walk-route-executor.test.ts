@@ -1098,3 +1098,49 @@ describe('WalkRouteExecutor — sample admission, terminal writes and ownership'
     expect(status.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
   });
 });
+
+describe('WalkRouteExecutor — newer sample and release ordering', () => {
+  it('a newer sample received in the stop callback is not overwritten by the old arrival sample', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2); // 0.5 → 1.5
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 0.5, y: 0, z: 0.5 }, { sequence: 3, observedAt: 2300 }));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points); // start sample seq 1
+    loop.advance(10); // step 0 in flight (deferred)
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    const status = loop.status()!;
+    expect(status.result).toBeNull(); // not ARRIVED by the stale sample
+    expect(status.nextPointIndex).toBe(1); // not advanced
+    expect(status.lastPosition).toEqual({ x: 0.5, y: 0, z: 0.5 }); // newer sample retained
+  });
+
+  it('a re-entrant advance during cancel does not report deviation', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.advance(1); // re-entrant advance during cancel's stopActive
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10); // step 0 in flight
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }));
+
+    loop.cancel('agent', 'stop');
+
+    const status = loop.status()!;
+    expect(status.result?.outcome).toBe('CANCELLED'); // not FAILED/deviation
+    expect(status.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
+  });
+});
