@@ -10,6 +10,7 @@
 
 import { parentPort } from 'node:worker_threads';
 import Database from 'better-sqlite3';
+import { SNAPSHOT_FRAME_BYTES } from './types.js';
 import type {
   HistorySnapshot,
   ResolvedSnapshotLimits,
@@ -28,14 +29,20 @@ const KNOWN_TABLES = new Set([
   'spatial_edges',
 ]);
 
-/** Required columns per table; a structurally incomplete same-named table is rejected. */
-const REQUIRED_COLUMNS: Record<string, string[]> = {
-  schema_meta: ['key', 'value'],
-  checkpoints: ['checkpoint_id', 'world_id', 'fragment_revision', 'topology_revision', 'seq'],
-  path_fragments: ['world_id', 'seq', 'id', 'payload'],
-  traversal_evidence: ['world_id', 'seq', 'id', 'payload'],
-  spatial_nodes: ['world_id', 'seq', 'id', 'payload'],
-  spatial_edges: ['world_id', 'seq', 'id', 'payload'],
+/** Required columns + the SQLite type affinity the read/write logic relies on. */
+const REQUIRED_COLUMNS: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  schema_meta: { key: 'TEXT', value: 'TEXT' },
+  checkpoints: {
+    checkpoint_id: 'TEXT',
+    world_id: 'TEXT',
+    fragment_revision: 'INTEGER',
+    topology_revision: 'INTEGER',
+    seq: 'INTEGER',
+  },
+  path_fragments: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
+  traversal_evidence: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
+  spatial_nodes: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
+  spatial_edges: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
 };
 
 const SCHEMA_SQL = `
@@ -155,16 +162,37 @@ function openDatabase(databasePath: string): Database.Database {
   return connection;
 }
 
-/** Reject a table that is missing any column the schema relies on. */
-function assertRequiredColumns(connection: Database.Database, table: string, required: string[]): void {
-  const cols = connection.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-  const names = new Set(cols.map((c) => c.name));
-  for (const column of required) {
-    if (!names.has(column)) {
+/** Reject a table missing a required column, or whose column has the wrong type affinity. */
+function assertRequiredColumns(
+  connection: Database.Database,
+  table: string,
+  required: Record<string, 'INTEGER' | 'TEXT'>,
+): void {
+  const cols = connection.prepare(`PRAGMA table_info(${table})`).all() as { name: string; type: string }[];
+  const byName = new Map(cols.map((c) => [c.name, c]));
+  for (const [column, affinity] of Object.entries(required)) {
+    const col = byName.get(column);
+    if (col === undefined) {
       connection.close();
       throw new Error(`table "${table}" is missing required column "${column}"`);
     }
+    if (affinityOf(col.type) !== affinity) {
+      connection.close();
+      throw new Error(
+        `table "${table}" column "${column}" must have ${affinity} affinity, got "${col.type}"`,
+      );
+    }
   }
+}
+
+/** Map a declared SQLite column type to its storage affinity (see SQLite §3.1). */
+function affinityOf(declaredType: string): 'INTEGER' | 'TEXT' | 'REAL' | 'BLOB' | 'NUMERIC' {
+  const t = declaredType.toUpperCase();
+  if (t.includes('INT')) return 'INTEGER';
+  if (t.includes('CHAR') || t.includes('CLOB') || t.includes('TEXT')) return 'TEXT';
+  if (t.includes('BLOB') || t === '') return 'BLOB';
+  if (t.includes('REAL') || t.includes('FLOA') || t.includes('DOUB')) return 'REAL';
+  return 'NUMERIC';
 }
 
 function stringifyRecord(record: unknown): string {
@@ -207,6 +235,9 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
     prepared.bytes += Buffer.byteLength(payload, 'utf8');
     prepared.edgeEvidenceRefs += e.refs.length;
   }
+  // The outer snapshot envelope (worldId + framing) is part of `maxBytes`, so even
+  // an empty snapshot with a large worldId is bounded.
+  prepared.bytes += SNAPSHOT_FRAME_BYTES + Buffer.byteLength(snapshot.worldId, 'utf8') + 2;
   return prepared;
 }
 
@@ -347,15 +378,15 @@ function computeDerivedCounts(snapshot: HistorySnapshot): {
   return { polylinePoints, entrancePoints, linkPairs, edgeEvidenceRefs };
 }
 
-/** Reject checkpoint rows whose ordering/identity/revision metadata is corrupt. */
+/** Reject checkpoint rows whose ordering/identity/revision metadata is corrupt or out of range. */
 function assertValidCheckpointMetadata(connection: Database.Database, wId: string): void {
   const bad = connection
     .prepare(
       `SELECT COUNT(*) AS n FROM checkpoints
        WHERE world_id = ?
-         AND (typeof(seq) != 'integer'
-              OR typeof(fragment_revision) != 'integer'
-              OR typeof(topology_revision) != 'integer'
+         AND (typeof(seq) != 'integer' OR seq < 1
+              OR typeof(fragment_revision) != 'integer' OR fragment_revision < 0
+              OR typeof(topology_revision) != 'integer' OR topology_revision < 0
               OR typeof(checkpoint_id) != 'text'
               OR checkpoint_id = '')`,
     )
@@ -403,7 +434,10 @@ function loadWorld(
     sumPayloadBytes(connection, 'path_fragments', wId) +
     sumPayloadBytes(connection, 'traversal_evidence', wId) +
     sumPayloadBytes(connection, 'spatial_nodes', wId) +
-    sumPayloadBytes(connection, 'spatial_edges', wId);
+    sumPayloadBytes(connection, 'spatial_edges', wId) +
+    SNAPSHOT_FRAME_BYTES +
+    Buffer.byteLength(wId, 'utf8') +
+    2;
   assertCountsWithinLimits(fragments, traversals, nodes, edges, bytes, resolved);
 
   const snapshot: HistorySnapshot = {

@@ -71,6 +71,27 @@ function makeDbPath(): string {
   return join(dir, 'history.db');
 }
 
+/** Create a full-schema database with a configurable `checkpoints.seq` declaration. */
+function writeRawSchema(dbPath: string, checkpointsSeqType: string): void {
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1');
+    CREATE TABLE checkpoints (
+      checkpoint_id TEXT PRIMARY KEY,
+      world_id TEXT NOT NULL,
+      fragment_revision INTEGER NOT NULL,
+      topology_revision INTEGER NOT NULL,
+      seq ${checkpointsSeqType} NOT NULL
+    );
+    CREATE TABLE path_fragments (world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (world_id, id));
+    CREATE TABLE traversal_evidence (world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (world_id, id));
+    CREATE TABLE spatial_nodes (world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (world_id, id));
+    CREATE TABLE spatial_edges (world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (world_id, id));
+  `);
+  db.close();
+}
+
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     // Windows can hold a transient lock on WAL/SHM files a moment after the worker
@@ -841,5 +862,62 @@ describe('P1/P2 regression', () => {
     await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toMatchObject({
       kind: 'schema',
     });
+  });
+
+  it('rejects a schema whose column has the wrong type affinity', async () => {
+    const dbPath = makeDbPath();
+    writeRawSchema(dbPath, 'TEXT'); // checkpoints.seq declared TEXT instead of INTEGER
+    await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toMatchObject({
+      kind: 'schema',
+    });
+  });
+
+  it('rejects a checkpoint with an out-of-range sequence number', async () => {
+    const dbPath = makeDbPath();
+    const session = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    session.history.saveFragment(frag());
+    await session.checkpoint();
+    await session.close();
+
+    const db = new Database(dbPath);
+    db.prepare('UPDATE checkpoints SET seq = -1 WHERE seq = (SELECT MAX(seq) FROM checkpoints)').run();
+    db.close();
+
+    await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toBeInstanceOf(
+      PersistenceError,
+    );
+  });
+
+  it('bounds an empty snapshot with a large worldId', async () => {
+    const session = await openHistorySession({
+      databasePath: makeDbPath(),
+      worldId: 'w'.repeat(1024 * 1024), // 1 MiB worldId, empty history
+      snapshotLimits: { maxBytes: 1024 },
+    });
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
+    await session.close();
+  });
+
+  it('rejects a large escape-heavy label against a small budget', async () => {
+    const session = await openHistorySession({
+      databasePath: makeDbPath(),
+      worldId: WORLD,
+      snapshotLimits: { maxBytes: 1024 },
+    });
+    session.topology.saveNode(node('n', 0, 0, 0, { label: '"'.repeat(1_000_000) }));
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
+    await session.close();
+  });
+
+  it('checkpointMeasure stops at the cheap lower bound when over budget', () => {
+    const history = new FragmentStore(WORLD);
+    const t = new TopologyStore(history);
+    t.saveNode(node('n', 0, 0, 0, { label: '"'.repeat(1000) }));
+
+    // Full escaped estimate would be ~2× the UTF-16 lower bound for quotes; a tight
+    // budget forces the cheap lower-bound path, which returns before the escaped scan.
+    const over = t.checkpointMeasure(100);
+    expect(over.bytes).toBeGreaterThan(100);
+    expect(over.bytes).toBeLessThan(2000);
   });
 });

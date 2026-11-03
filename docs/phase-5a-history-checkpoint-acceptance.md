@@ -172,7 +172,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过（pretypecheck 先 build）
 npm run build      → 通过（产出 dist/storage/sqlite/index.js + worker.js）
-npm test           → 395 passed（13 个测试文件；新增 43 项 storage-checkpoint 测试，
+npm test           → 400 passed（13 个测试文件；新增 48 项 storage-checkpoint 测试，
                       既有 topology / fragment / voxel / traversability 等全部保持通过）
 npx tsx examples/history-checkpoint.ts → 正常运行（以公开包名与子路径导入，先 build）
 npm pack 后独立临时消费者安装        → 见下方「包接入验证」
@@ -220,3 +220,18 @@ git diff --check   → 通过
 
 回归测试新增：JSON 转义字节边界、损坏 checkpoint 元数据、缺失必需列。关闭期限与未确认提交的具体
 故障注入复现（延迟 ACK / 丢弃确认）未通过公开 API 暴露测试开关，按「故障注入放内部接缝」处理。
+
+## 第三轮评审修正（P2）
+
+- **schema 只校验列名**：`assertRequiredColumns` 用 `PRAGMA table_info` 的声明类型按 SQLite 亲和性
+  规则（`affinityOf`）核对必需列的语义类型，`seq`/修订列须为 INTEGER、ID/payload 须为 TEXT；结构
+  不兼容的同名表在交付会话前以 schema 错误拒绝，避免「保存成功、重启失败」。
+- **checkpoint 序号未校验范围**：`assertValidCheckpointMetadata` 增加 `seq < 1`、`fragment_revision < 0`、
+  `topology_revision < 0` 的范围检查，在选取基线与计算下一序号之前完成。
+- **超限预检仍完整扫描**：`checkpointMeasure(maxBytes)` 接受预算，先用字符串 `.length` 的廉价下界拒绝
+  明显超限输入，再做带早停的转义估算；两个 Store 共享同一份剩余预算。
+- **外层 worldId 未计入预算**：两端统一 `maxBytes` 口径，把外层 `SNAPSHOT_FRAME_BYTES` + worldId 计入
+  session 预检与 Worker 复核，空快照配合超大 worldId 同样受限。
+
+回归测试新增：错误列亲和性、越界序号、超大 worldId 空快照、大字符串预算、`checkpointMeasure` 廉价
+下界早停。延迟 ACK / 丢失确认 / 关闭期限耗尽等故障注入复现仍按内部接缝处理，未暴露公开测试开关。

@@ -97,6 +97,15 @@ export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
+ * Conservative byte cost of the outer snapshot envelope (`{"worldId":…,"fragments":[],
+ * "traversals":[],"nodes":[],"edges":[]}` brackets/commas), excluding the `worldId`
+ * value itself (counted separately) and the record payloads. Both the session's
+ * pre-flight and the worker's re-check add this so an empty snapshot with a large
+ * `worldId` is still bounded by `maxBytes`.
+ */
+export const SNAPSHOT_FRAME_BYTES = 96;
+
+/**
  * The full four-fact snapshot sent to and returned from the worker. This is the
  * persisted shape, not a query projection: edges carry their original binding
  * snapshots, and records are ordered by insertion order.

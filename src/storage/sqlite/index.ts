@@ -13,7 +13,8 @@ import { isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { FragmentStore } from '../../topology/fragment-store.js';
 import { TopologyStore } from '../../topology/topology-store.js';
-import { PersistenceError, resolveSnapshotLimits, resolveTimeoutMs } from './types.js';
+import { jsonEscapedByteLength } from '../../topology/path-fragment.js';
+import { PersistenceError, resolveSnapshotLimits, resolveTimeoutMs, SNAPSHOT_FRAME_BYTES } from './types.js';
 import type {
   CheckpointResult,
   CloseResult,
@@ -160,15 +161,22 @@ class HistorySessionImpl implements HistorySession {
     const fragmentRevision = this.history.revision;
     const topologyRevision = this.topology.revision;
 
-    // Bounded pre-flight before any copy or message pass.
-    const fragmentMeasure = this.history.checkpointMeasure();
-    const topologyMeasure = this.topology.checkpointMeasure();
+    // Bounded pre-flight before any copy or message pass. The two stores share one
+    // remaining byte budget so the measure can stop early on over-limit input, and
+    // the outer snapshot envelope (worldId + framing) is counted too, so even an
+    // empty snapshot with a large worldId is bounded.
+    const maxBytes = this.limits.maxBytes;
+    const fragmentMeasure = this.history.checkpointMeasure(maxBytes);
+    const remainingBytes = maxBytes - fragmentMeasure.bytes;
+    const topologyMeasure = this.topology.checkpointMeasure(Math.max(0, remainingBytes));
+    const totalBytes =
+      SNAPSHOT_FRAME_BYTES + jsonEscapedByteLength(this.worldId) + 2 + fragmentMeasure.bytes + topologyMeasure.bytes;
     this.assertWithinLimits(fragmentMeasure.fragments, fragmentMeasure.traversals, topologyMeasure.nodes, topologyMeasure.edges, {
       polylinePoints: fragmentMeasure.polylinePoints,
       entrancePoints: fragmentMeasure.entrancePoints,
       linkPairs: fragmentMeasure.linkPairs,
       edgeEvidenceRefs: topologyMeasure.edgeEvidenceRefs,
-      bytes: fragmentMeasure.bytes + topologyMeasure.bytes,
+      bytes: totalBytes,
     });
 
     const fragmentSnapshot = this.history.checkpointSnapshot();

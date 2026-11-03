@@ -37,7 +37,7 @@ import {
   traversalEvidenceEqual,
 } from './path-fragment.js';
 import type { FragmentScope, SaveResult } from './fragment-store.js';
-import { estimateTraversalBytes, snapshotEvidence } from './fragment-store.js';
+import { estimateTraversalBytes, snapshotEvidence, traversalLowerBound } from './fragment-store.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 
 /** How a topology edge is justified. */
@@ -674,16 +674,35 @@ export class TopologyStore {
   // --- checkpoint support (phase 5A): bounded export + validated restore ---
 
   /**
-   * Exact size of the store's full topology, used by the checkpoint pre-flight to
-   * reject over-capacity saves before any copy or message pass. Read-only.
+   * Size of the store's full topology, used by the checkpoint pre-flight to reject
+   * over-capacity saves before any copy or message pass. `maxBytes` bounds the
+   * work: a cheap lower bound rejects obviously-over-limit input first, then a full
+   * escaped-byte estimate runs with early termination. Read-only.
    */
-  checkpointMeasure(): TopologyCheckpointMeasure {
+  checkpointMeasure(maxBytes = Number.POSITIVE_INFINITY): TopologyCheckpointMeasure {
     let edgeEvidenceRefs = 0;
+    for (const edge of this.edgeMap.values()) edgeEvidenceRefs += edge.refs.length;
+
+    let lowerBound = 0;
+    for (const node of this.nodeMap.values()) lowerBound += nodeLowerBound(node);
+    for (const edge of this.edgeMap.values()) lowerBound += edgeLowerBound(edge);
+    if (lowerBound > maxBytes) {
+      return {
+        nodes: this.nodeMap.size,
+        edges: this.edgeMap.size,
+        edgeEvidenceRefs,
+        bytes: lowerBound,
+      };
+    }
+
     let bytes = 0;
-    for (const node of this.nodeMap.values()) bytes += estimateNodeBytes(node);
+    for (const node of this.nodeMap.values()) {
+      bytes += estimateNodeBytes(node);
+      if (bytes > maxBytes) break;
+    }
     for (const edge of this.edgeMap.values()) {
-      edgeEvidenceRefs += edge.refs.length;
       bytes += estimateEdgeBytes(edge);
+      if (bytes > maxBytes) break;
     }
     return {
       nodes: this.nodeMap.size,
@@ -1991,33 +2010,54 @@ const BYTES_PER_POINT = 96;
 const BYTES_PER_NUMBER = 24;
 const STRING_QUOTES = 2;
 
-function estimateNodeBytes(n: SpatialNode): number {
+type StringCost = (s: string) => number;
+type TraversalCost = (e: TraversalEvidence) => number;
+
+function nodeStringBytes(n: SpatialNode, cost: StringCost): number {
   let bytes = 160;
-  bytes += jsonEscapedByteLength(n.id) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(n.worldId) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(n.dim) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(n.kind) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(n.source) + STRING_QUOTES;
-  bytes += n.tag === undefined ? 0 : jsonEscapedByteLength(n.tag) + STRING_QUOTES;
-  bytes += n.label === undefined ? 0 : jsonEscapedByteLength(n.label) + STRING_QUOTES;
+  bytes += cost(n.id) + STRING_QUOTES;
+  bytes += cost(n.worldId) + STRING_QUOTES;
+  bytes += cost(n.dim) + STRING_QUOTES;
+  bytes += cost(n.kind) + STRING_QUOTES;
+  bytes += cost(n.source) + STRING_QUOTES;
+  bytes += n.tag === undefined ? 0 : cost(n.tag) + STRING_QUOTES;
+  bytes += n.label === undefined ? 0 : cost(n.label) + STRING_QUOTES;
   // exact: `{"kind":"exact","pos":{…}}`; region adds `"center":{…}` and `"radius":…`.
   bytes += n.location.kind === 'exact' ? BYTES_PER_POINT + 24 : BYTES_PER_POINT + BYTES_PER_NUMBER + 48;
   return bytes;
 }
 
-function estimateEdgeBytes(e: StoredEdge): number {
+function edgeStringBytes(e: StoredEdge, cost: StringCost, traversalCost: TraversalCost): number {
   let bytes = 160;
-  bytes += jsonEscapedByteLength(e.id) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.from) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.to) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.type) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.basis) + STRING_QUOTES;
-  bytes += e.fragmentId === undefined ? 0 : jsonEscapedByteLength(e.fragmentId) + STRING_QUOTES;
-  bytes += e.source === undefined ? 0 : jsonEscapedByteLength(e.source) + STRING_QUOTES;
+  bytes += cost(e.id) + STRING_QUOTES;
+  bytes += cost(e.from) + STRING_QUOTES;
+  bytes += cost(e.to) + STRING_QUOTES;
+  bytes += cost(e.type) + STRING_QUOTES;
+  bytes += cost(e.basis) + STRING_QUOTES;
+  bytes += e.fragmentId === undefined ? 0 : cost(e.fragmentId) + STRING_QUOTES;
+  bytes += e.source === undefined ? 0 : cost(e.source) + STRING_QUOTES;
   // Each binding carries a full immutable traversal snapshot — count its real
-  // escaped string/point cost, not a fixed per-ref constant.
+  // string/point cost, not a fixed per-ref constant.
   for (const ref of e.refs) {
-    bytes += jsonEscapedByteLength(ref.evidenceId) + STRING_QUOTES + estimateTraversalBytes(ref.snapshot);
+    bytes += cost(ref.evidenceId) + STRING_QUOTES + traversalCost(ref.snapshot);
   }
   return bytes;
+}
+
+/** Conservative escaped-byte estimate (full per-character scan). */
+function estimateNodeBytes(n: SpatialNode): number {
+  return nodeStringBytes(n, jsonEscapedByteLength);
+}
+
+/** Cheap lower bound: UTF-16 `.length` (≤ UTF-8 bytes ≤ escaped bytes), O(1) per field. */
+function nodeLowerBound(n: SpatialNode): number {
+  return nodeStringBytes(n, (s) => s.length);
+}
+
+function estimateEdgeBytes(e: StoredEdge): number {
+  return edgeStringBytes(e, jsonEscapedByteLength, estimateTraversalBytes);
+}
+
+function edgeLowerBound(e: StoredEdge): number {
+  return edgeStringBytes(e, (s) => s.length, traversalLowerBound);
 }

@@ -352,23 +352,46 @@ export class FragmentStore {
   // --- checkpoint support (phase 5A): bounded export + validated restore ---
 
   /**
-   * Exact size of the store's full history, used by the checkpoint pre-flight to
-   * reject over-capacity saves *before* any copy or message pass. Read-only; never
-   * refreshes time, uses, or any other fact.
+   * Size of the store's full history, used by the checkpoint pre-flight to reject
+   * over-capacity saves *before* any copy or message pass. `maxBytes` bounds the
+   * work: a cheap lower bound (string `.length`, O(1) per field) rejects obviously
+   * over-limit input first, then a full escaped-byte estimate runs with early
+   * termination. Read-only; never refreshes time, uses, or any other fact.
    */
-  checkpointMeasure(): FragmentCheckpointMeasure {
+  checkpointMeasure(maxBytes = Number.POSITIVE_INFINITY): FragmentCheckpointMeasure {
     let polylinePoints = 0;
     let entrancePoints = 0;
     let linkPairs = 0;
-    let bytes = 0;
     for (const fragment of this.fragmentMap.values()) {
       polylinePoints += fragment.polyline.length;
       entrancePoints += fragment.entrances.length;
       linkPairs += fragment.links?.length ?? 0;
+    }
+
+    // Cheap lower bound first (no escaped-byte scan), so a huge string is rejected
+    // before its characters are walked.
+    let lowerBound = 0;
+    for (const fragment of this.fragmentMap.values()) lowerBound += fragmentLowerBound(fragment);
+    for (const evidence of this.traversalMap.values()) lowerBound += traversalLowerBound(evidence);
+    if (lowerBound > maxBytes) {
+      return {
+        fragments: this.fragmentMap.size,
+        traversals: this.traversalMap.size,
+        polylinePoints,
+        entrancePoints,
+        linkPairs,
+        bytes: lowerBound,
+      };
+    }
+
+    let bytes = 0;
+    for (const fragment of this.fragmentMap.values()) {
       bytes += estimateFragmentBytes(fragment);
+      if (bytes > maxBytes) break;
     }
     for (const evidence of this.traversalMap.values()) {
       bytes += estimateTraversalBytes(evidence);
+      if (bytes > maxBytes) break;
     }
     return {
       fragments: this.fragmentMap.size,
@@ -697,14 +720,16 @@ const BYTES_PER_NUMBER = 24;
 // Surrounding quotes added to every string value in the JSON object.
 const STRING_QUOTES = 2;
 
-function estimateFragmentBytes(f: PathFragment): number {
+type StringCost = (s: string) => number;
+
+function fragmentStringBytes(f: PathFragment, cost: StringCost): number {
   // Field names + `{`/`}`/commas, conservatively.
   let bytes = 192;
-  bytes += jsonEscapedByteLength(f.id) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(f.worldId) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(f.dim) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(f.kind) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(f.geometrySource) + STRING_QUOTES;
+  bytes += cost(f.id) + STRING_QUOTES;
+  bytes += cost(f.worldId) + STRING_QUOTES;
+  bytes += cost(f.dim) + STRING_QUOTES;
+  bytes += cost(f.kind) + STRING_QUOTES;
+  bytes += cost(f.geometrySource) + STRING_QUOTES;
   bytes += 4 * BYTES_PER_NUMBER; // deepestY, createdAt, lastUsedAt, uses
   bytes += f.polyline.length * BYTES_PER_POINT;
   bytes += f.entrances.length * BYTES_PER_POINT;
@@ -712,18 +737,38 @@ function estimateFragmentBytes(f: PathFragment): number {
   return bytes;
 }
 
-export function estimateTraversalBytes(e: TraversalEvidence): number {
+function traversalStringBytes(e: TraversalEvidence, cost: StringCost): number {
   let bytes = 160;
-  bytes += jsonEscapedByteLength(e.id) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.fragmentId) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.worldId) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.dim) + STRING_QUOTES;
-  bytes += jsonEscapedByteLength(e.source) + STRING_QUOTES;
-  bytes += e.sessionId === null ? 4 : jsonEscapedByteLength(e.sessionId) + STRING_QUOTES; // null → "null"
+  bytes += cost(e.id) + STRING_QUOTES;
+  bytes += cost(e.fragmentId) + STRING_QUOTES;
+  bytes += cost(e.worldId) + STRING_QUOTES;
+  bytes += cost(e.dim) + STRING_QUOTES;
+  bytes += cost(e.source) + STRING_QUOTES;
+  bytes += e.sessionId === null ? 4 : cost(e.sessionId) + STRING_QUOTES; // null → "null"
   bytes += e.observedAt === null ? 4 : BYTES_PER_NUMBER;
-  bytes += e.executionId === undefined ? 0 : jsonEscapedByteLength(e.executionId) + STRING_QUOTES;
-  bytes += e.actionId === undefined ? 0 : jsonEscapedByteLength(e.actionId) + STRING_QUOTES;
-  bytes += e.mode === undefined ? 0 : jsonEscapedByteLength(e.mode) + STRING_QUOTES;
+  bytes += e.executionId === undefined ? 0 : cost(e.executionId) + STRING_QUOTES;
+  bytes += e.actionId === undefined ? 0 : cost(e.actionId) + STRING_QUOTES;
+  bytes += e.mode === undefined ? 0 : cost(e.mode) + STRING_QUOTES;
   bytes += 2 * BYTES_PER_POINT; // from, to
   return bytes;
+}
+
+/** Conservative escaped-byte estimate (full per-character scan). */
+function estimateFragmentBytes(f: PathFragment): number {
+  return fragmentStringBytes(f, jsonEscapedByteLength);
+}
+
+/** Cheap lower bound: UTF-16 `.length` (≤ UTF-8 bytes ≤ escaped bytes), O(1) per field. */
+function fragmentLowerBound(f: PathFragment): number {
+  return fragmentStringBytes(f, (s) => s.length);
+}
+
+/** Conservative escaped-byte estimate for one traversal record (full per-character scan). */
+export function estimateTraversalBytes(e: TraversalEvidence): number {
+  return traversalStringBytes(e, jsonEscapedByteLength);
+}
+
+/** Cheap lower bound for one traversal record. */
+export function traversalLowerBound(e: TraversalEvidence): number {
+  return traversalStringBytes(e, (s) => s.length);
 }
