@@ -67,6 +67,14 @@ export interface VoxelMapOptions {
    * an observation's `observedAt`. Defaults to `Date.now`.
    */
   now?: () => number;
+  /**
+   * Require an explicit `beginSession(sessionId)` before any observation is
+   * accepted, instead of auto-activating the first observation's session. The
+   * combined spatial session sets this so a restored map (whose saved evidence is
+   * all STALE) can never have a late old-session observation silently become the
+   * current session and re-mark cells FRESH. Defaults to false.
+   */
+  requireSession?: boolean;
 }
 
 /** Read-only view of one cell. `observed: false` means never observed (UNKNOWN). */
@@ -86,6 +94,7 @@ export class VoxelMap {
   private readonly sections = new Map<string, Map<string, Section>>();
   private readonly validityWindowMs: number;
   private readonly now: () => number;
+  private readonly requireSession: boolean;
   private readonly staleBoundaries = new Map<string, number>();
   private currentSessionId: string | null = null;
   /**
@@ -104,6 +113,7 @@ export class VoxelMap {
     }
     this.validityWindowMs = validityWindowMs;
     this.now = options.now ?? Date.now;
+    this.requireSession = options.requireSession ?? false;
   }
 
   /** Current persistence revision (see `saveRevisionCount`). */
@@ -290,8 +300,11 @@ export class VoxelMap {
     if (snapshot.worldId !== this.worldId) {
       throw new Error(`snapshot worldId "${snapshot.worldId}" does not match map worldId "${this.worldId}"`);
     }
-    if (this.sections.size !== 0) {
-      throw new Error('restoreSnapshot requires an empty VoxelMap (it is the initialization path, not a runtime overwrite)');
+    // Restore is the initialization path only: reject a map that has already been
+    // activated (a session started) or that recorded an interruption boundary, even
+    // when it has no sections yet. "No sections" alone is not proof it is pristine.
+    if (this.sections.size !== 0 || this.currentSessionId !== null || this.staleBoundaries.size !== 0) {
+      throw new Error('restoreSnapshot requires a pristine VoxelMap (never activated or observed)');
     }
     if (!Array.isArray(snapshot.sections)) {
       throw new Error('voxel checkpoint snapshot sections must be an array');
@@ -354,6 +367,12 @@ export class VoxelMap {
 
   private applyValidated(observation: Observation): AppliedCell | null {
     if (this.currentSessionId === null) {
+      if (this.requireSession) {
+        // The host must name the current observation session explicitly before any
+        // observation is accepted; a late old-session observation must not be able
+        // to auto-activate the map and re-mark restored STALE cells FRESH.
+        return null;
+      }
       this.currentSessionId = observation.sessionId;
     } else if (observation.sessionId !== this.currentSessionId) {
       // A foreign or already-superseded session: rejected until `beginSession`.

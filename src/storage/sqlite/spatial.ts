@@ -120,7 +120,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
 
-    this.voxel = new VoxelMap(options.worldId, options.voxelOptions);
+    this.voxel = new VoxelMap(options.worldId, { ...options.voxelOptions, requireSession: true });
     this.history = new FragmentStore(options.worldId, options.fragmentOptions);
     this.topology = new TopologyStore(this.history, options.topologyOptions);
   }
@@ -181,8 +181,17 @@ class SpatialSessionImpl implements SpatialSession {
     const topologyRevision = this.topology.revision;
 
     const maxBytes = this.limits.maxBytes;
-    const historyEnvelope = SNAPSHOT_FRAME_BYTES + jsonEscapedByteLength(this.worldId) + 2;
-    const voxelEnvelope = VOXEL_FRAME_BYTES + jsonEscapedByteLength(this.worldId) + 2;
+    // Cheap lower bound first (2 × worldId `.length` + both fixed frames + 4 quotes):
+    // each code unit encodes to ≥ 1 escaped byte, so this is a safe under-estimate
+    // that rejects an obviously-over-limit worldId before scanning its characters.
+    const frameTotal = SNAPSHOT_FRAME_BYTES + VOXEL_FRAME_BYTES;
+    if (frameTotal + 2 * this.worldId.length + 4 > maxBytes) {
+      throw new PersistenceError('capacity', `worldId alone exceeds maxBytes (${maxBytes})`);
+    }
+    // Compute the escaped worldId cost exactly once and reuse it in both envelopes.
+    const escapedWorldId = jsonEscapedByteLength(this.worldId);
+    const historyEnvelope = SNAPSHOT_FRAME_BYTES + escapedWorldId + 2;
+    const voxelEnvelope = VOXEL_FRAME_BYTES + escapedWorldId + 2;
     if (historyEnvelope + voxelEnvelope > maxBytes) {
       throw new PersistenceError('capacity', `worldId alone exceeds maxBytes (${maxBytes})`);
     }

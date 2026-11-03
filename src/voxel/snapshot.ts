@@ -19,6 +19,7 @@ import { jsonEscapedByteLength } from '../bytes.js';
 import { SECTION_CELL_COUNT } from '../constants.js';
 import type { CellEvidence, Freshness, Observation } from '../observation/types.js';
 import { AIR_BLOCK_NAME, serializeBlockState } from './blockstate.js';
+import { blockToSection, cellIndex } from './coordinates.js';
 import { bitsRequired, readCell, setBit } from './palette.js';
 import type { Section } from './section.js';
 
@@ -159,7 +160,18 @@ export function restoreVoxelSection(worldId: string, raw: VoxelSectionSnapshot):
     if (evidenceMap.has(index as number)) {
       throw new Error(`duplicate voxel cell index ${String(index)} in section`);
     }
-    const evidence = validateCellEvidence(worldId, index as number, cells, raw.bits, raw.palette, (cell as VoxelCellSnapshot).evidence);
+    const evidence = validateCellEvidence(
+      worldId,
+      raw.dim,
+      raw.cx,
+      raw.cz,
+      raw.sy,
+      index as number,
+      cells,
+      raw.bits,
+      raw.palette,
+      (cell as VoxelCellSnapshot).evidence,
+    );
     evidenceMap.set(index as number, evidence);
     revisionSum += evidence.revision;
     const at = evidence.observation.observedAt;
@@ -199,6 +211,10 @@ export function restoreVoxelSection(worldId: string, raw: VoxelSectionSnapshot):
 /** Validate one restored cell's evidence and apply the FRESH → STALE initialization rule. */
 function validateCellEvidence(
   worldId: string,
+  dim: string,
+  cx: number,
+  cz: number,
+  sy: number,
   index: number,
   cells: Uint8Array,
   bits: number,
@@ -209,6 +225,19 @@ function validateCellEvidence(
     throw new Error('voxel cell evidence must be an object');
   }
   const observation = validateObservation(worldId, raw.observation);
+  // The evidence must belong to exactly this section and this local cell: its dim
+  // and its position-decomposed section/cell index must all agree, or a snapshot
+  // could smuggle an out-of-section / out-of-dimension observation into a cell.
+  if (observation.dim !== dim) {
+    throw new Error(`voxel cell ${index} observation dim "${observation.dim}" does not match section dim "${dim}"`);
+  }
+  const coords = blockToSection(observation.pos.x, observation.pos.y, observation.pos.z);
+  if (coords.cx !== cx || coords.cz !== cz || coords.sy !== sy) {
+    throw new Error(`voxel cell ${index} observation position does not belong to section (${cx}, ${cz}, ${sy})`);
+  }
+  if (cellIndex(coords.lx, coords.ly, coords.lz) !== index) {
+    throw new Error(`voxel cell ${index} observation position does not match its cell index`);
+  }
   if (!Number.isInteger(raw.revision) || raw.revision < 1) {
     throw new Error(`voxel cell evidence revision must be a positive integer: ${String(raw.revision)}`);
   }
@@ -319,8 +348,11 @@ function observationBytes(observation: Observation, cost: StringCost): number {
   let bytes = OBSERVATION_FIXED_BYTES;
   bytes += 3 * BYTES_PER_NUMBER; // pos x/y/z
   bytes += cost(observation.state.name) + STRING_QUOTES;
-  for (const [key, value] of Object.entries(observation.state.properties)) {
-    bytes += cost(key) + STRING_QUOTES + cost(value) + STRING_QUOTES + 1;
+  const propEntries = Object.entries(observation.state.properties);
+  bytes += 2; // properties object braces
+  bytes += Math.max(0, propEntries.length - 1); // inter-property commas
+  for (const [key, value] of propEntries) {
+    bytes += cost(key) + STRING_QUOTES + cost(value) + STRING_QUOTES + 1; // key ":" value
   }
   bytes += observation.stateComplete ? 4 : 5;
   bytes += cost(observation.evidence) + STRING_QUOTES;

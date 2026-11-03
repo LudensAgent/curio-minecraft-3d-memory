@@ -66,6 +66,23 @@ function evidence(
   return view.evidence;
 }
 
+/** Exact serialized bytes of one voxel section, mirroring the worker's encoder. */
+function exactVoxelSectionBytes(section: VoxelCheckpointSnapshot['sections'][number]): number {
+  const payload = {
+    v: 1,
+    dim: section.dim,
+    cx: section.cx,
+    cz: section.cz,
+    sy: section.sy,
+    palette: section.palette,
+    bits: section.bits,
+    cells: Buffer.from(section.cells).toString('base64'),
+    evidence: section.evidence.map((c) => ({ i: c.index, e: c.evidence })),
+    revision: section.revision,
+  };
+  return Buffer.byteLength(JSON.stringify(payload), 'utf8');
+}
+
 // --- temp db helpers ----------------------------------------------------------
 
 const tempDirs: string[] = [];
@@ -242,7 +259,7 @@ describe('VoxelMap restoreSnapshot', () => {
 
     const target = new VoxelMap(WORLD);
     target.observe(obs({ state: dirt, pos: { x: 5, y: 0, z: 0 } }));
-    expect(() => target.restoreSnapshot(snapshot)).toThrow(/empty/);
+    expect(() => target.restoreSnapshot(snapshot)).toThrow(/pristine/);
   });
 
   it('rejects corrupt snapshots without a half-restored map', () => {
@@ -283,6 +300,63 @@ describe('VoxelMap restoreSnapshot', () => {
     const mismatch = source.checkpointSnapshot();
     mismatch.sections[0]!.evidence[0]!.evidence.observation.state = dirt;
     expect(() => new VoxelMap(WORLD).restoreSnapshot(mismatch)).toThrow(/disagree/);
+  });
+
+  it('rejects an observation whose position belongs to another section or dimension', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+
+    // Position moved to a different section (cx=1) — must be rejected.
+    const wrongSection = source.checkpointSnapshot();
+    wrongSection.sections[0]!.evidence[0]!.evidence.observation.pos = { x: 16, y: 0, z: 0 };
+    expect(() => new VoxelMap(WORLD).restoreSnapshot(wrongSection)).toThrow(/section/);
+
+    // Position moved within the section but to a different local cell.
+    const wrongCell = source.checkpointSnapshot();
+    wrongCell.sections[0]!.evidence[0]!.evidence.observation.pos = { x: 1, y: 0, z: 0 };
+    expect(() => new VoxelMap(WORLD).restoreSnapshot(wrongCell)).toThrow(/cell index/);
+
+    // Observation from a different dimension.
+    const wrongDim = source.checkpointSnapshot();
+    wrongDim.sections[0]!.evidence[0]!.evidence.observation.dim = 'the_nether';
+    expect(() => new VoxelMap(WORLD).restoreSnapshot(wrongDim)).toThrow(/dim/);
+  });
+
+  it('rejects restore into a map that was already activated, even with no sections', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    const snapshot = source.checkpointSnapshot();
+
+    const activated = new VoxelMap(WORLD);
+    activated.beginSession('current');
+    expect(() => activated.restoreSnapshot(snapshot)).toThrow(/pristine/);
+
+    const interrupted = new VoxelMap(WORLD);
+    interrupted.markStale(DIM, 'unloaded');
+    expect(() => interrupted.restoreSnapshot(snapshot)).toThrow(/pristine/);
+  });
+
+  it('requireSession rejects observation before an explicit beginSession', () => {
+    const map = new VoxelMap(WORLD, { requireSession: true });
+    const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(report.sections).toEqual([]);
+    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
+
+    map.beginSession('s1');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(map.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
+  });
+
+  it('voxel byte estimate is conservative against the real serialized size (many properties)', () => {
+    const map = new VoxelMap(WORLD);
+    const props: Record<string, string> = {};
+    for (let i = 0; i < 1000; i++) props[`p${i}`] = `v${i}`;
+    map.observe(obs({ state: { name: 'minecraft:stone', properties: props }, pos: { x: 0, y: 0, z: 0 } }));
+
+    const snapshot = map.checkpointSnapshot();
+    const exact = snapshot.sections.reduce((sum, s) => sum + exactVoxelSectionBytes(s), 0);
+    const estimate = map.checkpointMeasure().bytes;
+    expect(estimate).toBeGreaterThanOrEqual(exact);
   });
 });
 
@@ -465,6 +539,72 @@ describe('SQLite combined spatial persistence', () => {
     await expect(
       openSpatialSession({ databasePath: dbPath, worldId: WORLD, snapshotLimits: { maxObservedCells: 1 } }),
     ).rejects.toBeInstanceOf(PersistenceError);
+  });
+
+  it('requires an explicit beginSession before observing after reopen', async () => {
+    const dbPath = makeDbPath();
+    const save = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    save.voxel.beginSession('s1');
+    save.voxel.observe(obs({ sessionId: 's1', state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+    await save.checkpoint();
+    await save.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    // A late old-session observation before beginSession must not auto-activate.
+    const late = reopened.voxel.observe(obs({ sessionId: 's1', state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 9999 }));
+    expect(late.sections).toEqual([]);
+    expect(evidence(reopened.voxel, 0, 0, 0).freshness).toBe('STALE');
+    expect(evidence(reopened.voxel, 0, 0, 0).observation.observedAt).toBe(1000);
+    await reopened.close();
+  });
+
+  it('rejects a 1 MiB worldId against a tiny combined budget before scanning', async () => {
+    const session = await openSpatialSession({
+      databasePath: makeDbPath(),
+      worldId: 'w'.repeat(1024 * 1024),
+      snapshotLimits: { maxBytes: 1024 },
+    });
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
+    await session.close();
+  });
+
+  it('rejects the combined over-budget before decoding voxel payloads', async () => {
+    const dbPath = makeDbPath();
+    const save = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    save.history.saveFragment(frag());
+    save.voxel.beginSession('s1');
+    save.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    await save.checkpoint();
+    await save.close();
+
+    const db = new Database(dbPath);
+    const sumOctet = (table: string): number =>
+      (db.prepare(`SELECT COALESCE(SUM(octet_length(payload)), 0) AS n FROM ${table} WHERE world_id = ?`).get(WORLD) as { n: number }).n;
+    const count = (table: string): number =>
+      (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE world_id = ?`).get(WORLD) as { n: number }).n;
+
+    const fragments = count('path_fragments');
+    const traversals = count('traversal_evidence');
+    const nodes = count('spatial_nodes');
+    const edges = count('spatial_edges');
+    const commas = Math.max(0, fragments - 1) + Math.max(0, traversals - 1) + Math.max(0, nodes - 1) + Math.max(0, edges - 1);
+    const escapedWorldId = Buffer.byteLength(JSON.stringify(WORLD), 'utf8');
+    const historyBytes =
+      sumOctet('path_fragments') + sumOctet('traversal_evidence') + sumOctet('spatial_nodes') + sumOctet('spatial_edges') +
+      SNAPSHOT_FRAME_BYTES + commas + escapedWorldId;
+    const sections = count('spatial_sections');
+    const voxelBytes = sumOctet('spatial_sections') + VOXEL_FRAME_BYTES + escapedWorldId + Math.max(0, sections - 1);
+
+    // Corrupt the voxel payload (same length, invalid JSON) so a decode would fail.
+    db.prepare("UPDATE spatial_sections SET payload = 'X' || substr(payload, 2)").run();
+    db.close();
+
+    const exactTotal = historyBytes + voxelBytes;
+    // Over the combined budget by one byte → the worker must reject on the byte
+    // check before ever JSON-parsing the corrupted voxel payload ('capacity', not 'data').
+    await expect(
+      openSpatialSession({ databasePath: dbPath, worldId: WORLD, snapshotLimits: { maxBytes: exactTotal - 1 } }),
+    ).rejects.toMatchObject({ kind: 'capacity' });
   });
 });
 

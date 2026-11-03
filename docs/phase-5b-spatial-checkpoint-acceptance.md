@@ -28,7 +28,7 @@
 | `src/storage/sqlite/worker.ts` | schema 升到 v2、`spatial_sections` 表、v1→v2 升级（备份 + 事务回滚）、体素编解码、组合 checkpoint 与体素加载 |
 | `src/storage/sqlite/spatial.ts` | `openSpatialSession` 与会话实现（组合三 Store 的 checkpoint/flush/close/状态） |
 | `src/storage/sqlite/index.ts` | 导出 `openSpatialSession` 与组合会话类型；历史入口保持不变 |
-| `tests/spatial-checkpoint.test.ts` | 23 项契约测试（纯 VoxelMap 修订/快照/恢复 + 真实 SQLite/Worker + schema 升级） |
+| `tests/spatial-checkpoint.test.ts` | 30 项契约测试（纯 VoxelMap 修订/快照/恢复 + 真实 SQLite/Worker + schema 升级） |
 | `examples/spatial-checkpoint.ts` | 可运行示例（以公开包名与子路径导入） |
 | `README.md` / `README_ZH.md` | 中英文说明更新 |
 
@@ -121,7 +121,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过（产出 dist/storage/sqlite/index.js + spatial.js + worker.js）
-npm test           → 425 passed（14 个测试文件；新增 23 项 spatial-checkpoint 测试，既有 402 项保持通过）
+npm test           → 432 passed（14 个测试文件；新增 30 项 spatial-checkpoint 测试，既有 402 项保持通过）
 npx tsx examples/spatial-checkpoint.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过
 ```
@@ -139,3 +139,21 @@ SQLite 原生模块。未进行真实 mineflayer/Curio 游戏验收。
 - 持久化或恢复当前 `OPEN`、执行任务、路线缓存。
 
 本批不宣称已接入真实游戏、自动保存、按需加载或 Curio 迁移。
+
+## 评审修正（P2）
+
+针对一轮代码评审的五个问题做了修正，并各加了回归测试：
+
+- **恢复未核对证据维度/坐标/所属格**：`restoreVoxelSection` 现在校验 `observation.dim` 与 Section 维度、
+  由位置分解出的 Section 坐标（cx/cz/sy）与局部格索引（cellIndex）三者一致；异维/异 Section/异格证据原子
+  拒绝。
+- **恢复与会话激活边界未封闭**：`restoreSnapshot` 只接受「未激活、未观测」的 pristine 地图（无 Section、无
+  当前会话、无中断边界），不再仅用「地图为空」判断；新增 `VoxelMapOptions.requireSession`，组合会话强制开启，
+  在显式 `beginSession` 前拒绝实时观察，阻止恢复后的旧会话迟到观察自动激活并刷新 STALE 格。
+- **组合入口回退世界 ID 预算早停**：`checkpoint()` 先用两个外层结构与 `2 × worldId.length` 的廉价下界拒绝，
+  再计算一次转义长度并复用到两个 envelope，保留 5A 已有保护。
+- **体素字节估算漏算属性逗号**：`observationBytes` 补齐属性对象括号与属性间逗号，估算对 1000 项属性输入仍保守
+  （回归测试断言 `checkpointMeasure().bytes >= 真实序列化字节`）。
+- **组合加载在解码后才检查共享字节预算**：`loadVoxel` 改为接收历史占用扣除后的剩余字节预算，在读取/解析
+  payload 前用 `octet_length` 拒绝超限；回归测试以损坏的体素 payload 验证按 `capacity`（而非 JSON 解析 `data`）
+  拒绝。

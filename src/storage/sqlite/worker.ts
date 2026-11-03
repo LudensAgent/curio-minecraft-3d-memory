@@ -657,6 +657,7 @@ function loadVoxel(
   connection: Database.Database,
   wId: string,
   resolved: ResolvedSnapshotLimits,
+  byteBudget: number,
 ): { voxelBaselineCheckpointId: string | null; voxelSnapshot: VoxelCheckpointSnapshot | null; bytes: number } {
   const cp = connection
     .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_voxel = 1 ORDER BY seq DESC LIMIT 1')
@@ -679,7 +680,10 @@ function loadVoxel(
   if (sections > resolved.maxVoxelSections) {
     throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
   }
-  if (bytes > resolved.maxBytes) {
+  // The remaining byte budget (history already consumed) is enforced here, before
+  // any payload is read or decoded, so the shared combined budget is respected
+  // without first materializing the voxel records.
+  if (bytes > byteBudget) {
     throw new Error(`snapshot exceeds maxBytes (${bytes})`);
   }
 
@@ -714,15 +718,12 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
     let voxelBaselineCheckpointId: string | null = null;
     let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
     if (msg.kind === 'spatial') {
-      const voxel = loadVoxel(connection, msg.worldId, msg.limits);
+      // Hand the voxel loader the budget left after history, so the shared combined
+      // budget is checked against `octet_length` *before* any voxel payload is read
+      // or decoded — never "sum of two full quotas, checked only after decoding".
+      const voxel = loadVoxel(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
       voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
       voxelSnapshot = voxel.voxelSnapshot;
-      // Combined byte budget: each domain already checked individually, but the
-      // two must also fit a single shared budget — never "sum of two full quotas".
-      const totalBytes = world.bytes + voxel.bytes;
-      if (totalBytes > msg.limits.maxBytes) {
-        throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
-      }
     }
     respond({
       type: 'open_ok',
