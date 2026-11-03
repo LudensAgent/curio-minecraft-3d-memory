@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { FragmentStore } from '../src/index.js';
-import type { PathFragment, TraversalEvidence, Vec3Like } from '../src/index.js';
+import type { FragmentChanges, PathFragment, TraversalEvidence, Vec3Like } from '../src/index.js';
 
 function pt(x: number, y: number, z: number): Vec3Like {
   return { x, y, z };
@@ -573,5 +573,55 @@ describe('FragmentStore — getter-provided inputs', () => {
     expect(got.polyline).toEqual([pt(0.5, 64, 0.5), pt(1.5, 64, 0.5)]);
     expect(got.entrances).toEqual([pt(0, 64, 0)]);
     expect(got.links).toEqual([{ a: pt(0.5, 64, 0.5), b: pt(1.5, 64, 0.5) }]);
+  });
+});
+
+describe('FragmentStore — update with getter-provided changes', () => {
+  it('applies getter-provided scalar and geometry changes', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment({ uses: 1, polyline: [pt(0.5, 64, 0.5), pt(1.5, 64, 0.5)] }));
+    class Changes implements FragmentChanges {
+      get uses(): number {
+        return 7;
+      }
+      get polyline(): Vec3Like[] {
+        return [pt(0, 64, 0), pt(1, 64, 0)];
+      }
+    }
+    expect(store.updateFragment('frag-1', new Changes()).status).toBe('updated');
+    const got = store.getFragment('frag-1')!;
+    expect(got.uses).toBe(7);
+    expect(got.polyline).toEqual([pt(0, 64, 0), pt(1, 64, 0)]);
+  });
+
+  it('keeps untouched fields and lets explicit links: undefined clear the links', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(
+      fragment({ uses: 3, links: [{ a: pt(0.5, 64, 0.5), b: pt(1.5, 64, 0.5) }] }),
+    );
+    class UsesChange implements FragmentChanges {
+      get uses(): number {
+        return 9;
+      }
+    }
+    store.updateFragment('frag-1', new UsesChange());
+    expect(store.getFragment('frag-1')!.uses).toBe(9);
+    expect(store.getFragment('frag-1')!.links).toHaveLength(1);
+    // Explicit undefined clears links rather than falling back to the old value.
+    expect(store.updateFragment('frag-1', { links: undefined }).status).toBe('updated');
+    expect(store.getFragment('frag-1')!.links).toBeUndefined();
+  });
+
+  it('rejects invalid coordinates on update and leaves the record intact', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment({ polyline: [pt(0.5, 64, 0.5), pt(1.5, 64, 0.5)] }));
+    expect(() => store.updateFragment('frag-1', { polyline: [pt(0, 0, NaN)] })).toThrow();
+    expect(store.getFragment('frag-1')!.polyline).toEqual([pt(0.5, 64, 0.5), pt(1.5, 64, 0.5)]);
+  });
+
+  it('returns unchanged when an update reproduces the current content', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment({ uses: 5 }));
+    expect(store.updateFragment('frag-1', { uses: 5 }).status).toBe('unchanged');
   });
 });

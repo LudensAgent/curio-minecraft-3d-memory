@@ -168,15 +168,7 @@ export class FragmentStore {
     if (existing === undefined) {
       throw new Error(`unknown fragment "${id}"`);
     }
-    const merged: PathFragment = {
-      ...existing,
-      ...changes,
-      // Identity and creation time are never rewriteable through an update.
-      id: existing.id,
-      worldId: existing.worldId,
-      dim: existing.dim,
-      createdAt: existing.createdAt,
-    };
+    const merged = applyChanges(existing, changes);
     const snapshot = snapshotFragment(this.worldId, merged, this.limits);
     if (fragmentsEqual(existing, snapshot)) return { status: 'unchanged' };
     this.fragmentMap.set(id, snapshot);
@@ -453,6 +445,38 @@ function evidencesEqual(a: TraversalEvidence, b: TraversalEvidence): boolean {
     pointsEqual(a.from, b.from) &&
     pointsEqual(a.to, b.to)
   );
+}
+
+/**
+ * Merge an explicit update onto an existing fragment. Identity and `createdAt`
+ * are preserved; every other field is read by presence (own or prototype
+ * getter) so a class-provided `FragmentChanges` is honored. `links` is the one
+ * field where an explicitly-undefined value clears it instead of falling back.
+ */
+function applyChanges(existing: PathFragment, changes: FragmentChanges): PathFragment {
+  return {
+    id: existing.id,
+    worldId: existing.worldId,
+    dim: existing.dim,
+    createdAt: existing.createdAt,
+    kind: pick(changes, 'kind', existing.kind),
+    entrances: pick(changes, 'entrances', existing.entrances),
+    polyline: pick(changes, 'polyline', existing.polyline),
+    geometrySource: pick(changes, 'geometrySource', existing.geometrySource),
+    links: 'links' in changes ? changes.links : existing.links,
+    deepestY: pick(changes, 'deepestY', existing.deepestY),
+    lastUsedAt: pick(changes, 'lastUsedAt', existing.lastUsedAt),
+    uses: pick(changes, 'uses', existing.uses),
+  };
+}
+
+/** Read a non-optional change field by presence (own or prototype getter), else keep the current value. */
+function pick<K extends keyof FragmentChanges>(
+  changes: FragmentChanges,
+  key: K,
+  fallback: NonNullable<FragmentChanges[K]>,
+): NonNullable<FragmentChanges[K]> {
+  return key in changes ? (changes[key] as NonNullable<FragmentChanges[K]>) : fallback;
 }
 
 function resolveLimits(options: FragmentStoreOptions): ResolvedLimits {

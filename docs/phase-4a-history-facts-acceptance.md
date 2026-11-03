@@ -18,7 +18,7 @@
 | `src/topology/path-fragment.ts` | 新增 `TraversalEvidence` 证据模型；`PathFragment` 字段与含义保持不变 |
 | `src/topology/index.ts` | 导出新类与类型 |
 | `src/index.ts` | 公开包入口导出 `FragmentStore` 及必要类型 |
-| `tests/fragment-store.test.ts` | 39 项契约测试 |
+| `tests/fragment-store.test.ts` | 43 项契约测试 |
 | `examples/fragment-store-history.ts` | 可运行示例（纯公共 API，不依赖 Curio / 游戏 / 数据库） |
 | `README.md` / `README_ZH.md` | 中英文说明更新 |
 
@@ -71,7 +71,7 @@ observedAt / source`，以及可选的执行/动作关联 `executionId` / `actio
 ```text
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 245 passed（含新增 39 项 fragment-store 测试，基线 206 项全部保持通过）
+npm test           → 249 passed（含新增 43 项 fragment-store 测试，基线 206 项全部保持通过）
 npx tsx examples/fragment-store-history.ts → 正常运行（以公开包名导入，需先 build）
 独立安装验证       → npm pack 后安装到全新目录，node 运行 + tsc 类型检查均通过
 ```
