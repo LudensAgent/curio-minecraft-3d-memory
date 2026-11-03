@@ -416,22 +416,46 @@ describe('TopologyStore — historicalAnchorCandidates budgets and completeness'
   });
 
   it('validates limit default, clamping, and invalid values', () => {
-    const { store } = setupChain();
-    expect(store.historicalAnchorCandidates('a').items.length).toBe(3); // default limit 20 > 3
-    expect(() => store.historicalAnchorCandidates('a', { limit: 0 })).toThrow(/limit/);
-    expect(() => store.historicalAnchorCandidates('a', { limit: -1 })).toThrow(/limit/);
-    expect(() => store.historicalAnchorCandidates('a', { limit: 1.5 })).toThrow(/limit/);
-    expect(() => store.historicalAnchorCandidates('a', { limit: NaN })).toThrow(/limit/);
-    expect(() => store.historicalAnchorCandidates('a', { limit: Infinity })).toThrow(/limit/);
-    expect(() => store.historicalAnchorCandidates('a', { limit: Number.MAX_SAFE_INTEGER + 1 })).toThrow(/limit/);
+    // A 26-node chain gives 26 reachable candidates, exceeding the default limit of 20.
+    const history = new FragmentStore(WORLD);
+    const store = new TopologyStore(history);
+    for (let i = 0; i < 26; i++) store.saveNode(makeNode(`n${i}`, pt(i + 0.5, 64, 0.5)));
+    for (let i = 0; i < 25; i++) {
+      seedResolvedEdge(history, store, `e${i}`, `n${i}`, `n${i + 1}`, `ev${i}`, `frag${i}`, pt(i + 0.5, 64, 0.5), pt(i + 1.5, 64, 0.5));
+    }
 
-    const bounded = new TopologyStore(new FragmentStore(WORLD), { maxQueryBatch: 2 });
-    bounded.saveNode(makeNode('a', A));
-    bounded.saveNode(makeNode('b', B));
-    bounded.saveNode(makeNode('c', C));
-    expect(bounded.historicalAnchorCandidates('a', { limit: 50 }).items.length).toBeLessThanOrEqual(2);
-    // Default limit is min(20, maxQueryBatch)=2 here.
-    expect(bounded.historicalAnchorCandidates('a').items.length).toBeLessThanOrEqual(2);
+    const def = store.historicalAnchorCandidates('n0');
+    expect(def.items.length).toBe(20); // default limit = min(20, maxQueryBatch=100) = 20
+    expect(def.matchedCount).toBe(26);
+    expect(def.resultsTruncated).toBe(true);
+    expect(def.disposition).toBe('complete');
+
+    expect(() => store.historicalAnchorCandidates('n0', { limit: 0 })).toThrow(/limit/);
+    expect(() => store.historicalAnchorCandidates('n0', { limit: -1 })).toThrow(/limit/);
+    expect(() => store.historicalAnchorCandidates('n0', { limit: 1.5 })).toThrow(/limit/);
+    expect(() => store.historicalAnchorCandidates('n0', { limit: NaN })).toThrow(/limit/);
+    expect(() => store.historicalAnchorCandidates('n0', { limit: Infinity })).toThrow(/limit/);
+    expect(() => store.historicalAnchorCandidates('n0', { limit: Number.MAX_SAFE_INTEGER + 1 })).toThrow(/limit/);
+
+    // Clamping: maxQueryBatch=2 with 3 reachable candidates.
+    const h2 = new FragmentStore(WORLD);
+    const s2 = new TopologyStore(h2, { maxQueryBatch: 2 });
+    for (let i = 0; i < 3; i++) s2.saveNode(makeNode(`n${i}`, pt(i + 0.5, 64, 0.5)));
+    for (let i = 0; i < 2; i++) {
+      seedResolvedEdge(h2, s2, `e${i}`, `n${i}`, `n${i + 1}`, `ev${i}`, `frag${i}`, pt(i + 0.5, 64, 0.5), pt(i + 1.5, 64, 0.5));
+    }
+
+    const clamped = s2.historicalAnchorCandidates('n0', { limit: 50 });
+    expect(clamped.items.length).toBe(2); // clamped to maxQueryBatch=2
+    expect(clamped.matchedCount).toBe(3);
+    expect(clamped.resultsTruncated).toBe(true);
+    expect(clamped.disposition).toBe('complete');
+
+    const clampedDefault = s2.historicalAnchorCandidates('n0');
+    expect(clampedDefault.items.length).toBe(2); // default = min(20, maxQueryBatch=2) = 2
+    expect(clampedDefault.matchedCount).toBe(3);
+    expect(clampedDefault.resultsTruncated).toBe(true);
+    expect(clampedDefault.disposition).toBe('complete');
   });
 
   it('accepts stable getter-provided options', () => {
