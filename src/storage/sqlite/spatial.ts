@@ -120,7 +120,14 @@ class SpatialSessionImpl implements SpatialSession {
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
 
-    this.voxel = new VoxelMap(options.worldId, { ...options.voxelOptions, requireSession: true });
+    // Read `validityWindowMs` / `now` explicitly rather than spreading the caller's
+    // options object: object spread only copies own enumerable properties, so it
+    // would silently drop class-prototype getters and fall back to defaults.
+    this.voxel = new VoxelMap(options.worldId, {
+      validityWindowMs: options.voxelOptions?.validityWindowMs,
+      now: options.voxelOptions?.now,
+      requireSession: true,
+    });
     this.history = new FragmentStore(options.worldId, options.fragmentOptions);
     this.topology = new TopologyStore(this.history, options.topologyOptions);
   }

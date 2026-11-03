@@ -28,7 +28,7 @@
 | `src/storage/sqlite/worker.ts` | schema 升到 v2、`spatial_sections` 表、v1→v2 升级（备份 + 事务回滚）、体素编解码、组合 checkpoint 与体素加载 |
 | `src/storage/sqlite/spatial.ts` | `openSpatialSession` 与会话实现（组合三 Store 的 checkpoint/flush/close/状态） |
 | `src/storage/sqlite/index.ts` | 导出 `openSpatialSession` 与组合会话类型；历史入口保持不变 |
-| `tests/spatial-checkpoint.test.ts` | 30 项契约测试（纯 VoxelMap 修订/快照/恢复 + 真实 SQLite/Worker + schema 升级） |
+| `tests/spatial-checkpoint.test.ts` | 31 项契约测试（纯 VoxelMap 修订/快照/恢复 + 真实 SQLite/Worker + schema 升级） |
 | `examples/spatial-checkpoint.ts` | 可运行示例（以公开包名与子路径导入） |
 | `README.md` / `README_ZH.md` | 中英文说明更新 |
 
@@ -121,7 +121,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过（产出 dist/storage/sqlite/index.js + spatial.js + worker.js）
-npm test           → 432 passed（14 个测试文件；新增 30 项 spatial-checkpoint 测试，既有 402 项保持通过）
+npm test           → 433 passed（14 个测试文件；新增 31 项 spatial-checkpoint 测试，既有 402 项保持通过）
 npx tsx examples/spatial-checkpoint.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过
 ```
@@ -157,3 +157,11 @@ SQLite 原生模块。未进行真实 mineflayer/Curio 游戏验收。
 - **组合加载在解码后才检查共享字节预算**：`loadVoxel` 改为接收历史占用扣除后的剩余字节预算，在读取/解析
   payload 前用 `octet_length` 拒绝超限；回归测试以损坏的体素 payload 验证按 `capacity`（而非 JSON 解析 `data`）
   拒绝。
+
+## 评审修正（P3）
+
+- **保留宿主配置对象的属性读取语义**：`openSpatialSession` 不再用对象展开复制 `voxelOptions`（对象展开只复制
+  自有可枚举属性，会丢失类原型 getter），改为显式读取 `validityWindowMs` / `now` 再强制 `requireSession: true`。
+  回归测试用类原型 getter 验证 `validUntil` 使用 `validityWindowMs=100`（而非默认 60000）且 `now=1500` 生效。
+- **加强早停测试断言**：世界 ID 早停测试补充 `vi.spyOn`，断言 `checkpointMeasure` / `checkpointSnapshot` 均未被
+  调用，锁定「未扫描字符串、未复制快照」的性能修复，而非仅断言最终报 `capacity`。

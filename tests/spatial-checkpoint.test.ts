@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -564,7 +564,46 @@ describe('SQLite combined spatial persistence', () => {
       worldId: 'w'.repeat(1024 * 1024),
       snapshotLimits: { maxBytes: 1024 },
     });
+    // The cheap worldId lower-bound must reject *before* any store is measured or
+    // snapshotted: neither the per-record scan nor the deep copy should run.
+    const measureSpies = [
+      vi.spyOn(session.voxel, 'checkpointMeasure'),
+      vi.spyOn(session.history, 'checkpointMeasure'),
+      vi.spyOn(session.topology, 'checkpointMeasure'),
+    ];
+    const snapshotSpies = [
+      vi.spyOn(session.voxel, 'checkpointSnapshot'),
+      vi.spyOn(session.history, 'checkpointSnapshot'),
+      vi.spyOn(session.topology, 'checkpointSnapshot'),
+    ];
+
     await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
+
+    for (const spy of [...measureSpies, ...snapshotSpies]) expect(spy).not.toHaveBeenCalled();
+    await session.close();
+  });
+
+  it('preserves class-prototype getters on voxel options', async () => {
+    class Config {
+      get validityWindowMs(): number {
+        return 100;
+      }
+      get now(): () => number {
+        return () => 1500;
+      }
+    }
+    const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD, voxelOptions: new Config() });
+
+    session.voxel.beginSession('s1');
+    session.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+    expect(evidence(session.voxel, 0, 0, 0).validUntil).toBe(1100); // 1000 + 100, not 1000 + 60000
+
+    // now() honored: after an interruption at 1500, a 1600 observation is accepted
+    // (it would be wrongly rejected if `now` had fallen back to Date.now()).
+    session.voxel.markStale(DIM, 'unloaded');
+    expect(session.voxel.observe(obs({ state: stone, pos: { x: 1, y: 0, z: 0 }, observedAt: 1600 })).sections.length).toBe(1);
+    expect(session.voxel.cellAt(DIM, 1, 0, 0).observed).toBe(true);
+
     await session.close();
   });
 
