@@ -370,7 +370,10 @@ function cloneFragment(f: PathFragment): PathFragment {
     entrances: f.entrances.map((p) => ({ x: p.x, y: p.y, z: p.z })),
     polyline: f.polyline.map((p) => ({ x: p.x, y: p.y, z: p.z })),
     geometrySource: f.geometrySource,
-    links: f.links?.map((l) => ({ a: { ...l.a }, b: { ...l.b } })),
+    links: f.links?.map((l) => ({
+      a: { x: l.a.x, y: l.a.y, z: l.a.z },
+      b: { x: l.b.x, y: l.b.y, z: l.b.z },
+    })),
     deepestY: f.deepestY,
     createdAt: f.createdAt,
     lastUsedAt: f.lastUsedAt,
@@ -379,10 +382,20 @@ function cloneFragment(f: PathFragment): PathFragment {
 }
 
 function cloneEvidence(e: TraversalEvidence): TraversalEvidence {
+  // Read every field explicitly: object spread skips prototype getters, so a
+  // class-provided input would otherwise lose its attribution and coordinates.
   return {
-    ...e,
-    from: { ...e.from },
-    to: { ...e.to },
+    id: e.id,
+    fragmentId: e.fragmentId,
+    from: { x: e.from.x, y: e.from.y, z: e.from.z },
+    to: { x: e.to.x, y: e.to.y, z: e.to.z },
+    worldId: e.worldId,
+    dim: e.dim,
+    sessionId: e.sessionId,
+    observedAt: e.observedAt,
+    source: e.source,
+    executionId: e.executionId,
+    actionId: e.actionId,
   };
 }
 

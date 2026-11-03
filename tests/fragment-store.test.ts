@@ -39,6 +39,68 @@ function evidence(overrides: Partial<TraversalEvidence> = {}): TraversalEvidence
   };
 }
 
+/** A `Vec3Like` whose coordinates live behind prototype getters, not own fields. */
+class GetterPoint implements Vec3Like {
+  private readonly _x: number;
+  private readonly _y: number;
+  private readonly _z: number;
+  constructor(x: number, y: number, z: number) {
+    this._x = x;
+    this._y = y;
+    this._z = z;
+  }
+  get x(): number {
+    return this._x;
+  }
+  get y(): number {
+    return this._y;
+  }
+  get z(): number {
+    return this._z;
+  }
+}
+
+/** A `TraversalEvidence` whose fields are prototype getters, not own fields. */
+class GetterTraversalEvidence implements TraversalEvidence {
+  private readonly _executionId: string;
+  constructor(executionId = 'exec-1') {
+    this._executionId = executionId;
+  }
+  get id(): string {
+    return 'ev-get';
+  }
+  get fragmentId(): string {
+    return 'frag-1';
+  }
+  get from(): Vec3Like {
+    return new GetterPoint(0.5, 64, 0.5);
+  }
+  get to(): Vec3Like {
+    return new GetterPoint(1.5, 64, 0.5);
+  }
+  get worldId(): string {
+    return 'world';
+  }
+  get dim(): string {
+    return 'overworld';
+  }
+  get sessionId(): string | null {
+    return 's1';
+  }
+  get observedAt(): number | null {
+    return 1000;
+  }
+  get source(): string {
+    return 'confirmed_walk';
+  }
+  get executionId(): string {
+    return this._executionId;
+  }
+  get actionId(): string {
+    return 'act-1';
+  }
+}
+
 describe('FragmentStore — historical geometry', () => {
   it('preserves negative, fractional and multi-height coordinates verbatim', () => {
     const store = new FragmentStore('world');
@@ -223,17 +285,28 @@ describe('FragmentStore — traversal evidence', () => {
     expect(store.traversals().total).toBe(0);
   });
 
-  it('preserves execution/action association and treats a changed association as a conflict', () => {
+  it('preserves execution/action association and re-delivery is idempotent', () => {
     const store = new FragmentStore('world');
     store.saveFragment(fragment());
     expect(store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-1' })).status).toBe('inserted');
-    // Re-delivery with the same association is idempotent.
     expect(store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-1' })).status).toBe('unchanged');
-    // A different association for the same id is a conflict, not a silent merge.
-    expect(() => store.addTraversal(evidence({ executionId: 'exec-2' }))).toThrow(/different content/);
     const got = store.traversals().items[0]!;
     expect(got.executionId).toBe('exec-1');
     expect(got.actionId).toBe('act-1');
+  });
+
+  it('treats a changed executionId alone as a conflict', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-1' }));
+    expect(() => store.addTraversal(evidence({ executionId: 'exec-2', actionId: 'act-1' }))).toThrow(/different content/);
+  });
+
+  it('treats a changed actionId alone as a conflict', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-1' }));
+    expect(() => store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-2' }))).toThrow(/different content/);
   });
 
   it('keeps association absent when the caller does not provide it', () => {
@@ -464,5 +537,41 @@ describe('FragmentStore — history vs current state separation', () => {
     store.saveFragment(fragment({ lastUsedAt: 4321, uses: 11 }));
     expect(store.getFragment('frag-1')!.lastUsedAt).toBe(4321);
     expect(store.getFragment('frag-1')!.uses).toBe(11);
+  });
+});
+
+describe('FragmentStore — getter-provided inputs', () => {
+  it('round-trips getter-provided evidence fields and coordinates', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    expect(store.addTraversal(new GetterTraversalEvidence()).status).toBe('inserted');
+    const got = store.traversals().items[0]!;
+    expect(got.id).toBe('ev-get');
+    expect(got.executionId).toBe('exec-1');
+    expect(got.actionId).toBe('act-1');
+    expect(got.from).toEqual(pt(0.5, 64, 0.5));
+    expect(got.to).toEqual(pt(1.5, 64, 0.5));
+  });
+
+  it('detects a conflict when a getter-provided executionId changes', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    store.addTraversal(new GetterTraversalEvidence('exec-1'));
+    expect(() => store.addTraversal(new GetterTraversalEvidence('exec-2'))).toThrow(/different content/);
+  });
+
+  it('round-trips getter-provided fragment coordinates and links endpoints', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(
+      fragment({
+        polyline: [new GetterPoint(0.5, 64, 0.5), new GetterPoint(1.5, 64, 0.5)],
+        entrances: [new GetterPoint(0, 64, 0)],
+        links: [{ a: new GetterPoint(0.5, 64, 0.5), b: new GetterPoint(1.5, 64, 0.5) }],
+      }),
+    );
+    const got = store.getFragment('frag-1')!;
+    expect(got.polyline).toEqual([pt(0.5, 64, 0.5), pt(1.5, 64, 0.5)]);
+    expect(got.entrances).toEqual([pt(0, 64, 0)]);
+    expect(got.links).toEqual([{ a: pt(0.5, 64, 0.5), b: pt(1.5, 64, 0.5) }]);
   });
 });
