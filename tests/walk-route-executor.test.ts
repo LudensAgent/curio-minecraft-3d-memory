@@ -1317,3 +1317,89 @@ describe('WalkRouteExecutor — unified final commit across entries', () => {
     expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
   });
 });
+
+describe('WalkRouteExecutor — release-time invalidation and handover evidence', () => {
+  it('a report invalidating the current step during the stop prevents arrival (promise)', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      const report = map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('BLOCKED');
+  });
+
+  it('a report invalidating the current step during the stop prevents arrival (external)', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      const report = map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    const delegationId = begin(loop, points);
+    loop.advance(10);
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2, observedAt: 2200 }));
+
+    expect(loop.status()!.result?.outcome).toBe('BLOCKED');
+  });
+
+  it('an unrelated section change during the stop still allows arrival', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      const report = map.observe(obs(STONE, { x: 100, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
+  });
+
+  it('the old cancel returns the displacement accepted before delegation handover', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const pointsB = [{ x: 10.5, y: 0, z: 0.5 }, { x: 11.5, y: 0, z: 0.5 }];
+    fill(map, STONE, [[10, -1, 0], [11, -1, 0]]);
+    fill(map, AIR, [[10, 0, 0], [10, 1, 0], [11, 0, 0], [11, 1, 0]]);
+
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }));
+      loop.start(makeRequest(pointsB));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    const result = loop.cancel('agent', 'stop');
+
+    expect(result.outcome).toBe('CANCELLED');
+    expect(result.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
+    expect(result.lastObservation?.observedAt).toBe(2200);
+  });
+});

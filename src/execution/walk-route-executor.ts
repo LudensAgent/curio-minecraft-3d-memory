@@ -84,6 +84,8 @@ export class WalkRouteExecutor {
   private nextPointIndex = 1;
   private lastPosition: Vec3Like | null = null;
   private lastSample: BodySample | null = null;
+  /** The previous delegation's last accepted sample, preserved at handover for its in-flight cancel/result. */
+  private handoverSample: BodySample | null = null;
   private activeStepIndex: number | null = null;
   private activeExecutionId: string | null = null;
   private activeAbort: AbortController | null = null;
@@ -138,6 +140,8 @@ export class WalkRouteExecutor {
     this.generation += 1;
     const myGeneration = this.generation;
     this.delegationId = `walk-${myGeneration}`;
+    // Preserve the previous delegation's last accepted evidence for its in-flight cancel/result.
+    this.handoverSample = this.lastSample === null ? null : snapshotSample(this.lastSample);
     this.stopActive();
     if (this.generation !== myGeneration) {
       // A re-entrant start() (from the stop/abort callback) superseded this one.
@@ -328,7 +332,13 @@ export class WalkRouteExecutor {
     // not replace the displacement this cancellation reports.
     const cancelled = this.buildFailure('CANCELLED', message, problem);
     this.stopActive();
-    if (generation !== this.generation) return cancelled; // superseded; return the old snapshot
+    if (generation !== this.generation) {
+      // Superseded: report the previous delegation's last accepted evidence, if any.
+      if (this.handoverSample !== null) {
+        return this.buildFailureWithSample('CANCELLED', message, problem, this.handoverSample);
+      }
+      return cancelled;
+    }
     if (this.result !== null) return cloneResult(this.result); // a re-entrant callback already terminated it
     // Rebuild after release so the cancellation reflects the latest trusted evidence.
     this.result = this.buildFailure('CANCELLED', message, problem);
@@ -406,6 +416,18 @@ export class WalkRouteExecutor {
       };
     }
     return null;
+  }
+
+  /** A failure result when the given step is no longer verified OPEN, or null when it is still passable. */
+  private stepNotOpenResult(stepIndex: number): NavResult | null {
+    const step = this.verifierStatus().steps[stepIndex];
+    if (step !== undefined && step.kind === 'verified') {
+      return step.result.status === 'OPEN' ? null : this.failForStep(stepIndex, step.result);
+    }
+    return this.buildFailure('FAILED', 'the in-flight segment was invalidated before arrival', {
+      kind: 'route_invalidated',
+      detail: 'a required section changed during execution',
+    });
   }
 
   /** The unified terminal guard. Returns true when the delegation is or becomes terminal. */
@@ -591,6 +613,13 @@ export class WalkRouteExecutor {
       return;
     }
 
+    // The current segment must still be OPEN: a report during the stop may have invalidated it.
+    const notOpen = this.stepNotOpenResult(this.nextPointIndex - 1);
+    if (notOpen !== null) {
+      this.result = notOpen;
+      return;
+    }
+
     // Arrival: from the latest accepted evidence, which may have superseded the move's sample.
     const target = this.points[this.nextPointIndex];
     if (target !== undefined && this.lastPosition !== null && positionsEqual(this.lastPosition, target) && this.lastSample !== null) {
@@ -664,6 +693,13 @@ export class WalkRouteExecutor {
     const reason = this.recheckTerminal(startedAt, validUntil, ruleVersion);
     if (reason !== null) {
       this.result = this.buildFailure(reason.outcome, reason.message, reason.problem);
+      return;
+    }
+
+    // The current segment must still be OPEN: a report during the stop may have invalidated it.
+    const notOpen = this.stepNotOpenResult(this.nextPointIndex - 1);
+    if (notOpen !== null) {
+      this.result = notOpen;
       return;
     }
 
@@ -759,6 +795,24 @@ export class WalkRouteExecutor {
         ? { lastPosition: { ...this.lastPosition }, lastObservation: sampleToObservation(this.lastSample) }
         : {};
     return { outcome, message, problem, confirmed: false, trace, ...tail };
+  }
+
+  /** Build a failure result carrying a specific sample's position and observation (for handover). */
+  private buildFailureWithSample(
+    outcome: FailureOutcome,
+    message: string,
+    problem: NavProblem,
+    sample: BodySample,
+  ): NavResult {
+    return {
+      outcome,
+      message,
+      problem,
+      confirmed: false,
+      trace: this.trace.map((t) => ({ pos: { ...t.pos }, ts: t.ts })),
+      lastPosition: { ...sample.pos },
+      lastObservation: sampleToObservation(sample),
+    };
   }
 
   private snapshot(): WalkRouteStatus {
