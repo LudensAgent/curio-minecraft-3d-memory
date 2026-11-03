@@ -62,10 +62,11 @@
 - **引用解析**：接受 `traversed` 边时保存证据 ID 与当时绑定的证据语义快照（快照只用于
   保持绑定含义、比较与历史展示，不是第二个可写权威源）。查询边时通过只读历史接口重新
   解析当页引用，比较证据的**全部声明字段**（身份、片段、作用域、端点、会话、时间、
-  来源、执行/动作关联及可选 `mode`），区分：
-  - `resolved`：引用可解析且内容匹配；
-  - `missing`：引用缺失（原证据/片段已被删除）；
-  - `mismatch`：引用存在但内容不匹配。
+  来源、执行/动作关联及可选 `mode`），并重新核对所属片段是否存在及其 `worldId`/`dim`
+  是否与证据一致，区分：
+  - `resolved`：引用可解析、所属片段仍在且作用域一致、内容匹配；
+  - `missing`：引用缺失（原证据或所属片段已被删除）；
+  - `mismatch`：引用存在但内容不匹配，或所属片段作用域漂移。
   候选边的 `resolution` 为 `null`（无证据引用可解析）。
 
 ## 删除、更新与容量语义
@@ -82,6 +83,14 @@
   节点仍被任意边引用时拒绝改变 `location` 与删除节点（同值 `location` 更新保持幂等）。
 - **边**：`save / update / get / list / forget`。`id / from / to` 创建后不变，调整端点应
   显式删旧建新；改 `basis` 为 `traversed`（或改 `evidenceIds`）时重新执行全部校验。
+- **更新与重绑**：只有显式提供 `evidenceIds`（重绑）才重新解析证据并重建绑定快照；空
+  更新保持幂等，仅改 `type / source / fragmentId / basis` 等无关字段时保留原绑定快照
+  （因此「删除原证据 + 同 ID 不同内容重导入」的边在无关字段更新后仍报告 `mismatch`，
+  不被悄悄恢复为 `resolved`）。保留绑定时仍核对新 `fragmentId` 与所有原绑定快照一致，
+  不一致则原子拒绝。
+- **引用集合校验**：`evidenceIds` 必须是数组；先确认数组类型，再检查长度、空洞与逐项
+  证据存在性。稀疏数组与非数组（如 `{}`、`{ length: -1 }`）都会被原子拒绝，不会静默
+  创建「无证据但 `resolved`」的边。新增、候选升级与显式重绑共用该校验。
 - **容量**：`maxAgentNodes` / `maxProgramNodes`（独立额度）/ `maxEdges` /
   `maxEdgeEvidenceRefs`（单边证据引用数）/ `maxQueryBatch` 均可配置；超限抛明确错误，
   不静默截断证据、不自动淘汰；校验、冲突、容量或引用检查失败后记录与关联索引均无部分
@@ -107,7 +116,7 @@ getter 值（如非有限坐标）导致原子拒绝。
 ```text
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 279 passed（含新增 30 项 topology-store 测试，基线 249 项全部保持通过）
+npm test           → 285 passed（含新增 36 项 topology-store 测试，基线 249 项全部保持通过）
 npx tsx examples/topology-facts.ts → 正常运行（以公开包名导入，需先 build）
 独立安装验证       → npm pack 后安装到全新目录，node 运行 + tsc 类型检查均通过
 git diff --check   → 通过

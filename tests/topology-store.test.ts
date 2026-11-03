@@ -668,4 +668,54 @@ describe('TopologyStore — regression: rebind, sparse refs, fragment scope', ()
     expect(view.resolution).toBe('mismatch');
     expect(view.references[0]!.status).toBe('mismatch');
   });
+
+  it('rejects a fragmentId update that disagrees with the bound evidence', () => {
+    const { history, store } = setup();
+    store.saveEdge(traversedEdge());
+    history.saveFragment(fragment({ id: 'frag-nether', dim: 'nether' }));
+
+    expect(() => store.updateEdge('e-ab', { fragmentId: 'ghost' })).toThrow(
+      /does not match evidence fragment/,
+    );
+    expect(() => store.updateEdge('e-ab', { fragmentId: 'frag-nether' })).toThrow(
+      /does not match evidence fragment/,
+    );
+    // The edge is unchanged and still resolved.
+    const view = store.getEdge('e-ab')!;
+    expect(view.fragmentId).toBeUndefined();
+    expect(view.resolution).toBe('resolved');
+
+    // A matching fragmentId update is accepted.
+    expect(store.updateEdge('e-ab', { fragmentId: 'frag-1' }).status).toBe('updated');
+    expect(store.getEdge('e-ab')!.fragmentId).toBe('frag-1');
+  });
+
+  it('rejects non-array evidence reference collections', () => {
+    const store = new TopologyStore(stubHistory());
+    store.saveNode(node({ id: 'a' }));
+    store.saveNode(node({ id: 'b', location: { kind: 'exact', pos: { ...POS_B } } }));
+
+    const bogus1 = {} as unknown as string[];
+    const bogus2 = { length: -1 } as unknown as string[];
+    for (const bogus of [bogus1, bogus2]) {
+      expect(() =>
+        store.saveEdge({
+          id: 'e',
+          from: 'a',
+          to: 'b',
+          type: 'HORIZONTAL',
+          basis: 'traversed',
+          evidenceIds: bogus,
+        }),
+      ).toThrow(/must be an array/);
+    }
+    expect(store.edges().total).toBe(0);
+
+    // Candidate upgrade with a non-array collection is also rejected.
+    store.saveEdge({ id: 'e', from: 'a', to: 'b', type: 'HORIZONTAL', basis: 'candidate', evidenceIds: [] });
+    expect(() => store.updateEdge('e', { basis: 'traversed', evidenceIds: bogus1 })).toThrow(
+      /must be an array/,
+    );
+    expect(store.getEdge('e')!.basis).toBe('candidate');
+  });
 });

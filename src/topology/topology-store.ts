@@ -471,6 +471,9 @@ export class TopologyStore {
     dim: string,
   ): StoredEvidenceRef[] {
     const evidenceIds = edge.evidenceIds ?? [];
+    if (!Array.isArray(evidenceIds)) {
+      throw new Error(`edge evidenceIds must be an array`);
+    }
     if (edge.basis === 'candidate') {
       if (evidenceIds.length !== 0) {
         throw new Error(`candidate edges must not reference traversal evidence`);
@@ -500,6 +503,18 @@ export class TopologyStore {
     if (merged.basis === 'candidate') return [];
     if (existing.refs.length === 0) {
       throw new Error(`traversed edges must reference at least one traversal evidence`);
+    }
+    // Even without rebinding, a changed `fragmentId` must stay consistent with the
+    // bound evidence; otherwise an unrelated update could point the edge at a
+    // fragment the evidence never belonged to.
+    if (merged.fragmentId !== undefined) {
+      for (const ref of existing.refs) {
+        if (ref.snapshot.fragmentId !== merged.fragmentId) {
+          throw new Error(
+            `edge fragmentId "${merged.fragmentId}" does not match evidence fragment "${ref.snapshot.fragmentId}"`,
+          );
+        }
+      }
     }
     return existing.refs;
   }
