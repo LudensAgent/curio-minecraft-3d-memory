@@ -185,13 +185,15 @@ function axisSweepOverlapTimes(
   sMax: number,
 ): [number, number] | null {
   if (d === 0) {
-    return max0 > sMin && min0 < sMax ? [0, 1] : null;
+    return max0 - sMin > EPS && sMax - min0 > EPS ? [0, 1] : null;
   }
   const tA = (sMin - max0) / d;
   const tB = (sMax - min0) / d;
   const tMin = Math.max(0, Math.min(tA, tB));
   const tMax = Math.min(1, Math.max(tA, tB));
-  return tMax > tMin ? [tMin, tMax] : null;
+  // A near-degenerate interval (e.g. an exact-touch contact whose computed time is
+  // 0.999…6 rather than 1.0) is a touch, not a collision.
+  return tMax - tMin > EPS ? [tMin, tMax] : null;
 }
 
 /**
@@ -224,7 +226,7 @@ function boxSweepOverlaps(
 
   const tMin = Math.max(xTimes[0], yTimes[0], zTimes[0]);
   const tMax = Math.min(xTimes[1], yTimes[1], zTimes[1]);
-  return tMax > tMin;
+  return tMax - tMin > EPS;
 }
 
 function overlaps(min1: number, max1: number, min2: number, max2: number): boolean {

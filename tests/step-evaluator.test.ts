@@ -603,6 +603,25 @@ describe('evaluateGroundedWalkSegment — swept vertical collision', () => {
     expect(r.problem?.kind).toBe('collision');
   });
 
+  it('treats an exact-touch ceiling contact as a touch, not a collision', () => {
+    const map = yMap();
+    map.observe(obs({ name: 'minecraft:ceiling', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+    // Feet rise 0 → 0.0125: head 1.8 → 1.8125, exactly the ceiling bottom (touch only).
+    const q = { worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk' as const, body: bodyAt(0.5, 0, 0.5), direction: { axis: 'x' as const, sign: 1 as const } };
+    const r = evaluateGroundedWalkSegment(map, q, { x: 1.5, y: 0.0125, z: 0.5 }, ceilingProvider, 2000, 0.05);
+    expect(r.status).toBe('OPEN');
+  });
+
+  it('detects a rise that actually penetrates the ceiling', () => {
+    const map = yMap();
+    map.observe(obs({ name: 'minecraft:ceiling', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+    // Feet rise 0 → 0.02: head 1.82, past the 1.8125 bottom.
+    const q = { worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk' as const, body: bodyAt(0.5, 0, 0.5), direction: { axis: 'x' as const, sign: 1 as const } };
+    const r = evaluateGroundedWalkSegment(map, q, { x: 1.5, y: 0.02, z: 0.5 }, ceilingProvider, 2000, 0.05);
+    expect(r.status).toBe('BLOCKED');
+    expect(r.problem?.kind).toBe('collision');
+  });
+
   it('does not block a descent that clears the obstacle', () => {
     const map = yMap();
     map.observe(obs({ name: 'minecraft:sliver', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 1500, sequence: 2 }));

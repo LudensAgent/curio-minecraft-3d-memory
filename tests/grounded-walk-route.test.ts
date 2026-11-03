@@ -89,17 +89,23 @@ describe('grounded walk arrival (opt-in)', () => {
     expect(h.loop.status()!.result?.outcome).toBe('BLOCKED');
   });
 
-  it('does not arrive when a foot-height rise collides with a ceiling', () => {
+  it('does not arrive when a foot-height rise collides with a ceiling before the target', async () => {
     const h = setup();
     // Ceiling whose bottom is 1.8125 over the destination cell (1,1,0).
     const provider = { ...fakeProvider, resolve: (state: Parameters<typeof fakeProvider.resolve>[0], cell: Vec3Like, read: Parameters<typeof fakeProvider.resolve>[2]) => state.name === 'minecraft:ceiling' ? { kind: 'shape' as const, shape: { boxes: [{ minX: 0, maxX: 1, minY: 0.8125, maxY: 1, minZ: 0, maxZ: 1 }], supportFaces: [] } } : fakeProvider.resolve(state, cell, read) };
     h.map.observe(obs({ name: 'minecraft:ceiling', properties: {} }, { x: 1, y: 1, z: 0 }, { observedAt: 2000, sequence: 2 }));
     const initial = h.loop.start({ worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, bodyArrival: arrival, shapeProvider: provider, deadlineMs: 20_000, timeoutMs: 3000 });
-    // Feet measured at y=0.04: the correction sweep carries a vertical component whose
-    // head (1.84) crosses the 1.8125 ceiling before reaching the destination.
-    h.settle({ x: 0.5, y: 0.04, z: 0.5 }, { executionId: initial.delegationId }); h.loop.advance(10);
-    expect(h.requests).toHaveLength(0);
+    // Confirm the move actually started.
+    h.settle({ x: 0.5, y: 0, z: 0.5 }, { executionId: initial.delegationId }); h.loop.advance(10);
+    expect(h.requests).toHaveLength(1);
+    // The move completes with the feet risen to y=0.04 (head 1.84): the corridor
+    // re-check from the start (y=0) to this risen sample must block, never ARRIVED.
+    h.resolve({ sample: { worldId: 'world', dim: 'overworld', sessionId: 's1', executionId: h.requests[0]!.executionId, observedAt: 2200, sequence: 3, alive: true, connected: true, observationReady: true, onGround: true, inWater: false, pos: { x: 1.5, y: 0.04, z: 0.5 }, velocity: { x: 0, y: -0.0784, z: 0 } } });
+    await Promise.resolve();
     expect(h.loop.status()!.result?.outcome).toBe('BLOCKED');
+    expect(h.loop.status()!.result?.outcome).not.toBe('ARRIVED');
+    expect(h.stopped).toContain(h.requests[0]!.executionId);
+    expect(h.loop.status()!.lastPosition?.y).toBe(0.04);
   });
 
   it('keeps the active segment on unrelated/later same-section changes, then refuses the blocked next segment', () => {
