@@ -43,6 +43,8 @@ export type NavProblem =
   // invalidated mid-execution. These must not be collapsed into BLOCKED/NO_PATH.
   | { kind: 'deviation'; expected: Vec3Like; actual: Vec3Like }
   | { kind: 'unconfirmed_arrival'; expected: Vec3Like }
+  | { kind: 'unmeasured_position'; expected: Vec3Like }
+  | { kind: 'support_missing'; pos: Vec3Like; detail: string }
   | { kind: 'route_invalidated'; detail: string }
   | { kind: 'scope_changed'; detail: string }
   | { kind: 'unavailable'; detail: string }

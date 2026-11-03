@@ -52,11 +52,12 @@ function obs(state: { name: string; properties: Record<string, string> }, pos: V
   };
 }
 
-function sampleAt(req: { worldId: string; dim: string; sessionId: string }, pos: Vec3Like): BodySample {
+function sampleAt(req: { worldId: string; dim: string; sessionId: string; executionId: string }, pos: Vec3Like): BodySample {
   return {
     worldId: req.worldId,
     dim: req.dim,
     sessionId: req.sessionId,
+    executionId: req.executionId,
     pos: { ...pos },
     observedAt: now,
     alive: true,
@@ -124,6 +125,9 @@ async function main(): Promise<void> {
   console.log('=== start ===');
   const initial = loop.start(request);
   console.log(`  route verdict: ${initial.route.verdict}`);
+
+  // Confirm the body is measured at the route start before the first step.
+  loop.onSample(sampleAt({ ...SCOPE, executionId: initial.delegationId }, points[0]!));
 
   // Step 0: verify + start, then the body confirms arrival at points[1].
   loop.advance(10);

@@ -30,6 +30,12 @@ export interface BodySample {
   observationReady: boolean;
   onGround: boolean;
   inWater: boolean;
+  /**
+   * Execution identity this sample belongs to. A move result echoes the move's
+   * `ExecutableMove.executionId`; a host push uses the delegation id. The loop
+   * only trusts a sample whose identity matches — never by timestamp alone.
+   */
+  executionId: string;
 }
 
 /** Why a single move did not produce a confirming sample. */
@@ -102,6 +108,8 @@ export interface WalkRouteStatus {
   worldId: string;
   dim: string;
   sessionId: string;
+  /** Stable identity of this delegation; host samples must carry it in `BodySample.executionId`. */
+  delegationId: string;
   /** Terminal result, or null while running. */
   result: NavResult | null;
   /** Index (0-based) of the next route point still to be reached; `points.length` means ARRIVED. */
