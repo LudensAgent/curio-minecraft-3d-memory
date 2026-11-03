@@ -140,3 +140,22 @@ export function assertValidMode(mode: MoveMode | undefined): void {
     throw new Error(`mode "${String(mode)}" is not a known movement mode`);
   }
 }
+
+/**
+ * UTF-8 encoded byte length of a string (pure JS, no `Buffer`). Used by the
+ * checkpoint byte estimation so multi-byte labels/sources are counted at their
+ * real storage cost rather than as UTF-16 code units.
+ */
+export function utf8ByteLength(str: string): number {
+  let bytes = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4; // surrogate pair
+      i += 1; // skip the low surrogate
+    } else bytes += 3;
+  }
+  return bytes;
+}

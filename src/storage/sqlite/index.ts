@@ -91,6 +91,8 @@ class HistorySessionImpl implements HistorySession {
   private baselineCheckpointId: string | null = null;
   private lastConfirmedCheckpointId: string | null = null;
   private lastError: PersistenceError | null = null;
+  /** Checkpoint id whose commit confirmation was lost (timeout/unconfirmed). */
+  private unconfirmedCheckpointId: string | null = null;
 
   constructor(options: OpenHistorySessionOptions) {
     if (typeof options.databasePath !== 'string' || options.databasePath.length === 0) {
@@ -123,7 +125,7 @@ class HistorySessionImpl implements HistorySession {
       result = await this.requestOpen();
     } catch (err) {
       this.lifecycle = 'closed';
-      this.terminateWorker();
+      await this.terminateWorker();
       throw err;
     }
     try {
@@ -133,12 +135,15 @@ class HistorySessionImpl implements HistorySession {
       }
     } catch (err) {
       this.lifecycle = 'closed';
-      this.terminateWorker();
+      await this.terminateWorker();
       throw new PersistenceError('data', `restore failed: ${(err as Error).message}`);
     }
     this.baselineCheckpointId = result.baselineCheckpointId;
-    this.confirmedFragmentRevision = 0;
-    this.confirmedTopologyRevision = 0;
+    // `restoreSnapshot` bumps each store's revision (restore is a mutation); the
+    // confirmed baseline is exactly the post-restore revision, so the session
+    // starts clean while a later *runtime* restore would still read as dirty.
+    this.confirmedFragmentRevision = this.history.revision;
+    this.confirmedTopologyRevision = this.topology.revision;
   }
 
   async checkpoint(): Promise<CheckpointResult> {
@@ -214,23 +219,35 @@ class HistorySessionImpl implements HistorySession {
       baselineCheckpointId: this.baselineCheckpointId,
       lastConfirmedCheckpointId: this.lastConfirmedCheckpointId,
       inFlightCheckpointId: this.inFlight?.checkpointId ?? null,
+      unconfirmedCheckpointId: this.unconfirmedCheckpointId,
       lastError: this.lastError,
     };
   }
 
   async flush(): Promise<FlushResult> {
     const inFlight = this.inFlight;
-    if (inFlight === null) {
-      return { pending: false, completed: true, dirty: this.isDirty(), error: null };
+    if (inFlight !== null) {
+      try {
+        await inFlight.promise;
+        return { pending: true, completed: true, dirty: this.isDirty(), error: null };
+      } catch (err) {
+        const error =
+          err instanceof PersistenceError ? err : new PersistenceError('worker_communication', String(err));
+        return { pending: true, completed: false, dirty: true, error };
+      }
     }
-    try {
-      await inFlight.promise;
-      return { pending: true, completed: true, dirty: this.isDirty(), error: null };
-    } catch (err) {
-      const error =
-        err instanceof PersistenceError ? err : new PersistenceError('worker_communication', String(err));
-      return { pending: true, completed: false, dirty: true, error };
+    // No in-flight request, but an earlier commit was never confirmed: report it
+    // rather than claiming success.
+    if (this.unconfirmedCheckpointId !== null) {
+      return {
+        pending: true,
+        completed: false,
+        dirty: true,
+        error:
+          this.lastError ?? new PersistenceError('timeout_unconfirmed', 'a checkpoint commit was not confirmed'),
+      };
     }
+    return { pending: false, completed: true, dirty: this.isDirty(), error: null };
   }
 
   async close(): Promise<CloseResult> {
@@ -238,15 +255,18 @@ class HistorySessionImpl implements HistorySession {
       return {
         completed: this.cleanlyClosed,
         lastConfirmedCheckpointId: this.lastConfirmedCheckpointId,
-        unconfirmedRequest: this.inFlight !== null,
+        unconfirmedRequest: this.inFlight !== null || this.unconfirmedCheckpointId !== null,
         dirty: this.isDirty(),
         error: this.lastError,
       };
     }
 
     this.lifecycle = 'closing';
-    let unconfirmed = false;
-    let closeError: PersistenceError | null = null;
+    // A single total deadline governs the whole close, so waiting for an in-flight
+    // checkpoint cannot silently extend the shutdown phase.
+    const deadline = Date.now() + this.timeoutMs;
+    let unconfirmed = this.unconfirmedCheckpointId !== null;
+    let closeError: PersistenceError | null = this.lastError;
 
     if (this.inFlight !== null) {
       try {
@@ -258,12 +278,12 @@ class HistorySessionImpl implements HistorySession {
       }
     }
 
-    const closed = await this.shutdownWorker();
+    const remaining = deadline - Date.now();
+    const closed = remaining > 0 ? await this.shutdownWorker(remaining) : false;
     this.cleanlyClosed = closed;
     this.lifecycle = 'closed';
     if (!closed && closeError === null) {
-      closeError =
-        this.lastError ?? new PersistenceError('worker_communication', 'persistence worker did not close cleanly');
+      closeError = new PersistenceError('worker_communication', 'persistence worker did not close within the deadline');
     }
     return {
       completed: closed,
@@ -319,16 +339,16 @@ class HistorySessionImpl implements HistorySession {
     if (extra.bytes > L.maxBytes) throw over('maxBytes', extra.bytes);
   }
 
-  private shutdownWorker(): Promise<boolean> {
+  private shutdownWorker(timeoutMs: number): Promise<boolean> {
     if (this.worker === null) return Promise.resolve(false);
     const worker = this.worker;
     const requestId = this.nextRequestId++;
     return new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
-        this.terminateWorker();
+        void this.terminateWorker();
         resolve(false);
-      }, this.timeoutMs);
+      }, timeoutMs);
       this.pending.set(requestId, {
         kind: 'close',
         resolve: (value: unknown) => resolve(value === true),
@@ -383,7 +403,7 @@ class HistorySessionImpl implements HistorySession {
       const error = new PersistenceError('worker_start', 'persistence worker did not respond to open within timeout');
       this.lastError = error;
       this.lifecycle = 'closed';
-      this.terminateWorker();
+      void this.terminateWorker();
       entry.reject(error);
       return;
     }
@@ -394,15 +414,16 @@ class HistorySessionImpl implements HistorySession {
       );
       this.lastError = error;
       this.inFlight = null;
+      this.unconfirmedCheckpointId = entry.checkpointId ?? null;
       this.lifecycle = 'closed'; // poisoned: no further writes accepted, no auto-retry
       this.failAllPending(error);
       entry.reject(error);
-      this.terminateWorker();
+      void this.terminateWorker();
       return;
     }
     // close timeout
     this.lifecycle = 'closed';
-    this.terminateWorker();
+    void this.terminateWorker();
     entry.resolve(false);
   }
 
@@ -414,7 +435,7 @@ class HistorySessionImpl implements HistorySession {
     this.lastError = error;
     this.lifecycle = 'closed';
     this.failAllPending(error);
-    this.terminateWorker();
+    void this.terminateWorker();
   }
 
   private handleWorkerExit(): void {
@@ -428,20 +449,24 @@ class HistorySessionImpl implements HistorySession {
   private failAllPending(error: PersistenceError): void {
     for (const entry of this.pending.values()) {
       if (entry.timer !== undefined) clearTimeout(entry.timer);
+      // A checkpoint whose worker died before acking may or may not have committed;
+      // keep its id so `flush`/`close`/state can report it as unconfirmed.
+      if (entry.kind === 'checkpoint' && entry.checkpointId !== undefined) {
+        this.unconfirmedCheckpointId = entry.checkpointId;
+      }
       entry.reject(error);
     }
     this.pending.clear();
     this.inFlight = null;
   }
 
-  private terminateWorker(): void {
+  private terminateWorker(): Promise<void> {
     const worker = this.worker;
-    if (worker === null) return;
+    if (worker === null) return Promise.resolve();
     this.worker = null;
-    try {
-      void worker.terminate();
-    } catch {
-      /* already gone */
-    }
+    return worker.terminate().then(
+      () => undefined,
+      () => undefined,
+    );
   }
 }

@@ -127,7 +127,7 @@ describe('FragmentStore mutation revision', () => {
     });
   });
 
-  it('restoreSnapshot resets revision and rebuilds ownership', () => {
+  it('restoreSnapshot rebuilds ownership and marks a mutation', () => {
     const s = new FragmentStore(WORLD);
     s.saveFragment(frag());
     s.addTraversal(trav());
@@ -135,7 +135,7 @@ describe('FragmentStore mutation revision', () => {
 
     const snapshot = s.checkpointSnapshot();
     s.restoreSnapshot(snapshot);
-    expect(s.revision).toBe(0);
+    expect(s.revision).toBe(3); // restore is a mutation, not a reset to baseline
     expect(s.getFragment('f1')).not.toBeNull();
     expect(s.getTraversal('ev1')).not.toBeNull();
   });
@@ -198,7 +198,7 @@ describe('TopologyStore mutation revision + export/restore', () => {
     const t2 = new TopologyStore(history);
     t2.restoreSnapshot(snapshot);
     expect(t2.getEdge('e1')!.resolution).toBe('resolved');
-    expect(t2.revision).toBe(0);
+    expect(t2.revision).toBe(1); // restore is a mutation, not a reset to baseline
   });
 
   it('restoreSnapshot rejects a binding whose endpoints do not match the edge', () => {
@@ -680,5 +680,123 @@ describe('SQLite history checkpoint persistence', () => {
     await expect(openHistorySession({ databasePath: 'relative/history.db', worldId: WORLD })).rejects.toMatchObject(
       { kind: 'invalid_argument' },
     );
+  });
+});
+
+// ==============================================================================
+// Regression tests for the P1/P2 review findings
+// ==============================================================================
+
+describe('P1/P2 regression', () => {
+  it('marks the session dirty after a runtime restore of a fresh snapshot', async () => {
+    const session = await openHistorySession({ databasePath: makeDbPath(), worldId: WORLD });
+    expect(session.getPersistenceState().dirty).toBe(false);
+
+    session.history.restoreSnapshot({ worldId: WORLD, fragments: [frag()], traversals: [] });
+    expect(session.getPersistenceState().dirty).toBe(true);
+    await session.close();
+  });
+
+  it('rejects a restore that exceeds store capacity (maxFragments)', async () => {
+    const dbPath = makeDbPath();
+    const session = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    session.history.saveFragment(frag({ id: 'fa' }));
+    session.history.saveFragment(frag({ id: 'fb' }));
+    await session.checkpoint();
+    await session.close();
+
+    await expect(
+      openHistorySession({ databasePath: dbPath, worldId: WORLD, fragmentOptions: { maxFragments: 1 } }),
+    ).rejects.toBeInstanceOf(PersistenceError);
+  });
+
+  it('rejects a binding whose evidenceId disagrees with its snapshot id', () => {
+    const history = new FragmentStore(WORLD);
+    const t = new TopologyStore(history);
+    t.saveNode(node('a', 0, 64, 0));
+    t.saveNode(node('b', 1, 64, 0));
+    expect(() =>
+      t.restoreSnapshot({
+        worldId: WORLD,
+        nodes: [node('a', 0, 64, 0), node('b', 1, 64, 0)],
+        edges: [
+          {
+            id: 'e1',
+            from: 'a',
+            to: 'b',
+            type: 'HORIZONTAL',
+            basis: 'traversed',
+            refs: [{ evidenceId: 'ev-other', snapshot: trav() }],
+          },
+        ],
+      }),
+    ).toThrow(/does not match/);
+  });
+
+  it('rejects an edge whose fragmentId disagrees with its binding snapshot', () => {
+    const history = new FragmentStore(WORLD);
+    const t = new TopologyStore(history);
+    t.saveNode(node('a', 0, 64, 0));
+    t.saveNode(node('b', 1, 64, 0));
+    expect(() =>
+      t.restoreSnapshot({
+        worldId: WORLD,
+        nodes: [node('a', 0, 64, 0), node('b', 1, 64, 0)],
+        edges: [
+          {
+            id: 'e1',
+            from: 'a',
+            to: 'b',
+            type: 'HORIZONTAL',
+            basis: 'traversed',
+            fragmentId: 'other-frag',
+            refs: [{ evidenceId: 'ev1', snapshot: trav() }],
+          },
+        ],
+      }),
+    ).toThrow(/fragment/);
+  });
+
+  it('rejects a database with orphaned facts and no checkpoint metadata', async () => {
+    const dbPath = makeDbPath();
+    const session = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    session.history.saveFragment(frag());
+    await session.checkpoint();
+    await session.close();
+
+    const db = new Database(dbPath);
+    db.prepare('DELETE FROM checkpoints WHERE world_id = ?').run(WORLD);
+    db.close();
+
+    await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toBeInstanceOf(
+      PersistenceError,
+    );
+  });
+
+  it('rejects a database with a missing required table', async () => {
+    const dbPath = makeDbPath();
+    const session = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    await session.checkpoint();
+    await session.close();
+
+    const db = new Database(dbPath);
+    db.exec('DROP TABLE spatial_edges');
+    db.close();
+
+    await expect(openHistorySession({ databasePath: dbPath, worldId: WORLD })).rejects.toMatchObject({
+      kind: 'schema',
+    });
+  });
+
+  it('bounds UTF-8 byte size for multi-byte labels', async () => {
+    const session = await openHistorySession({
+      databasePath: makeDbPath(),
+      worldId: WORLD,
+      snapshotLimits: { maxBytes: 300 },
+    });
+    // 100 CJK chars: 100 UTF-16 code units but 300 UTF-8 bytes.
+    session.topology.saveNode(node('n', 0, 0, 0, { label: '汉'.repeat(100) }));
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
+    await session.close();
   });
 });

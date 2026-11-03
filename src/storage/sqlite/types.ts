@@ -173,6 +173,8 @@ export interface PersistenceState {
   lastConfirmedCheckpointId: string | null;
   /** Checkpoint id currently in flight (null when none). */
   inFlightCheckpointId: string | null;
+  /** Checkpoint id whose commit confirmation was lost (timeout/unconfirmed), if any. */
+  unconfirmedCheckpointId: string | null;
   lastError: PersistenceError | null;
 }
 

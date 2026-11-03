@@ -171,7 +171,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过（pretypecheck 先 build）
 npm run build      → 通过（产出 dist/storage/sqlite/index.js + worker.js）
-npm test           → 385 passed（13 个测试文件；新增 33 项 storage-checkpoint 测试，
+npm test           → 392 passed（13 个测试文件；新增 40 项 storage-checkpoint 测试，
                       既有 topology / fragment / voxel / traversability 等全部保持通过）
 npx tsx examples/history-checkpoint.ts → 正常运行（以公开包名与子路径导入，先 build）
 npm pack 后独立临时消费者安装        → 见下方「包接入验证」
@@ -183,3 +183,22 @@ git diff --check   → 通过
 查询一致，并演示 `missing` 与 `mismatch` 在恢复后仍被保留。
 
 未进行真实 mineflayer/Curio 游戏验收；本阶段不以真实游戏为验收前置。
+
+## 评审修正（P1/P2）
+
+针对一轮代码评审的六处问题做了修正，并各加了回归测试：
+
+- **P1 恢复入口把未保存数据标成 clean**：`restoreSnapshot` 不再把 revision 重置为 0，而是作为一次
+  变更递增；会话 `initialize` 在恢复后把确认基线设为恢复后的 revision，运行时公开恢复会产生可检测
+  的修订变化（dirty=true）。
+- **P2 超时后丢失「提交未确认」状态**：新增 `unconfirmedCheckpointId` 独立保留未确认 checkpoint 的
+  ID，`flush`/`close`/`getPersistenceState` 据此报告，不再用「无在途请求」代替「已确认」。
+- **P2 close 未遵守单个总期限**：`close()` 入口固定截止时间，后续 `shutdownWorker` 只用剩余时间。
+- **P2 快照字节上限未约束真实数据量**：预检改用 UTF-8 字节口径（纯 `utf8ByteLength`），边绑定快照
+  按其完整内容估算（不再用固定每引用常量）；Worker 用 `Buffer.byteLength` 复核。
+- **P2 恢复限额检查不完整且过晚**：Worker 在读取前用 `COUNT` + `octet_length` 预检数量与体积；两个
+  Store 的 `restoreSnapshot` 补齐 fragment/traversal/agent·program 节点/边的总容量检查。
+- **P2 恢复未校验绑定内部身份一致性**：`restoreEvidenceRef` 校验 `evidenceId === snapshot.id` 与
+  `fragmentId === snapshot.fragmentId`，同时继续允许权威证据缺失/变更（不重绑）。
+- **P2 损坏库被当成空库**：`openDatabase` 校验全部必需表；`loadWorld` 在无 checkpoint 时确认该世界
+  确无事实行，否则报告损坏；open 失败时关闭连接并等待 Worker 退出，避免遗留文件锁。

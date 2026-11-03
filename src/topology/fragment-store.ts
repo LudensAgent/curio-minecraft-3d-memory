@@ -26,6 +26,7 @@ import {
   assertValidMode,
   cloneTraversalEvidence,
   traversalEvidenceEqual,
+  utf8ByteLength,
 } from './path-fragment.js';
 import type { Vec3Like } from '../types.js';
 
@@ -403,6 +404,16 @@ export class FragmentStore {
     if (snapshot.worldId !== this.worldId) {
       throw new Error(`snapshot worldId "${snapshot.worldId}" does not match store worldId "${this.worldId}"`);
     }
+    if (snapshot.fragments.length > this.limits.maxFragments) {
+      throw new Error(
+        `snapshot has ${snapshot.fragments.length} fragments, exceeding ${this.limits.maxFragments}`,
+      );
+    }
+    if (snapshot.traversals.length > this.limits.maxTraversals) {
+      throw new Error(
+        `snapshot has ${snapshot.traversals.length} traversals, exceeding ${this.limits.maxTraversals}`,
+      );
+    }
     const fragments = new Map<string, PathFragment>();
     for (const raw of snapshot.fragments) {
       const validated = snapshotFragment(this.worldId, raw, this.limits);
@@ -439,7 +450,10 @@ export class FragmentStore {
     for (const [id, value] of traversals) this.traversalMap.set(id, value);
     this.fragmentToTraversalIds.clear();
     for (const [id, value] of fragmentToTraversalIds) this.fragmentToTraversalIds.set(id, value);
-    this.mutationRevision = 0;
+    // Restore is a mutation: it replaces the store's facts, so it must mark the
+    // store dirty. Only a session initializer (which then sets the confirmed
+    // baseline to the post-restore revision) treats it as a clean baseline.
+    this.mutationRevision += 1;
   }
 }
 
@@ -679,20 +693,30 @@ const BYTES_PER_LINK = 96; // two points plus {a:{...},b:{...}} framing
 
 function estimateFragmentBytes(f: PathFragment): number {
   let bytes = 64;
-  bytes += f.id.length + f.worldId.length + f.dim.length + f.kind.length + f.geometrySource.length;
+  bytes +=
+    utf8ByteLength(f.id) +
+    utf8ByteLength(f.worldId) +
+    utf8ByteLength(f.dim) +
+    utf8ByteLength(f.kind) +
+    utf8ByteLength(f.geometrySource);
   bytes += f.polyline.length * BYTES_PER_POINT;
   bytes += f.entrances.length * BYTES_PER_POINT;
   bytes += (f.links?.length ?? 0) * BYTES_PER_LINK;
   return bytes;
 }
 
-function estimateTraversalBytes(e: TraversalEvidence): number {
+export function estimateTraversalBytes(e: TraversalEvidence): number {
   let bytes = 48;
-  bytes += e.id.length + e.fragmentId.length + e.worldId.length + e.dim.length + e.source.length;
-  bytes += e.sessionId?.length ?? 0;
-  bytes += e.executionId?.length ?? 0;
-  bytes += e.actionId?.length ?? 0;
-  bytes += e.mode?.length ?? 0;
+  bytes +=
+    utf8ByteLength(e.id) +
+    utf8ByteLength(e.fragmentId) +
+    utf8ByteLength(e.worldId) +
+    utf8ByteLength(e.dim) +
+    utf8ByteLength(e.source);
+  bytes += e.sessionId === null ? 0 : utf8ByteLength(e.sessionId);
+  bytes += e.executionId === undefined ? 0 : utf8ByteLength(e.executionId);
+  bytes += e.actionId === undefined ? 0 : utf8ByteLength(e.actionId);
+  bytes += e.mode === undefined ? 0 : utf8ByteLength(e.mode);
   bytes += 2 * BYTES_PER_POINT;
   return bytes;
 }

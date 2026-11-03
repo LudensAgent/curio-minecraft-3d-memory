@@ -30,9 +30,14 @@
 
 import type { ConnectionType, LandmarkTag, NodeKind, NodeSource, SpatialNode } from './graph.js';
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
-import { assertValidMode, cloneTraversalEvidence, traversalEvidenceEqual } from './path-fragment.js';
+import {
+  assertValidMode,
+  cloneTraversalEvidence,
+  traversalEvidenceEqual,
+  utf8ByteLength,
+} from './path-fragment.js';
 import type { FragmentScope, SaveResult } from './fragment-store.js';
-import { snapshotEvidence } from './fragment-store.js';
+import { estimateTraversalBytes, snapshotEvidence } from './fragment-store.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 
 /** How a topology edge is justified. */
@@ -715,12 +720,25 @@ export class TopologyStore {
       throw new Error(`snapshot worldId "${snapshot.worldId}" does not match store worldId "${this.worldId}"`);
     }
     const nodes = new Map<string, SpatialNode>();
+    let agentNodes = 0;
+    let programNodes = 0;
     for (const raw of snapshot.nodes) {
       const validated = snapshotNode(this.worldId, raw);
       if (nodes.has(validated.id)) {
         throw new Error(`duplicate node id "${validated.id}" in snapshot`);
       }
       nodes.set(validated.id, validated);
+      if (validated.source === 'agent') agentNodes += 1;
+      else programNodes += 1;
+    }
+    if (agentNodes > this.limits.maxAgentNodes) {
+      throw new Error(`snapshot has ${agentNodes} agent nodes, exceeding ${this.limits.maxAgentNodes}`);
+    }
+    if (programNodes > this.limits.maxProgramNodes) {
+      throw new Error(`snapshot has ${programNodes} program nodes, exceeding ${this.limits.maxProgramNodes}`);
+    }
+    if (snapshot.edges.length > this.limits.maxEdges) {
+      throw new Error(`snapshot has ${snapshot.edges.length} edges, exceeding ${this.limits.maxEdges}`);
     }
     const edges = new Map<string, StoredEdge>();
     const nodeToEdgeIds = new Map<string, Set<string>>();
@@ -739,7 +757,10 @@ export class TopologyStore {
     for (const [id, value] of edges) this.edgeMap.set(id, value);
     this.nodeToEdgeIds.clear();
     for (const [id, value] of nodeToEdgeIds) this.nodeToEdgeIds.set(id, value);
-    this.mutationRevision = 0;
+    // Restore is a mutation: it replaces the store's facts, so it must mark the
+    // store dirty. Only a session initializer (which then sets the confirmed
+    // baseline to the post-restore revision) treats it as a clean baseline.
+    this.mutationRevision += 1;
   }
 
   // --- bounded historical graph queries (phase 4C) ---
@@ -1345,7 +1366,7 @@ export class TopologyStore {
       }
     }
     for (let i = 0; i < rawRefs.length; i++) {
-      refs.push(restoreEvidenceRef(this.worldId, raw.id, rawRefs[i], fromNode, toNode));
+      refs.push(restoreEvidenceRef(this.worldId, raw.id, rawRefs[i], fromNode, toNode, raw.fragmentId));
     }
 
     const stored: StoredEdge = {
@@ -1922,9 +1943,11 @@ function toEdgeSnapshot(edge: StoredEdge): TopologyEdgeSnapshot {
 
 /**
  * Validate one restored binding reference against the restored edge endpoints
- * only — structural validity plus internal consistency (scope + endpoint match),
- * never a read of the current authoritative history. The snapshot is the binding's
- * own immutable copy, so a deleted/replaced evidence record still restores verbatim.
+ * only — structural validity plus internal consistency (identity, scope + endpoint
+ * match), never a read of the current authoritative history. The snapshot is the
+ * binding's own immutable copy, so a deleted/replaced evidence record still
+ * restores verbatim, but a binding whose snapshot identity disagrees with its own
+ * `evidenceId`/edge `fragmentId` is rejected as corrupt.
  */
 function restoreEvidenceRef(
   worldId: string,
@@ -1932,6 +1955,7 @@ function restoreEvidenceRef(
   raw: unknown,
   fromNode: SpatialNode,
   toNode: SpatialNode,
+  edgeFragmentId: string | undefined,
 ): StoredEvidenceRef {
   if (raw === null || typeof raw !== 'object') {
     throw new Error(`edge "${edgeId}" binding reference must be an object`);
@@ -1943,6 +1967,14 @@ function restoreEvidenceRef(
   const snapshot = (raw as { snapshot?: unknown }).snapshot;
   // `snapshotEvidence` re-validates structure and world scope and returns a clone.
   const validated = snapshotEvidence(worldId, snapshot as TraversalEvidence);
+  if (validated.id !== evidenceId) {
+    throw new Error(`edge "${edgeId}" binding "${evidenceId}" snapshot id "${validated.id}" does not match`);
+  }
+  if (edgeFragmentId !== undefined && validated.fragmentId !== edgeFragmentId) {
+    throw new Error(
+      `edge "${edgeId}" fragmentId "${edgeFragmentId}" does not match binding "${evidenceId}" fragment "${validated.fragmentId}"`,
+    );
+  }
   if (validated.dim !== fromNode.dim) {
     throw new Error(`edge "${edgeId}" binding "${evidenceId}" dim does not match endpoint dim`);
   }
@@ -1956,23 +1988,35 @@ function restoreEvidenceRef(
 }
 
 const BYTES_PER_POINT = 48;
-const BYTES_PER_REF = 96;
 
 function estimateNodeBytes(n: SpatialNode): number {
   let bytes = 48;
-  bytes += n.id.length + n.worldId.length + n.dim.length + n.kind.length + n.source.length;
-  bytes += n.tag?.length ?? 0;
-  bytes += n.label?.length ?? 0;
+  bytes +=
+    utf8ByteLength(n.id) +
+    utf8ByteLength(n.worldId) +
+    utf8ByteLength(n.dim) +
+    utf8ByteLength(n.kind) +
+    utf8ByteLength(n.source);
+  bytes += n.tag === undefined ? 0 : utf8ByteLength(n.tag);
+  bytes += n.label === undefined ? 0 : utf8ByteLength(n.label);
   bytes += n.location.kind === 'exact' ? BYTES_PER_POINT : BYTES_PER_POINT + 16;
   return bytes;
 }
 
 function estimateEdgeBytes(e: StoredEdge): number {
   let bytes = 64;
-  bytes += e.id.length + e.from.length + e.to.length + e.type.length + e.basis.length;
-  bytes += e.fragmentId?.length ?? 0;
-  bytes += e.source?.length ?? 0;
-  bytes += e.refs.length * BYTES_PER_REF;
-  for (const ref of e.refs) bytes += ref.evidenceId.length;
+  bytes +=
+    utf8ByteLength(e.id) +
+    utf8ByteLength(e.from) +
+    utf8ByteLength(e.to) +
+    utf8ByteLength(e.type) +
+    utf8ByteLength(e.basis);
+  bytes += e.fragmentId === undefined ? 0 : utf8ByteLength(e.fragmentId);
+  bytes += e.source === undefined ? 0 : utf8ByteLength(e.source);
+  // Each binding carries a full immutable traversal snapshot — count its real
+  // string/point cost, not a fixed per-ref constant.
+  for (const ref of e.refs) {
+    bytes += utf8ByteLength(ref.evidenceId) + estimateTraversalBytes(ref.snapshot);
+  }
   return bytes;
 }

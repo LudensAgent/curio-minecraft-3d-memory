@@ -133,6 +133,12 @@ function openDatabase(databasePath: string): Database.Database {
       throw new Error(`unknown table "${name}" in database`);
     }
   }
+  for (const required of KNOWN_TABLES) {
+    if (!names.has(required)) {
+      connection.close();
+      throw new Error(`missing required table "${required}"`);
+    }
+  }
   return connection;
 }
 
@@ -155,7 +161,7 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
   for (const f of snapshot.fragments) {
     const payload = stringifyRecord(f);
     prepared.fragments.push({ id: f.id, payload });
-    prepared.bytes += payload.length;
+    prepared.bytes += Buffer.byteLength(payload, 'utf8');
     prepared.polylinePoints += f.polyline.length;
     prepared.entrancePoints += f.entrances.length;
     prepared.linkPairs += f.links?.length ?? 0;
@@ -163,34 +169,71 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
   for (const t of snapshot.traversals) {
     const payload = stringifyRecord(t);
     prepared.traversals.push({ id: t.id, payload });
-    prepared.bytes += payload.length;
+    prepared.bytes += Buffer.byteLength(payload, 'utf8');
   }
   for (const n of snapshot.nodes) {
     const payload = stringifyRecord(n);
     prepared.nodes.push({ id: n.id, payload });
-    prepared.bytes += payload.length;
+    prepared.bytes += Buffer.byteLength(payload, 'utf8');
   }
   for (const e of snapshot.edges) {
     const payload = stringifyRecord(e);
     prepared.edges.push({ id: e.id, payload });
-    prepared.bytes += payload.length;
+    prepared.bytes += Buffer.byteLength(payload, 'utf8');
     prepared.edgeEvidenceRefs += e.refs.length;
   }
   return prepared;
 }
 
+function assertCountsWithinLimits(
+  fragments: number,
+  traversals: number,
+  nodes: number,
+  edges: number,
+  bytes: number,
+  resolved: ResolvedSnapshotLimits,
+): void {
+  if (fragments > resolved.maxFragments) throw new Error(`snapshot exceeds maxFragments (${fragments})`);
+  if (traversals > resolved.maxTraversals) throw new Error(`snapshot exceeds maxTraversals (${traversals})`);
+  if (nodes > resolved.maxNodes) throw new Error(`snapshot exceeds maxNodes (${nodes})`);
+  if (edges > resolved.maxEdges) throw new Error(`snapshot exceeds maxEdges (${edges})`);
+  if (bytes > resolved.maxBytes) throw new Error(`snapshot exceeds maxBytes (${bytes})`);
+}
+
+function assertDerivedWithinLimits(
+  derived: { polylinePoints: number; entrancePoints: number; linkPairs: number; edgeEvidenceRefs: number },
+  resolved: ResolvedSnapshotLimits,
+): void {
+  if (derived.polylinePoints > resolved.maxPolylinePoints) {
+    throw new Error(`snapshot exceeds maxPolylinePoints (${derived.polylinePoints})`);
+  }
+  if (derived.entrancePoints > resolved.maxEntrancePoints) {
+    throw new Error(`snapshot exceeds maxEntrancePoints (${derived.entrancePoints})`);
+  }
+  if (derived.linkPairs > resolved.maxLinks) throw new Error(`snapshot exceeds maxLinks (${derived.linkPairs})`);
+  if (derived.edgeEvidenceRefs > resolved.maxEdgeEvidenceRefs) {
+    throw new Error(`snapshot exceeds maxEdgeEvidenceRefs (${derived.edgeEvidenceRefs})`);
+  }
+}
+
 function assertWithinLimits(prepared: PreparedSnapshot, resolved: ResolvedSnapshotLimits): void {
-  const over = (name: string): Error =>
-    new Error(`snapshot exceeds ${name} (${resolved[name as keyof ResolvedSnapshotLimits]})`);
-  if (prepared.fragments.length > resolved.maxFragments) throw over('maxFragments');
-  if (prepared.traversals.length > resolved.maxTraversals) throw over('maxTraversals');
-  if (prepared.nodes.length > resolved.maxNodes) throw over('maxNodes');
-  if (prepared.edges.length > resolved.maxEdges) throw over('maxEdges');
-  if (prepared.polylinePoints > resolved.maxPolylinePoints) throw over('maxPolylinePoints');
-  if (prepared.entrancePoints > resolved.maxEntrancePoints) throw over('maxEntrancePoints');
-  if (prepared.linkPairs > resolved.maxLinks) throw over('maxLinks');
-  if (prepared.edgeEvidenceRefs > resolved.maxEdgeEvidenceRefs) throw over('maxEdgeEvidenceRefs');
-  if (prepared.bytes > resolved.maxBytes) throw over('maxBytes');
+  assertCountsWithinLimits(
+    prepared.fragments.length,
+    prepared.traversals.length,
+    prepared.nodes.length,
+    prepared.edges.length,
+    prepared.bytes,
+    resolved,
+  );
+  assertDerivedWithinLimits(
+    {
+      polylinePoints: prepared.polylinePoints,
+      entrancePoints: prepared.entrancePoints,
+      linkPairs: prepared.linkPairs,
+      edgeEvidenceRefs: prepared.edgeEvidenceRefs,
+    },
+    resolved,
+  );
 }
 
 function writeCheckpoint(
@@ -239,11 +282,44 @@ function writeCheckpoint(
   tx();
 }
 
+function countRows(connection: Database.Database, table: string, wId: string): number {
+  const row = connection
+    .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE world_id = ?`)
+    .get(wId) as { n: number };
+  return row.n;
+}
+
+function sumPayloadBytes(connection: Database.Database, table: string, wId: string): number {
+  const row = connection
+    .prepare(`SELECT COALESCE(SUM(octet_length(payload)), 0) AS n FROM ${table} WHERE world_id = ?`)
+    .get(wId) as { n: number };
+  return row.n;
+}
+
 function readAll(connection: Database.Database, table: string, wId: string): unknown[] {
   const rows = connection
     .prepare(`SELECT payload FROM ${table} WHERE world_id = ? ORDER BY seq`)
     .all(wId) as { payload: string }[];
   return rows.map((r) => JSON.parse(r.payload) as unknown);
+}
+
+function computeDerivedCounts(snapshot: HistorySnapshot): {
+  polylinePoints: number;
+  entrancePoints: number;
+  linkPairs: number;
+  edgeEvidenceRefs: number;
+} {
+  let polylinePoints = 0;
+  let entrancePoints = 0;
+  let linkPairs = 0;
+  let edgeEvidenceRefs = 0;
+  for (const f of snapshot.fragments) {
+    polylinePoints += f.polyline.length;
+    entrancePoints += f.entrances.length;
+    linkPairs += f.links?.length ?? 0;
+  }
+  for (const e of snapshot.edges) edgeEvidenceRefs += e.refs.length;
+  return { polylinePoints, entrancePoints, linkPairs, edgeEvidenceRefs };
 }
 
 function loadWorld(
@@ -255,8 +331,33 @@ function loadWorld(
     .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
     .get(wId) as { checkpoint_id: string } | undefined;
   if (cp === undefined) {
+    // Corruption guard: fact rows without checkpoint metadata must not read as an
+    // empty world (the next empty checkpoint would otherwise silently erase them).
+    const orphans =
+      countRows(connection, 'path_fragments', wId) +
+      countRows(connection, 'traversal_evidence', wId) +
+      countRows(connection, 'spatial_nodes', wId) +
+      countRows(connection, 'spatial_edges', wId);
+    if (orphans > 0) {
+      throw new Error('world has fact rows but no checkpoint metadata');
+    }
     return { baselineCheckpointId: null, snapshot: null };
   }
+
+  // Bounded pre-check *before* reading/decoding any records: enforce record counts
+  // and the real UTF-8 byte total against the limits, so an oversized database is
+  // rejected without materializing and re-encoding it on the worker.
+  const fragments = countRows(connection, 'path_fragments', wId);
+  const traversals = countRows(connection, 'traversal_evidence', wId);
+  const nodes = countRows(connection, 'spatial_nodes', wId);
+  const edges = countRows(connection, 'spatial_edges', wId);
+  const bytes =
+    sumPayloadBytes(connection, 'path_fragments', wId) +
+    sumPayloadBytes(connection, 'traversal_evidence', wId) +
+    sumPayloadBytes(connection, 'spatial_nodes', wId) +
+    sumPayloadBytes(connection, 'spatial_edges', wId);
+  assertCountsWithinLimits(fragments, traversals, nodes, edges, bytes, resolved);
+
   const snapshot: HistorySnapshot = {
     worldId: wId,
     fragments: readAll(connection, 'path_fragments', wId) as HistorySnapshot['fragments'],
@@ -264,9 +365,7 @@ function loadWorld(
     nodes: readAll(connection, 'spatial_nodes', wId) as HistorySnapshot['nodes'],
     edges: readAll(connection, 'spatial_edges', wId) as HistorySnapshot['edges'],
   };
-  // Bound the load before returning it to the main thread.
-  const prepared = prepareSnapshot(snapshot);
-  assertWithinLimits(prepared, resolved);
+  assertDerivedWithinLimits(computeDerivedCounts(snapshot), resolved);
   return { baselineCheckpointId: cp.checkpoint_id, snapshot };
 }
 
@@ -279,7 +378,15 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
     const { baselineCheckpointId, snapshot } = loadWorld(connection, msg.worldId, msg.limits);
     respond({ type: 'open_ok', requestId: msg.requestId, baselineCheckpointId, snapshot });
   } catch (err) {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'data', message: (err as Error).message });
+    // A failed load must release the connection before the session tears the
+    // worker down, so the database file is not left locked on the host OS.
+    db = null;
+    worldId = null;
+    limits = null;
+    connection.close();
+    const message = (err as Error).message;
+    const kind = /exceeds/.test(message) ? 'capacity' : 'data';
+    respond({ type: 'error', requestId: msg.requestId, kind, message });
   }
 }
 
