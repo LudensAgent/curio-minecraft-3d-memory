@@ -21,8 +21,9 @@ import type {
   WorkerResponse,
 } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
+import type { VoxelDirectoryEntry } from '../../voxel/residency.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -34,6 +35,8 @@ const KNOWN_TABLES_V1 = new Set([
 ]);
 
 const KNOWN_TABLES_V2 = new Set([...KNOWN_TABLES_V1, 'spatial_sections']);
+
+const KNOWN_TABLES_V3 = new Set(KNOWN_TABLES_V2);
 
 /** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
 const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
@@ -64,6 +67,20 @@ const REQUIRED_COLUMNS_V2: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
     seq: 'INTEGER',
   },
   spatial_sections: { world_id: 'TEXT', seq: 'INTEGER', id: 'TEXT', payload: 'TEXT' },
+};
+
+/** Required columns for the v3 schema (adds per-section committed metadata columns). */
+const REQUIRED_COLUMNS_V3: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V2,
+  spatial_sections: {
+    world_id: 'TEXT',
+    seq: 'INTEGER',
+    id: 'TEXT',
+    payload: 'TEXT',
+    observed_cells: 'INTEGER',
+    palette_entries: 'INTEGER',
+    revision: 'INTEGER',
+  },
 };
 
 const SCHEMA_SQL = `
@@ -120,6 +137,9 @@ CREATE TABLE spatial_sections (
   seq INTEGER NOT NULL,
   id TEXT NOT NULL,
   payload TEXT NOT NULL,
+  observed_cells INTEGER NOT NULL DEFAULT 0,
+  palette_entries INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (world_id, id)
 );
 `;
@@ -137,7 +157,7 @@ interface PreparedSnapshot {
 }
 
 interface PreparedVoxelSnapshot {
-  sections: { id: string; payload: string }[];
+  sections: { id: string; payload: string; observedCells: number; paletteEntries: number; revision: number }[];
   bytes: number;
 }
 
@@ -187,12 +207,22 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV1ToV2(connection, databasePath);
+    upgradeV2ToV3(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (2)
-  validateKnownTables(connection, names, KNOWN_TABLES_V2);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V2)) {
+  if (version === 2) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V2);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V2)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV2ToV3(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (3)
+  validateKnownTables(connection, names, KNOWN_TABLES_V3);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V3)) {
     assertRequiredColumns(connection, table, columns);
   }
   return connection;
@@ -238,6 +268,36 @@ function upgradeV1ToV2(connection: Database.Database, databasePath: string): voi
       )
     `);
     connection.prepare("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
+/**
+ * Upgrade a validated v2 database in place: write a consistent backup first, then
+ * add the per-section committed metadata columns and backfill them from each
+ * existing payload (a bounded, one-time decode) inside one transaction, so a
+ * failure rolls back to a still-v2 database without touching the payloads.
+ */
+function upgradeV2ToV3(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v3-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.exec('ALTER TABLE spatial_sections ADD COLUMN observed_cells INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE spatial_sections ADD COLUMN palette_entries INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE spatial_sections ADD COLUMN revision INTEGER NOT NULL DEFAULT 0');
+    const rows = connection.prepare('SELECT world_id, id, payload FROM spatial_sections').all() as {
+      world_id: string;
+      id: string;
+      payload: string;
+    }[];
+    const update = connection.prepare(
+      'UPDATE spatial_sections SET observed_cells = ?, palette_entries = ?, revision = ? WHERE world_id = ? AND id = ?',
+    );
+    for (const row of rows) {
+      const section = decodeVoxelSection(row.payload);
+      update.run(section.evidence.length, section.palette.length, section.revision, row.world_id, row.id);
+    }
+    connection.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
   });
   tx();
 }
@@ -340,10 +400,21 @@ function voxelSectionId(section: VoxelSectionSnapshot): string {
   return JSON.stringify([section.dim, section.cx, section.cz, section.sy]);
 }
 
+/** Stable id for a section key (for load requests). */
+function voxelSectionIdFromKey(key: { dim: string; cx: number; cz: number; sy: number }): string {
+  return JSON.stringify([key.dim, key.cx, key.cz, key.sy]);
+}
+
 function prepareVoxelSnapshot(snapshot: VoxelCheckpointSnapshot): PreparedVoxelSnapshot {
   const sections = snapshot.sections.map((section) => {
     const payload = encodeVoxelSection(section);
-    return { id: voxelSectionId(section), payload };
+    return {
+      id: voxelSectionId(section),
+      payload,
+      observedCells: section.evidence.length,
+      paletteEntries: section.palette.length,
+      revision: section.revision,
+    };
   });
   let bytes = VOXEL_FRAME_BYTES + Buffer.byteLength(JSON.stringify(snapshot.worldId), 'utf8');
   bytes += Math.max(0, sections.length - 1);
@@ -433,7 +504,7 @@ function writeCheckpoint(
   fragmentRevision: number,
   topologyRevision: number,
   prepared: PreparedSnapshot,
-  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: { id: string; payload: string }[] },
+  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
   resolved: ResolvedSnapshotLimits,
 ): void {
   const tx = connection.transaction(() => {
@@ -471,9 +542,11 @@ function writeCheckpoint(
     if (voxel.mode === 'full') {
       connection.prepare('DELETE FROM spatial_sections WHERE world_id = ?').run(wId);
       const insertSection = connection.prepare(
-        'INSERT INTO spatial_sections (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
+        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision) VALUES (?, ?, ?, ?, ?, ?, ?)',
       );
-      voxel.sections.forEach((s, i) => insertSection.run(wId, i, s.id, s.payload));
+      voxel.sections.forEach((s, i) =>
+        insertSection.run(wId, i, s.id, s.payload, s.observedCells, s.paletteEntries, s.revision),
+      );
     } else if (voxel.mode === 'incremental') {
       // Existing rows keep their `seq` (stable order); new rows are appended after
       // the current max seq, in batch order. Only an existing row's payload changes,
@@ -483,10 +556,12 @@ function writeCheckpoint(
         .get(wId) as { n: number };
       const baseSeq = maxSeqRow.n;
       const upsertSection = connection.prepare(
-        'INSERT INTO spatial_sections (world_id, seq, id, payload) VALUES (?, ?, ?, ?) ' +
-          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload',
+        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision) VALUES (?, ?, ?, ?, ?, ?, ?) ' +
+          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision',
       );
-      voxel.sections.forEach((s, i) => upsertSection.run(wId, baseSeq + i + 1, s.id, s.payload));
+      voxel.sections.forEach((s, i) =>
+        upsertSection.run(wId, baseSeq + i + 1, s.id, s.payload, s.observedCells, s.paletteEntries, s.revision),
+      );
       // The resulting full set must still re-open under the same limits: reject
       // (and roll back) before commit if the increments accumulate past capacity.
       assertVoxelFullSetWithinLimits(connection, wId, prepared.bytes, resolved);
@@ -525,6 +600,14 @@ function assertVoxelFullSetWithinLimits(
   if (sections > resolved.maxVoxelSections) {
     throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
   }
+  const observedCells = sumColumn(connection, 'spatial_sections', 'observed_cells', wId);
+  if (observedCells > resolved.maxObservedCells) {
+    throw new Error(`snapshot exceeds maxObservedCells (${observedCells})`);
+  }
+  const paletteEntries = sumColumn(connection, 'spatial_sections', 'palette_entries', wId);
+  if (paletteEntries > resolved.maxPaletteEntries) {
+    throw new Error(`snapshot exceeds maxPaletteEntries (${paletteEntries})`);
+  }
   const voxelBytes =
     sumPayloadBytes(connection, 'spatial_sections', wId) +
     VOXEL_FRAME_BYTES +
@@ -534,6 +617,13 @@ function assertVoxelFullSetWithinLimits(
   if (total > resolved.maxBytes) {
     throw new Error(`snapshot exceeds maxBytes (${total})`);
   }
+}
+
+function sumColumn(connection: Database.Database, table: string, column: string, wId: string): number {
+  const row = connection
+    .prepare(`SELECT COALESCE(SUM(${column}), 0) AS n FROM ${table} WHERE world_id = ?`)
+    .get(wId) as { n: number };
+  return row.n;
 }
 
 function countRows(connection: Database.Database, table: string, wId: string): number {
@@ -754,6 +844,88 @@ function loadVoxel(
   return { voxelBaselineCheckpointId: cp.checkpoint_id, voxelSnapshot: { worldId: wId, sections: decoded }, bytes };
 }
 
+/**
+ * Read only the committed section directory (manual loading): identity, stable
+ * order, committed payload byte size, and the committed observed-cell/palette/
+ * revision metadata — never the payloads. The byte/count budget is checked before
+ * any row is materialized, so a manual open never decodes a single payload.
+ */
+function loadVoxelDirectory(
+  connection: Database.Database,
+  wId: string,
+  resolved: ResolvedSnapshotLimits,
+  byteBudget: number,
+): { voxelBaselineCheckpointId: string | null; voxelDirectory: VoxelDirectoryEntry[]; bytes: number } {
+  const cp = connection
+    .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_voxel = 1 ORDER BY seq DESC LIMIT 1')
+    .get(wId) as { checkpoint_id: string } | undefined;
+  if (cp === undefined) {
+    if (countRows(connection, 'spatial_sections', wId) > 0) {
+      throw new Error('world has voxel rows but no voxel checkpoint metadata');
+    }
+    return { voxelBaselineCheckpointId: null, voxelDirectory: [], bytes: 0 };
+  }
+
+  const sections = countRows(connection, 'spatial_sections', wId);
+  const bytes =
+    sumPayloadBytes(connection, 'spatial_sections', wId) +
+    VOXEL_FRAME_BYTES +
+    Buffer.byteLength(JSON.stringify(wId), 'utf8') +
+    Math.max(0, sections - 1);
+  if (sections > resolved.maxVoxelSections) {
+    throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
+  }
+  if (bytes > byteBudget) {
+    throw new Error(`snapshot exceeds maxBytes (${bytes})`);
+  }
+
+  const rows = connection
+    .prepare(
+      'SELECT id, seq, octet_length(payload) AS bytes, observed_cells, palette_entries, revision FROM spatial_sections WHERE world_id = ? ORDER BY seq',
+    )
+    .all(wId) as { id: string; seq: number; bytes: number; observed_cells: number; palette_entries: number; revision: number }[];
+
+  const directory: VoxelDirectoryEntry[] = [];
+  let observedCells = 0;
+  let paletteEntries = 0;
+  for (const row of rows) {
+    const [dim, cx, cz, sy] = parseSectionId(row.id);
+    observedCells += row.observed_cells;
+    paletteEntries += row.palette_entries;
+    directory.push({
+      key: { worldId: wId, dim, cx, cz, sy },
+      seq: row.seq,
+      bytes: row.bytes,
+      observedCells: row.observed_cells,
+      paletteEntries: row.palette_entries,
+      revision: row.revision,
+    });
+  }
+  if (observedCells > resolved.maxObservedCells) {
+    throw new Error(`snapshot exceeds maxObservedCells (${observedCells})`);
+  }
+  if (paletteEntries > resolved.maxPaletteEntries) {
+    throw new Error(`snapshot exceeds maxPaletteEntries (${paletteEntries})`);
+  }
+  return { voxelBaselineCheckpointId: cp.checkpoint_id, voxelDirectory: directory, bytes };
+}
+
+/** Parse a stable section id (`JSON.stringify([dim, cx, cz, sy])`) back into its parts. */
+function parseSectionId(id: string): [string, number, number, number] {
+  const arr = JSON.parse(id) as unknown;
+  if (
+    !Array.isArray(arr) ||
+    arr.length !== 4 ||
+    typeof arr[0] !== 'string' ||
+    !Number.isInteger(arr[1]) ||
+    !Number.isInteger(arr[2]) ||
+    !Number.isInteger(arr[3])
+  ) {
+    throw new Error('corrupt section id');
+  }
+  return [arr[0], arr[1] as number, arr[2] as number, arr[3] as number];
+}
+
 function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   const connection = openDatabase(msg.databasePath);
   db = connection;
@@ -763,13 +935,20 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
     const world = loadWorld(connection, msg.worldId, msg.limits);
     let voxelBaselineCheckpointId: string | null = null;
     let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
+    let voxelDirectory: VoxelDirectoryEntry[] | null = null;
     if (msg.kind === 'spatial') {
       // Hand the voxel loader the budget left after history, so the shared combined
       // budget is checked against `octet_length` *before* any voxel payload is read
       // or decoded — never "sum of two full quotas, checked only after decoding".
-      const voxel = loadVoxel(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
-      voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
-      voxelSnapshot = voxel.voxelSnapshot;
+      if (msg.voxelLoading === 'manual') {
+        const voxel = loadVoxelDirectory(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
+        voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
+        voxelDirectory = voxel.voxelDirectory;
+      } else {
+        const voxel = loadVoxel(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
+        voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
+        voxelSnapshot = voxel.voxelSnapshot;
+      }
     }
     respond({
       type: 'open_ok',
@@ -778,6 +957,7 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       snapshot: world.snapshot,
       voxelBaselineCheckpointId,
       voxelSnapshot,
+      voxelDirectory,
     });
   } catch (err) {
     db = null;
@@ -846,6 +1026,42 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   respond({ type: 'checkpoint_ok', requestId: msg.requestId, checkpointId: msg.checkpointId });
 }
 
+function handleLoadSections(msg: WorkerRequest & { type: 'load_sections' }): void {
+  if (db === null || worldId === null || limits === null) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'worker is not open' });
+    return;
+  }
+  if (msg.worldId !== worldId) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'load worldId does not match session worldId' });
+    return;
+  }
+  try {
+    const metaStmt = db.prepare('SELECT octet_length(payload) AS bytes FROM spatial_sections WHERE world_id = ? AND id = ?');
+    const loadStmt = db.prepare('SELECT payload FROM spatial_sections WHERE world_id = ? AND id = ?');
+    const existing: { id: string; bytes: number }[] = [];
+    const missing: { dim: string; cx: number; cz: number; sy: number }[] = [];
+    let totalBytes = 0;
+    for (const key of msg.keys) {
+      const id = voxelSectionIdFromKey(key);
+      const row = metaStmt.get(worldId, id) as { bytes: number } | undefined;
+      if (row === undefined) {
+        missing.push(key);
+        continue;
+      }
+      totalBytes += row.bytes;
+      existing.push({ id, bytes: row.bytes });
+    }
+    if (totalBytes > limits.maxBytes) {
+      throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
+    }
+    const sections = existing.map((entry) => decodeVoxelSection((loadStmt.get(worldId, entry.id) as { payload: string }).payload));
+    respond({ type: 'load_ok', requestId: msg.requestId, sections, missing });
+  } catch (err) {
+    const message = (err as Error).message;
+    respond({ type: 'error', requestId: msg.requestId, kind: /exceeds/.test(message) ? 'capacity' : 'data', message });
+  }
+}
+
 function handleClose(msg: WorkerRequest & { type: 'close' }): void {
   if (db !== null) {
     db.close();
@@ -871,6 +1087,9 @@ parentPort!.on('message', (msg: WorkerRequest) => {
       break;
     case 'checkpoint':
       handleCheckpoint(msg);
+      break;
+    case 'load_sections':
+      handleLoadSections(msg);
       break;
     case 'close':
       handleClose(msg);

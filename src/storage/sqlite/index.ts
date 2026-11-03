@@ -36,6 +36,7 @@ export type {
   FlushResult,
   HistorySession,
   HistorySnapshot,
+  LoadSectionsResult,
   OpenHistorySessionOptions,
   OpenSpatialSessionOptions,
   PersistenceErrorKind,
@@ -46,6 +47,7 @@ export type {
   SpatialCheckpointResult,
   SpatialPersistenceState,
   SpatialSession,
+  VoxelLoading,
 } from './types.js';
 export { openSpatialSession } from './spatial.js';
 
@@ -360,6 +362,7 @@ class HistorySessionImpl implements HistorySession {
         worldId: this.worldId,
         limits: this.limits,
         kind: 'history',
+        voxelLoading: 'eager',
       } satisfies WorkerRequest);
     });
   }

@@ -17,6 +17,7 @@
 
 import type { Observation } from '../observation/types.js';
 import { sectionKeyString } from '../voxel/section.js';
+import type { SectionKey } from '../voxel/section.js';
 import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import type { CollisionShapeProvider } from './collision-shape.js';
 import { evaluateWalkStep } from './step.js';
@@ -118,6 +119,22 @@ export class TraversabilityCache {
         this.bySection.set(depKey, set);
       }
       set.add(key);
+    }
+  }
+
+  /**
+   * Drop every cached entry that depended on one of the given sections, regardless
+   * of revision. A residency change (unload or reload) does not advance
+   * `Section.revision`, so the revision-based `invalidate(report)` cannot see it;
+   * the host calls this with the sections whose residency changed so an unloaded
+   * section never keeps returning an old OPEN and a reloaded section never keeps a
+   * pre-load UNKNOWN.
+   */
+  invalidateSections(keys: readonly SectionKey[]): void {
+    for (const key of keys) {
+      const entryKeys = this.bySection.get(sectionKeyString(key));
+      if (entryKeys === undefined) continue;
+      for (const entryKey of [...entryKeys]) this.removeEntry(entryKey);
     }
   }
 

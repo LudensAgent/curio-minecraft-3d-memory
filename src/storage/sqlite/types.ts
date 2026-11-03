@@ -17,6 +17,13 @@ import type {
   TopologyEdgeSnapshot,
   TraversalEvidence,
 } from '../../topology/index.js';
+import type { SectionKey } from '../../voxel/section.js';
+import type {
+  ResidencyLimits,
+  SectionResidencyInfo,
+  UnloadSectionsResult,
+  VoxelDirectoryEntry,
+} from '../../voxel/residency.js';
 import type { VoxelCheckpointSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelMap, VoxelMapOptions } from '../../voxel/voxel-map.js';
 
@@ -34,6 +41,7 @@ export type PersistenceErrorKind =
   | 'worker_start'
   | 'worker_communication'
   | 'timeout_unconfirmed'
+  | 'timeout'
   | 'schema'
   | 'data';
 
@@ -223,6 +231,9 @@ export interface HistorySession {
   close(): Promise<CloseResult>;
 }
 
+/** How a combined spatial session loads voxel sections at open. */
+export type VoxelLoading = 'eager' | 'manual';
+
 /** Options for `openSpatialSession`. */
 export interface OpenSpatialSessionOptions {
   /** Absolute path to the SQLite database file. Required. */
@@ -233,8 +244,24 @@ export interface OpenSpatialSessionOptions {
   fragmentOptions?: FragmentStoreOptions;
   topologyOptions?: TopologyStoreOptions;
   snapshotLimits?: SnapshotLimits;
+  /**
+   * Voxel loading mode. `eager` (default) restores every committed section into
+   * memory at open, preserving the phase 5B/5C behavior. `manual` reads only the
+   * committed section directory at open and requires explicit `loadSections`.
+   */
+  voxelLoading?: VoxelLoading;
+  /** Working-set bounds used when `voxelLoading` is `manual`. */
+  residencyLimits?: ResidencyLimits;
   /** Bound for worker open/checkpoint/close/flush waits. Default 30000 ms. */
   timeoutMs?: number;
+}
+
+/** Result of `SpatialSession.loadSections`. */
+export interface LoadSectionsResult {
+  /** Sections that were loaded (and are now resident). */
+  loaded: SectionKey[];
+  /** Requested sections with no committed record. */
+  missing: SectionKey[];
 }
 
 /** Result of a successful combined spatial checkpoint. */
@@ -286,6 +313,16 @@ export interface SpatialSession {
   flush(): Promise<FlushResult>;
   /** Stop accepting writes and shut the persistence channel down within a bounded time. */
   close(): Promise<CloseResult>;
+  /** Residency of one section (manual mode); mirrors `VoxelMap.sectionResidency`. */
+  sectionResidency(key: SectionKey): SectionResidencyInfo;
+  /** Explicitly load committed sections into memory (manual mode only). */
+  loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult>;
+  /** Safely unload resident sections; rejects pinned/dirty/uncommitted with reasons. */
+  unloadSections(keys: readonly SectionKey[]): UnloadSectionsResult;
+  /** Acquire a bounded pin lease; pass its token to `releasePins` to drop it. */
+  pinSections(keys: readonly SectionKey[]): { token: string; keys: SectionKey[] };
+  /** Release pin leases by token; releasing an unknown token is a no-op. */
+  releasePins(tokens: readonly string[]): void;
 }
 
 /** Which facts a worker session persists (history-only vs combined spatial). */
@@ -311,6 +348,8 @@ export type WorkerRequest =
       worldId: string;
       limits: ResolvedSnapshotLimits;
       kind: WorkerSessionKind;
+      /** How a combined spatial session loads voxel sections at open. */
+      voxelLoading: VoxelLoading;
     }
   | {
       type: 'checkpoint';
@@ -326,6 +365,13 @@ export type WorkerRequest =
       /** The full set for `full`, the changed set for `incremental`; ignored for `none`. */
       voxelSnapshot: VoxelCheckpointSnapshot;
     }
+  | {
+      type: 'load_sections';
+      requestId: number;
+      worldId: string;
+      /** Distinct section coordinates to load. */
+      keys: { dim: string; cx: number; cz: number; sy: number }[];
+    }
   | { type: 'close'; requestId: number };
 
 /** Wire response messages sent from the worker to the session. */
@@ -338,6 +384,16 @@ export type WorkerResponse =
       /** Voxel baseline checkpoint id, or null when voxel has never been saved. */
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
+      /** Committed section directory (manual loading); null when loaded eagerly. */
+      voxelDirectory: VoxelDirectoryEntry[] | null;
+    }
+  | {
+      type: 'load_ok';
+      requestId: number;
+      /** Decoded payloads for the requested keys that had a committed record. */
+      sections: VoxelCheckpointSnapshot['sections'];
+      /** Requested coordinates with no committed record. */
+      missing: { dim: string; cx: number; cz: number; sy: number }[];
     }
   | { type: 'checkpoint_ok'; requestId: number; checkpointId: string }
   | { type: 'closed'; requestId: number }

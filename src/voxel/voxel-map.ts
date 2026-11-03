@@ -25,11 +25,22 @@ import type { Section, SectionKey } from './section.js';
 import {
   cloneCellEvidence,
   cloneObservation,
+  estimateObservationResidentGrowth,
   estimateVoxelSectionBytes,
   restoreVoxelSection,
   snapshotVoxelSection,
   voxelSectionLowerBound,
 } from './snapshot.js';
+import { resolveResidencyLimits, VoxelResidencyError } from './residency.js';
+import type {
+  CommittedSectionInfo,
+  PinLease,
+  ResidencyLimits,
+  ResolvedResidencyLimits,
+  SectionResidencyInfo,
+  UnloadSectionsResult,
+  VoxelDirectoryEntry,
+} from './residency.js';
 import type {
   VoxelCheckpointCounts,
   VoxelCheckpointMeasure,
@@ -81,6 +92,16 @@ export interface VoxelMapOptions {
    * current session and re-mark cells FRESH. Defaults to false.
    */
   requireSession?: boolean;
+  /**
+   * Enable manual on-demand Section residency (design §9.2). When true the map
+   * distinguishes committed-on-disk sections from resident-in-memory sections and
+   * requires an explicit load before a write to a saved section. `installDirectory`
+   * must be called once after construction. Defaults to false (every section is
+   * eager-resident).
+   */
+  manualResidency?: boolean;
+  /** Working-set bounds used when `manualResidency` is true. */
+  residencyLimits?: ResidencyLimits;
 }
 
 /** Read-only view of one cell. `observed: false` means never observed (UNKNOWN). */
@@ -101,6 +122,29 @@ export class VoxelMap {
   private readonly validityWindowMs: number;
   private readonly now: () => number;
   private readonly requireSession: boolean;
+  private readonly manualResidency: boolean;
+  private readonly residentLimits: ResolvedResidencyLimits;
+  /**
+   * Committed section directory (manual mode only), keyed by a dim|coords key.
+   * Read once at open from the worker without decoding any payload.
+   */
+  private readonly directory = new Map<string, VoxelDirectoryEntry>();
+  /** Transient residency flags for non-resident sections: loading / load_failed. */
+  private readonly extraResidency = new Map<string, 'loading' | 'load_failed'>();
+  private readonly pins = new Map<string, PinLease>();
+  /** Distinct pinned section key → number of active leases protecting it. */
+  private readonly pinCounts = new Map<string, number>();
+  /**
+   * Conservative resident working-set size: the sum of `estimateVoxelSectionBytes`
+   * over resident sections, maintained by before/after estimates on observe, load
+   * and unload. A conservative estimate, not exact heap usage. `markStale` /
+   * `beginSession` only flip freshness (a small `staleReason` string per cell) and
+   * do not change the dominant palette/cells/evidence terms.
+   */
+  private residentBytes = 0;
+  private residentSectionCount = 0;
+  private directoryInstalled = false;
+  private nextPinToken = 1;
   private readonly staleBoundaries = new Map<string, number>();
   private currentSessionId: string | null = null;
   /**
@@ -135,6 +179,8 @@ export class VoxelMap {
     this.validityWindowMs = validityWindowMs;
     this.now = options.now ?? Date.now;
     this.requireSession = options.requireSession ?? false;
+    this.manualResidency = options.manualResidency ?? false;
+    this.residentLimits = resolveResidencyLimits(options.residencyLimits);
   }
 
   /** Current persistence revision (see `saveRevisionCount`). */
@@ -194,7 +240,8 @@ export class VoxelMap {
   /** Accept one confirmed observation and return its localized change (or empty). */
   observe(observation: Observation): ChangeReport {
     validateObservation(this.worldId, observation);
-    const applied = this.applyValidated(observation);
+    this.assertWritable([observation]);
+    const applied = this.applyWithResidentAccounting(observation);
     if (applied === null) return { sections: [] };
     this.recordSaveChange(applied.section);
     return {
@@ -211,16 +258,18 @@ export class VoxelMap {
 
   /**
    * Accept a batch; only the confirmed observations are written, gaps are not
-   * cells. The whole batch is validated up front so an invalid observation does
-   * not leave behind a half-applied batch.
+   * cells. The whole batch is validated up front — both for malformed input and
+   * for the manual-residency write guard — so an invalid observation or a
+   * not-resident section does not leave behind a half-applied batch.
    */
   observeBatch(batch: ObservationBatch): ChangeReport {
     for (const observation of batch.observations) {
       validateObservation(this.worldId, observation);
     }
+    this.assertWritable(batch.observations);
     const bySection = new Map<Section, SectionChange>();
     for (const observation of batch.observations) {
-      const applied = this.applyValidated(observation);
+      const applied = this.applyWithResidentAccounting(observation);
       if (applied === null) continue;
       this.recordSaveChange(applied.section);
       addChange(bySection, applied.section, {
@@ -295,6 +344,11 @@ export class VoxelMap {
    * caller owns the returned objects; mutating them never reaches the store.
    */
   checkpointSnapshot(): VoxelCheckpointSnapshot {
+    if (this.manualResidency && this.hasNonResidentDirectory()) {
+      throw new Error(
+        'checkpointSnapshot requires a fully resident map; unloaded sections would be silently dropped',
+      );
+    }
     const out: VoxelCheckpointSnapshot['sections'] = [];
     for (const dimMap of this.sections.values()) {
       for (const section of dimMap.values()) {
@@ -315,6 +369,38 @@ export class VoxelMap {
         observedCells += section.evidence.size;
         paletteEntries += section.palette.length;
       }
+    }
+    return { sections, observedCells, paletteEntries };
+  }
+
+  /**
+   * Cheap count of the *full* committed fact set — resident sections (counted
+   * from their live state) plus directory sections that are not currently
+   * resident (counted from their committed metadata). In manual mode this is
+   * larger than `checkpointCounts()`; in eager mode the directory is empty and
+   * the two are equal. Used by the session so a partial-resident map does not
+   * under-count the full set against `maxVoxelSections`/`maxObservedCells`/
+   * `maxPaletteEntries`.
+   */
+  checkpointFullCounts(): VoxelCheckpointCounts {
+    const residentKeys = new Set<string>();
+    let sections = 0;
+    let observedCells = 0;
+    let paletteEntries = 0;
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        residentKeys.add(dirKey(section.key.dim, section.key.cx, section.key.cz, section.key.sy));
+        sections += 1;
+        observedCells += section.evidence.size;
+        paletteEntries += section.palette.length;
+      }
+    }
+    for (const entry of this.directory.values()) {
+      const key = dirKey(entry.key.dim, entry.key.cx, entry.key.cz, entry.key.sy);
+      if (residentKeys.has(key)) continue;
+      sections += 1;
+      observedCells += entry.observedCells;
+      paletteEntries += entry.paletteEntries;
     }
     return { sections, observedCells, paletteEntries };
   }
@@ -424,6 +510,216 @@ export class VoxelMap {
     // session initializer, which then sets the confirmed baseline to the
     // post-restore revision, treats it as clean.
     this.saveRevisionCount += 1;
+  }
+
+  // --- manual residency (phase 5D1) ---
+
+  /**
+   * Install the committed section directory read at open. Called exactly once,
+   * before the map is sealed for delivery. Each entry is keyed by `worldId` +
+   * dim/cx/cz/sy; the directory is the authoritative "what is committed on disk"
+   * set, never a second authority over section facts (its fields mirror the
+   * committed payload).
+   */
+  installDirectory(entries: readonly VoxelDirectoryEntry[]): void {
+    if (!this.manualResidency) {
+      throw new Error('installDirectory is only available in manual residency mode');
+    }
+    if (this.directoryInstalled) {
+      throw new Error('the section directory is already installed');
+    }
+    for (const entry of entries) {
+      if (entry.key.worldId !== this.worldId) {
+        throw new Error(
+          `directory entry worldId "${entry.key.worldId}" does not match map worldId "${this.worldId}"`,
+        );
+      }
+      const key = dirKey(entry.key.dim, entry.key.cx, entry.key.cz, entry.key.sy);
+      if (this.directory.has(key)) {
+        throw new Error(`duplicate directory entry (${entry.key.dim}, ${entry.key.cx}, ${entry.key.cz}, ${entry.key.sy})`);
+      }
+      this.directory.set(key, entry);
+    }
+    this.directoryInstalled = true;
+  }
+
+  /** Residency of one section plus its committed record, when one exists. */
+  sectionResidency(key: SectionKey): SectionResidencyInfo {
+    assertSectionKey(this.worldId, key);
+    const committed = this.committedInfo(key);
+    if (this.hasSectionKey(key.dim, key.cx, key.cz, key.sy)) {
+      return { residency: 'resident', committed };
+    }
+    const extra = this.extraResidency.get(dirKey(key.dim, key.cx, key.cz, key.sy));
+    if (extra === 'loading') return { residency: 'loading', committed };
+    if (extra === 'load_failed') return { residency: 'load_failed', committed };
+    if (committed !== undefined) return { residency: 'not_resident', committed };
+    return { residency: 'no_record' };
+  }
+
+  /** Mark sections as having a load in flight (the session drives this around the worker round-trip). */
+  markLoading(keys: readonly SectionKey[]): void {
+    for (const key of keys) {
+      assertSectionKey(this.worldId, key);
+      this.extraResidency.set(dirKey(key.dim, key.cx, key.cz, key.sy), 'loading');
+    }
+  }
+
+  /** Mark a failed load so the sections read as saved-but-not-resident, never as no-record. */
+  markLoadFailed(keys: readonly SectionKey[]): void {
+    for (const key of keys) {
+      assertSectionKey(this.worldId, key);
+      this.extraResidency.set(dirKey(key.dim, key.cx, key.cz, key.sy), 'load_failed');
+    }
+  }
+
+  /** Clear transient loading/failed markers (used for keys the worker reported have no record). */
+  clearTransientResidency(keys: readonly SectionKey[]): void {
+    for (const key of keys) {
+      this.extraResidency.delete(dirKey(key.dim, key.cx, key.cz, key.sy));
+    }
+  }
+
+  /**
+   * Narrow runtime section-install path: validate every snapshot, check the
+   * working-set capacity, then install atomically. Never replays `observe`, never
+   * refreshes evidence time, never advances the save revision or dirties a
+   * section, and never resets the current session or interruption boundaries.
+   * Returns the installed section keys for the caller to feed cache invalidation.
+   */
+  installLoadedSections(snapshots: readonly VoxelSectionSnapshot[]): SectionKey[] {
+    if (!this.manualResidency) {
+      throw new Error('installLoadedSections is only available in manual residency mode');
+    }
+    // Validate + build every section first, so a corrupt section in the middle
+    // never publishes a half-valid, half-corrupt batch.
+    const built: Section[] = [];
+    const seen = new Set<string>();
+    for (const raw of snapshots) {
+      const section = restoreVoxelSection(this.worldId, raw);
+      const key = dirKey(section.key.dim, section.key.cx, section.key.cz, section.key.sy);
+      if (seen.has(key)) {
+        throw new Error(`duplicate loaded section (${section.key.dim}, ${section.key.cx}, ${section.key.cz}, ${section.key.sy})`);
+      }
+      seen.add(key);
+      built.push(section);
+    }
+
+    const fresh = built.filter((s) => !this.hasSectionKey(s.key.dim, s.key.cx, s.key.cz, s.key.sy));
+    const addedBytes = fresh.reduce((sum, s) => sum + estimateVoxelSectionBytes(s), 0);
+    if (this.residentSectionCount + fresh.length > this.residentLimits.maxResidentSections) {
+      throw new Error(
+        `resident sections would exceed maxResidentSections (${this.residentSectionCount + fresh.length} > ${this.residentLimits.maxResidentSections})`,
+      );
+    }
+    if (this.residentBytes + addedBytes > this.residentLimits.maxResidentBytes) {
+      throw new Error(
+        `resident working set would exceed maxResidentBytes (${this.residentBytes + addedBytes} > ${this.residentLimits.maxResidentBytes})`,
+      );
+    }
+
+    for (const section of built) this.setSection(section);
+    this.residentSectionCount += fresh.length;
+    this.residentBytes += addedBytes;
+    for (const section of built) {
+      this.extraResidency.delete(dirKey(section.key.dim, section.key.cx, section.key.cz, section.key.sy));
+    }
+    return built.map((s) => ({ ...s.key }));
+  }
+
+  /**
+   * Controlled, safe unload of resident sections. Only sections with a committed
+   * record, no pending (unsaved) change, and no active pin are released; anything
+   * else is reported with a structured reason. Unloading releases only the runtime
+   * payload — it never deletes the directory record, never clears history, never
+   * auto-saves, and never marks the section as never-observed.
+   */
+  unloadSections(keys: readonly SectionKey[]): UnloadSectionsResult {
+    const result: UnloadSectionsResult = { unloaded: [], rejected: [] };
+    for (const key of keys) {
+      assertSectionKey(this.worldId, key);
+      const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+      if (!this.hasSectionKey(key.dim, key.cx, key.cz, key.sy)) continue; // already non-resident
+      if ((this.pinCounts.get(dk) ?? 0) > 0) {
+        result.rejected.push({ key: { ...key }, reason: 'pinned' });
+        continue;
+      }
+      if (!this.directory.has(dk)) {
+        result.rejected.push({ key: { ...key }, reason: 'not_committed' });
+        continue;
+      }
+      const section = this.residentSection(key)!;
+      if (this.pendingSections.has(section)) {
+        result.rejected.push({ key: { ...key }, reason: 'dirty' });
+        continue;
+      }
+
+      const dimMap = this.sections.get(key.dim)!;
+      dimMap.delete(innerKey(key.cx, key.cz, key.sy));
+      if (dimMap.size === 0) this.sections.delete(key.dim);
+      this.residentBytes -= estimateVoxelSectionBytes(section);
+      this.residentSectionCount -= 1;
+      result.unloaded.push({ ...key });
+    }
+    return result;
+  }
+
+  /**
+   * Acquire a bounded protection lease over a set of sections. Pinning does not
+   * load or refresh evidence; it only prevents `unloadSections` from releasing
+   * the section. Multiple callers may pin the same section; each lease is dropped
+   * independently.
+   */
+  pinSections(keys: readonly SectionKey[]): PinLease {
+    if (!this.manualResidency) {
+      throw new Error('pinSections requires manual residency mode');
+    }
+    const deduped = dedupeKeys(keys);
+    if (deduped.length > this.residentLimits.maxLoadBatchSections) {
+      throw new Error(`pin request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residentLimits.maxLoadBatchSections})`);
+    }
+    if (this.pins.size >= this.residentLimits.maxPins) {
+      throw new Error(`pin leases exceed maxPins (${this.pins.size} >= ${this.residentLimits.maxPins})`);
+    }
+    // Apply the increments, then check the distinct-pinned-sections cap; on over
+    // cap, roll back this lease's increments and leave the pin set unchanged.
+    for (const key of deduped) {
+      const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+      this.pinCounts.set(dk, (this.pinCounts.get(dk) ?? 0) + 1);
+    }
+    if (this.pinCounts.size > this.residentLimits.maxPinnedSections) {
+      for (const key of deduped) {
+        const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+        const count = this.pinCounts.get(dk)! - 1;
+        if (count <= 0) this.pinCounts.delete(dk);
+        else this.pinCounts.set(dk, count);
+      }
+      throw new Error(`pinned sections exceed maxPinnedSections (${this.residentLimits.maxPinnedSections})`);
+    }
+    const token = `pin-${this.nextPinToken++}`;
+    const lease: PinLease = { token, keys: deduped.map((k) => ({ ...k })) };
+    this.pins.set(token, lease);
+    return { token, keys: lease.keys.map((k) => ({ ...k })) };
+  }
+
+  /**
+   * Release one or more pin leases. Releasing only ever drops the caller's own
+   * lease; an unknown or already-released token is a no-op, so a late cleanup of
+   * an old task can never undo a newer task's protection.
+   */
+  releasePins(tokens: readonly string[]): void {
+    for (const token of tokens) {
+      const lease = this.pins.get(token);
+      if (lease === undefined) continue;
+      this.pins.delete(token);
+      for (const key of lease.keys) {
+        const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+        const count = this.pinCounts.get(dk);
+        if (count === undefined) continue;
+        if (count <= 1) this.pinCounts.delete(dk);
+        else this.pinCounts.set(dk, count - 1);
+      }
+    }
   }
 
   // --- internals ---
@@ -616,6 +912,98 @@ export class VoxelMap {
     this.saveRevisionCount += 1;
     this.pendingSections.set(section, this.saveRevisionCount);
   }
+
+  private committedInfo(key: SectionKey): CommittedSectionInfo | undefined {
+    const entry = this.directory.get(dirKey(key.dim, key.cx, key.cz, key.sy));
+    if (entry === undefined) return undefined;
+    return {
+      revision: entry.revision,
+      bytes: entry.bytes,
+      observedCells: entry.observedCells,
+      paletteEntries: entry.paletteEntries,
+    };
+  }
+
+  private hasNonResidentDirectory(): boolean {
+    for (const entry of this.directory.values()) {
+      if (!this.hasSectionKey(entry.key.dim, entry.key.cx, entry.key.cz, entry.key.sy)) return true;
+    }
+    return false;
+  }
+
+  private hasSectionKey(dim: string, cx: number, cz: number, sy: number): boolean {
+    return this.sections.get(dim)?.has(innerKey(cx, cz, sy)) ?? false;
+  }
+
+  private residentSection(key: SectionKey): Section | undefined {
+    return this.sections.get(key.dim)?.get(innerKey(key.cx, key.cz, key.sy));
+  }
+
+  private setSection(section: Section): void {
+    let dimMap = this.sections.get(section.key.dim);
+    if (dimMap === undefined) {
+      dimMap = new Map();
+      this.sections.set(section.key.dim, dimMap);
+    }
+    dimMap.set(innerKey(section.key.cx, section.key.cz, section.key.sy), section);
+  }
+
+  /**
+   * Manual-mode write guard: reject (before any mutation) a batch that would
+   * write a committed-but-not-resident (or loading/failed) section, or that
+   * would push the resident working set over its bounds. A no-op in eager mode.
+   */
+  private assertWritable(observations: readonly Observation[]): void {
+    if (!this.manualResidency) return;
+    const missing: SectionKey[] = [];
+    const missingSeen = new Set<string>();
+    const newSections = new Set<string>();
+    for (const observation of observations) {
+      const { cx, cz, sy } = blockToSection(observation.pos.x, observation.pos.y, observation.pos.z);
+      const key = dirKey(observation.dim, cx, cz, sy);
+      if (this.hasSectionKey(observation.dim, cx, cz, sy)) continue;
+      const known = this.directory.has(key) || this.extraResidency.has(key);
+      if (known) {
+        if (!missingSeen.has(key)) {
+          missingSeen.add(key);
+          missing.push({ worldId: this.worldId, dim: observation.dim, cx, cz, sy });
+        }
+      } else {
+        newSections.add(key);
+      }
+    }
+    if (missing.length > 0) throw new VoxelResidencyError(missing);
+
+    if (this.residentSectionCount + newSections.size > this.residentLimits.maxResidentSections) {
+      throw new Error(
+        `resident sections would exceed maxResidentSections (${this.residentSectionCount + newSections.size} > ${this.residentLimits.maxResidentSections})`,
+      );
+    }
+    let growth = 0;
+    for (const observation of observations) growth += estimateObservationResidentGrowth(observation);
+    if (this.residentBytes + growth > this.residentLimits.maxResidentBytes) {
+      throw new Error(
+        `resident working set would exceed maxResidentBytes (${this.residentBytes + growth} > ${this.residentLimits.maxResidentBytes})`,
+      );
+    }
+  }
+
+  /**
+   * Apply a validated observation and keep the conservative resident working-set
+   * size exact (before/after section estimates). A rejected/idempotent observation
+   * (null) changes nothing.
+   */
+  private applyWithResidentAccounting(observation: Observation): AppliedCell | null {
+    if (!this.manualResidency) return this.applyValidated(observation);
+    const existing = this.lookupSection(observation.dim, observation.pos.x, observation.pos.y, observation.pos.z);
+    const beforeBytes = existing === undefined ? 0 : estimateVoxelSectionBytes(existing);
+    const applied = this.applyValidated(observation);
+    if (applied === null) return null;
+    const afterBytes = estimateVoxelSectionBytes(applied.section);
+    this.residentBytes += afterBytes - beforeBytes;
+    if (existing === undefined) this.residentSectionCount += 1;
+    return applied;
+  }
 }
 
 function addChange(
@@ -680,4 +1068,33 @@ function assertIntegerCoords(x: number, y: number, z: number): void {
   if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
     throw new Error(`coordinates must be integer grid coordinates: (${x}, ${y}, ${z})`);
   }
+}
+
+/** Internal residency-map key for one section within this map's worldId. */
+function dirKey(dim: string, cx: number, cz: number, sy: number): string {
+  return `${dim}|${cx},${cz},${sy}`;
+}
+
+function assertSectionKey(worldId: string, key: SectionKey): void {
+  if (key.worldId !== worldId) {
+    throw new Error(`section key worldId "${key.worldId}" does not match map worldId "${worldId}"`);
+  }
+  if (typeof key.dim !== 'string' || key.dim.length === 0) {
+    throw new Error('section key dim must be a non-empty string');
+  }
+  if (!Number.isInteger(key.cx) || !Number.isInteger(key.cz) || !Number.isInteger(key.sy)) {
+    throw new Error(`section key coordinates must be integers: (${key.cx}, ${key.cz}, ${key.sy})`);
+  }
+}
+
+function dedupeKeys(keys: readonly SectionKey[]): SectionKey[] {
+  const seen = new Set<string>();
+  const out: SectionKey[] = [];
+  for (const key of keys) {
+    const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+    if (seen.has(dk)) continue;
+    seen.add(dk);
+    out.push({ ...key });
+  }
+  return out;
 }

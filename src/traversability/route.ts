@@ -27,6 +27,7 @@
 import type { Observation } from '../observation/types.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 import { sectionKeyString } from '../voxel/section.js';
+import type { SectionKey } from '../voxel/section.js';
 import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import { TraversabilityCache } from './cache.js';
 import type { CollisionShapeProvider } from './collision-shape.js';
@@ -306,6 +307,23 @@ export class RouteVerifier {
     this.expireStale(this.currentNow());
     this.invalidateByReport(report);
     this.cache.invalidate(report);
+  }
+
+  /**
+   * Drop step results and cached entries that depended on sections whose residency
+   * changed (unload or reload). Unlike a `ChangeReport`, a residency change does
+   * not advance `Section.revision`, so it must be handled by section key here; an
+   * unaffected section keeps its results. The host calls this with the sections
+   * `unloadSections` released or `loadSections` installed.
+   */
+  invalidateSections(keys: readonly SectionKey[]): void {
+    this.cache.invalidateSections(keys);
+    if (this.route === null) return;
+    for (const key of keys) {
+      const steps = this.sectionToSteps.get(sectionKeyString(key));
+      if (steps === undefined) continue;
+      for (const i of [...steps]) this.invalidateStep(i);
+    }
   }
 
   /** Drop the tracked route and all its results/dependencies. The shared cache is left intact. */

@@ -419,3 +419,23 @@ export function estimateVoxelSectionBytes(section: Section): number {
 export function voxelSectionLowerBound(section: Section): number {
   return voxelSectionBytes(section, (s) => s.length);
 }
+
+/**
+ * Conservative upper bound on the resident-byte growth one observation can add to
+ * a section — whether the section is brand-new or already resident. It covers the
+ * worst case of a fresh section (fixed overhead + one palette entry + one packed
+ * cell) plus one evidence entry, and the worst case of a palette-width re-pack
+ * (cells grows by at most one 4096-bit row). It is an over-estimate by design: the
+ * exact `residentBytes` counter is maintained from before/after section estimates,
+ * and this bound is only used to reject an over-capacity write *before* mutation.
+ */
+export function estimateObservationResidentGrowth(observation: Observation): number {
+  const cost = jsonEscapedByteLength;
+  let bytes = SECTION_FIXED_BYTES + CELL_FIXED_BYTES;
+  bytes += observationBytes(observation, cost);
+  bytes += BYTES_PER_NUMBER; // evidence index
+  bytes += STRING_QUOTES + cost(serializeBlockState(observation.state)); // one palette entry
+  bytes += base64Length(SECTION_CELL_COUNT / 8); // one 4096-bit row: new cell or re-pack growth
+  bytes += 4 * BYTES_PER_NUMBER; // dim + cx/cz/sy + bits + revision
+  return bytes;
+}

@@ -11,6 +11,23 @@ export {
   writeCell,
 } from './palette.js';
 export type { Section, SectionKey } from './section.js';
+export {
+  DEFAULT_RESIDENCY_LIMITS,
+  resolveResidencyLimits,
+  VoxelResidencyError,
+} from './residency.js';
+export type {
+  CommittedSectionInfo,
+  PinLease,
+  ResidencyLimits,
+  ResolvedResidencyLimits,
+  SectionResidency,
+  SectionResidencyInfo,
+  UnloadRejectionReason,
+  UnloadSectionsResult,
+  VoxelDirectory,
+  VoxelDirectoryEntry,
+} from './residency.js';
 export type {
   VoxelCellSnapshot,
   VoxelCheckpointCounts,

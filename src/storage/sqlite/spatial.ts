@@ -19,6 +19,15 @@ import { randomUUID } from 'node:crypto';
 import { FragmentStore } from '../../topology/fragment-store.js';
 import { TopologyStore } from '../../topology/topology-store.js';
 import { VoxelMap } from '../../voxel/voxel-map.js';
+import { sectionKeyString } from '../../voxel/section.js';
+import type { SectionKey } from '../../voxel/section.js';
+import { resolveResidencyLimits } from '../../voxel/residency.js';
+import type {
+  ResolvedResidencyLimits,
+  SectionResidencyInfo,
+  UnloadSectionsResult,
+  VoxelDirectoryEntry,
+} from '../../voxel/residency.js';
 import { jsonEscapedByteLength } from '../../bytes.js';
 import {
   PersistenceError,
@@ -30,21 +39,23 @@ import {
 import type {
   CloseResult,
   FlushResult,
+  LoadSectionsResult,
   OpenSpatialSessionOptions,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   SpatialCheckpointResult,
   SpatialPersistenceState,
   SpatialSession,
+  VoxelLoading,
   VoxelSaveMode,
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
 import type { HistorySnapshot } from './types.js';
-import type { VoxelCheckpointSnapshot } from '../../voxel/snapshot.js';
+import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 
 interface PendingRequest {
-  kind: 'open' | 'checkpoint' | 'close';
+  kind: 'open' | 'checkpoint' | 'load' | 'close';
   resolve: (value: unknown) => void;
   reject: (e: PersistenceError) => void;
   timer?: NodeJS.Timeout;
@@ -96,6 +107,9 @@ class SpatialSessionImpl implements SpatialSession {
   private nextRequestId = 1;
   private pending = new Map<number, PendingRequest>();
   private inFlight: InFlightCheckpoint | null = null;
+  private loadInFlight = false;
+  private readonly voxelLoading: VoxelLoading;
+  private readonly residencyLimits: ResolvedResidencyLimits;
 
   private confirmedVoxelRevision = 0;
   private confirmedFragmentRevision = 0;
@@ -122,6 +136,8 @@ class SpatialSessionImpl implements SpatialSession {
     this.databasePath = options.databasePath;
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
+    this.voxelLoading = options.voxelLoading ?? 'eager';
+    this.residencyLimits = resolveResidencyLimits(options.residencyLimits);
 
     // Read `validityWindowMs` / `now` explicitly rather than spreading the caller's
     // options object: object spread only copies own enumerable properties, so it
@@ -130,6 +146,8 @@ class SpatialSessionImpl implements SpatialSession {
       validityWindowMs: options.voxelOptions?.validityWindowMs,
       now: options.voxelOptions?.now,
       requireSession: true,
+      manualResidency: this.voxelLoading === 'manual',
+      residencyLimits: options.residencyLimits,
     });
     this.history = new FragmentStore(options.worldId, options.fragmentOptions);
     this.topology = new TopologyStore(this.history, options.topologyOptions);
@@ -147,6 +165,7 @@ class SpatialSessionImpl implements SpatialSession {
       snapshot: HistorySnapshot | null;
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
+      voxelDirectory: VoxelDirectoryEntry[] | null;
     };
     try {
       result = await this.requestOpen();
@@ -160,7 +179,11 @@ class SpatialSessionImpl implements SpatialSession {
         this.history.restoreSnapshot(result.snapshot);
         this.topology.restoreSnapshot(result.snapshot);
       }
-      if (result.voxelSnapshot !== null) {
+      if (this.voxelLoading === 'manual') {
+        if (result.voxelDirectory !== null) {
+          this.voxel.installDirectory(result.voxelDirectory);
+        }
+      } else if (result.voxelSnapshot !== null) {
         this.voxel.restoreSnapshot(result.voxelSnapshot);
       }
     } catch (err) {
@@ -186,8 +209,8 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.lifecycle === 'closed') {
       throw new PersistenceError('closed', 'session is closed; new checkpoints are not accepted');
     }
-    if (this.inFlight !== null) {
-      throw new PersistenceError('busy', `a checkpoint is already in flight (${this.inFlight.checkpointId})`);
+    if (this.inFlight !== null || this.loadInFlight) {
+      throw new PersistenceError('busy', `a persistence request is already in flight (${this.inFlight?.checkpointId ?? 'section load'})`);
     }
 
     const voxelRevision = this.voxel.saveRevision;
@@ -248,7 +271,9 @@ class SpatialSessionImpl implements SpatialSession {
       observedCells = voxelMeasure.observedCells;
       paletteEntries = voxelMeasure.paletteEntries;
     } else {
-      const counts = this.voxel.checkpointCounts();
+      // Full-set counts (not just resident) so a partial-resident map does not
+      // under-count the committed fact set against the voxel capacity limits.
+      const counts = this.voxel.checkpointFullCounts();
       const dirtyMeasure = this.voxel.checkpointDirtyMeasure(Math.max(0, afterTopology));
       totalBytes =
         historyEnvelope +
@@ -324,6 +349,82 @@ class SpatialSessionImpl implements SpatialSession {
     });
     this.inFlight = { checkpointId, promise };
     return promise;
+  }
+
+  sectionResidency(key: SectionKey): SectionResidencyInfo {
+    return this.voxel.sectionResidency(key);
+  }
+
+  unloadSections(keys: readonly SectionKey[]): UnloadSectionsResult {
+    return this.voxel.unloadSections(keys);
+  }
+
+  pinSections(keys: readonly SectionKey[]): { token: string; keys: SectionKey[] } {
+    return this.voxel.pinSections(keys);
+  }
+
+  releasePins(tokens: readonly string[]): void {
+    this.voxel.releasePins(tokens);
+  }
+
+  /**
+   * Explicitly load committed sections into the resident working set (manual mode
+   * only). Already-resident keys are skipped; keys with no committed record are
+   * reported in `missing`. The loaded evidence keeps its original time/source and
+   * reads as STALE — it never becomes a fresh observation or a current OPEN.
+   */
+  async loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult> {
+    if (this.voxelLoading !== 'manual') {
+      throw new PersistenceError('invalid_argument', 'loadSections requires voxelLoading "manual"');
+    }
+    if (this.lifecycle === 'closing') {
+      throw new PersistenceError('closing', 'session is closing; new loads are not accepted');
+    }
+    if (this.lifecycle === 'closed') {
+      throw new PersistenceError('closed', 'session is closed; new loads are not accepted');
+    }
+    if (this.inFlight !== null || this.loadInFlight) {
+      throw new PersistenceError('busy', 'a persistence request is already in flight');
+    }
+
+    const deduped = this.validateAndDedupeKeys(keys);
+    if (deduped.length > this.residencyLimits.maxLoadBatchSections) {
+      throw new PersistenceError(
+        'capacity',
+        `load request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residencyLimits.maxLoadBatchSections})`,
+      );
+    }
+    const fetch = deduped.filter((k) => this.voxel.sectionResidency(k).residency !== 'resident');
+    if (fetch.length === 0) return { loaded: [], missing: [] };
+
+    this.voxel.markLoading(fetch);
+    this.loadInFlight = true;
+    let sections: VoxelSectionSnapshot[];
+    let missingCoords: { dim: string; cx: number; cz: number; sy: number }[];
+    try {
+      const result = await this.requestLoadSections(fetch);
+      sections = result.sections;
+      missingCoords = result.missing;
+    } catch (err) {
+      this.voxel.markLoadFailed(fetch);
+      throw err;
+    } finally {
+      this.loadInFlight = false;
+    }
+
+    const missing = missingCoords.map((m) => ({ worldId: this.worldId, ...m }));
+    this.voxel.clearTransientResidency(missing);
+    const missingSet = new Set(missing.map((k) => sectionKeyString(k)));
+    const toFail = fetch.filter((k) => !missingSet.has(sectionKeyString(k)));
+    let installed: SectionKey[];
+    try {
+      installed = this.voxel.installLoadedSections(sections);
+    } catch (err) {
+      this.voxel.markLoadFailed(toFail);
+      const message = (err as Error).message;
+      throw new PersistenceError(/exceeds/.test(message) ? 'capacity' : 'data', message);
+    }
+    return { loaded: installed, missing };
   }
 
   getPersistenceState(): SpatialPersistenceState {
@@ -419,6 +520,50 @@ class SpatialSessionImpl implements SpatialSession {
 
   // --- internals ---
 
+  private validateAndDedupeKeys(keys: readonly SectionKey[]): SectionKey[] {
+    const out: SectionKey[] = [];
+    const seen = new Set<string>();
+    for (const key of keys) {
+      if (key.worldId !== this.worldId) {
+        throw new PersistenceError(
+          'invalid_argument',
+          `section key worldId "${key.worldId}" does not match session worldId "${this.worldId}"`,
+        );
+      }
+      if (typeof key.dim !== 'string' || key.dim.length === 0) {
+        throw new PersistenceError('invalid_argument', 'section key dim must be a non-empty string');
+      }
+      if (!Number.isInteger(key.cx) || !Number.isInteger(key.cz) || !Number.isInteger(key.sy)) {
+        throw new PersistenceError(
+          'invalid_argument',
+          `section key coordinates must be integers: (${key.cx}, ${key.cz}, ${key.sy})`,
+        );
+      }
+      const s = sectionKeyString(key);
+      if (seen.has(s)) continue;
+      seen.add(s);
+      out.push({ ...key });
+    }
+    return out;
+  }
+
+  private requestLoadSections(keys: SectionKey[]): Promise<{
+    sections: VoxelSectionSnapshot[];
+    missing: { dim: string; cx: number; cz: number; sy: number }[];
+  }> {
+    const requestId = this.nextRequestId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => this.onTimeout(requestId), this.timeoutMs);
+      this.pending.set(requestId, { kind: 'load', resolve: resolve as (value: unknown) => void, reject, timer });
+      this.worker!.postMessage({
+        type: 'load_sections',
+        requestId,
+        worldId: this.worldId,
+        keys: keys.map((k) => ({ dim: k.dim, cx: k.cx, cz: k.cz, sy: k.sy })),
+      } satisfies WorkerRequest);
+    });
+  }
+
   private isDirty(): boolean {
     return (
       this.voxel.saveRevision !== this.confirmedVoxelRevision ||
@@ -432,6 +577,7 @@ class SpatialSessionImpl implements SpatialSession {
     snapshot: HistorySnapshot | null;
     voxelBaselineCheckpointId: string | null;
     voxelSnapshot: VoxelCheckpointSnapshot | null;
+    voxelDirectory: VoxelDirectoryEntry[] | null;
   }> {
     const requestId = this.nextRequestId++;
     return new Promise((resolve, reject) => {
@@ -444,6 +590,7 @@ class SpatialSessionImpl implements SpatialSession {
         worldId: this.worldId,
         limits: this.limits,
         kind: 'spatial',
+        voxelLoading: this.voxelLoading,
       } satisfies WorkerRequest);
     });
   }
@@ -522,7 +669,11 @@ class SpatialSessionImpl implements SpatialSession {
         snapshot: openMsg.snapshot,
         voxelBaselineCheckpointId: openMsg.voxelBaselineCheckpointId,
         voxelSnapshot: openMsg.voxelSnapshot,
+        voxelDirectory: openMsg.voxelDirectory,
       });
+    } else if (entry.kind === 'load') {
+      const loadMsg = msg as WorkerResponse & { type: 'load_ok' };
+      entry.resolve({ sections: loadMsg.sections, missing: loadMsg.missing });
     } else if (entry.kind === 'checkpoint') {
       const okMsg = msg as WorkerResponse & { type: 'checkpoint_ok' };
       this.inFlight = null;
@@ -572,6 +723,14 @@ class SpatialSessionImpl implements SpatialSession {
       this.failAllPending(error);
       entry.reject(error);
       void this.terminateWorker();
+      return;
+    }
+    if (entry.kind === 'load') {
+      // A read timeout is distinct from an unconfirmed save: the session stays
+      // usable, but the requested sections read as failed-not-resident.
+      const error = new PersistenceError('timeout', 'section load did not complete within timeout');
+      this.lastError = error;
+      entry.reject(error);
       return;
     }
     this.lifecycle = 'closed';

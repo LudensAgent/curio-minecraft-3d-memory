@@ -24,6 +24,7 @@
 - **显式历史 checkpoint 持久化**（`storage/`，阶段 5A）：通过 `curio-minecraft-3d-memory/storage/sqlite` 子路径的 `openHistorySession`，用单个 SQLite Worker 持久化四类历史事实（`PathFragment`、`TraversalEvidence`、`SpatialNode` 及带原始绑定快照的拓扑边）。`checkpoint()` 是唯一显式保存触发点；`flush()`/`close()` 不隐式保存新内存变化。见 `docs/phase-5a-history-checkpoint-acceptance.md`。
 - **显式组合空间 checkpoint 持久化**（`storage/`，阶段 5B）：通过同一子路径的 `openSpatialSession`，用单个 SQLite Worker 与单个事务把最近观测地图（`VoxelMap`）与历史事实一起持久化。启动时恢复完整观测状态并统一转 `STALE`；新观测只刷新实际观察到的格。见 `docs/phase-5b-spatial-checkpoint-acceptance.md`。
 - **体素增量 checkpoint**（`storage/`，阶段 5C）：已有体素保存基线后，`checkpoint()` 只复制、编码并写入自上次确认保存以来事实发生变化的 Section，而不是整份替换。首次保存仍建立完整基线；空增量绝不清库；Worker 复核增量后的完整集合，使连续小增量无法累积出无法重新打开的数据库。见 `docs/phase-5c-voxel-incremental-checkpoint-acceptance.md`。
+- **手动按需 Section 驻留**（`storage/`，阶段 5D1）：`openSpatialSession({ voxelLoading: 'manual' })` 在打开时只读取已提交 Section 目录，并需要显式 `loadSections` 后才能向已保存的 Section 写入。安全 `unloadSections`、有界 `pinSections`/`releasePins` 租约、`sectionResidency` 查询（`no_record` / `not_resident` / `loading` / `resident` / `load_failed`），以及驻留驱动的通行缓存与路线验证局部失效。未驻留不等于从未观察，回载不伪造新观察或当前 `OPEN`，部分驻留的增量 checkpoint 不删除未加载记录。见 `docs/phase-5d1-section-residency-acceptance.md`。
 
 内存层以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与 `examples/walk-route-execution.ts`）；checkpoint 层以**真实 SQLite + 真实 Worker**验证（见 `tests/storage-checkpoint.test.ts`、`tests/spatial-checkpoint.test.ts`、`examples/history-checkpoint.ts` 与 `examples/spatial-checkpoint.ts`）。**尚未**接入真实 mineflayer/Curio 身体或寻路。
 
@@ -248,12 +249,57 @@ reopened.voxel.cellAt('overworld', x, y, z); // 已提交事实，统一转 STAL
   超限在复制前拒绝；Worker 另在事务内复核增量后的完整集合、超限整批回滚。
 - **基线后增量（5C）**：首次 `checkpoint()` 写完整体素集合；之后只复制、编码并写入发生变化的
   Section（`voxelMode: 'incremental'`），未变化的 Section payload 保持字节级不变。历史本轮仍为完整快照。
-- **schema 升级**：v1 数据库升级到 v2（新增 `spatial_sections` 与体素 checkpoint 列），带一致备份与事务
-  回滚；既有历史、ID、顺序与绑定被保留。历史入口 `openHistorySession` 的写入只替换历史，不触碰体素。
+- **schema 升级**：v1 数据库升级到 v2（新增 `spatial_sections` 与体素 checkpoint 列），再 v2 → v3（新增每
+  Section 已提交元数据列并从既有 payload 回填），各带一致备份与事务回滚；既有历史、ID、顺序与绑定被保留。
+  历史入口 `openHistorySession` 的写入只替换历史，不触碰体素。
 - **生命周期**：`checkpoint()` 在 `busy`/`closing`/`closed` 时拒绝；`flush()` 只等待已接受的 checkpoint；
   `close()` 报告最后确认的 checkpoint、未保存变化与未确认请求。
 
 见 [`docs/phase-5b-spatial-checkpoint-acceptance.md`](docs/phase-5b-spatial-checkpoint-acceptance.md)。
+
+## 手动按需 Section 驻留
+
+`openSpatialSession({ voxelLoading: 'manual' })`（阶段 5D1）把已提交 Section **目录**与驻留内存工作集分开。打开时不解码完整已提交事实集；调用方显式加载 Section，并 Pin 当前路线实际依赖的那些 Section。
+
+```ts
+import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
+import type { SectionKey } from 'curio-minecraft-3d-memory';
+
+const session = await openSpatialSession({ databasePath, worldId: 'world', voxelLoading: 'manual' });
+const key: SectionKey = { worldId: 'world', dim: 'overworld', cx: 0, cz: 0, sy: 4 };
+
+session.sectionResidency(key).residency;      // 'no_record' | 'not_resident' | 'loading' | 'resident' | 'load_failed'
+const { loaded, missing } = await session.loadSections([key]); // 显式、有界加载
+session.voxel.beginSession('live');
+session.voxel.observe({ /* … 携带原时间的重新观察 … */ });
+await session.checkpoint();                    // 增量；绝不删除未加载记录
+
+const lease = session.pinSections([key]);     // 保护路线实际依赖的 Section
+session.unloadSections([key]);                 // 被 Pin 保护时拒绝（结构化原因）
+session.releasePins([lease.token]);
+session.unloadSections([key]);                 // 安全：已提交 + 干净 + 未 Pin
+```
+
+行为：
+
+- **目录 vs 驻留。** 打开时只读取已提交目录（身份、稳定顺序、payload 字节数、已观察格/palette 数、revision），
+  不解码 payload，并受同一 `maxVoxelSections`/`maxBytes`/`maxObservedCells`/`maxPaletteEntries` 限制。驻留工作集
+  有独立的 `maxResidentSections`/`maxResidentBytes` 上限（`ResidencyLimits`），覆盖加载、新建 Section 与观察增长。
+- **显式预加载契约。** 向已保存但未驻留（或加载中）的 Section 写入会在任何变更前抛出 `VoxelResidencyError`
+  （`requires_load`）；全新 Section 在驻留预算内直接接受。`observeBatch` 整批预检，未就绪 Section 不会留下半批
+  写入。调用方先加载，再携原始 `observedAt`/`sessionId`/`sequence`/来源重投观察。
+- **加载 ≠ 观察。** `loadSections` 恢复的已提交证据统一转 `STALE`（过去观察），绝不冒充新观察或当前 `OPEN`；
+  不重放 `observe`、不置脏、不重置会话/中断边界。
+- **安全卸载。** `unloadSections` 只释放已提交、无未保存变化、未被 Pin 的 Section，其余给出结构化原因
+  （`pinned` / `dirty` / `not_committed`）。只释放运行态 payload，不删除目录记录、不清历史、不自动保存、不把
+  该 Section 标为从未观察。
+- **Pin 租约。** `pinSections` 返回 token；`releasePins(token)` 只释放自身租约。多个调用方可 Pin 同一 Section，
+  重复/未知 token 释放为无操作，旧任务迟到释放不会解除新任务保护。Pin 不隐式加载、不刷新证据。
+- **驻留失效。** `unloadSections`/`loadSections` 返回变更的 key；将其喂给 `TraversabilityCache.invalidateSections(keys)` /
+  `RouteVerifier.invalidateSections(keys)`，卸载后不再返回旧 `OPEN`、回载后不再卡在此前 `UNKNOWN`，无关 Section 不受影响。
+  见 `docs/phase-5d1-section-residency-acceptance.md`。
+
+本轮只是手动按需驻留机制：不含自动 LRU/淘汰、预取、观察 overlay，也未接入真实 mineflayer/Curio 路线保护。
 
 ## 目录结构
 
@@ -281,7 +327,8 @@ examples/
 ├── historical-anchor-query.ts      # 可运行的 Fake 有界历史锚点查询示例
 ├── history-checkpoint.ts           # 可运行的 SQLite 历史 checkpoint 生命周期示例
 ├── spatial-checkpoint.ts           # 可运行的组合空间 checkpoint 生命周期示例
-└── spatial-checkpoint-incremental.ts # 可运行的体素增量 checkpoint 示例
+├── spatial-checkpoint-incremental.ts # 可运行的体素增量 checkpoint 示例
+└── spatial-residency.ts            # 可运行的手动按需 Section 驻留示例
 ```
 
 ## 开发
@@ -299,6 +346,7 @@ npx tsx examples/historical-anchor-query.ts   # 运行 Fake 有界历史锚点�
 npx tsx examples/history-checkpoint.ts        # 运行 SQLite checkpoint 生命周期示例
 npx tsx examples/spatial-checkpoint.ts        # 运行组合空间 checkpoint 生命周期示例
 npx tsx examples/spatial-checkpoint-incremental.ts # 运行体素增量 checkpoint 示例
+npx tsx examples/spatial-residency.ts         # 运行手动按需 Section 驻留示例
 ```
 
 > `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts`、`examples/historical-anchor-query.ts` 与 `examples/history-checkpoint.ts` 以公开包名（`curio-minecraft-3d-memory`，其中 `history-checkpoint.ts` 使用 `curio-minecraft-3d-memory/storage/sqlite` 子路径）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。

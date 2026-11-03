@@ -660,7 +660,7 @@ describe('SQLite combined spatial persistence', () => {
 // Schema upgrade + corruption tests
 // ==============================================================================
 
-describe('v1 → v2 schema upgrade', () => {
+describe('v1 → latest schema upgrade', () => {
   it('upgrades a v1 database and preserves existing history data', async () => {
     const dbPath = makeDbPath();
     writeV1Schema(dbPath);
@@ -683,7 +683,7 @@ describe('v1 → v2 schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('2');
+    expect(version).toBe('3');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();
