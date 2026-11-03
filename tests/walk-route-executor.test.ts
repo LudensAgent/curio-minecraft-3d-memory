@@ -8,6 +8,7 @@ import type {
   ExecutableMove,
   ExecutableMoveResult,
   MoveExecutor,
+  SectionKey,
   Vec3Like,
   WalkRouteRequest,
 } from '../src/index.js';
@@ -119,6 +120,26 @@ function openRouteMap(map: VoxelMap, nPoints: number): Vec3Like[] {
     map.observe(obs(AIR, { x: k, y: 1, z: 0 }));
   }
   return Array.from({ length: nPoints }, (_, k) => ({ x: k + 0.5, y: 0, z: 0.5 }));
+}
+
+/** A manual-residency map whose one-step +X route is OPEN, with the support section committed + clean. */
+function openManualRouteMap(): { map: VoxelMap; supportKey: SectionKey } {
+  const map = new VoxelMap('world', { manualResidency: true });
+  const supportKey: SectionKey = { worldId: 'world', dim: 'overworld', cx: 0, cz: 0, sy: -1 };
+  map.installDirectory([{ key: supportKey, seq: 0, bytes: 100, observedCells: 2, paletteEntries: 2, revision: 2 }]);
+  map.beginSession('s1');
+  const source = new VoxelMap('world');
+  source.observe(obs(STONE, { x: 0, y: -1, z: 0 }));
+  source.observe(obs(STONE, { x: 1, y: -1, z: 0 }));
+  map.installLoadedSections(source.checkpointSnapshot().sections);
+  map.observe(obs(STONE, { x: 0, y: -1, z: 0 }, { observedAt: 2000, sequence: 1 }));
+  map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 2000, sequence: 2 }));
+  map.observe(obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 2000, sequence: 3 }));
+  map.observe(obs(AIR, { x: 0, y: 1, z: 0 }, { observedAt: 2000, sequence: 4 }));
+  map.observe(obs(AIR, { x: 1, y: 0, z: 0 }, { observedAt: 2000, sequence: 5 }));
+  map.observe(obs(AIR, { x: 1, y: 1, z: 0 }, { observedAt: 2000, sequence: 6 }));
+  map.confirmSections(map.saveRevision);
+  return { map, supportKey };
 }
 
 function fill(map: VoxelMap, state: BlockState, cells: Cell[]): void {
@@ -1590,5 +1611,30 @@ describe('WalkRouteExecutor — cancel-context nesting and terminal-order consis
     loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2, observedAt: 2500 }));
 
     expect(loop.status()!.result?.outcome).toBe('TIMEOUT');
+  });
+});
+
+describe('WalkRouteExecutor — residency invalidation', () => {
+  it('stops the in-flight move when a dependency section is unloaded', async () => {
+    const { map, supportKey } = openManualRouteMap();
+    const executor = new FakeMoveExecutor();
+    const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+    const points = [
+      { x: 0.5, y: 0, z: 0.5 },
+      { x: 1.5, y: 0, z: 0.5 },
+    ];
+
+    begin(loop, points);
+    const started = loop.advance(10);
+    expect(started.activeStepIndex).toBe(0);
+    expect(started.result).toBeNull();
+    expect(executor.stopped).toHaveLength(0);
+
+    map.unloadSections([supportKey]);
+    loop.checkTimeout();
+
+    const status = loop.status()!;
+    expect(status.result?.problem?.kind).toBe('route_invalidated');
+    expect(executor.stopped.length).toBeGreaterThan(0); // in-flight move was stopped
   });
 });

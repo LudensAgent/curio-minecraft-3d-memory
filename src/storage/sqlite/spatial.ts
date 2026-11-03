@@ -690,7 +690,7 @@ class SpatialSessionImpl implements SpatialSession {
       // ACK-time memory state), so a confirmed save is reflected as committed and
       // its committed metadata matches what the worker actually wrote.
       if (entry.voxelMode !== undefined && entry.voxelMode !== 'none') {
-        this.voxel.commitDirectory(entry.voxelMode, entry.voxelSections ?? []);
+        this.voxel.commitDirectory(entry.voxelMode, entry.voxelSections ?? [], okMsg.voxelBytes);
       }
       this.voxelBaselineEstablished = true;
       this.confirmedVoxelRevision = entry.voxelRevision!;

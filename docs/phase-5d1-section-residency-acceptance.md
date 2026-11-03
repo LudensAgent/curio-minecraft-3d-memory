@@ -107,7 +107,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 484 passed（16 个测试文件；新增 28 项 spatial-voxel-residency 测试）
+npm test           → 488 passed（16 个测试文件；新增 30 项 spatial-voxel-residency 测试）
 npx tsx examples/spatial-residency.ts → 正常运行（以公开包名与子路径导入）
 git diff --check   → 通过（见提交前检查）
 ```
@@ -167,3 +167,22 @@ git diff --check   → 通过（见提交前检查）
   区分 `timeout_unconfirmed`（保存结果未知）。
 - **P3 Pin 作用域校验缺口**：`pinSections` 在任何状态修改前对全部 key 做 `assertSectionKey`（worldId/dim/整数
   坐标），异世界 key 不能按当前地图坐标建立保护。回归测试「pinSections rejects a key from another world」。
+
+## 评审修正（第二轮）
+
+- **P2 卸载依赖后正在执行的移动仍继续**：`WalkRouteExecutor` 在 `startMove` 时记录每个依赖 Section 的驻留代次，
+  `guard()` 新增 `residencyReason()` 检测代次变化并终止在途移动（保留任务归属与迟到回调保护）；`RouteVerifier.advance`
+  在 `runPending` 之前执行驻留失效，使单次 `advance()` 既发现失效又复验。回归测试「stops the in-flight move when a
+  dependency section is unloaded」。
+- **P2 标记证据过期突破驻留字节上限**：改为「统一计费」——`estimateVoxelSectionResidentBytes` 对每个格一律按最坏
+  （含 `staleReason`）开销计费，`residentBytes` 始终是实际内存的保守上界；`markStale`/`beginSession` 不再增加计数
+  （空间已在接纳证据时预留），观测预检 `estimateObservationResidentGrowth` 同步按最坏开销预留。回归测试「resident
+  billing reserves stale metadata」与「observe is rejected when the worst-case footprint exceeds the resident cap」。
+- **P2 committed.bytes 使用估算值**：Worker 在 `checkpoint_ok` 中返回每 Section 实际 `octet_length`，`commitDirectory`
+  据此更新目录字节数（估算仅作兜底）；仍用捕获快照，旧 ACK 不清除后续变化。回归测试「committed.bytes reflects the
+  actual on-disk octet_length」。
+- **P2 迁移套用单世界容量限制到整个数据库**：`upgradeV2ToV3` 不再把 `maxVoxelSections`/`maxObservedCells`/
+  `maxPaletteEntries`/`maxBytes` 当全局预检，这些限制仍在打开具体世界时按世界作用域执行；迁移只保留固定批次
+  `rowid` 游标与事务回滚。回归测试「does not apply single-world limits across the whole database」。
+- **P2 批量观测平方级同步开销**：`observeBatch` 改为按受影响 Section 合并核算（每 Section 一次 before/after 估算，
+  而非逐观测各两次），使整 Section 批量写入保持 O(section)；同时 `markStale` 不再做整段重估（统一计费下增量恒为零）。

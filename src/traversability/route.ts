@@ -272,6 +272,9 @@ export class RouteVerifier {
     this.requireRoute();
     this.reconcileRuleVersion();
     this.expireStale(this.currentNow());
+    // Invalidate residency-changed steps before processing pending, so a single
+    // advance() both discovers the change and re-verifies the affected step.
+    this.invalidateByResidency();
     this.runPending(budget);
     return this.snapshot();
   }

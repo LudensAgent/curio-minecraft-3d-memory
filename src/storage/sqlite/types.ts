@@ -395,7 +395,13 @@ export type WorkerResponse =
       /** Requested coordinates with no committed record. */
       missing: { dim: string; cx: number; cz: number; sy: number }[];
     }
-  | { type: 'checkpoint_ok'; requestId: number; checkpointId: string }
+  | {
+      type: 'checkpoint_ok';
+      requestId: number;
+      checkpointId: string;
+      /** Actual committed payload octet_length per section, for the directory's exact byte count. */
+      voxelBytes: { dim: string; cx: number; cz: number; sy: number; bytes: number }[];
+    }
   | { type: 'closed'; requestId: number }
   | { type: 'error'; requestId: number; kind: PersistenceErrorKind; message: string };
 

@@ -170,7 +170,7 @@ function respond(msg: WorkerResponse): void {
 }
 
 /** Open (or validate / upgrade) the database, returning a connection ready for the session's world. */
-function openDatabase(databasePath: string, limits: ResolvedSnapshotLimits): Database.Database {
+function openDatabase(databasePath: string): Database.Database {
   const connection = new Database(databasePath);
   connection.pragma('journal_mode = WAL');
   connection.pragma('synchronous = NORMAL');
@@ -207,7 +207,7 @@ function openDatabase(databasePath: string, limits: ResolvedSnapshotLimits): Dat
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV1ToV2(connection, databasePath);
-    upgradeV2ToV3(connection, databasePath, limits);
+    upgradeV2ToV3(connection, databasePath);
     return connection;
   }
 
@@ -216,7 +216,7 @@ function openDatabase(databasePath: string, limits: ResolvedSnapshotLimits): Dat
     for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V2)) {
       assertRequiredColumns(connection, table, columns);
     }
-    upgradeV2ToV3(connection, databasePath, limits);
+    upgradeV2ToV3(connection, databasePath);
     return connection;
   }
 
@@ -277,32 +277,20 @@ function upgradeV1ToV2(connection: Database.Database, databasePath: string): voi
  * add the per-section committed metadata columns and backfill them from existing
  * payloads inside one transaction, so a failure rolls back to a still-v2 database.
  *
- * The backfill is bounded: a cheap metadata pre-check (row count and payload byte
- * total, no decode) rejects an over-capacity database before any payload is read,
- * and the remaining decode/update runs through a stable `rowid` cursor in batches,
- * enforcing the observed-cell/palette limits as it goes — never one unbounded
- * `.all()` + decode of the whole table.
+ * The backfill is bounded by a fixed batch size over a stable `rowid` cursor —
+ * never one unbounded `.all()` + decode of the whole table — but it is a *schema
+ * migration*, not a per-world capacity check: single-world limits (`maxVoxelSections`,
+ * `maxObservedCells`, `maxPaletteEntries`, `maxBytes`) are enforced later, per
+ * world, when a specific world is opened. A database holding several worlds may
+ * legitimately backfill more sections in total than any one world is allowed.
  */
-function upgradeV2ToV3(connection: Database.Database, databasePath: string, limits: ResolvedSnapshotLimits): void {
+function upgradeV2ToV3(connection: Database.Database, databasePath: string): void {
   const backupPath = `${databasePath}.pre-v3-${randomUUID()}`;
   connection.prepare('VACUUM INTO ?').run(backupPath);
   const tx = connection.transaction(() => {
     connection.exec('ALTER TABLE spatial_sections ADD COLUMN observed_cells INTEGER NOT NULL DEFAULT 0');
     connection.exec('ALTER TABLE spatial_sections ADD COLUMN palette_entries INTEGER NOT NULL DEFAULT 0');
     connection.exec('ALTER TABLE spatial_sections ADD COLUMN revision INTEGER NOT NULL DEFAULT 0');
-
-    // Cheap pre-check before decoding any payload: reject an over-capacity database
-    // on metadata alone, so the migration never does unbounded decode work first.
-    const count = (connection.prepare('SELECT COUNT(*) AS n FROM spatial_sections').get() as { n: number }).n;
-    if (count > limits.maxVoxelSections) {
-      throw new Error(`snapshot exceeds maxVoxelSections (${count})`);
-    }
-    const payloadBytes = (
-      connection.prepare('SELECT COALESCE(SUM(octet_length(payload)), 0) AS n FROM spatial_sections').get() as { n: number }
-    ).n;
-    if (payloadBytes > limits.maxBytes) {
-      throw new Error(`snapshot exceeds maxBytes (${payloadBytes})`);
-    }
 
     const BATCH_SIZE = 100;
     const select = connection.prepare(
@@ -313,8 +301,6 @@ function upgradeV2ToV3(connection: Database.Database, databasePath: string, limi
     );
 
     let cursor = 0;
-    let observedCells = 0;
-    let paletteEntries = 0;
     for (;;) {
       const rows = select.all(cursor, BATCH_SIZE) as {
         rowid: number;
@@ -325,14 +311,6 @@ function upgradeV2ToV3(connection: Database.Database, databasePath: string, limi
       if (rows.length === 0) break;
       for (const row of rows) {
         const section = decodeVoxelSection(row.payload);
-        observedCells += section.evidence.length;
-        paletteEntries += section.palette.length;
-        if (observedCells > limits.maxObservedCells) {
-          throw new Error(`snapshot exceeds maxObservedCells (${observedCells})`);
-        }
-        if (paletteEntries > limits.maxPaletteEntries) {
-          throw new Error(`snapshot exceeds maxPaletteEntries (${paletteEntries})`);
-        }
         update.run(section.evidence.length, section.palette.length, section.revision, row.world_id, row.id);
       }
       cursor = rows[rows.length - 1]!.rowid;
@@ -968,7 +946,7 @@ function parseSectionId(id: string): [string, number, number, number] {
 }
 
 function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
-  const connection = openDatabase(msg.databasePath, msg.limits);
+  const connection = openDatabase(msg.databasePath);
   db = connection;
   worldId = msg.worldId;
   limits = msg.limits;
@@ -1064,7 +1042,11 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: /exceeds/.test(message) ? 'capacity' : 'sql', message });
     return;
   }
-  respond({ type: 'checkpoint_ok', requestId: msg.requestId, checkpointId: msg.checkpointId });
+  const voxelBytes = (preparedVoxel?.sections ?? []).map((s) => {
+    const [dim, cx, cz, sy] = parseSectionId(s.id);
+    return { dim, cx, cz, sy, bytes: Buffer.byteLength(s.payload, 'utf8') };
+  });
+  respond({ type: 'checkpoint_ok', requestId: msg.requestId, checkpointId: msg.checkpointId, voxelBytes });
 }
 
 function handleLoadSections(msg: WorkerRequest & { type: 'load_sections' }): void {

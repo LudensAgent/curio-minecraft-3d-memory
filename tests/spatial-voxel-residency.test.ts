@@ -230,7 +230,7 @@ describe('VoxelMap manual residency (pure core)', () => {
     expect(map.unloadSections([sectionKey(DIM, 0, 0, 0)]).unloaded).toEqual([]);
   });
 
-  it('markStale accounts for resident byte growth', () => {
+  it('resident billing reserves stale metadata so markStale never grows the working set', () => {
     const map = manualMap();
     map.installDirectory([]);
     map.beginSession('s1');
@@ -238,7 +238,20 @@ describe('VoxelMap manual residency (pure core)', () => {
     map.confirmSections(map.saveRevision);
     const before = map.residentSize().bytes;
     map.markStale(DIM, 'unloaded');
-    expect(map.residentSize().bytes).toBeGreaterThan(before); // staleReason growth accounted
+    expect(map.residentSize().bytes).toBe(before); // worst-case already billed at observe
+  });
+
+  it('observe is rejected when the worst-case (stale) footprint exceeds the resident cap', () => {
+    const probe = manualMap();
+    probe.installDirectory([]);
+    probe.beginSession('s1');
+    probe.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 } }));
+    const worstCase = probe.residentSize().bytes; // FRESH cell billed at its stale worst case
+
+    const map = manualMap({ residencyLimits: { maxResidentBytes: worstCase - 1 } });
+    map.installDirectory([]);
+    map.beginSession('s1');
+    expect(() => map.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 } }))).toThrow(/maxResidentBytes/);
   });
 });
 
@@ -616,6 +629,27 @@ describe('SQLite manual voxel loading', () => {
     expect(committedAfter.revision).toBeGreaterThan(committedBefore!.revision);
     expect(s2.unloadSections([key]).unloaded).toEqual([key]); // clean after checkpoint
     await s2.close();
+  });
+
+  it('committed.bytes reflects the actual on-disk octet_length', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    s1.voxel.beginSession('s1');
+    s1.voxel.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 } }));
+    s1.voxel.observe(voxelObs({ pos: { x: 1, y: 0, z: 0 }, observedAt: 1000, sequence: 2 }));
+    await s1.checkpoint();
+
+    const key = sectionKey(DIM, 0, 0, 0);
+    const reported = s1.sectionResidency(key).committed!.bytes;
+
+    const db = new Database(dbPath, { readonly: true });
+    const row = db
+      .prepare('SELECT octet_length(payload) AS n FROM spatial_sections WHERE world_id = ? AND id = ?')
+      .get(WORLD, sectionId(DIM, 0, 0, 0)) as { n: number };
+    db.close();
+
+    expect(reported).toBe(row.n); // exact octet_length, not a main-thread estimate
+    await s1.close();
   });
 });
 

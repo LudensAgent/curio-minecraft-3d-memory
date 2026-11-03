@@ -29,6 +29,7 @@
 import type { LastObservation, NavProblem, NavResult } from '../navigation/types.js';
 import type { Observation } from '../observation/types.js';
 import { sectionKeyString } from '../voxel/section.js';
+import type { SectionKey } from '../voxel/section.js';
 import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import { RouteVerifier } from '../traversability/route.js';
 import type { RouteStatus } from '../traversability/route.js';
@@ -100,6 +101,8 @@ export class WalkRouteExecutor {
   private activeExecutionId: string | null = null;
   private activeAbort: AbortController | null = null;
   private activeDependencies: Set<string> | null = null;
+  /** Residency generation of each active dependency at start time, for unload detection. */
+  private activeDependencyResidency: { key: SectionKey; generation: number }[] | null = null;
   private activeRuleVersion: string | null = null;
   private activeValidUntil = Number.POSITIVE_INFINITY;
   private activeStartedAt: number | null = null;
@@ -471,12 +474,27 @@ export class WalkRouteExecutor {
   /** The unified terminal guard. Returns true when the delegation is or becomes terminal. */
   private guard(): boolean {
     if (this.result !== null) return true;
-    const reason = this.terminalReason();
+    const reason = this.terminalReason() ?? this.residencyReason();
     if (reason !== null) {
       this.terminate(reason.outcome, reason.message, reason.problem);
       return true;
     }
     return false;
+  }
+
+  /** Terminal reason when an active dependency section changed residency (unload/load). */
+  private residencyReason(): TerminalReason | null {
+    if (this.activeDependencyResidency === null) return null;
+    for (const dep of this.activeDependencyResidency) {
+      if (this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy) !== dep.generation) {
+        return {
+          outcome: 'FAILED',
+          message: 'the in-flight segment was invalidated by a residency change',
+          problem: { kind: 'route_invalidated', detail: 'a required section was unloaded during execution' },
+        };
+      }
+    }
+    return null;
   }
 
   /** True when this flow may still write state: same delegation and not yet terminal. */
@@ -543,6 +561,10 @@ export class WalkRouteExecutor {
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
     this.activeDependencies = new Set(evaluation.dependencies.map((d) => sectionKeyString(d.key)));
+    this.activeDependencyResidency = evaluation.dependencies.map((d) => ({
+      key: { ...d.key },
+      generation: this.map.residencyGeneration(d.key.dim, d.key.cx, d.key.cz, d.key.sy),
+    }));
     this.activeRuleVersion = route.ruleVersion;
     this.activeValidUntil = evaluation.validUntil;
     this.activeStartedAt = startedAt;
@@ -815,6 +837,7 @@ export class WalkRouteExecutor {
     this.activeExecutionId = null;
     this.activeAbort = null;
     this.activeDependencies = null;
+    this.activeDependencyResidency = null;
     this.activeRuleVersion = null;
     this.activeValidUntil = Number.POSITIVE_INFINITY;
     this.activeStartedAt = null;

@@ -111,6 +111,8 @@ export function snapshotVoxelSection(section: Section): VoxelSectionSnapshot {
 // --- restore: validation + reconstruction --------------------------------------
 
 const STALE_REASONS = ['unloaded', 'observation_gap', 'expired', 'pending_effect', 'conflict'] as const;
+/** Longest known stale reason, used to bill the worst-case resident footprint. */
+const WORST_CASE_STALE_REASON = 'observation_gap';
 const EVIDENCE_KINDS = ['seen', 'contact', 'confirmed_effect'] as const;
 const OBSERVATION_SOURCES = ['vision', 'agent_action', 'local_rescan'] as const;
 
@@ -383,18 +385,20 @@ function observationBytes(observation: Observation, cost: StringCost): number {
   return bytes;
 }
 
-function cellEvidenceBytes(evidence: CellEvidence, cost: StringCost): number {
+function cellEvidenceBytes(evidence: CellEvidence, cost: StringCost, forceStaleReason = false): number {
   let bytes = CELL_FIXED_BYTES;
   bytes += BYTES_PER_NUMBER; // index
   bytes += observationBytes(evidence.observation, cost);
   bytes += BYTES_PER_NUMBER; // revision
   bytes += cost(evidence.freshness) + STRING_QUOTES;
-  if (evidence.staleReason !== undefined) bytes += cost(evidence.staleReason) + STRING_QUOTES;
+  if (forceStaleReason || evidence.staleReason !== undefined) {
+    bytes += cost(evidence.staleReason ?? WORST_CASE_STALE_REASON) + STRING_QUOTES;
+  }
   bytes += BYTES_PER_NUMBER; // validUntil
   return bytes;
 }
 
-function voxelSectionBytes(section: Section, cost: StringCost): number {
+function voxelSectionBytes(section: Section, cost: StringCost, forceStaleReason = false): number {
   let bytes = SECTION_FIXED_BYTES;
   bytes += cost(section.key.dim) + STRING_QUOTES;
   bytes += 3 * BYTES_PER_NUMBER; // cx, cz, sy
@@ -405,7 +409,7 @@ function voxelSectionBytes(section: Section, cost: StringCost): number {
   bytes += paletteBytes;
   bytes += STRING_QUOTES + base64Length(section.cells.length);
   let evidenceBytes = Math.max(0, section.evidence.size - 1);
-  for (const evidence of section.evidence.values()) evidenceBytes += cellEvidenceBytes(evidence, cost);
+  for (const evidence of section.evidence.values()) evidenceBytes += cellEvidenceBytes(evidence, cost, forceStaleReason);
   bytes += evidenceBytes;
   return bytes;
 }
@@ -418,6 +422,17 @@ export function estimateVoxelSectionBytes(section: Section): number {
 /** Cheap lower bound: UTF-16 `.length` (≤ UTF-8 bytes ≤ escaped bytes). */
 export function voxelSectionLowerBound(section: Section): number {
   return voxelSectionBytes(section, (s) => s.length);
+}
+
+/**
+ * Conservative resident working-set estimate: like `estimateVoxelSectionBytes`
+ * but bills every cell for its worst-case `staleReason` field regardless of current
+ * freshness. A FRESH cell can later become STALE (markStale / beginSession) without
+ * growing past its reservation, so the resident byte cap is a hard upper bound that
+ * freshness transitions can never exceed.
+ */
+export function estimateVoxelSectionResidentBytes(section: Section): number {
+  return voxelSectionBytes(section, jsonEscapedByteLength, true);
 }
 
 /**
@@ -455,7 +470,9 @@ export function estimateObservationResidentGrowth(observation: Observation): num
     ]),
     revision: 1,
   };
-  return estimateVoxelSectionBytes(section);
+  // Bill the worst-case (stale) footprint, so the pre-flight reserves the space a
+  // later markStale/beginSession would need.
+  return estimateVoxelSectionResidentBytes(section);
 }
 
 /**

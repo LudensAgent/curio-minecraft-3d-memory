@@ -776,3 +776,40 @@ describe('v1 → latest schema upgrade', () => {
     );
   });
 });
+
+describe('v2 → v3 migration scope', () => {
+  it('does not apply single-world limits across the whole database', async () => {
+    const dbPath = makeDbPath();
+    // Two worlds, each with one committed section, in a v3 database.
+    const a = await openSpatialSession({ databasePath: dbPath, worldId: 'worldA' });
+    a.voxel.beginSession('s1');
+    a.voxel.observe(obs({ worldId: 'worldA', pos: { x: 0, y: 0, z: 0 } }));
+    await a.checkpoint();
+    await a.close();
+
+    const b = await openSpatialSession({ databasePath: dbPath, worldId: 'worldB' });
+    b.voxel.beginSession('s1');
+    b.voxel.observe(obs({ worldId: 'worldB', pos: { x: 0, y: 0, z: 0 } }));
+    await b.checkpoint();
+    await b.close();
+
+    // Downgrade to v2 (drop the per-section metadata columns) so a reopen must
+    // migrate again.
+    const db = new Database(dbPath);
+    db.exec('ALTER TABLE spatial_sections DROP COLUMN observed_cells');
+    db.exec('ALTER TABLE spatial_sections DROP COLUMN palette_entries');
+    db.exec('ALTER TABLE spatial_sections DROP COLUMN revision');
+    db.exec("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'");
+    db.close();
+
+    // The whole database holds two sections; worldA alone holds one. A per-world
+    // maxVoxelSections=1 must not be applied to the whole-DB total during migration.
+    const reopened = await openSpatialSession({
+      databasePath: dbPath,
+      worldId: 'worldA',
+      snapshotLimits: { maxVoxelSections: 1 },
+    });
+    expect(reopened.voxel.checkpointCounts().sections).toBe(1);
+    await reopened.close();
+  });
+});

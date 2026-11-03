@@ -27,6 +27,7 @@ import {
   cloneObservation,
   estimateObservationResidentGrowth,
   estimateVoxelSectionBytes,
+  estimateVoxelSectionResidentBytes,
   estimateVoxelSectionSnapshotBytes,
   restoreVoxelSection,
   snapshotVoxelSection,
@@ -250,19 +251,7 @@ export class VoxelMap {
   observe(observation: Observation): ChangeReport {
     validateObservation(this.worldId, observation);
     this.assertWritable([observation]);
-    const applied = this.applyWithResidentAccounting(observation);
-    if (applied === null) return { sections: [] };
-    this.recordSaveChange(applied.section);
-    return {
-      sections: [
-        {
-          key: { ...applied.section.key },
-          revision: applied.section.revision,
-          invalidated: applied.kind !== 'refreshed',
-          cells: [{ pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind }],
-        },
-      ],
-    };
+    return this.applyObservations([observation]);
   }
 
   /**
@@ -276,17 +265,7 @@ export class VoxelMap {
       validateObservation(this.worldId, observation);
     }
     this.assertWritable(batch.observations);
-    const bySection = new Map<Section, SectionChange>();
-    for (const observation of batch.observations) {
-      const applied = this.applyWithResidentAccounting(observation);
-      if (applied === null) continue;
-      this.recordSaveChange(applied.section);
-      addChange(bySection, applied.section, {
-        pos: { x: applied.x, y: applied.y, z: applied.z },
-        kind: applied.kind,
-      });
-    }
-    return { sections: [...bySection.values()] };
+    return this.applyObservations(batch.observations);
   }
 
   /** Read the current cell state; never mutates, scans, or refreshes evidence time/version. */
@@ -641,7 +620,7 @@ export class VoxelMap {
     }
 
     const fresh = built;
-    const addedBytes = fresh.reduce((sum, s) => sum + estimateVoxelSectionBytes(s), 0);
+    const addedBytes = fresh.reduce((sum, s) => sum + estimateVoxelSectionResidentBytes(s), 0);
     if (this.residentSectionCount + fresh.length > this.residentLimits.maxResidentSections) {
       throw new Error(
         `resident sections would exceed maxResidentSections (${this.residentSectionCount + fresh.length} > ${this.residentLimits.maxResidentSections})`,
@@ -695,7 +674,7 @@ export class VoxelMap {
       const dimMap = this.sections.get(key.dim)!;
       dimMap.delete(innerKey(key.cx, key.cz, key.sy));
       if (dimMap.size === 0) this.sections.delete(key.dim);
-      this.residentBytes -= estimateVoxelSectionBytes(section);
+      this.residentBytes -= estimateVoxelSectionResidentBytes(section);
       this.residentSectionCount -= 1;
       this.bumpResidencyGeneration(key.dim, key.cx, key.cz, key.sy);
       result.unloaded.push({ ...key });
@@ -772,9 +751,14 @@ export class VoxelMap {
    * upserts only the captured (dirty) sections and leaves other directory entries
    * untouched.
    */
-  commitDirectory(mode: 'full' | 'incremental', sections: readonly VoxelSectionSnapshot[]): void {
+  commitDirectory(
+    mode: 'full' | 'incremental',
+    sections: readonly VoxelSectionSnapshot[],
+    committedBytes: readonly { dim: string; cx: number; cz: number; sy: number; bytes: number }[],
+  ): void {
     if (!this.manualResidency) return;
     if (mode === 'full') this.directory.clear();
+    const byteMap = new Map(committedBytes.map((b) => [dirKey(b.dim, b.cx, b.cz, b.sy), b.bytes]));
     let nextSeq = this.directory.size === 0 ? 0 : Math.max(...[...this.directory.values()].map((e) => e.seq)) + 1;
     for (const raw of sections) {
       const key = dirKey(raw.dim, raw.cx, raw.cz, raw.sy);
@@ -782,7 +766,9 @@ export class VoxelMap {
       this.directory.set(key, {
         key: { worldId: this.worldId, dim: raw.dim, cx: raw.cx, cz: raw.cz, sy: raw.sy },
         seq: existing?.seq ?? nextSeq++,
-        bytes: estimateVoxelSectionSnapshotBytes(raw),
+        // The worker returns the actual committed octet_length; the estimate is only
+        // a fallback if the ACK did not carry bytes (never the normal path).
+        bytes: byteMap.get(key) ?? estimateVoxelSectionSnapshotBytes(raw),
         observedCells: raw.evidence.length,
         paletteEntries: raw.palette.length,
         revision: raw.revision,
@@ -803,7 +789,6 @@ export class VoxelMap {
     reason: StaleReason,
     bySection: Map<Section, SectionChange>,
   ): void {
-    const before = this.manualResidency ? estimateVoxelSectionBytes(section) : 0;
     for (const [index, evidence] of section.evidence) {
       if (evidence.freshness === 'STALE') continue;
       if (!shouldStale(evidence)) continue;
@@ -819,9 +804,6 @@ export class VoxelMap {
       this.recordSaveChange(section);
       addChange(bySection, section, { pos, kind: 'staled' });
     }
-    // StaleReason is a new per-cell field: account its resident-byte growth so
-    // repeated markStale/beginSession cannot silently inflate the working set.
-    if (this.manualResidency) this.residentBytes += estimateVoxelSectionBytes(section) - before;
   }
 
   private applyValidated(observation: Observation): AppliedCell | null {
@@ -1066,20 +1048,43 @@ export class VoxelMap {
   }
 
   /**
-   * Apply a validated observation and keep the conservative resident working-set
-   * size exact (before/after section estimates). A rejected/idempotent observation
-   * (null) changes nothing.
+   * Apply validated observations and keep the conservative resident working-set
+   * size exact. In manual mode the accounting is aggregated per touched section
+   * (one before/after estimate each), not per observation, so a full-section batch
+   * stays O(section) rather than O(section²).
    */
-  private applyWithResidentAccounting(observation: Observation): AppliedCell | null {
-    if (!this.manualResidency) return this.applyValidated(observation);
-    const existing = this.lookupSection(observation.dim, observation.pos.x, observation.pos.y, observation.pos.z);
-    const beforeBytes = existing === undefined ? 0 : estimateVoxelSectionBytes(existing);
-    const applied = this.applyValidated(observation);
-    if (applied === null) return null;
-    const afterBytes = estimateVoxelSectionBytes(applied.section);
-    this.residentBytes += afterBytes - beforeBytes;
-    if (existing === undefined) this.residentSectionCount += 1;
-    return applied;
+  private applyObservations(observations: readonly Observation[]): ChangeReport {
+    if (!this.manualResidency) {
+      const bySection = new Map<Section, SectionChange>();
+      for (const observation of observations) {
+        const applied = this.applyValidated(observation);
+        if (applied === null) continue;
+        this.recordSaveChange(applied.section);
+        addChange(bySection, applied.section, { pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind });
+      }
+      return { sections: [...bySection.values()] };
+    }
+
+    const bySection = new Map<Section, SectionChange>();
+    const touched = new Map<Section, number>(); // section → pre-mutation resident bytes (0 = brand new)
+    for (const observation of observations) {
+      const existing = this.lookupSection(observation.dim, observation.pos.x, observation.pos.y, observation.pos.z);
+      if (existing !== undefined && !touched.has(existing)) {
+        touched.set(existing, estimateVoxelSectionResidentBytes(existing));
+      }
+      const applied = this.applyValidated(observation);
+      if (applied === null) continue;
+      if (existing === undefined && !touched.has(applied.section)) {
+        touched.set(applied.section, 0);
+      }
+      this.recordSaveChange(applied.section);
+      addChange(bySection, applied.section, { pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind });
+    }
+    for (const [section, before] of touched) {
+      this.residentBytes += estimateVoxelSectionResidentBytes(section) - before;
+      if (before === 0) this.residentSectionCount += 1;
+    }
+    return { sections: [...bySection.values()] };
   }
 }
 
