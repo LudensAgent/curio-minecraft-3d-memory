@@ -10,7 +10,15 @@
 - **数据三层分离**：历史几何（永不因堵塞删除）、最近观测状态（版本化、带证据）、派生通行性（可失效缓存）。
 - **不反向依赖宿主**：通过 `WorldAdapter` 抽象消费 mineflayer/Curio 的感知与执行，不 import 宿主源码。
 
-设计依据与开发约束见 [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design.md) 与 [`AGENTS.md`](AGENTS.md)。设计文档中的接口是**目标契约**，本仓库当前为**初步目录架构**：类型与目录已就位，各阶段实现按设计 §10 逐步落地。
+设计依据与开发约束见 [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design.md) 与 [`AGENTS.md`](AGENTS.md)。设计文档中的接口是**目标契约**，本仓库按设计 §10 逐步落地。
+
+### 已实现
+
+- **体素地图**（`voxel/`）：稀疏、版本化的观测状态，含逐格证据、会话/中断处理与局部 `ChangeReport`。
+- **通行性**（`traversability/`）：只读单步行走评估、可失效缓存，以及对有序点列的受限路线验证。
+- **受控 walk 路线执行**（`execution/`）：`WalkRouteExecutor` 把已验证路线连接到可注入的单步 `MoveExecutor` 与实测身体反馈。它只执行调用者提供的点列（同高度、沿 X/Z 单轴一格），无有效 OPEN 证据不启动路段，`ARRIVED` 必须以实测 `exact` 位置为依据，并会在路段证据变化时撤销执行中的控制。
+
+以上均以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与可运行的 `examples/walk-route-execution.ts`）。**尚未**接入真实 mineflayer/Curio 身体、寻路或 SQLite 持久化。
 
 ## 目录结构
 
@@ -25,9 +33,13 @@ src/
 ├── topology/           # Topology Manager：路径片段 / 节点 / 边（§3.1、§5）
 ├── adapter/            # WorldAdapter 目标适配面（§2.1）
 ├── navigation/         # L2 导航原语与结果信封（§7）
+├── execution/          # 受控 walk 路线执行闭环（§7 第一步、阶段 3）
 ├── store/              # SpatialMemoryStore 运行态接口（§9）
 ├── storage/            # SQLite 持久化与 Worker（§9，阶段 5）
 └── compat/             # 旧 WorldMemory 入口的兼容层（§8、§9.1）
+
+examples/
+└── walk-route-execution.ts  # 可运行的 Fake 执行闭环示例
 ```
 
 ## 开发
@@ -37,6 +49,7 @@ npm install
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run
 npm run build       # 产出 dist/（NodeNext ESM + 类型声明）
+npx tsx examples/walk-route-execution.ts  # 运行 Fake 执行示例
 ```
 
 > 持久化驱动（`better-sqlite3`）按设计 §9.2 在阶段 5 接入，本阶段 `storage/` 仅含接口与 schema 契约，未引入原生依赖。

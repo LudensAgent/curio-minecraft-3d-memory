@@ -120,6 +120,19 @@ export type {
   NavResult,
 } from './navigation/index.js';
 
+// Execution — controlled walk-route execution loop (design §7 first step, phase 3)
+export { WalkRouteExecutor } from './execution/index.js';
+export type {
+  BodySample,
+  ExecutableMove,
+  ExecutableMoveResult,
+  MoveExecutor,
+  MoveFailure,
+  WalkRouteExecutorOptions,
+  WalkRouteRequest,
+  WalkRouteStatus,
+} from './execution/index.js';
+
 // Store
 export type { SpatialMemoryStore } from './store/index.js';
 

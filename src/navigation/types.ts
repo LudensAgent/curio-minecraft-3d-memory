@@ -37,7 +37,16 @@ export type NavProblem =
       kind: 'cancelled';
       by: 'agent' | 'user' | 'scheduler' | 'lifecycle' | 'unknown';
       reason: string;
-    };
+    }
+  // Execution-phase failures (design §7): the body left the route or scope, a
+  // move returned without a confirming position, or the segment's evidence was
+  // invalidated mid-execution. These must not be collapsed into BLOCKED/NO_PATH.
+  | { kind: 'deviation'; expected: Vec3Like; actual: Vec3Like }
+  | { kind: 'unconfirmed_arrival'; expected: Vec3Like }
+  | { kind: 'route_invalidated'; detail: string }
+  | { kind: 'scope_changed'; detail: string }
+  | { kind: 'unavailable'; detail: string }
+  | { kind: 'execution_failed'; detail: string };
 
 export type ArrivalSpec =
   | { kind: 'exact' }
