@@ -1543,3 +1543,52 @@ describe('WalkRouteExecutor — release-time invalidation priority', () => {
     expect(loop.status()!.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
   });
 });
+
+describe('WalkRouteExecutor — cancel-context nesting and terminal-order consistency', () => {
+  it('a nested cancel on the same delegation does not clear the outer cancel context', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const pointsB = [{ x: 10.5, y: 0, z: 0.5 }, { x: 11.5, y: 0, z: 0.5 }];
+    fill(map, STONE, [[10, -1, 0], [11, -1, 0]]);
+    fill(map, AIR, [[10, 0, 0], [10, 1, 0], [11, 0, 0], [11, 1, 0]]);
+
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }));
+      loop.cancel('agent', 'inner'); // inner cancel on A returns 1.0
+      loop.start(makeRequest(pointsB)); // then handover to B
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    const result = loop.cancel('agent', 'outer');
+
+    expect(result.outcome).toBe('CANCELLED');
+    expect(result.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 }); // not 0.5
+    expect(result.lastObservation?.observedAt).toBe(2200);
+  });
+
+  it('the external sample path reports timeout before local invalidation', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      const report = map.observe(obs({ name: 'minecraft:dirt', properties: {} }, { x: 1, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+      clock = 4000; // cross the deadline during the stop
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    const delegationId = begin(loop, points, { deadlineMs: 3000 });
+    loop.advance(10);
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2, observedAt: 2500 }));
+
+    expect(loop.status()!.result?.outcome).toBe('TIMEOUT');
+  });
+});

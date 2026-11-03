@@ -107,8 +107,8 @@ export class WalkRouteExecutor {
   private result: NavResult | null = null;
   /** Nesting depth of stopActive's external stop/abort callbacks; re-scheduling is forbidden while > 0. */
   private releasing = 0;
-  /** True while a cancel() is releasing control, so a re-entrant start() preserves a handover snapshot. */
-  private cancelling = false;
+  /** Per-generation nesting depth of cancel() while releasing control; a re-entrant start() preserves that snapshot. */
+  private cancellingDepth = new Map<number, number>();
 
   constructor(map: VoxelMap, executor: MoveExecutor, options: WalkRouteExecutorOptions = {}) {
     this.map = map;
@@ -154,8 +154,8 @@ export class WalkRouteExecutor {
     const myGeneration = this.generation;
     this.delegationId = `walk-${myGeneration}`;
     // Preserve the previous delegation's last accepted evidence (position, time and
-    // confirmed trace) only while a cancel() is releasing control and may need it.
-    if (this.cancelling && this.lastSample !== null) {
+    // confirmed trace) only when its cancel() is still releasing control and may need it.
+    if ((this.cancellingDepth.get(previousGeneration) ?? 0) > 0 && this.lastSample !== null) {
       this.handovers.set(previousGeneration, {
         sample: snapshotSample(this.lastSample),
         trace: this.trace.map((t) => ({ pos: { ...t.pos }, ts: t.ts })),
@@ -360,11 +360,13 @@ export class WalkRouteExecutor {
     // Build the cancellation snapshot before releasing: a re-entrant start() must
     // not replace the displacement this cancellation reports.
     const cancelled = this.buildFailure('CANCELLED', message, problem);
-    this.cancelling = true;
+    this.cancellingDepth.set(generation, (this.cancellingDepth.get(generation) ?? 0) + 1);
     try {
       this.stopActive();
     } finally {
-      this.cancelling = false;
+      const depth = (this.cancellingDepth.get(generation) ?? 0) - 1;
+      if (depth <= 0) this.cancellingDepth.delete(generation);
+      else this.cancellingDepth.set(generation, depth);
     }
     if (generation !== this.generation) {
       // Superseded: report this delegation's own last accepted evidence, if any, and release it.
@@ -740,6 +742,13 @@ export class WalkRouteExecutor {
     this.stopActive(); // measured arrival and control release are separate confirmations
     if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
 
+    // Re-check the terminal conditions (deadline / per-move timeout / rule / TTL) first.
+    const reason = this.recheckTerminal(startedAt, validUntil, ruleVersion);
+    if (reason !== null) {
+      this.result = this.buildFailure(reason.outcome, reason.message, reason.problem);
+      return;
+    }
+
     // The released action's dependencies were invalidated by a report during the stop.
     if (this.releasedInvalidated) {
       this.result = this.buildFailure('FAILED', 'the in-flight segment was invalidated by an observed world change', {
@@ -748,13 +757,6 @@ export class WalkRouteExecutor {
       });
       this.releasedDependencies = null;
       this.releasedInvalidated = false;
-      return;
-    }
-
-    // Re-check the terminal conditions after release before committing arrival.
-    const reason = this.recheckTerminal(startedAt, validUntil, ruleVersion);
-    if (reason !== null) {
-      this.result = this.buildFailure(reason.outcome, reason.message, reason.problem);
       return;
     }
 
