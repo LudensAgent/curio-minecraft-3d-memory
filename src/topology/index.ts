@@ -18,3 +18,19 @@ export type {
   TraversalPage,
   TraversalQuery,
 } from './fragment-store.js';
+export { TopologyStore } from './topology-store.js';
+export type {
+  EdgeBasis,
+  EdgeChanges,
+  EdgePage,
+  EdgeQuery,
+  EdgeReference,
+  EdgeView,
+  NodeChanges,
+  NodePage,
+  NodeQuery,
+  ReferenceStatus,
+  TopologyEdge,
+  TopologyHistorySource,
+  TopologyStoreOptions,
+} from './topology-store.js';

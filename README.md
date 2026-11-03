@@ -18,6 +18,7 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 - **Traversability** (`traversability/`): read-only single-step walk evaluation, an invalidation-friendly cache, and bounded route verification over an ordered point list.
 - **Controlled walk-route execution** (`execution/`): `WalkRouteExecutor` connects a verified route to an injectable single-step `MoveExecutor` with measured body feedback. It only executes the caller's ordered points (same height, ±1 along X/Z), never starts a step without current OPEN evidence, requires a measured `exact` position for `ARRIVED`, and revokes an in-flight segment when its evidence changes.
 - **Historical path store** (`topology/`, phase 4A): `FragmentStore` keeps historical path geometry (`PathFragment`) and confirmed traversal evidence (`TraversalEvidence`) strictly separated from current world state — with idempotent writes, explicit update, delete, paginated reads, capacity limits, and snapshot isolation.
+- **Topology facts store** (`topology/`, phase 4B): `TopologyStore` records explicit spatial nodes and directional connections (`candidate` vs evidence-backed `traversed`), keeps per-edge evidence references, and reports whether those references still resolve — never whether the path is currently passable.
 
 These are validated **in-memory with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`). They do **not** yet wire a real mineflayer/Curio body, pathfinding, or SQLite persistence.
 
@@ -60,6 +61,41 @@ Behavior:
 
 History is strictly separated from current state: the store never touches `VoxelMap`, never produces a current `OPEN`, and blockage/staleness elsewhere never deletes recorded history. See [`docs/phase-4a-history-facts-acceptance.md`](docs/phase-4a-history-facts-acceptance.md).
 
+## Topology facts store
+
+`TopologyStore` (phase 4B) records the *explicit* topology the caller submits, and keeps it separate from both historical geometry and current traversability. It is bound to one immutable `worldId` and reads evidence through a narrow read-only interface satisfied directly by `FragmentStore`.
+
+```ts
+import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
+
+const history = new FragmentStore('world');
+const topology = new TopologyStore(history);
+
+// Nodes (existing SpatialNode shape).
+topology.saveNode({ id: 'a', kind: 'place', source: 'agent', worldId: 'world',
+  dim: 'overworld', location: { kind: 'exact', pos: { x: 0.5, y: 64, z: 0.5 } } });
+topology.saveNode({ id: 'b', kind: 'place', source: 'agent', worldId: 'world',
+  dim: 'overworld', location: { kind: 'exact', pos: { x: 1.5, y: 64, z: 0.5 } } });
+
+// A candidate edge: an explicit "to-verify" relation, not a traversed fact.
+topology.saveEdge({ id: 'e-ab', from: 'a', to: 'b', type: 'HORIZONTAL',
+  basis: 'candidate', source: 'manual', evidenceIds: [] });
+
+// A traversed edge: backed by a concrete A→B traversal record.
+topology.saveEdge({ id: 'e-ab2', from: 'a', to: 'b', type: 'HORIZONTAL',
+  basis: 'traversed', evidenceIds: ['ev-1'] });
+```
+
+Behavior:
+
+- **Directed.** A→B and B→A are independent records; saving A→B never generates B→A.
+- **Two bases.** `candidate` is a pending relation (no evidence); `traversed` requires matching `TraversalEvidence` whose `from`/`to` equal the edge endpoints exactly.
+- **Reference resolution.** Each traversed edge is re-resolved against the history on read: `resolved` / `missing` / `mismatch`. Deleting a source fragment leaves the edge record and reports `missing` — it is never translated into a current `BLOCKED`.
+- **Guards.** A node referenced by an edge cannot change `location` or be deleted; removing the edge first is required. Deleting an edge never deletes fragments or evidence.
+- **Capacity.** Separate `agent`/`program` node quotas plus edge/evidence-ref/query limits; overflow is an explicit error, never silent eviction.
+
+Only same-world, same-dimension, exact-endpoint, non-`PORTAL` connections are supported; region nodes can be stored and queried but not used as edge endpoints. See [`docs/phase-4b-topology-facts-acceptance.md`](docs/phase-4b-topology-facts-acceptance.md).
+
 ## Project structure
 
 ```
@@ -80,7 +116,8 @@ src/
 
 examples/
 ├── walk-route-execution.ts   # runnable Fake demo of the execution loop
-└── fragment-store-history.ts # runnable Fake demo of historical facts vs current blockage
+├── fragment-store-history.ts # runnable Fake demo of historical facts vs current blockage
+└── topology-facts.ts         # runnable Fake demo of explicit topology facts vs current blockage
 ```
 
 ## Development
@@ -92,9 +129,10 @@ npm test            # vitest run
 npm run build       # emits dist/ (NodeNext ESM + type declarations)
 npx tsx examples/walk-route-execution.ts    # run the Fake execution demo
 npx tsx examples/fragment-store-history.ts  # run the Fake historical-facts demo
+npx tsx examples/topology-facts.ts          # run the Fake explicit-topology demo
 ```
 
-> `examples/fragment-store-history.ts` imports the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so it exercises the package `exports` entry — run `npm run build` first.
+> `examples/fragment-store-history.ts` and `examples/topology-facts.ts` import the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
 
 > The persistence driver (`better-sqlite3`) is wired in at phase 5 (design §9.2); `storage/` currently holds only the schema contract and worker interface, with no native dependency.
 

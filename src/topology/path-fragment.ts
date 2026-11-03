@@ -5,7 +5,7 @@
  * passable segments and disconnects the affected navigation edges.
  */
 
-import type { Vec3Like } from '../types.js';
+import type { MoveMode, Vec3Like } from '../types.js';
 
 export interface PathFragment {
   id: string;
@@ -68,4 +68,75 @@ export interface TraversalEvidence {
    * Absent = unknown — never inferred from temporal proximity.
    */
   actionId?: string;
+  /**
+   * Movement mode the caller knows was used for this traversal. Absent = unknown;
+   * it is never defaulted to `walk`, inferred from `source`/`type`, or guessed from
+   * coordinate deltas. It participates in idempotency and conflict comparison, but
+   * adds no execution capability or authorization.
+   */
+  mode?: MoveMode;
+}
+
+const MOVE_MODES: readonly MoveMode[] = ['walk', 'jump', 'sneak', 'swim', 'climb', 'ladder', 'drop'];
+
+/** Whether a `MoveMode` string is one of the known modes (kept internal — consumers validate via the store). */
+function isMoveMode(value: unknown): value is MoveMode {
+  return typeof value === 'string' && (MOVE_MODES as readonly string[]).includes(value);
+}
+
+function pointsEqual(a: Vec3Like, b: Vec3Like): boolean {
+  return a.x === b.x && a.y === b.y && a.z === b.z;
+}
+
+/**
+ * Deep-copy a `TraversalEvidence`, reading every field explicitly so a
+ * prototype-getter-provided input is honored (object spread skips getters).
+ * The result owns plain data objects; mutating it never reaches the source.
+ */
+export function cloneTraversalEvidence(e: TraversalEvidence): TraversalEvidence {
+  return {
+    id: e.id,
+    fragmentId: e.fragmentId,
+    from: { x: e.from.x, y: e.from.y, z: e.from.z },
+    to: { x: e.to.x, y: e.to.y, z: e.to.z },
+    worldId: e.worldId,
+    dim: e.dim,
+    sessionId: e.sessionId,
+    observedAt: e.observedAt,
+    source: e.source,
+    executionId: e.executionId,
+    actionId: e.actionId,
+    mode: e.mode,
+  };
+}
+
+/**
+ * Field-for-field equality over every declared `TraversalEvidence` field:
+ * identity, fragment, scope, endpoints, session, time, source, execution/action
+ * association, and the optional `mode`. Used for idempotency/conflict detection
+ * and, in the topology layer, for deciding whether a still-present record still
+ * matches the evidence an edge was bound to.
+ */
+export function traversalEvidenceEqual(a: TraversalEvidence, b: TraversalEvidence): boolean {
+  return (
+    a.id === b.id &&
+    a.fragmentId === b.fragmentId &&
+    a.worldId === b.worldId &&
+    a.dim === b.dim &&
+    a.sessionId === b.sessionId &&
+    a.observedAt === b.observedAt &&
+    a.source === b.source &&
+    a.executionId === b.executionId &&
+    a.actionId === b.actionId &&
+    a.mode === b.mode &&
+    pointsEqual(a.from, b.from) &&
+    pointsEqual(a.to, b.to)
+  );
+}
+
+/** Validate that an optional `mode`, when present, is a known movement mode. */
+export function assertValidMode(mode: MoveMode | undefined): void {
+  if (mode !== undefined && !isMoveMode(mode)) {
+    throw new Error(`mode "${String(mode)}" is not a known movement mode`);
+  }
 }

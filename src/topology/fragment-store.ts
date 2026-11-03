@@ -22,6 +22,11 @@
  */
 
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
+import {
+  assertValidMode,
+  cloneTraversalEvidence,
+  traversalEvidenceEqual,
+} from './path-fragment.js';
 import type { Vec3Like } from '../types.js';
 
 /** What one write operation did. `unchanged` is the idempotent no-op. */
@@ -230,7 +235,7 @@ export class FragmentStore {
     }
     const existing = this.traversalMap.get(evidence.id);
     if (existing !== undefined) {
-      if (evidencesEqual(existing, snapshot)) return { status: 'unchanged' };
+      if (traversalEvidenceEqual(existing, snapshot)) return { status: 'unchanged' };
       throw new Error(`traversal evidence "${evidence.id}" already exists with different content`);
     }
     if (this.traversalMap.size >= this.limits.maxTraversals) {
@@ -248,6 +253,16 @@ export class FragmentStore {
     return { status: 'inserted' };
   }
 
+  /**
+   * Read one traversal record by id (deep-copied snapshot), or `null` when absent.
+   * A direct by-id lookup — never a scan of the paginated listing — and read-only:
+   * it does not refresh time, uses, or any other fact.
+   */
+  getTraversal(id: string): TraversalEvidence | null {
+    const evidence = this.traversalMap.get(id);
+    return evidence === undefined ? null : cloneTraversalEvidence(evidence);
+  }
+
   /** Paginated read of traversal evidence. Read-only, and directional: A→B never implies B→A. */
   traversals(query: TraversalQuery = {}): TraversalPage {
     const limit = clampLimit(query.limit, this.limits.maxQueryBatch);
@@ -261,7 +276,7 @@ export class FragmentStore {
       .sort();
     const { pageIds, nextAfter } = selectPage(ids, query.after, limit);
     return {
-      items: pageIds.map((id) => cloneEvidence(this.traversalMap.get(id)!)),
+      items: pageIds.map((id) => cloneTraversalEvidence(this.traversalMap.get(id)!)),
       total: ids.length,
       nextAfter,
     };
@@ -348,9 +363,10 @@ function snapshotEvidence(worldId: string, e: TraversalEvidence): TraversalEvide
   if (e.actionId !== undefined && (typeof e.actionId !== 'string' || e.actionId.length === 0)) {
     throw new Error(`traversal actionId must be a non-empty string when present`);
   }
+  assertValidMode(e.mode);
   assertFinitePoint(e.from, 'traversal.from');
   assertFinitePoint(e.to, 'traversal.to');
-  return cloneEvidence(e);
+  return cloneTraversalEvidence(e);
 }
 
 function cloneFragment(f: PathFragment): PathFragment {
@@ -370,24 +386,6 @@ function cloneFragment(f: PathFragment): PathFragment {
     createdAt: f.createdAt,
     lastUsedAt: f.lastUsedAt,
     uses: f.uses,
-  };
-}
-
-function cloneEvidence(e: TraversalEvidence): TraversalEvidence {
-  // Read every field explicitly: object spread skips prototype getters, so a
-  // class-provided input would otherwise lose its attribution and coordinates.
-  return {
-    id: e.id,
-    fragmentId: e.fragmentId,
-    from: { x: e.from.x, y: e.from.y, z: e.from.z },
-    to: { x: e.to.x, y: e.to.y, z: e.to.z },
-    worldId: e.worldId,
-    dim: e.dim,
-    sessionId: e.sessionId,
-    observedAt: e.observedAt,
-    source: e.source,
-    executionId: e.executionId,
-    actionId: e.actionId,
   };
 }
 
@@ -428,22 +426,6 @@ function linksEqual(
   return (
     a.length === b.length &&
     a.every((l, i) => pointsEqual(l.a, b[i]!.a) && pointsEqual(l.b, b[i]!.b))
-  );
-}
-
-function evidencesEqual(a: TraversalEvidence, b: TraversalEvidence): boolean {
-  return (
-    a.id === b.id &&
-    a.fragmentId === b.fragmentId &&
-    a.worldId === b.worldId &&
-    a.dim === b.dim &&
-    a.sessionId === b.sessionId &&
-    a.observedAt === b.observedAt &&
-    a.source === b.source &&
-    a.executionId === b.executionId &&
-    a.actionId === b.actionId &&
-    pointsEqual(a.from, b.from) &&
-    pointsEqual(a.to, b.to)
   );
 }
 

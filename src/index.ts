@@ -81,22 +81,36 @@ export type {
   RouteVerifierOptions,
 } from './traversability/index.js';
 
-// Topology — historical geometry + confirmed traversal evidence (phase 4A)
-export { FragmentStore } from './topology/index.js';
+// Topology — historical geometry + confirmed traversal evidence (phase 4A),
+// and explicit in-memory topology facts (phase 4B)
+export { FragmentStore, TopologyStore } from './topology/index.js';
 export type {
   ConnectionType,
+  EdgeBasis,
+  EdgeChanges,
+  EdgePage,
+  EdgeQuery,
+  EdgeReference,
+  EdgeView,
   FragmentChanges,
   FragmentPage,
   FragmentQuery,
   FragmentStoreOptions,
   LandmarkTag,
+  NodeChanges,
   NodeKind,
+  NodePage,
+  NodeQuery,
   NodeSource,
   PathFragment,
+  ReferenceStatus,
   SaveResult,
   SaveStatus,
   SpatialEdge,
   SpatialNode,
+  TopologyEdge,
+  TopologyHistorySource,
+  TopologyStoreOptions,
   TraversalEvidence,
   TraversalPage,
   TraversalQuery,

@@ -36,10 +36,11 @@ export type LandmarkTag =
   | 'portal';
 
 /**
- * Who recorded this anchor (design §5 "命名空间分流"). Drives eviction durability
- * and display namespace: `agent` points are persistent and never auto-evicted;
- * `program` points are capacity-bounded (oldest evicted first) and must not share a
- * display namespace with agent-named points.
+ * Who recorded this anchor (design §5 "命名空间分流"). Drives separate capacity
+ * quotas and the display namespace: `agent` and `program` nodes draw on their own
+ * quotas and must not share a display namespace. In this phase both kinds are
+ * capacity-bounded with explicit rejection on overflow — no oldest-first eviction
+ * is implemented here (a later phase may add durability-based eviction).
  */
 export type NodeSource = 'agent' | 'program';
 
