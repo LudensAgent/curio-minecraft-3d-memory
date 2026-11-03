@@ -286,12 +286,26 @@ export class RouteVerifier {
       this.cache.invalidate(report);
       return null;
     }
+    this.invalidate(report);
+    this.runPending(budget);
+    return this.snapshot();
+  }
+
+  /**
+   * Invalidate the single-step cache and drop every step result that depended on a
+   * changed section, without re-verifying. This lets a caller consume a report
+   * (so a later re-registration or re-entrant start cannot read a stale OPEN) while
+   * deferring the bounded re-verification to a separate `advance`.
+   */
+  invalidate(report: ChangeReport): void {
+    if (this.route === null) {
+      this.cache.invalidate(report);
+      return;
+    }
     this.reconcileRuleVersion();
     this.expireStale(this.currentNow());
     this.invalidateByReport(report);
     this.cache.invalidate(report);
-    this.runPending(budget);
-    return this.snapshot();
   }
 
   /** Drop the tracked route and all its results/dependencies. The shared cache is left intact. */

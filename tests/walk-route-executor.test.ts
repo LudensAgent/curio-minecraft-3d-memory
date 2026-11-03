@@ -63,6 +63,33 @@ class ReentrantExecutor implements MoveExecutor {
   }
 }
 
+/** Fake executor whose move() is deferred and whose stop() synchronously invokes a callback. */
+class CancelOnStopExecutor implements MoveExecutor {
+  readonly stopped: string[] = [];
+  private onStop: (() => void) | null = null;
+  private resolveMove: ((r: ExecutableMoveResult) => void) | null = null;
+
+  setOnStop(fn: () => void): void {
+    this.onStop = fn;
+  }
+
+  move(): Promise<ExecutableMoveResult> {
+    return new Promise<ExecutableMoveResult>((resolve) => {
+      this.resolveMove = resolve;
+    });
+  }
+
+  resolve(result: ExecutableMoveResult): void {
+    this.resolveMove?.(result);
+    this.resolveMove = null;
+  }
+
+  stop(executionId: string): void {
+    this.stopped.push(executionId);
+    this.onStop?.();
+  }
+}
+
 function makeSample(
   scope: { worldId: string; dim: string; sessionId: string; executionId: string },
   pos: Vec3Like,
@@ -916,7 +943,7 @@ describe('WalkRouteExecutor — sample admission, terminal writes and ownership'
     expect(status.activeStepIndex).toBeNull();
   });
 
-  it('an old observe call does not judge its report against a re-entrant new delegation', () => {
+  it('an old observe call reads a freshly invalidated cache on a re-entrant start', () => {
     let clock = 2000;
     const map = new VoxelMap('world', { now: () => clock });
     fill(map, STONE, [[0, -1, 0], [1, -1, 0], [10, -1, 0], [11, -1, 0]]);
@@ -926,24 +953,73 @@ describe('WalkRouteExecutor — sample admission, terminal writes and ownership'
 
     const executor = new ReentrantExecutor();
     let loop!: WalkRouteExecutor;
-    executor.setOnStop(() => {
-      const s = loop.start(makeRequest(pointsB));
-      loop.onSample(makeSample({ ...SCOPE, executionId: s.delegationId }, pointsB[0]!, { sequence: 1, observedAt: 4000 }));
-      loop.advance(10); // start B's move
-    });
     loop = new WalkRouteExecutor(map, executor, { now: () => clock });
 
+    // Verify route B first to populate the cache with an OPEN step.
+    begin(loop, pointsB);
+    loop.advance(10); // B's step OPEN (cache entry); move stays in-flight
+
+    // Replace B with A.
     begin(loop, pointsA, { deadlineMs: 3000 });
     loop.advance(10); // A's move in flight
     clock = 4000; // past A's deadline
 
-    const report = map.observe(obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 3500, sequence: 99 }));
+    executor.setOnStop(() => {
+      const s = loop.start(makeRequest(pointsB));
+      loop.onSample(makeSample({ ...SCOPE, executionId: s.delegationId }, pointsB[0]!, { sequence: 1, observedAt: 4000 }));
+      loop.advance(10); // B's re-verification must see the wall, not the stale OPEN
+    });
+
+    const report = map.observe(obs(STONE, { x: 10, y: 0, z: 0 }, { observedAt: 3500, sequence: 99 })); // wall at B's target
     loop.observe(report, 10);
 
     const status = loop.status()!;
-    expect(status.delegationId).toBe('walk-2');
-    expect(status.result).toBeNull(); // B not stopped by the old report
-    expect(status.activeStepIndex).toBe(0); // B's move still active
+    expect(status.delegationId).toBe('walk-3');
+    expect(status.activeStepIndex).toBeNull(); // no move scheduled against stale OPEN
+    const step = status.route.steps[0]!;
+    expect(step.kind === 'verified' && step.result.status).toBe('BLOCKED');
+  });
+
+  it('a re-entrant advance during stop does not re-schedule the same step', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.advance(1); // re-entrant advance on the same delegation
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10); // step 0 in flight
+
+    loop.cancel('agent', 'stop');
+
+    const status = loop.status()!;
+    expect(status.result?.outcome).toBe('CANCELLED');
+    expect(status.activeStepIndex).toBeNull(); // no orphaned move
+  });
+
+  it('a Promise-returned displacement is retained across a synchronous cancel', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.cancel('agent', 'stop');
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10); // step 0 in flight (deferred promise)
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    const status = loop.status()!;
+    expect(status.result?.outcome).toBe('CANCELLED');
+    expect(status.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
+    expect(status.result?.lastObservation?.observedAt).toBe(2200);
   });
 
   it('a cancel in the stop callback is not overwritten by arrival', () => {

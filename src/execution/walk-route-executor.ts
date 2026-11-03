@@ -93,6 +93,8 @@ export class WalkRouteExecutor {
   private activeStartedAt: number | null = null;
   private trace: { pos: Vec3Like; ts: number }[] = [];
   private result: NavResult | null = null;
+  /** Nesting depth of stopActive's external stop/abort callbacks; re-scheduling is forbidden while > 0. */
+  private releasing = 0;
 
   constructor(map: VoxelMap, executor: MoveExecutor, options: WalkRouteExecutorOptions = {}) {
     this.map = map;
@@ -219,11 +221,16 @@ export class WalkRouteExecutor {
     return this.snapshot();
   }
 
-  /** Consume a `ChangeReport`: run the terminal guard, revoke an invalidated in-flight step, then re-verify within budget. */
+  /** Consume a `ChangeReport`: invalidate the cache, revoke an invalidated in-flight step, then re-verify within budget. */
   observe(report: ChangeReport, budget: number): WalkRouteStatus {
     this.requireRequest();
     validateBudget(budget);
     const generation = this.generation;
+
+    // Invalidate the cache BEFORE any stop/abort callback, so a re-entrant start()
+    // cannot read a stale OPEN cached from before this report.
+    this.verifier.invalidate(report);
+
     this.guard(); // may re-enter start() via the stop/abort callback
 
     // Judge the report against the active step only if this call still owns the
@@ -235,9 +242,8 @@ export class WalkRouteExecutor {
       });
     }
 
-    // Always consume the report (cache invalidation), even after termination, so a
-    // stale OPEN cannot revive in a later re-registration.
-    this.verifier.apply(report, budget);
+    // Re-verify (bounded) after the affected action has been revoked.
+    this.verifier.advance(budget);
     this.guard();
 
     return this.snapshot();
@@ -459,6 +465,10 @@ export class WalkRouteExecutor {
       return;
     }
 
+    // Forbid re-scheduling while a stop/abort callback is unwinding, so a re-entrant
+    // advance() cannot orphan a move right before a terminal result is written.
+    if (this.releasing > 0) return;
+
     this.activeStepIndex = stepIndex;
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
@@ -497,38 +507,47 @@ export class WalkRouteExecutor {
     const moveStartedAt = this.activeStartedAt;
     const basisInvalidated = this.activeBasisInvalidated();
 
-    this.stopActive();
-    if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
-
     const sample = result.sample;
     const failure = result.failure;
 
-    // Validate the sample: filter execution identity and ordering first, then
-    // interpret scope/lifecycle, so a foreign or replayed sample cannot override an
-    // explicit cancel/timeout reason or trigger a spurious scope/lifecycle verdict.
+    // Validate and record the trusted sample BEFORE releasing control, so a
+    // re-entrant cancel()/start() from stopActive preserves the confirmed partial
+    // displacement (position + original observation time).
     let usable: BodySample | null = null;
+    let sampleVerdict: 'scope_changed' | 'unavailable' | null = null;
     if (sample !== undefined && this.sampleFinite(sample)) {
       if (sample.executionId !== executionId) {
         // Foreign sample: ignore it, do not interpret its scope/lifecycle.
       } else if (!this.sampleOrdered(sample)) {
         // Replayed/out-of-order sample: ignore it, do not interpret its scope/lifecycle.
       } else if (!this.scopeMatches(sample)) {
-        this.result = this.buildFailure('FAILED', 'the body left the delegation scope during execution', {
-          kind: 'scope_changed',
-          detail: 'sample world/dim/session does not match the delegation',
-        });
-        return;
+        sampleVerdict = 'scope_changed';
       } else if (this.lifecycleBroken(sample)) {
         this.recordSamplePosition(sample); // preserve the latest trusted position before terminating
-        this.result = this.buildFailure('FAILED', 'the body became unavailable during execution', {
-          kind: 'unavailable',
-          detail: `alive=${sample.alive} connected=${sample.connected} observationReady=${sample.observationReady}`,
-        });
-        return;
+        sampleVerdict = 'unavailable';
       } else {
         usable = sample;
         this.recordSamplePosition(sample);
       }
+    }
+
+    this.stopActive();
+    if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
+
+    if (sampleVerdict === 'scope_changed') {
+      this.result = this.buildFailure('FAILED', 'the body left the delegation scope during execution', {
+        kind: 'scope_changed',
+        detail: 'sample world/dim/session does not match the delegation',
+      });
+      return;
+    }
+    if (sampleVerdict === 'unavailable') {
+      const s = sample as BodySample; // sampleVerdict is only set when the sample is defined
+      this.result = this.buildFailure('FAILED', 'the body became unavailable during execution', {
+        kind: 'unavailable',
+        detail: `alive=${s.alive} connected=${s.connected} observationReady=${s.observationReady}`,
+      });
+      return;
     }
 
     // Decide terminal (deadline / per-move timeout / basis), preserving the recorded displacement.
@@ -670,8 +689,13 @@ export class WalkRouteExecutor {
     const abort = this.activeAbort;
     this.clearActiveState();
     if (executionId !== null && abort !== null) {
-      this.executor.stop(executionId);
-      abort.abort();
+      this.releasing += 1;
+      try {
+        this.executor.stop(executionId);
+        abort.abort();
+      } finally {
+        this.releasing -= 1;
+      }
     }
   }
 
