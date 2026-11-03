@@ -20,6 +20,7 @@
 - **历史路径存储**（`topology/`，阶段 4A）：`FragmentStore` 将历史路径几何（`PathFragment`）与已确认经过证据（`TraversalEvidence`）与当前世界状态严格分离 —— 支持幂等写入、明确更新、删除、分页读取、容量上限与快照隔离。
 - **拓扑事实存储**（`topology/`，阶段 4B）：`TopologyStore` 记录显式空间节点与有向连接（`candidate` 候选 vs 有依据的 `traversed`），保留每条边的证据引用，并报告这些引用当前能否解析 —— 但从不回答当前是否可通行。
 - **有界历史图查询**（`topology/`，阶段 4C）：`TopologyStore` 新增有界、只读的 `adjacency` / `reachable` / `route` 查询 —— 有限工作预算、模式筛选、轻量历史读取，以及精确的 `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` 结果 —— 仍不声称当前可通行、不生成可执行路线。
+- **有界历史锚点查询**（`topology/`，阶段 4D）：`TopologyStore.historicalAnchorCandidates` 查询从节点出发、沿证据解析的历史连接可达且满足筛选（source/tag/kind）的锚点，按 `bfs`/`highest`/`deepest` 排序限流，附带共享证明 —— 不声称当前可通行、不选择行动目标、不生成可执行路线。
 
 以上均以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与可运行的 `examples/walk-route-execution.ts`）。**尚未**接入真实 mineflayer/Curio 身体、寻路或 SQLite 持久化。
 
@@ -140,6 +141,41 @@ if (r.status === 'FOUND') {
 这些查询只返回历史事实，不产生当前 `OPEN`、不声称身体已到达、不生成可执行点列。见
 [`docs/phase-4c-historical-topology-query-acceptance.md`](docs/phase-4c-historical-topology-query-acceptance.md)。
 
+## 有界历史锚点查询
+
+`TopologyStore.historicalAnchorCandidates(fromNodeId, options?)`（阶段 4D）回答「从这个已知节点
+出发，沿证据解析、模式匹配的 `traversed` 边可以到达哪些已记录的锚点？最高或最深的是哪个？」。
+
+```ts
+import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
+
+const history = new FragmentStore('world');
+const topology = new TopologyStore(history);
+// … 保存节点与经过边 …
+
+const r = topology.historicalAnchorCandidates('a', { tag: 'resource', order: 'highest', limit: 1 });
+r.items;          // [{ node: SpatialNode, hops: 3 }]
+r.matchedCount;   // 应用 limit 前的候选数
+r.proofSegments;  // 到达返回候选所需的前驱路径并集
+r.disposition;    // 'complete' | 'evidence_gaps' | 'budget_exhausted'
+```
+
+行为：
+
+- **端点**：起点必须是已存在的 `exact` 节点；区域端点与缺失节点明确失败；`maxNodes: 0` 不返回
+  未经校验的起点。
+- **过滤**：`source` / `tag` / `kind` 按 AND 组合，只过滤返回候选、不裁剪遍历；缺失 `tag` 的
+  节点不匹配指定 `tag`；不匹配的中间节点仍被穿越。
+- **排序**：`bfs`（发现顺序）、`highest`（`pos.y` 降序）、`deepest`（`pos.y` 升序）；同高度保持
+  BFS 顺序。高度只来自节点 `pos.y`，不来自片段 `deepestY` 或连接类型。
+- **完整性**：`matchedCount` 为 limit 前的候选数；`resultsTruncated` 仅表示被 limit 截断；
+  `disposition` 报告搜索是否完成；空 `items` 不自动等于「没有候选」。
+- **证明**：`proofSegments` 是到达返回候选所需前驱路径的去重并集，按前驱在先顺序输出，每段带
+  见证证据。
+
+`highest`/`deepest` 不声称是地表或洞穴最深处，查询不证明当前可通行、不选择行动目标。见
+[`docs/phase-4d-historical-anchor-query-acceptance.md`](docs/phase-4d-historical-anchor-query-acceptance.md)。
+
 ## 目录结构
 
 ```
@@ -162,7 +198,8 @@ examples/
 ├── walk-route-execution.ts         # 可运行的 Fake 执行闭环示例
 ├── fragment-store-history.ts       # 可运行的 Fake 历史事实与当前阻塞对照示例
 ├── topology-facts.ts               # 可运行的 Fake 显式拓扑事实与当前阻塞对照示例
-└── historical-topology-query.ts    # 可运行的 Fake 有界历史图查询示例
+├── historical-topology-query.ts    # 可运行的 Fake 有界历史图查询示例
+└── historical-anchor-query.ts      # 可运行的 Fake 有界历史锚点查询示例
 ```
 
 ## 开发
@@ -176,9 +213,10 @@ npx tsx examples/walk-route-execution.ts    # 运行 Fake 执行示例
 npx tsx examples/fragment-store-history.ts  # 运行 Fake 历史事实示例
 npx tsx examples/topology-facts.ts          # 运行 Fake 显式拓扑示例
 npx tsx examples/historical-topology-query.ts # 运行 Fake 有界历史图查询示例
+npx tsx examples/historical-anchor-query.ts   # 运行 Fake 有界历史锚点查询示例
 ```
 
-> `examples/fragment-store-history.ts`、`examples/topology-facts.ts` 与 `examples/historical-topology-query.ts` 以公开包名（`curio-minecraft-3d-memory`）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
+> `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts` 与 `examples/historical-anchor-query.ts` 以公开包名（`curio-minecraft-3d-memory`）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
 
 > 持久化驱动（`better-sqlite3`）按设计 §9.2 在阶段 5 接入，本阶段 `storage/` 仅含接口与 schema 契约，未引入原生依赖。
 

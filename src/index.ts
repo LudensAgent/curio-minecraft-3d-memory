@@ -88,6 +88,7 @@ export { FragmentStore, TopologyStore } from './topology/index.js';
 export type {
   AdjacencyOptions,
   AdjacencyResult,
+  AnchorOrder,
   ConnectionType,
   EdgeBasis,
   EdgeChanges,
@@ -100,6 +101,9 @@ export type {
   FragmentQuery,
   FragmentScope,
   FragmentStoreOptions,
+  HistoricalAnchorCandidate,
+  HistoricalAnchorQueryOptions,
+  HistoricalAnchorQueryResult,
   LandmarkTag,
   NodeChanges,
   NodeKind,

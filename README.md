@@ -20,6 +20,7 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 - **Historical path store** (`topology/`, phase 4A): `FragmentStore` keeps historical path geometry (`PathFragment`) and confirmed traversal evidence (`TraversalEvidence`) strictly separated from current world state — with idempotent writes, explicit update, delete, paginated reads, capacity limits, and snapshot isolation.
 - **Topology facts store** (`topology/`, phase 4B): `TopologyStore` records explicit spatial nodes and directional connections (`candidate` vs evidence-backed `traversed`), keeps per-edge evidence references, and reports whether those references still resolve — never whether the path is currently passable.
 - **Bounded historical graph queries** (`topology/`, phase 4C): `TopologyStore` adds bounded, read-only `adjacency`, `reachable`, and `route` queries over the recorded topology — finite work budgets, mode filtering, lightweight history reads, and precise `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` results — still never a current-traversability or executable-route claim.
+- **Bounded historical anchor queries** (`topology/`, phase 4D): `TopologyStore.historicalAnchorCandidates` finds the recorded, evidence-resolved anchors reachable from a node (filtered by source/tag/kind, sorted by `bfs`/`highest`/`deepest`, limited), with shared proof segments — never a current-passability, target-selection, or executable-route claim.
 
 These are validated **in-memory with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`). They do **not** yet wire a real mineflayer/Curio body, pathfinding, or SQLite persistence.
 
@@ -130,6 +131,34 @@ Behavior:
 
 These queries return historical facts and never produce a current `OPEN`, a body-arrival claim, or an executable point list. See [`docs/phase-4c-historical-topology-query-acceptance.md`](docs/phase-4c-historical-topology-query-acceptance.md).
 
+## Bounded historical anchor queries
+
+`TopologyStore.historicalAnchorCandidates(fromNodeId, options?)` (phase 4D) answers "from this known node, which recorded anchors are reachable over evidence-resolved, mode-matching `traversed` edges — and which is highest/deepest?".
+
+```ts
+import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
+
+const history = new FragmentStore('world');
+const topology = new TopologyStore(history);
+// … save nodes and traversed edges …
+
+const r = topology.historicalAnchorCandidates('a', { tag: 'resource', order: 'highest', limit: 1 });
+r.items;          // [{ node: SpatialNode, hops: 3 }]
+r.matchedCount;   // candidates before limit
+r.proofSegments;  // union of predecessor paths to the returned candidates
+r.disposition;    // 'complete' | 'evidence_gaps' | 'budget_exhausted'
+```
+
+Behavior:
+
+- **Endpoints.** The start must be an existing, `exact` node. Region endpoints and missing nodes fail explicitly; `maxNodes: 0` returns no unvalidated start.
+- **Filters.** `source` / `tag` / `kind` are AND-combined and only filter the returned candidates — never the traversal. A node with no tag never matches a specified `tag`; a non-matching intermediate node is still traversed.
+- **Ordering.** `bfs` (discovery order), `highest` (descending `pos.y`), `deepest` (ascending `pos.y`); height ties keep BFS order. Height comes only from the node's exact `pos.y`, never from fragment `deepestY` or connection type.
+- **Completeness.** `matchedCount` counts candidates before `limit`; `resultsTruncated` only means the limit cut the list; `disposition` reports whether the search finished. An empty `items` is not by itself "no candidates".
+- **Proof.** `proofSegments` is the deduplicated union of BFS predecessor paths to the returned candidates, ordered predecessor-first, with the witness evidence per segment.
+
+`highest`/`deepest` never claim a surface or a cave floor, and the query never proves current passability or selects an action target. See [`docs/phase-4d-historical-anchor-query-acceptance.md`](docs/phase-4d-historical-anchor-query-acceptance.md).
+
 ## Project structure
 
 ```
@@ -152,7 +181,8 @@ examples/
 ├── walk-route-execution.ts         # runnable Fake demo of the execution loop
 ├── fragment-store-history.ts       # runnable Fake demo of historical facts vs current blockage
 ├── topology-facts.ts               # runnable Fake demo of explicit topology facts vs current blockage
-└── historical-topology-query.ts    # runnable Fake demo of bounded historical graph queries
+├── historical-topology-query.ts    # runnable Fake demo of bounded historical graph queries
+└── historical-anchor-query.ts      # runnable Fake demo of bounded historical anchor queries
 ```
 
 ## Development
@@ -166,9 +196,10 @@ npx tsx examples/walk-route-execution.ts    # run the Fake execution demo
 npx tsx examples/fragment-store-history.ts  # run the Fake historical-facts demo
 npx tsx examples/topology-facts.ts          # run the Fake explicit-topology demo
 npx tsx examples/historical-topology-query.ts # run the Fake bounded-query demo
+npx tsx examples/historical-anchor-query.ts   # run the Fake bounded-anchor-query demo
 ```
 
-> `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, and `examples/historical-topology-query.ts` import the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
+> `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, and `examples/historical-anchor-query.ts` import the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
 
 > The persistence driver (`better-sqlite3`) is wired in at phase 5 (design §9.2); `storage/` currently holds only the schema contract and worker interface, with no native dependency.
 

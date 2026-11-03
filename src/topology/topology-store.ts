@@ -279,6 +279,52 @@ export interface RouteQueryResult {
   exhausted?: QueryBudgetKey;
 }
 
+// --- bounded historical reachable-anchor query (phase 4D) ---
+
+/** Sort order for historical anchor candidates. */
+export type AnchorOrder = 'bfs' | 'highest' | 'deepest';
+
+/** Options for the bounded historical reachable-anchor query. */
+export interface HistoricalAnchorQueryOptions extends TopologyQueryOptions {
+  /** Filter on node source (AND-combined with `tag`/`kind`). */
+  source?: NodeSource;
+  /** Filter on node tag; nodes without a tag never match a specified tag. */
+  tag?: LandmarkTag;
+  /** Filter on node kind. */
+  kind?: NodeKind;
+  /** Whether the start node may be returned as a zero-hop candidate. Defaults to true. */
+  includeStart?: boolean;
+  /** Sort order. Defaults to 'bfs'. */
+  order?: AnchorOrder;
+  /** Maximum returned candidates; clamped to `maxQueryBatch`. Defaults to min(20, maxQueryBatch). */
+  limit?: number;
+}
+
+/** One matched candidate: its node snapshot plus BFS hop count from the start. */
+export interface HistoricalAnchorCandidate {
+  node: SpatialNode;
+  hops: number;
+}
+
+/** Result of a bounded historical reachable-anchor query. */
+export interface HistoricalAnchorQueryResult {
+  from: string;
+  mode?: MoveMode;
+  order: AnchorOrder;
+  items: HistoricalAnchorCandidate[];
+  /** Union of the BFS predecessor paths needed to reach the returned candidates, in predecessor-first order. */
+  proofSegments: RouteSegment[];
+  /** Matched candidate count before applying `limit`. */
+  matchedCount: number;
+  /** True when `matchedCount` exceeds `items.length`. */
+  resultsTruncated: boolean;
+  disposition: SearchDisposition;
+  gaps: SearchGapKind[];
+  stats: QueryStats;
+  diagnostics: SearchDiagnostic[];
+  exhausted?: QueryBudgetKey;
+}
+
 /**
  * Explicit update to an existing node. `id`/`worldId`/`dim`/`source` are
  * immutable; `kind`/`tag`/`label` may be changed (an explicitly-`undefined`
@@ -681,6 +727,76 @@ export class TopologyStore {
     };
   }
 
+  /**
+   * Bounded, read-only historical reachable-anchor query. Returns the nodes
+   * reachable from `fromNodeId` over recorded, evidence-resolved, mode-matching
+   * `traversed` edges that also satisfy the filter, sorted and limited.
+   * `highest`/`deepest` order on the node's exact `pos.y` only — never a surface
+   * or cave-depth claim. Never proves current traversability or an executable
+   * route, and never selects an action target.
+   */
+  historicalAnchorCandidates(
+    fromNodeId: string,
+    options: HistoricalAnchorQueryOptions = {},
+  ): HistoricalAnchorQueryResult {
+    const includeStart = resolveIncludeStart(options.includeStart);
+    const order = resolveOrder(options.order);
+    const limit = resolveLimit(options.limit, this.limits.maxQueryBatch);
+    if (options.source !== undefined && !NODE_SOURCES.includes(options.source)) {
+      throw new Error(`source "${String(options.source)}" is not a known node source`);
+    }
+    if (options.tag !== undefined && !LANDMARK_TAGS.includes(options.tag)) {
+      throw new Error(`tag "${String(options.tag)}" is not a known landmark tag`);
+    }
+    if (options.kind !== undefined && !NODE_KINDS.includes(options.kind)) {
+      throw new Error(`kind "${String(options.kind)}" is not a known node kind`);
+    }
+
+    const out = this.runSearch(fromNodeId, undefined, options);
+
+    const bfsIndex = new Map<string, number>();
+    out.order.forEach((id, i) => bfsIndex.set(id, i));
+
+    const matched: { node: SpatialNode; hops: number }[] = [];
+    for (const id of out.order) {
+      if (id === fromNodeId && !includeStart) continue;
+      const node = out.nodes.get(id);
+      if (node === undefined) continue; // defensive; every confirmed node is indexed
+      if (options.source !== undefined && node.source !== options.source) continue;
+      if (options.tag !== undefined && node.tag !== options.tag) continue;
+      if (options.kind !== undefined && node.kind !== options.kind) continue;
+      matched.push({ node, hops: out.depth.get(id) ?? 0 });
+    }
+    const matchedCount = matched.length;
+    sortMatched(matched, order, bfsIndex);
+
+    const items = matched.slice(0, limit).map((m) => ({ node: cloneNode(m.node), hops: m.hops }));
+    const candidateIds = items.filter((i) => i.hops > 0).map((i) => i.node.id);
+    const proofSegments = buildProofSegments(fromNodeId, candidateIds, out.parent, bfsIndex);
+
+    const disposition: SearchDisposition =
+      out.exhausted !== undefined
+        ? 'budget_exhausted'
+        : out.gaps.length > 0
+          ? 'evidence_gaps'
+          : 'complete';
+
+    return {
+      from: fromNodeId,
+      mode: options.mode,
+      order,
+      items,
+      proofSegments,
+      matchedCount,
+      resultsTruncated: matchedCount > items.length,
+      disposition,
+      gaps: out.gaps,
+      stats: out.stats,
+      diagnostics: out.diagnostics,
+      exhausted: out.exhausted,
+    };
+  }
+
   private runSearch(
     fromNodeId: string,
     toNodeId: string | undefined,
@@ -693,6 +809,8 @@ export class TopologyStore {
     const traversalCache = new Map<string, TraversalEvidence | null>();
     const scopeCache = new Map<string, { worldId: string; dim: string } | null>();
     const order: string[] = [];
+    const depth = new Map<string, number>();
+    const nodes = new Map<string, SpatialNode>();
     const parent = new Map<string, ParentEntry>();
     const gaps = new Set<SearchGapKind>();
     const diagnostics: SearchDiagnostic[] = [];
@@ -730,6 +848,8 @@ export class TopologyStore {
       to: toNodeId,
       foundTarget,
       order,
+      depth,
+      nodes,
       parent,
       gaps: [...gaps],
       diagnostics,
@@ -748,6 +868,8 @@ export class TopologyStore {
     if (budget.exhausted !== null) return finish();
     if (from === null) throw new Error(`unknown node "${fromNodeId}"`);
     if (from.location.kind !== 'exact') throw new Error(`node "${fromNodeId}" is not an exact location`);
+    depth.set(fromNodeId, 0);
+    nodes.set(fromNodeId, from);
 
     if (toNodeId !== undefined) {
       const to = readNode(toNodeId);
@@ -801,6 +923,8 @@ export class TopologyStore {
         visited.add(neighborId);
         order.push(neighborId);
         queue.push(neighborId);
+        depth.set(neighborId, (depth.get(nodeId) ?? 0) + 1);
+        nodes.set(neighborId, neighbor);
         parent.set(neighborId, { viaNode: nodeId, viaEdge: edge, witness: resolved.witness! });
         if (toNodeId !== undefined && neighborId === toNodeId) foundTarget = true;
       }
@@ -1261,6 +1385,10 @@ interface SearchOutput {
   /** True only when endpoint validation succeeded and the target was confirmed reached. */
   foundTarget: boolean;
   order: string[];
+  /** Hops from `from` for each confirmed reachable node (start = 0). */
+  depth: Map<string, number>;
+  /** Internal node snapshots for each confirmed reachable node (cloned at the public boundary). */
+  nodes: Map<string, SpatialNode>;
   parent: Map<string, ParentEntry>;
   gaps: SearchGapKind[];
   diagnostics: SearchDiagnostic[];
@@ -1471,4 +1599,88 @@ function pickWitness(
     if (candidates[i]!.evidenceId < best.evidenceId) best = candidates[i]!;
   }
   return { evidenceId: best.evidenceId, evidence: best.evidence };
+}
+
+// --- bounded historical reachable-anchor query internals (phase 4D) ---
+
+function resolveIncludeStart(value: boolean | undefined): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== 'boolean') {
+    throw new Error(`includeStart must be a boolean: ${String(value)}`);
+  }
+  return value;
+}
+
+function resolveOrder(value: AnchorOrder | undefined): AnchorOrder {
+  if (value === undefined) return 'bfs';
+  if (value !== 'bfs' && value !== 'highest' && value !== 'deepest') {
+    throw new Error(`order "${String(value)}" is not known (bfs|highest|deepest)`);
+  }
+  return value;
+}
+
+function resolveLimit(value: number | undefined, maxQueryBatch: number): number {
+  const v = value === undefined ? Math.min(20, maxQueryBatch) : value;
+  if (!Number.isSafeInteger(v) || v < 1) {
+    throw new Error(`limit must be a positive safe integer: ${String(v)}`);
+  }
+  return Math.min(v, maxQueryBatch);
+}
+
+/** Sort matched candidates in place; height ties keep BFS discovery order. */
+function sortMatched(
+  matched: { node: SpatialNode; hops: number }[],
+  order: AnchorOrder,
+  bfsIndex: Map<string, number>,
+): void {
+  if (order === 'bfs') {
+    matched.sort((a, b) => (bfsIndex.get(a.node.id) ?? 0) - (bfsIndex.get(b.node.id) ?? 0));
+    return;
+  }
+  const y = (n: SpatialNode): number => (n.location.kind === 'exact' ? n.location.pos.y : 0);
+  matched.sort((a, b) => {
+    const ya = y(a.node);
+    const yb = y(b.node);
+    if (ya !== yb) return order === 'highest' ? yb - ya : ya - yb;
+    return (bfsIndex.get(a.node.id) ?? 0) - (bfsIndex.get(b.node.id) ?? 0);
+  });
+}
+
+/**
+ * Build the union of BFS predecessor paths needed to reach `candidateIds` from
+ * `from`, deduplicating shared prefixes and ordered predecessor-first (by the
+ * `to` node's BFS discovery index).
+ */
+function buildProofSegments(
+  from: string,
+  candidateIds: string[],
+  parent: Map<string, ParentEntry>,
+  bfsIndex: Map<string, number>,
+): RouteSegment[] {
+  if (candidateIds.length === 0) return [];
+  const collected = new Map<string, ParentEntry>(); // keyed by node id (the edge's `to`)
+  for (const id of candidateIds) {
+    let cursor = id;
+    while (cursor !== from) {
+      if (collected.has(cursor)) break; // shared prefix already collected
+      const entry = parent.get(cursor);
+      if (entry === undefined) break; // defensive; a confirmed candidate is always reachable
+      collected.set(cursor, entry);
+      cursor = entry.viaNode;
+    }
+  }
+  const orderedIds = [...collected.keys()].sort(
+    (a, b) => (bfsIndex.get(a) ?? 0) - (bfsIndex.get(b) ?? 0),
+  );
+  return orderedIds.map((id) => {
+    const entry = collected.get(id)!;
+    return {
+      edgeId: entry.viaEdge.id,
+      from: entry.viaEdge.from,
+      to: entry.viaEdge.to,
+      type: entry.viaEdge.type,
+      evidenceId: entry.witness.evidenceId,
+      evidence: cloneTraversalEvidence(entry.witness.evidence),
+    };
+  });
 }
