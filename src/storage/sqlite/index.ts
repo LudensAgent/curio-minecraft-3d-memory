@@ -37,6 +37,7 @@ export type {
   HistorySession,
   HistorySnapshot,
   LoadSectionsResult,
+  MeasureSectionsResult,
   OpenHistorySessionOptions,
   OpenSpatialSessionOptions,
   PersistenceErrorKind,

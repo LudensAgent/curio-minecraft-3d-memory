@@ -127,7 +127,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 527 passed（18 个测试文件；新增 34 项 working-set 测试）
+npm test           → 533 passed（18 个测试文件；新增 40 项 working-set 测试）
 npx tsx examples/working-set.ts → 正常运行（以公开包名与子路径导入，Fake 路线 ARRIVED）
 git diff --check   → 通过
 ```
@@ -178,6 +178,30 @@ git diff --check   → 通过
 路线生命周期补齐：既有成功用例改为在「Pin 阻止淘汰」断言前先 `checkpoint`（使依赖为**干净**已提交，Pin 单独阻止淘汰，
 而非 dirty 阻止）；新增「releases on cancel」（取消/替换后释放）、「a late release of an old task does not drop a newer
 task protection」（迟到释放）用例。
+
+## 评审修正（二轮，4 项 P2 + 路线生命周期验收缺口）
+
+针对二轮评审的 4 项问题与路线验收缺口做了修正，并各加回归测试：
+
+- **P2 字节估算仍会拒绝实际可容纳的请求**：新增 `estimateVoxelSectionResidentBytesFromSnapshot`（从解码快照精确计算驻留
+  成本），`SpatialSession` 拆分出 `measureSections`（有界解码、不安装、返回精确成本）+ `installSections`（安装），
+  `loadSections = measure + install`。`WorkingSetManager.prepare` 改为「先测量精确成本 → 按精确成本淘汰 → 安装」，不再用
+  保守估算驱动淘汰与预算判断。回归测试「fits a request at the exact byte boundary」用真实 SQLite 复现（3 段恰好占满预算、
+  第 4 段恰好淘汰 1 段后成功）。
+- **P2 数量预检漏算已驻留段**：数量预检从 `toLoad.length > maxResidentSections` 改为
+  `resident.length + toLoad.length > maxResidentSections`（整请求的驻留足迹）。回归测试「rejects a request whose resident +
+  to-load exceeds capacity before evicting」验证 Z 段不被误淘汰。
+- **P2 门禁仍是管理器实例级**：`operationInFlight` 从管理器移到 `SpatialSession`（`workingSetLock`），新增
+  `acquireWorkingSetOperation`/`releaseWorkingSetOperation`；`checkpoint`/`loadSections` 都检查 `workingSetLock`，多个
+  管理器与直接加载/保存入口共享一致门禁。回归测试「shares the operation gate across managers and direct checkpoint」
+  （m1.prepare 在途时 m2.free 与 checkpoint 都被拒绝）。
+- **P2 加载期间数量不足被误分类为字节不足**：`mapLoadError` 按错误正文区分 `maxResidentSections`（`count_capacity`）与
+  `maxResidentBytes`（`byte_capacity`）；且 `prepare` 改为先测量后淘汰，安装前的数量溢出在淘汰阶段即被识别。回归测试
+  「classifies a load-time count overflow as count_capacity」。
+
+路线生命周期验收缺口补齐：新增 `HangingExecutor`（可暂停的 Fake 移动）。「protects clean deps under cache pressure during
+execution」在**执行中**施加缓存压力（干净依赖被 Pin 阻止淘汰）后触发 `cancel`，验证取消后释放租约可淘汰；「a replaced task
+whose lease is released late」用真实执行器验证任务替换与旧任务迟到释放不解除新任务保护。
 
 ## 本轮未实现
 

@@ -542,3 +542,28 @@ const RESIDENT_COMMITTED_CELL_OVERHEAD =
   2 * STRING_QUOTES +
   WORST_CASE_STALE_REASON.length +
   'STALE'.length;
+
+/**
+ * Exact resident working-set cost of a *decoded* section snapshot, matching
+ * `estimateVoxelSectionResidentBytes` byte-for-byte but computed directly from the
+ * persisted snapshot form (no full `restoreVoxelSection` reconstruction). This is
+ * the accurate-cost bridge for eviction planning: after the worker decodes a
+ * section, the manager measures this cost *before* installing it, so it can decide
+ * how much to evict without over- or under-planning on a conservative estimate.
+ */
+export function estimateVoxelSectionResidentBytesFromSnapshot(raw: VoxelSectionSnapshot): number {
+  const cost = jsonEscapedByteLength;
+  let bytes = SECTION_FIXED_BYTES;
+  bytes += cost(raw.dim) + STRING_QUOTES;
+  bytes += 3 * BYTES_PER_NUMBER; // cx cz sy
+  bytes += BYTES_PER_NUMBER; // bits
+  bytes += BYTES_PER_NUMBER; // revision
+  let paletteBytes = Math.max(0, raw.palette.length - 1);
+  for (const entry of raw.palette) paletteBytes += cost(entry) + STRING_QUOTES;
+  bytes += paletteBytes;
+  bytes += STRING_QUOTES + base64Length(raw.cells.length);
+  let evidenceBytes = Math.max(0, raw.evidence.length - 1);
+  for (const cell of raw.evidence) evidenceBytes += cellEvidenceBytes(cell.evidence, cost, true);
+  bytes += evidenceBytes;
+  return bytes;
+}

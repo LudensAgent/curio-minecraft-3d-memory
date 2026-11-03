@@ -37,7 +37,7 @@ export type {
   VoxelDirtyMeasure,
   VoxelSectionSnapshot,
 } from './snapshot.js';
-export { estimateVoxelSectionResidentBytesFromCommitted } from './snapshot.js';
+export { estimateVoxelSectionResidentBytesFromCommitted, estimateVoxelSectionResidentBytesFromSnapshot } from './snapshot.js';
 export { VoxelMap } from './voxel-map.js';
 export type {
   CellChange,

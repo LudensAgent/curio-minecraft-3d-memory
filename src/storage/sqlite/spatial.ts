@@ -40,6 +40,7 @@ import type {
   CloseResult,
   FlushResult,
   LoadSectionsResult,
+  MeasureSectionsResult,
   OpenSpatialSessionOptions,
   ResolvedSnapshotLimits,
   SessionLifecycle,
@@ -53,6 +54,7 @@ import type {
 } from './types.js';
 import type { HistorySnapshot } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
+import { estimateVoxelSectionResidentBytesFromSnapshot } from '../../voxel/snapshot.js';
 
 interface PendingRequest {
   kind: 'open' | 'checkpoint' | 'load' | 'close';
@@ -113,7 +115,7 @@ class SpatialSessionImpl implements SpatialSession {
   }
 
   get busy(): boolean {
-    return this.inFlight !== null || this.loadInFlight;
+    return this.inFlight !== null || this.loadInFlight || this.workingSetLock;
   }
 
   private readonly worldId: string;
@@ -128,6 +130,8 @@ class SpatialSessionImpl implements SpatialSession {
   private pending = new Map<number, PendingRequest>();
   private inFlight: InFlightCheckpoint | null = null;
   private loadInFlight = false;
+  /** Session-wide operation gate shared by working-set managers and direct load/save. */
+  private workingSetLock = false;
   private readonly voxelLoadingField: VoxelLoading;
   private readonly residencyLimitsField: ResolvedResidencyLimits;
 
@@ -229,8 +233,8 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.lifecycleField === 'closed') {
       throw new PersistenceError('closed', 'session is closed; new checkpoints are not accepted');
     }
-    if (this.inFlight !== null || this.loadInFlight) {
-      throw new PersistenceError('busy', `a persistence request is already in flight (${this.inFlight?.checkpointId ?? 'section load'})`);
+    if (this.inFlight !== null || this.loadInFlight || this.workingSetLock) {
+      throw new PersistenceError('busy', 'a persistence request is already in flight');
     }
 
     const voxelRevision = this.voxel.saveRevision;
@@ -396,8 +400,23 @@ class SpatialSessionImpl implements SpatialSession {
    * reads as STALE — it never becomes a fresh observation or a current OPEN.
    */
   async loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult> {
+    if (this.workingSetLock) {
+      throw new PersistenceError('busy', 'a working-set operation is in flight');
+    }
+    const { sections, missing } = await this.measureSections(keys);
+    if (sections.length === 0) return { loaded: [], missing };
+    return { loaded: this.installSections(sections), missing };
+  }
+
+  /**
+   * Bounded read: decode the requested committed sections *without* installing them,
+   * returning their snapshots and their exact resident cost. The caller (a
+   * working-set manager) holds the session operation gate while it drives
+   * measure → evict → install, so this method does not re-check `workingSetLock`.
+   */
+  async measureSections(keys: readonly SectionKey[]): Promise<MeasureSectionsResult> {
     if (this.voxelLoadingField !== 'manual') {
-      throw new PersistenceError('invalid_argument', 'loadSections requires voxelLoading "manual"');
+      throw new PersistenceError('invalid_argument', 'measureSections requires voxelLoading "manual"');
     }
     if (this.lifecycleField === 'closing') {
       throw new PersistenceError('closing', 'session is closing; new loads are not accepted');
@@ -417,38 +436,64 @@ class SpatialSessionImpl implements SpatialSession {
       );
     }
     const fetch = deduped.filter((k) => this.voxel.sectionResidency(k).residency !== 'resident');
-    if (fetch.length === 0) return { loaded: [], missing: [] };
+    if (fetch.length === 0) return { sections: [], missing: [], residentBytes: 0 };
 
     this.voxel.markLoading(fetch);
     this.loadInFlight = true;
-    let sections: VoxelSectionSnapshot[];
-    let missingCoords: { dim: string; cx: number; cz: number; sy: number }[];
     try {
       const result = await this.requestLoadSections(fetch);
-      sections = result.sections;
-      missingCoords = result.missing;
+      const missing = result.missing.map((m) => ({ worldId: this.worldId, ...m }));
+      this.voxel.clearTransientResidency(missing);
+      const residentBytes = result.sections.reduce(
+        (sum, section) => sum + estimateVoxelSectionResidentBytesFromSnapshot(section),
+        0,
+      );
+      return { sections: result.sections, missing, residentBytes };
     } catch (err) {
       this.voxel.markLoadFailed(fetch);
       throw err;
     } finally {
       this.loadInFlight = false;
     }
+  }
 
-    const missing = missingCoords.map((m) => ({ worldId: this.worldId, ...m }));
-    this.voxel.clearTransientResidency(missing);
-    const missingSet = new Set(missing.map((k) => sectionKeyString(k)));
-    const toFail = fetch.filter((k) => !missingSet.has(sectionKeyString(k)));
-    let installed: SectionKey[];
+  /** Install already-measured snapshots; marks them load_failed and wraps a capacity refusal. */
+  installSections(sections: readonly VoxelSectionSnapshot[]): SectionKey[] {
     try {
-      installed = this.voxel.installLoadedSections(sections);
+      return this.voxel.installLoadedSections(sections);
     } catch (err) {
-      this.voxel.markLoadFailed(toFail);
+      const keys: SectionKey[] = sections.map((s) => ({ worldId: this.worldId, dim: s.dim, cx: s.cx, cz: s.cz, sy: s.sy }));
+      this.voxel.markLoadFailed(keys);
       const message = (err as Error).message;
       // `installLoadedSections` reports "would exceed maxResidentSections/Bytes"
       // (first person "exceed"), so match both spellings.
       throw new PersistenceError(/exceed/.test(message) ? 'capacity' : 'data', message);
     }
-    return { loaded: installed, missing };
+  }
+
+  /**
+   * Acquire the session-wide operation gate shared by every working-set manager and
+   * the direct load/checkpoint entries. Throws busy when any operation is in flight.
+   */
+  acquireWorkingSetOperation(): void {
+    if (this.lifecycleField === 'closing') {
+      throw new PersistenceError('closing', 'session is closing; working-set operations are not accepted');
+    }
+    if (this.lifecycleField === 'closed') {
+      throw new PersistenceError('closed', 'session is closed; working-set operations are not accepted');
+    }
+    if (this.workingSetLock) {
+      throw new PersistenceError('busy', 'another working-set operation is in flight');
+    }
+    if (this.inFlight !== null || this.loadInFlight) {
+      throw new PersistenceError('busy', 'a persistence request is in flight');
+    }
+    this.workingSetLock = true;
+  }
+
+  /** Release the session-wide operation gate. */
+  releaseWorkingSetOperation(): void {
+    this.workingSetLock = false;
   }
 
   getPersistenceState(): SpatialPersistenceState {

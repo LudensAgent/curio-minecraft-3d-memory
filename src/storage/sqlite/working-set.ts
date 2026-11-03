@@ -16,16 +16,17 @@
  * never refreshes evidence time, and never substitutes for observed-at / sequence /
  * revision / save batch.
  *
- * Read-only queries (`stats`) do not load, evict, save, or scan the world; they
- * only read the in-memory resident set (bounded by `maxResidentSections`) and the
- * manager's own LRU index.
+ * The prepare/free operation gate is held by the *session*, not this manager, so
+ * multiple managers and the direct load/checkpoint entries share one mutual
+ * exclusion. Read-only queries (`stats`) do not load, evict, save, or scan the
+ * world; they only read the in-memory resident set (bounded by `maxResidentSections`)
+ * and the manager's own LRU index.
  */
 
 import { sectionKeyString } from '../../voxel/section.js';
 import type { SectionKey } from '../../voxel/section.js';
 import { LruOrder } from '../../voxel/lru.js';
 import type { ResolvedResidencyLimits, UnloadRejectionReason } from '../../voxel/residency.js';
-import { estimateVoxelSectionResidentBytesFromCommitted } from '../../voxel/snapshot.js';
 import { PersistenceError } from './types.js';
 import type { SpatialSession } from './types.js';
 
@@ -162,9 +163,9 @@ export function resolveWorkingSetLimits(options: WorkingSetLimits | undefined): 
  * Bounded working-set manager over a manual `SpatialSession`.
  *
  * The caller enables this explicitly by constructing it; the default eager session
- * behavior is untouched. It reuses the session's `loadSections` / `unloadSections` /
- * `pinSections` / `releasePins` / `sectionResidency` and the map's resident
- * accounting, never a parallel load/unload path.
+ * behavior is untouched. It reuses the session's `measureSections` / `installSections` /
+ * `unloadSections` / `pinSections` / `releasePins` / `sectionResidency` and the map's
+ * resident accounting, never a parallel load/unload path.
  */
 export class WorkingSetManager {
   private readonly session: SpatialSession;
@@ -173,8 +174,6 @@ export class WorkingSetManager {
   private readonly lru = new LruOrder();
   /** Section key string → SectionKey, rebuilt from the resident set on reconcile. */
   private readonly keyIndex = new Map<string, SectionKey>();
-  /** Re-entrancy guard: serializes prepare/free across their (async) duration. */
-  private operationInFlight = false;
 
   constructor(session: SpatialSession, options: WorkingSetLimits = {}) {
     if (session.voxelLoading !== 'manual') {
@@ -186,24 +185,15 @@ export class WorkingSetManager {
   }
 
   /**
-   * Explicitly prepare a set of sections: validate, protect, evict to fit, load,
-   * and return the resident + protected set with a lease. Never observes the world,
-   * never fabricates a section for a missing record, and never treats a load as a
-   * current observation or an OPEN passability conclusion.
+   * Explicitly prepare a set of sections: validate, protect, measure, evict to fit,
+   * load, and return the resident + protected set with a lease. Never observes the
+   * world, never fabricates a section for a missing record, and never treats a load
+   * as a current observation or an OPEN passability conclusion.
    *
    * Throws `PersistenceError` (before any mutation) when the session is busy,
    * closing or closed, or when another manager operation is in flight.
    */
   async prepare(keys: readonly SectionKey[]): Promise<PrepareResult> {
-    this.acquireGate();
-    try {
-      return await this.prepareGuarded(keys);
-    } finally {
-      this.releaseGate();
-    }
-  }
-
-  private async prepareGuarded(keys: readonly SectionKey[]): Promise<PrepareResult> {
     const worldId = this.session.voxel.worldId;
     const diagnostics = new DiagnosticBuffer(this.bounds.maxDiagnostics);
     const result: PrepareResult = {
@@ -221,109 +211,114 @@ export class WorkingSetManager {
       diagnostics: diagnostics.items,
     };
 
-    const deduped = this.validateKeys(keys);
-    if (deduped.length > this.residency.maxLoadBatchSections) {
-      result.capacity = this.gap(
-        'request_too_large',
-        `request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residency.maxLoadBatchSections})`,
-      );
-      diagnostics.push(result.capacity.message);
-      return result;
-    }
-
-    const resident: SectionKey[] = [];
-    const toLoad: SectionKey[] = [];
-    for (const key of deduped) {
-      switch (this.session.sectionResidency(key).residency) {
-        case 'resident':
-          resident.push(key);
-          break;
-        case 'not_resident':
-          toLoad.push(key);
-          break;
-        case 'no_record':
-          result.noRecord.push(key);
-          break;
-        case 'loading':
-        case 'load_failed':
-          result.notReady.push(key);
-          break;
-      }
-    }
-
-    // Sound count pre-check: the request alone cannot fit even an empty working set.
-    // Reject before any eviction so an impossible request has no side effects.
-    if (toLoad.length > this.residency.maxResidentSections) {
-      result.capacity = this.gap(
-        'count_capacity',
-        `request has ${toLoad.length} sections to load, exceeding maxResidentSections (${this.residency.maxResidentSections})`,
-      );
-      diagnostics.push(result.capacity.message);
-      return result;
-    }
-
-    result.alreadyResident = resident.map((k) => ({ ...k }));
-
-    // Protect the sections that are (or will be) resident, so the manager can never
-    // evict the first half of the request to make room for the second half. noRecord
-    // and notReady sections are not resident and need no protection.
-    const protectedKeys = [...resident, ...toLoad];
-    let lease: { token: string; keys: SectionKey[] };
-    try {
-      lease = this.session.pinSections(protectedKeys);
-    } catch (err) {
-      // Over the pin budget (maxPins / maxPinnedSections): nothing was evicted yet.
-      throw this.toPersistenceError(err);
-    }
-
+    this.session.acquireWorkingSetOperation();
+    let toLoad: SectionKey[] = [];
+    let lease: { token: string; keys: SectionKey[] } = { token: '', keys: [] };
     let hardFailure = false;
+    let complete = true;
+    let deduped: SectionKey[] = [];
     try {
-      this.reconcile();
-      // A successful request hit (an already-resident section) advances its LRU
-      // position; a load inserts it at MRU below. Both are runtime cache metadata.
-      for (const key of resident) this.lru.touch(sectionKeyString(key));
-      const protectedSet = new Set(protectedKeys.map(sectionKeyString));
-
-      const eviction = this.evictToFit(toLoad, protectedSet, diagnostics);
-      result.evicted = eviction.evicted.map((k) => ({ ...k }));
-      result.evictionRejected = eviction.rejected.map((r) => ({ key: { ...r.key }, reason: r.reason }));
-      if (eviction.gap !== null) {
-        result.capacity = eviction.gap;
-        hardFailure = true;
+      deduped = this.validateKeys(keys);
+      if (deduped.length > this.residency.maxLoadBatchSections) {
+        result.capacity = this.gap(
+          'request_too_large',
+          `request has ${deduped.length} sections, exceeding maxLoadBatchSections (${this.residency.maxLoadBatchSections})`,
+        );
+        diagnostics.push(result.capacity.message);
+        return result;
       }
 
-      if (toLoad.length > 0 && !hardFailure) {
+      const resident: SectionKey[] = [];
+      for (const key of deduped) {
+        switch (this.session.sectionResidency(key).residency) {
+          case 'resident':
+            resident.push(key);
+            break;
+          case 'not_resident':
+            toLoad.push(key);
+            break;
+          case 'no_record':
+            result.noRecord.push(key);
+            break;
+          case 'loading':
+          case 'load_failed':
+            result.notReady.push(key);
+            break;
+        }
+      }
+
+      // Sound count pre-check over the *whole* request (already-resident + to-load):
+      // reject before any eviction so an impossible request has no side effects.
+      if (resident.length + toLoad.length > this.residency.maxResidentSections) {
+        result.capacity = this.gap(
+          'count_capacity',
+          `request needs ${resident.length + toLoad.length} resident sections, exceeding maxResidentSections (${this.residency.maxResidentSections})`,
+        );
+        diagnostics.push(result.capacity.message);
+        return result;
+      }
+
+      result.alreadyResident = resident.map((k) => ({ ...k }));
+
+      // Protect the sections that are (or will be) resident, so the manager can never
+      // evict the first half of the request to make room for the second half.
+      const protectedKeys = [...resident, ...toLoad];
+      try {
+        lease = this.session.pinSections(protectedKeys);
+      } catch (err) {
+        throw this.toPersistenceError(err);
+      }
+
+      this.reconcile();
+      for (const key of resident) this.lru.touch(sectionKeyString(key));
+
+      if (toLoad.length > 0) {
+        const protectedSet = new Set(protectedKeys.map(sectionKeyString));
         try {
-          const loaded = await this.session.loadSections(toLoad);
-          result.loaded = loaded.loaded.map((k) => ({ ...k }));
-          for (const key of loaded.loaded) this.lru.insert(sectionKeyString(key));
-          for (const missing of loaded.missing) result.noRecord.push({ ...missing });
-          this.reconcile();
+          const measured = await this.session.measureSections(toLoad);
+          for (const missing of measured.missing) result.noRecord.push({ ...missing });
+
+          const eviction = this.evictToFit(toLoad.length, measured.residentBytes, protectedSet, diagnostics);
+          result.evicted = eviction.evicted.map((k) => ({ ...k }));
+          result.evictionRejected = eviction.rejected.map((r) => ({ key: { ...r.key }, reason: r.reason }));
+          if (eviction.gap !== null) {
+            result.capacity = eviction.gap;
+            hardFailure = true;
+            this.session.voxel.markLoadFailed(toLoad); // abandon the measured, uninstalled sections
+          } else {
+            const installed = this.session.installSections(measured.sections);
+            result.loaded = installed.map((k) => ({ ...k }));
+            for (const key of installed) this.lru.insert(sectionKeyString(key));
+            this.reconcile();
+          }
         } catch (err) {
           result.capacity = this.mapLoadError(err);
           hardFailure = true;
         }
       }
+
+      complete = !hardFailure && result.noRecord.length === 0 && result.notReady.length === 0;
     } finally {
-      // Status and lease/protection must be consistent: only a fully-prepared,
-      // fully-protected request is "ready" and keeps the lease; anything else releases
-      // the temporary lease and reports `prepared` as empty.
-      const complete = !hardFailure && result.noRecord.length === 0 && result.notReady.length === 0;
-      if (hardFailure) {
-        result.status = 'failed';
-        this.session.releasePins([lease.token]);
-        result.lease = { token: '', keys: [] };
-        result.prepared = [];
-      } else if (!complete) {
-        result.status = 'incomplete';
-        this.session.releasePins([lease.token]);
-        result.lease = { token: '', keys: [] };
-        result.prepared = [];
-      } else {
-        result.status = 'ready';
-        result.lease = { token: lease.token, keys: lease.keys.map((k) => ({ ...k })) };
-        result.prepared = deduped.map((k) => ({ ...k }));
-      }
+      this.session.releaseWorkingSetOperation();
+    }
+
+    // Status and lease/protection must be consistent: only a fully-prepared,
+    // fully-protected request is "ready" and keeps the lease; anything else releases
+    // the temporary lease and reports `prepared` as empty.
+    if (hardFailure) {
+      result.status = 'failed';
+      this.session.releasePins([lease.token]);
+      result.lease = { token: '', keys: [] };
+      result.prepared = [];
+    } else if (!complete) {
+      result.status = 'incomplete';
+      this.session.releasePins([lease.token]);
+      result.lease = { token: '', keys: [] };
+      result.prepared = [];
+    } else {
+      result.status = 'ready';
+      result.lease = { token: lease.token, keys: lease.keys.map((k) => ({ ...k })) };
+      result.prepared = deduped.map((k) => ({ ...k }));
     }
 
     for (const key of result.loaded) diagnostics.push(`loaded ${fmt(key)}`);
@@ -342,7 +337,7 @@ export class WorkingSetManager {
    * always before any mutation.
    */
   free(target?: { sections?: number; bytes?: number }): FreeResult {
-    this.acquireGate();
+    this.session.acquireWorkingSetOperation();
     try {
       const diagnostics = new DiagnosticBuffer(this.bounds.maxDiagnostics);
       const result: FreeResult = { evicted: [], evictionRejected: [], capacity: null, diagnostics: diagnostics.items };
@@ -370,8 +365,6 @@ export class WorkingSetManager {
 
         const next = this.nextCandidate(candidates, cursor, EMPTY_SET);
         if (next === null) {
-          // No target means "evict everything eligible"; exhausting candidates is the
-          // success condition, not a gap. Only a target reports an unreachable gap.
           if (target !== undefined) {
             result.capacity = this.gap('no_eligible_candidates', 'no eligible section is available to evict');
             diagnostics.push(result.capacity.message);
@@ -410,7 +403,7 @@ export class WorkingSetManager {
       }
       return result;
     } finally {
-      this.releaseGate();
+      this.session.releaseWorkingSetOperation();
     }
   }
 
@@ -431,28 +424,6 @@ export class WorkingSetManager {
   }
 
   // --- internals ---
-
-  /** Acquire the session-level operation gate before any pin/LRU/unload mutation. */
-  private acquireGate(): void {
-    if (this.operationInFlight) {
-      throw new PersistenceError('busy', 'another working-set operation is in flight');
-    }
-    const lifecycle = this.session.lifecycle;
-    if (lifecycle === 'closing') {
-      throw new PersistenceError('closing', 'session is closing; working-set operations are not accepted');
-    }
-    if (lifecycle === 'closed') {
-      throw new PersistenceError('closed', 'session is closed; working-set operations are not accepted');
-    }
-    if (this.session.busy) {
-      throw new PersistenceError('busy', 'a persistence request is in flight');
-    }
-    this.operationInFlight = true;
-  }
-
-  private releaseGate(): void {
-    this.operationInFlight = false;
-  }
 
   /** Validate every key (scope, dim, integer coords) before any state change. */
   private validateKeys(keys: readonly SectionKey[]): SectionKey[] {
@@ -503,29 +474,21 @@ export class WorkingSetManager {
 
   /**
    * Evict LRU-eligible sections until the to-load sections fit the resident count
-   * and byte budgets, or a bound/exhaustion is hit. The final dirty/pin/commit check
-   * always goes through `unloadSections` (never a cached eligibility guess).
-   *
-   * The candidate list is snapshotted once and walked with a cursor, so every
-   * candidate is visited at most once (no O(n²) re-scan). A byte-only overflow of
-   * the *conservative* estimate is not treated as a hard capacity gap: the estimate
-   * is an upper bound and may exceed the budget while the exact resident cost fits,
-   * so in that case control falls through to the load, whose exact accounting
-   * (`installLoadedSections`) is authoritative.
+   * and byte budgets, or a bound/exhaustion is hit. The byte figure is the *exact*
+   * resident cost measured from the decoded snapshots, so a remaining byte overflow
+   * after candidates are exhausted is a genuine `byte_capacity`. The final dirty/pin/
+   * commit check always goes through `unloadSections` (never a cached eligibility
+   * guess). The candidate list is snapshotted once and walked with a cursor, so every
+   * candidate is visited at most once (no O(n²) re-scan).
    */
   private evictToFit(
-    toLoad: SectionKey[],
+    toLoadCount: number,
+    toLoadBytes: number,
     protectedSet: Set<string>,
     diagnostics: DiagnosticBuffer,
   ): { evicted: SectionKey[]; rejected: EvictionRejection[]; gap: CapacityGap | null } {
     const evicted: SectionKey[] = [];
     const rejected: EvictionRejection[] = [];
-
-    const loadBytesEstimate = toLoad.reduce((sum, key) => {
-      const committed = this.session.sectionResidency(key).committed;
-      return sum + (committed === undefined ? 0 : estimateVoxelSectionResidentBytesFromCommitted(committed));
-    }, 0);
-
     const candidates = this.lru.oldestFirst();
     let cursor = 0;
     let candidateChecks = 0;
@@ -533,25 +496,30 @@ export class WorkingSetManager {
 
     for (;;) {
       const size = this.session.voxel.residentSize();
-      const needCount = size.sections + toLoad.length - this.residency.maxResidentSections;
-      const needBytes = size.bytes + loadBytesEstimate - this.residency.maxResidentBytes;
+      const needCount = size.sections + toLoadCount - this.residency.maxResidentSections;
+      const needBytes = size.bytes + toLoadBytes - this.residency.maxResidentBytes;
       if (needCount <= 0 && needBytes <= 0) break;
 
       const next = this.nextCandidate(candidates, cursor, protectedSet);
       if (next === null) {
-        // Only a genuine count overflow is a hard gap here; a byte-estimate overflow
-        // falls through to the load, whose exact check decides.
         if (needCount > 0) {
           return {
             evicted,
             rejected,
             gap: this.gap(
               'count_capacity',
-              `cannot fit ${toLoad.length} sections to load: no eligible candidate to evict`,
+              `cannot fit ${toLoadCount} sections to load: no eligible candidate to evict`,
             ),
           };
         }
-        return { evicted, rejected, gap: null };
+        return {
+          evicted,
+          rejected,
+          gap: this.gap(
+            'byte_capacity',
+            `cannot fit ${toLoadCount} sections (${toLoadBytes} resident bytes): no eligible candidate to evict`,
+          ),
+        };
       }
       cursor = next.cursor;
       candidateChecks += 1;
@@ -616,7 +584,11 @@ export class WorkingSetManager {
     if (err instanceof PersistenceError) {
       switch (err.kind) {
         case 'capacity':
-          return this.gap('byte_capacity', err.message);
+          // The install refuses either the section-count bound or the byte bound;
+          // preserve the distinction so the caller can react to the real constraint.
+          return /maxResidentSections/.test(err.message)
+            ? this.gap('count_capacity', err.message)
+            : this.gap('byte_capacity', err.message);
         case 'busy':
           return this.gap('busy', err.message);
         case 'closed':

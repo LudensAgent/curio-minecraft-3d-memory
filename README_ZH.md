@@ -331,13 +331,15 @@ manager.stats();                 // 有界只读快照（不加载/淘汰/保存
 行为：
 
 - **显式启用。** 默认 eager 加载不变；调用方构造 `WorkingSetManager` 才启用，且要求 `manual` 驻留会话。
-- **会话门禁。** `prepare`/`free` 在任何 Pin/LRU/卸载前先取得会话级操作门禁，busy（checkpoint 或 section load 在途）、
-  closing/closed、或另一个管理器操作在途时直接拒绝，绝不「先淘汰再报 busy」。
+- **会话门禁。** `prepare`/`free` 在任何 Pin/LRU/卸载前先取得**会话级**操作门禁（由 `SpatialSession` 持有，多个管理器与
+  直接 `loadSections`/`checkpoint` 入口共享），busy、closing/closed、或另一个操作在途时直接拒绝，绝不「先淘汰再报 busy」。
+- **精确成本。** `prepare` 先通过有界解码（`measureSections`）精确测量待加载 Section 的驻留成本，再按精确成本淘汰并安装
+  （`installSections`），绝不用保守字节估算淘汰或误拒；恰好落在字节边界上的请求会被接受。
 - **结果与租约一致。** `status` 区分 `ready`（全部驻留且受保护）、`incomplete`（存在 `noRecord`/`notReady`，无租约）、
   `failed`（容量缺口或读取失败，无租约）；`prepared` 始终反映实际保护状态。
 - **确定性 LRU。** 成功命中（已驻留）与成功加载都会推进 Section 的 LRU 位置；新 Section 有确定初始位置。LRU 只是运行态缓存元数据——不持久化、不替代 `observedAt`/`sequence`/`revision`/保存批次、不刷新证据时间。淘汰循环单次快照 LRU 并用游标单向遍历，每个候选至多访问一次。
 - **安全淘汰。** 按最旧优先选择候选并跳过本次请求集合；最终卸载始终经 `session.unloadSections`，因此 dirty、被 Pin、未提交的 Section 以结构化原因上报（`dirty` / `pinned` / `not_committed`），绝不凭陈旧元数据猜测。只释放已提交、干净、未被 Pin 的 Section；明显无法容纳的请求在淘汰前即被拒绝。
-- **有界失败。** `no_record` 与 `load_failed` 分别表达，绝不报为「已就绪」。硬失败（读取失败 / 容量）会释放临时租约；部分淘汰后加载失败被如实上报，不伪装成回滚，也不删除数据库事实、不清除无关 dirty。
+- **有界失败。** `no_record` 与 `load_failed` 分别表达，绝不报为「已就绪」。硬失败（读取失败 / 容量）会释放临时租约；部分淘汰后加载失败被如实上报，不伪装成回滚，也不删除数据库事实、不清除无关 dirty。数量缺口与字节缺口在结构化原因中区分。
 - **索引一致。** 绕过管理器的直接 `loadSections` / `unloadSections` / `observe` 之后，`stats()` 会把 LRU 索引与真实驻留集合对齐（有界内存枚举），因此管理器不要求调用方放弃既有公开入口。
 
 路线 Pin 闭环见 `examples/working-set.ts`：准备路线实际依赖的 Section → 恢复当前证据 → 验证 → 保护依赖 → 执行 Fake walk 路线 → 释放 → 腾空间。本轮只新增有界工作集管理：不含预测预取、后台淘汰、自动 checkpoint、观察 overlay、新寻路，也未接入真实 mineflayer/Curio。

@@ -25,7 +25,7 @@ import type {
   UnloadSectionsResult,
   VoxelDirectoryEntry,
 } from '../../voxel/residency.js';
-import type { VoxelCheckpointSnapshot } from '../../voxel/snapshot.js';
+import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelMap, VoxelMapOptions } from '../../voxel/voxel-map.js';
 
 /** Lifecycle of a history session. */
@@ -326,12 +326,39 @@ export interface SpatialSession {
   sectionResidency(key: SectionKey): SectionResidencyInfo;
   /** Explicitly load committed sections into memory (manual mode only). */
   loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult>;
+  /**
+   * Bounded read: decode the requested committed sections *without* installing them,
+   * returning their snapshots and their exact resident cost. Used by the working-set
+   * manager to decide how much to evict before installing; the manager holds the
+   * session operation gate while it drives measure → evict → install.
+   */
+  measureSections(keys: readonly SectionKey[]): Promise<MeasureSectionsResult>;
+  /** Install already-measured section snapshots into the resident working set. */
+  installSections(sections: readonly VoxelSectionSnapshot[]): SectionKey[];
   /** Safely unload resident sections; rejects pinned/dirty/uncommitted with reasons. */
   unloadSections(keys: readonly SectionKey[]): UnloadSectionsResult;
   /** Acquire a bounded pin lease; pass its token to `releasePins` to drop it. */
   pinSections(keys: readonly SectionKey[]): { token: string; keys: SectionKey[] };
   /** Release pin leases by token; releasing an unknown token is a no-op. */
   releasePins(tokens: readonly string[]): void;
+  /**
+   * Acquire the session-wide operation gate shared by every working-set manager and
+   * the direct load/checkpoint entries. Throws `PersistenceError('busy')` when any
+   * operation is already in flight. Call `releaseWorkingSetOperation` in a finally.
+   */
+  acquireWorkingSetOperation(): void;
+  /** Release the session-wide operation gate. */
+  releaseWorkingSetOperation(): void;
+}
+
+/** Result of `SpatialSession.measureSections` (bounded decode without install). */
+export interface MeasureSectionsResult {
+  /** Decoded snapshots for the requested keys that had a committed record. */
+  sections: VoxelSectionSnapshot[];
+  /** Requested keys with no committed record. */
+  missing: SectionKey[];
+  /** Exact resident working-set cost of `sections` (same billing as install). */
+  residentBytes: number;
 }
 
 /** Which facts a worker session persists (history-only vs combined spatial). */

@@ -542,6 +542,83 @@ describe('WorkingSetManager', () => {
     expect(freed.capacity?.kind).toBe('no_eligible_candidates');
     await session.close();
   });
+
+  it('fits a request at the exact byte boundary using the measured cost, not the estimate', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 4);
+
+    // Measure the exact resident cost of three sections.
+    const probe = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 4 } });
+    const pl = await probe.manager.prepare([keyAt(0), keyAt(1), keyAt(2)]);
+    const threeBytes = probe.session.voxel.residentSize().bytes;
+    await probe.session.close();
+
+    // Reopen: three sections fill the budget exactly; a 4th needs exactly one eviction.
+    const { session, manager } = await manualSession(
+      dbPath,
+      { residencyLimits: { maxResidentSections: 4, maxResidentBytes: threeBytes } },
+      { maxUnloadSections: 1 },
+    );
+    const a = await manager.prepare([keyAt(0), keyAt(1), keyAt(2)]);
+    session.releasePins([a.lease.token]);
+
+    const r = await manager.prepare([keyAt(3)]); // must evict exactly 1 to fit
+    expect(r.status).toBe('ready');
+    expect(r.capacity).toBeNull();
+    expect(r.evicted).toHaveLength(1);
+    expect(r.loaded).toEqual([keyAt(3)]);
+    expect(session.voxel.residentSize().sections).toBe(3);
+    expect(session.voxel.residentSize().bytes).toBeLessThanOrEqual(threeBytes);
+    await session.close();
+  });
+
+  it('rejects a request whose resident + to-load exceeds capacity before evicting', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 5);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 2 } });
+    // A (keyAt 0) and Z (keyAt 4) resident.
+    const l = await manager.prepare([keyAt(0), keyAt(4)]);
+    session.releasePins([l.lease.token]);
+
+    // Request A, B, C: A already resident, B/C to load → needs 3 sections > 2.
+    const r = await manager.prepare([keyAt(0), keyAt(1), keyAt(2)]);
+    expect(r.status).toBe('failed');
+    expect(r.capacity?.kind).toBe('count_capacity');
+    expect(r.evicted).toEqual([]); // Z was NOT evicted
+    expect(session.sectionResidency(keyAt(4)).residency).toBe('resident');
+    await session.close();
+  });
+
+  it('shares the operation gate across managers and direct checkpoint', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    const m1 = new WorkingSetManager(session);
+    const m2 = new WorkingSetManager(session);
+
+    // m1.prepare holds the session-wide gate across its async measure.
+    const pending = m1.prepare([keyAt(1)]);
+    expect(() => m2.free()).toThrow(/in flight/);
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'busy' });
+    await pending;
+    await session.close();
+  });
+
+  it('classifies a load-time count overflow as count_capacity, not byte_capacity', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 1 } });
+
+    // Start loading keyAt(0); while its measure awaits the worker, add a new section.
+    const pending = manager.prepare([keyAt(0)]);
+    session.voxel.beginSession('live');
+    session.voxel.observe(voxelObs({ sessionId: 'live', pos: { x: 900, y: 64, z: 0 }, observedAt: 2000, sequence: 1 }));
+
+    const r = await pending;
+    expect(r.status).toBe('failed');
+    expect(r.capacity?.kind).toBe('count_capacity'); // not byte_capacity
+    await session.close();
+  });
 });
 
 // ==============================================================================
@@ -555,6 +632,32 @@ class FakeMoveExecutor implements MoveExecutor {
     return Promise.resolve({ sample: sampleAt(request.worldId, request.dim, request.sessionId, request.executionId, request.to, ++this.seq) });
   }
   stop(): void {}
+}
+
+/** Fake single-step executor whose move() hangs until the host resolves it — for mid-execution tests. */
+class HangingExecutor implements MoveExecutor {
+  private resolveMove: ((r: ExecutableMoveResult) => void) | null = null;
+  private last: ExecutableMove | null = null;
+  readonly stopped: string[] = [];
+
+  move(request: ExecutableMove): Promise<ExecutableMoveResult> {
+    this.last = request;
+    return new Promise((resolve) => {
+      this.resolveMove = resolve;
+    });
+  }
+
+  resolve(pos: Vec3Like): void {
+    if (this.last === null || this.resolveMove === null) return;
+    const request = this.last;
+    this.last = null;
+    this.resolveMove({ sample: sampleAt(request.worldId, request.dim, request.sessionId, request.executionId, pos, 999) });
+    this.resolveMove = null;
+  }
+
+  stop(executionId: string): void {
+    this.stopped.push(executionId);
+  }
 }
 
 function sampleAt(
@@ -735,6 +838,111 @@ describe('working-set + Fake walk-route lifecycle', () => {
     // The old task's late release must not drop the newer task's protection.
     session.releasePins([first.lease.token]); // no-op: already released
     expect(manager.free().evicted).toEqual([]); // still pinned by the newer task
+
+    session.releasePins([second.lease.token]);
+    expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
+    await session.close();
+  });
+
+  it('protects clean deps under cache pressure during execution, then releases on cancel', async () => {
+    const dbPath = makeDbPath();
+    await seedWalk(dbPath);
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    const manager = new WorkingSetManager(session);
+
+    const supportKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: -1 };
+    const airKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 0 };
+
+    const initial = await manager.prepare([supportKey, airKey]);
+    session.releasePins([initial.lease.token]);
+    session.voxel.beginSession('live');
+    for (let x = 0; x <= 1; x++) {
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x, y: -1, z: 0 } });
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 2, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 0, z: 0 } });
+      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 3, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 1, z: 0 } });
+    }
+    await session.checkpoint(); // clean (committed) deps
+
+    const points: Vec3Like[] = [
+      { x: 0.5, y: 0, z: 0.5 },
+      { x: 1.5, y: 0, z: 0.5 },
+    ];
+    const verifier = new RouteVerifier(session.voxel, { now: () => 2000 });
+    verifier.register({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), shapeProvider: provider, points });
+    const verified = verifier.advance(10);
+    expect(verified.verdict).toBe('OPEN');
+    const deps: SectionKey[] = [];
+    const seenDeps = new Set<string>();
+    for (const step of verified.steps) {
+      if (step.kind !== 'verified') continue;
+      for (const d of step.result.dependencies) {
+        const s = `${d.key.dim}|${d.key.cx},${d.key.cz},${d.key.sy}`;
+        if (!seenDeps.has(s)) {
+          seenDeps.add(s);
+          deps.push({ ...d.key });
+        }
+      }
+    }
+
+    const lease = await manager.prepare(deps); // pin the clean deps
+
+    const executor = new HangingExecutor();
+    const loop = new WalkRouteExecutor(session.voxel, executor, { now: () => 2000 });
+    const started = loop.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
+    loop.onSample(sampleAt(WORLD, DIM, 'live', started.delegationId, points[0]!, 1));
+    loop.advance(10);
+    expect(loop.status()!.activeStepIndex).toBe(0); // move is in flight (hanging)
+
+    // Cache pressure DURING execution: clean + pinned deps are not evicted.
+    expect(manager.free().evicted).toEqual([]);
+
+    // Cancel mid-execution.
+    const cancelled = loop.cancel('user', 'test');
+    expect(cancelled.outcome).toBe('CANCELLED');
+
+    // Release → clean + unpinned deps become evictable.
+    session.releasePins([lease.lease.token]);
+    expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
+    await session.close();
+  });
+
+  it('a replaced task whose lease is released late does not drop the newer task protection', async () => {
+    const dbPath = makeDbPath();
+    await seedWalk(dbPath);
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    const manager = new WorkingSetManager(session);
+
+    const supportKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: -1 };
+    const airKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 0 };
+
+    const initial = await manager.prepare([supportKey, airKey]);
+    session.releasePins([initial.lease.token]);
+    session.voxel.beginSession('live');
+    session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x: 0, y: -1, z: 0 } });
+    await session.checkpoint();
+
+    const points: Vec3Like[] = [
+      { x: 0.5, y: 0, z: 0.5 },
+      { x: 1.5, y: 0, z: 0.5 },
+    ];
+
+    // Task 1 pins the deps and starts a hanging execution.
+    const first = await manager.prepare([supportKey, airKey]);
+    const loop1 = new WalkRouteExecutor(session.voxel, new HangingExecutor(), { now: () => 2000 });
+    const s1 = loop1.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
+    loop1.onSample(sampleAt(WORLD, DIM, 'live', s1.delegationId, points[0]!, 1));
+    loop1.advance(10);
+
+    // Task 2 replaces task 1 and pins the same deps.
+    const second = await manager.prepare([supportKey, airKey]);
+    const loop2 = new WalkRouteExecutor(session.voxel, new HangingExecutor(), { now: () => 2000 });
+    const s2 = loop2.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
+    loop2.onSample(sampleAt(WORLD, DIM, 'live', s2.delegationId, points[0]!, 1));
+    loop2.advance(10);
+
+    // Task 1's late release must not drop task 2's protection.
+    session.releasePins([first.lease.token]);
+    expect(manager.free().evicted).toEqual([]);
 
     session.releasePins([second.lease.token]);
     expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
