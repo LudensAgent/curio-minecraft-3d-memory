@@ -1431,6 +1431,7 @@ describe('WalkRouteExecutor — full handover snapshot and dependency invalidati
 
     begin(loop, points);
     loop.advance(10); await tick(); // confirm step 0 (trace = [points[1]])
+    loop.advance(10); // start step 1, so there is an active move to stop
     expect(loop.status()!.nextPointIndex).toBe(2);
 
     executor.setOnStop(() => { loop.start(makeRequest(pointsB)); });
@@ -1439,6 +1440,7 @@ describe('WalkRouteExecutor — full handover snapshot and dependency invalidati
     expect(result.outcome).toBe('CANCELLED');
     expect(result.lastPosition).toEqual(points[1]);
     expect(result.trace).toEqual([{ pos: points[1], ts: 2100 }]); // confirmed trace preserved
+    expect(loop.status()!.delegationId).toBe('walk-2'); // handover actually happened
   });
 
   it('the old cancel returns its own position, not a later handover', () => {
@@ -1489,5 +1491,55 @@ describe('WalkRouteExecutor — full handover snapshot and dependency invalidati
 
     expect(loop.status()!.result?.outcome).toBe('FAILED');
     expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
+  });
+});
+
+describe('WalkRouteExecutor — release-time invalidation priority', () => {
+  it('a release-time invalidation does not override a cancel failure', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      const report = map.observe(obs({ name: 'minecraft:dirt', properties: {} }, { x: 1, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({
+      sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }),
+      failure: { kind: 'cancelled' },
+    });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('CANCELLED');
+    expect(loop.status()!.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
+  });
+
+  it('a release-time invalidation does not override a timeout failure', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      const report = map.observe(obs({ name: 'minecraft:dirt', properties: {} }, { x: 1, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({
+      sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }),
+      failure: { kind: 'timed_out' },
+    });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('TIMEOUT');
+    expect(loop.status()!.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
   });
 });
