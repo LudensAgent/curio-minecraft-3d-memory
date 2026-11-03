@@ -172,7 +172,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过（pretypecheck 先 build）
 npm run build      → 通过（产出 dist/storage/sqlite/index.js + worker.js）
-npm test           → 400 passed（13 个测试文件；新增 48 项 storage-checkpoint 测试，
+npm test           → 402 passed（13 个测试文件；新增 50 项 storage-checkpoint 测试，
                       既有 topology / fragment / voxel / traversability 等全部保持通过）
 npx tsx examples/history-checkpoint.ts → 正常运行（以公开包名与子路径导入，先 build）
 npm pack 后独立临时消费者安装        → 见下方「包接入验证」
@@ -235,3 +235,15 @@ git diff --check   → 通过
 
 回归测试新增：错误列亲和性、越界序号、超大 worldId 空快照、大字符串预算、`checkpointMeasure` 廉价
 下界早停。延迟 ACK / 丢失确认 / 关闭期限耗尽等故障注入复现仍按内部接缝处理，未暴露公开测试开关。
+
+## 第四轮评审修正（P2）
+
+- **Worker 低估完整快照体积**：两端计量统一为「固定结构 65 字节 + 四个数组的记录间逗号 + JSON 转义
+  后的 worldId + 记录负载」。`SNAPSHOT_FRAME_BYTES` 改为固定基础 65；Worker 用
+  `Buffer.byteLength(JSON.stringify(worldId))` 精确计入转义，不再低估；主线程用 `jsonEscapedByteLength`
+  保守估算（可高估）。
+- **主线程 worldId 计量未按预算早停**：`checkpoint()` 先用 `worldId.length` + 固定结构做廉价拒绝，超限
+  即抛 `capacity`；再计算转义后的 worldId 精确值，并把剩余预算交给两个 Store。
+
+回归测试新增：转义 worldId 恢复拒绝、多记录记录间逗号恢复拒绝。上一轮「超大 worldId 空快照」测试
+现已由廉价下界在扫描/复制/发送前直接拒绝。

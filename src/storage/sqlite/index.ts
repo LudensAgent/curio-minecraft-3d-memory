@@ -71,6 +71,16 @@ export async function openHistorySession(options: OpenHistorySessionOptions): Pr
   return session;
 }
 
+/** Sum of `,` separators between adjacent records in the four snapshot arrays. */
+function interRecordCommas(fragments: number, traversals: number, nodes: number, edges: number): number {
+  return (
+    Math.max(0, fragments - 1) +
+    Math.max(0, traversals - 1) +
+    Math.max(0, nodes - 1) +
+    Math.max(0, edges - 1)
+  );
+}
+
 class HistorySessionImpl implements HistorySession {
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
@@ -161,16 +171,24 @@ class HistorySessionImpl implements HistorySession {
     const fragmentRevision = this.history.revision;
     const topologyRevision = this.topology.revision;
 
-    // Bounded pre-flight before any copy or message pass. The two stores share one
-    // remaining byte budget so the measure can stop early on over-limit input, and
-    // the outer snapshot envelope (worldId + framing) is counted too, so even an
-    // empty snapshot with a large worldId is bounded.
+    // Bounded pre-flight before any copy or message pass. The outer envelope is
+    // deducted first (cheaply, via worldId `.length`), then the two stores share the
+    // remaining byte budget so the measure can stop early on over-limit input.
     const maxBytes = this.limits.maxBytes;
-    const fragmentMeasure = this.history.checkpointMeasure(maxBytes);
-    const remainingBytes = maxBytes - fragmentMeasure.bytes;
+    if (SNAPSHOT_FRAME_BYTES + this.worldId.length > maxBytes) {
+      throw new PersistenceError('capacity', `worldId alone exceeds maxBytes (${maxBytes})`);
+    }
+    // Exact escaped worldId cost; this scan only runs once the cheap lower bound
+    // above has already ruled out obviously-over-limit worldIds.
+    const envelopeBytes = SNAPSHOT_FRAME_BYTES + jsonEscapedByteLength(this.worldId) + 2;
+    const fragmentMeasure = this.history.checkpointMeasure(maxBytes - envelopeBytes);
+    const remainingBytes = maxBytes - envelopeBytes - fragmentMeasure.bytes;
     const topologyMeasure = this.topology.checkpointMeasure(Math.max(0, remainingBytes));
     const totalBytes =
-      SNAPSHOT_FRAME_BYTES + jsonEscapedByteLength(this.worldId) + 2 + fragmentMeasure.bytes + topologyMeasure.bytes;
+      envelopeBytes +
+      interRecordCommas(fragmentMeasure.fragments, fragmentMeasure.traversals, topologyMeasure.nodes, topologyMeasure.edges) +
+      fragmentMeasure.bytes +
+      topologyMeasure.bytes;
     this.assertWithinLimits(fragmentMeasure.fragments, fragmentMeasure.traversals, topologyMeasure.nodes, topologyMeasure.edges, {
       polylinePoints: fragmentMeasure.polylinePoints,
       entrancePoints: fragmentMeasure.entrancePoints,

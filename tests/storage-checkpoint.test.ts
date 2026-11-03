@@ -920,4 +920,41 @@ describe('P1/P2 regression', () => {
     expect(over.bytes).toBeGreaterThan(100);
     expect(over.bytes).toBeLessThan(2000);
   });
+
+  it('rejects restore when worldId escaping exceeds the byte budget', async () => {
+    const dbPath = makeDbPath();
+    const worldId = '"'.repeat(500);
+    const save = await openHistorySession({ databasePath: dbPath, worldId });
+    await save.checkpoint();
+    await save.close();
+
+    const exact = Buffer.byteLength(
+      JSON.stringify({ worldId, fragments: [], traversals: [], nodes: [], edges: [] }),
+      'utf8',
+    );
+    await expect(
+      openHistorySession({ databasePath: dbPath, worldId, snapshotLimits: { maxBytes: exact - 1 } }),
+    ).rejects.toMatchObject({ kind: 'capacity' });
+  });
+
+  it('rejects restore when inter-record commas exceed the byte budget', async () => {
+    const dbPath = makeDbPath();
+    const save = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    for (let i = 0; i < 100; i++) save.topology.saveNode(node(`n${i}`, i, 64, 0));
+    await save.checkpoint();
+    await save.close();
+
+    // Reconstruct the exact serialized snapshot (same cloneNode field order).
+    const hist = new FragmentStore(WORLD);
+    const topo = new TopologyStore(hist);
+    for (let i = 0; i < 100; i++) topo.saveNode(node(`n${i}`, i, 64, 0));
+    const snap = topo.checkpointSnapshot();
+    const exact = Buffer.byteLength(
+      JSON.stringify({ worldId: WORLD, fragments: [], traversals: [], nodes: snap.nodes, edges: snap.edges }),
+      'utf8',
+    );
+    await expect(
+      openHistorySession({ databasePath: dbPath, worldId: WORLD, snapshotLimits: { maxBytes: exact - 1 } }),
+    ).rejects.toMatchObject({ kind: 'capacity' });
+  });
 });

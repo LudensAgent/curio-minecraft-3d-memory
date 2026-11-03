@@ -97,13 +97,12 @@ export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
- * Conservative byte cost of the outer snapshot envelope (`{"worldId":…,"fragments":[],
- * "traversals":[],"nodes":[],"edges":[]}` brackets/commas), excluding the `worldId`
- * value itself (counted separately) and the record payloads. Both the session's
- * pre-flight and the worker's re-check add this so an empty snapshot with a large
- * `worldId` is still bounded by `maxBytes`.
+ * Fixed byte cost of the outer snapshot envelope (`{"worldId":…,"fragments":…,
+ * "traversals":…,"nodes":…,"edges":…}` — field names, braces, colons, and the four
+ * `[`/`]` array brackets), *excluding* the JSON-escaped `worldId` value and the
+ * inter-record commas (both counted separately, since they grow with content).
  */
-export const SNAPSHOT_FRAME_BYTES = 96;
+export const SNAPSHOT_FRAME_BYTES = 65;
 
 /**
  * The full four-fact snapshot sent to and returned from the worker. This is the

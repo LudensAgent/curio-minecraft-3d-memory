@@ -235,10 +235,35 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
     prepared.bytes += Buffer.byteLength(payload, 'utf8');
     prepared.edgeEvidenceRefs += e.refs.length;
   }
-  // The outer snapshot envelope (worldId + framing) is part of `maxBytes`, so even
-  // an empty snapshot with a large worldId is bounded.
-  prepared.bytes += SNAPSHOT_FRAME_BYTES + Buffer.byteLength(snapshot.worldId, 'utf8') + 2;
+  // The outer snapshot envelope (worldId + framing) is part of `maxBytes`: count the
+  // fixed frame, the inter-record array commas, and the JSON-escaped worldId exactly,
+  // so the worker never underestimates the real serialized size.
+  prepared.bytes += snapshotEnvelopeBytes(snapshot);
   return prepared;
+}
+
+/** Exact outer-envelope bytes: fixed frame + inter-record commas + JSON-escaped worldId. */
+function snapshotEnvelopeBytes(snapshot: HistorySnapshot): number {
+  return (
+    SNAPSHOT_FRAME_BYTES +
+    interRecordCommas(
+      snapshot.fragments.length,
+      snapshot.traversals.length,
+      snapshot.nodes.length,
+      snapshot.edges.length,
+    ) +
+    Buffer.byteLength(JSON.stringify(snapshot.worldId), 'utf8')
+  );
+}
+
+/** Sum of `,` separators between adjacent records in the four arrays (0 for empty/single). */
+function interRecordCommas(fragments: number, traversals: number, nodes: number, edges: number): number {
+  return (
+    Math.max(0, fragments - 1) +
+    Math.max(0, traversals - 1) +
+    Math.max(0, nodes - 1) +
+    Math.max(0, edges - 1)
+  );
 }
 
 function assertCountsWithinLimits(
@@ -436,8 +461,8 @@ function loadWorld(
     sumPayloadBytes(connection, 'spatial_nodes', wId) +
     sumPayloadBytes(connection, 'spatial_edges', wId) +
     SNAPSHOT_FRAME_BYTES +
-    Buffer.byteLength(wId, 'utf8') +
-    2;
+    interRecordCommas(fragments, traversals, nodes, edges) +
+    Buffer.byteLength(JSON.stringify(wId), 'utf8');
   assertCountsWithinLimits(fragments, traversals, nodes, edges, bytes, resolved);
 
   const snapshot: HistorySnapshot = {
