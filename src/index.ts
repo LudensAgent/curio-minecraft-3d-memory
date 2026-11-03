@@ -194,6 +194,7 @@ export type {
 export { WalkRouteExecutor } from './execution/index.js';
 export type {
   BodySample,
+  GroundedArrival,
   ExecutableMove,
   ExecutableMoveResult,
   MoveExecutor,
