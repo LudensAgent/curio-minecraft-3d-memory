@@ -52,12 +52,15 @@ function obs(state: { name: string; properties: Record<string, string> }, pos: V
   };
 }
 
+let sampleSeq = 0;
+
 function sampleAt(req: { worldId: string; dim: string; sessionId: string; executionId: string }, pos: Vec3Like): BodySample {
   return {
     worldId: req.worldId,
     dim: req.dim,
     sessionId: req.sessionId,
     executionId: req.executionId,
+    sequence: ++sampleSeq,
     pos: { ...pos },
     observedAt: now,
     alive: true,
@@ -119,7 +122,7 @@ async function main(): Promise<void> {
     arrival: { kind: 'exact' },
     shapeProvider: provider,
     deadlineMs: 100_000,
-    timeoutMs: 1000,
+    timeoutMs: 10_000,
   };
 
   console.log('=== start ===');

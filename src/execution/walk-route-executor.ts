@@ -15,13 +15,14 @@
  *   all OPEN.
  *
  * Body samples are trusted only by execution association (`executionId`) plus a
- * monotonic observation ordering — never by a "timestamp strictly greater than
- * start" rule, which would drop same-millisecond samples.
+ * monotonic per-delegation sequence and a non-decreasing observation time —
+ * never by a "timestamp strictly greater than start" rule, which would drop
+ * same-millisecond samples or accept replayed ones.
  *
- * The loop is host-driven and bounded: `advance` / `observe` / `onSample` /
- * `checkTimeout` are the only entry points that advance state, and each `advance`
- * observes a verification budget and starts at most one in-flight step. Reading
- * `status` never moves, turns, scans, or refreshes evidence time.
+ * Every entry that can advance state (`advance` / `observe` / `onSample` /
+ * `checkTimeout`, plus the move-completion callback) runs the same terminal
+ * guard: deadline + per-move timeout + in-flight basis invalidation, and revokes
+ * control before clearing handles.
  */
 
 import type { LastObservation, NavProblem, NavResult } from '../navigation/types.js';
@@ -68,8 +69,10 @@ export class WalkRouteExecutor {
   private delegationId = '';
   /** Delegation start time (clock); samples must not predate it. */
   private startedAt = 0;
-  /** Monotonic (non-decreasing) observation floor; equal values are allowed (same-ms). */
+  /** Non-decreasing observation floor; equal values are allowed (same-ms). */
   private lastSampleObservedAt = 0;
+  /** Strictly-increasing per-delegation sample sequence; rejects replayed samples. */
+  private lastSampleSequence = 0;
   private nextPointIndex = 1;
   private lastPosition: Vec3Like | null = null;
   private lastSample: BodySample | null = null;
@@ -129,6 +132,7 @@ export class WalkRouteExecutor {
     this.request = snapshotRequest(request, points, body);
     this.startedAt = this.currentNow();
     this.lastSampleObservedAt = this.startedAt;
+    this.lastSampleSequence = 0;
     this.nextPointIndex = 1;
     this.lastPosition = null;
     this.lastSample = null;
@@ -162,31 +166,17 @@ export class WalkRouteExecutor {
     return this.snapshot();
   }
 
-  /** Advance one bounded round: check timeouts, revoke an invalidated in-flight step, then re-verify and start at most one step. */
+  /** Advance one bounded round: run the terminal guard, re-verify within budget, then start at most one step. */
   advance(budget: number): WalkRouteStatus {
-    if (this.result !== null) return this.snapshot();
     this.requireRequest();
     validateBudget(budget);
+    if (this.guard()) return this.snapshot();
 
-    if (this.checkTimeouts()) return this.snapshot();
-
-    // Revoke an in-flight move whose OPEN basis changed (rule version or TTL)
-    // BEFORE re-verifying, so a rule-version change that still yields OPEN does
-    // not let the old move continue.
-    if (this.activeStepIndex !== null && this.activeBasisInvalidated()) {
-      this.stopActive();
-      this.result = this.buildFailure('FAILED', 'the in-flight segment lost its OPEN verification basis', {
-        kind: 'route_invalidated',
-        detail: 'rule-version or TTL invalidation revoked the in-flight step',
-      });
-    }
-
-    // Bounded re-verify (also refreshes the cache after a revocation above).
+    // Bounded re-verify.
     this.verifier.advance(budget);
 
     if (this.result !== null) return this.snapshot();
     if (this.activeStepIndex !== null) return this.snapshot(); // still in flight
-
     if (this.nextPointIndex >= this.points.length) return this.snapshot();
 
     const stepIndex = this.nextPointIndex - 1;
@@ -209,64 +199,48 @@ export class WalkRouteExecutor {
       return this.snapshot();
     }
 
-    const step = this.verifierStatus().steps[stepIndex];
-    if (step === undefined || step.kind !== 'verified') {
-      // Still pending verification (budget exhausted or invalidated): stay running, do not start.
-      return this.snapshot();
-    }
-    if (step.result.status !== 'OPEN') {
-      this.result = this.failForStep(stepIndex, step.result);
-      return this.snapshot();
-    }
-
-    this.startMove(stepIndex, step.result);
+    this.startMove(stepIndex);
     return this.snapshot();
   }
 
-  /** Consume a `ChangeReport`: revoke an invalidated in-flight step first, then re-verify within budget. */
+  /** Consume a `ChangeReport`: run the terminal guard, revoke an invalidated in-flight step, then re-verify within budget. */
   observe(report: ChangeReport, budget: number): WalkRouteStatus {
     this.requireRequest();
     validateBudget(budget);
+    this.guard();
 
-    // Revoke the in-flight move FIRST when the report touches its basis, so the
-    // original execution is not silently kept alive by a re-verification that
-    // happens to stay OPEN.
     if (this.result === null && this.activeStepIndex !== null && this.reportTouchesActiveStep(report)) {
-      this.stopActive();
-      this.result = this.buildFailure('FAILED', 'the in-flight segment was invalidated by an observed world change', {
+      this.terminate('FAILED', 'the in-flight segment was invalidated by an observed world change', {
         kind: 'route_invalidated',
         detail: 'a required section changed while the segment was executing',
       });
     }
 
-    // Always consume the report into the verifier (cache invalidation), even after
-    // termination, so a stale OPEN cannot revive in a later re-registration.
+    // Always consume the report (cache invalidation), even after termination, so a
+    // stale OPEN cannot revive in a later re-registration.
     this.verifier.apply(report, budget);
 
     return this.snapshot();
   }
 
-  /** Accept measured body feedback (host push). Handles association, ordering, scope, lifecycle and position. */
+  /** Accept measured body feedback (host push). Handles boundary validation, association, ordering, scope, lifecycle and position. */
   onSample(sample: BodySample): WalkRouteStatus {
     this.requireRequest();
-    if (this.result !== null) return this.snapshot();
+    if (this.guard()) return this.snapshot();
 
-    // Association: only samples from this delegation are authoritative.
-    if (sample.executionId !== this.delegationId) return this.snapshot();
-    // Ordering: reject pre-delegation or out-of-order samples; equal is allowed (same-ms).
-    if (!this.sampleOrdered(sample)) return this.snapshot();
+    if (!this.sampleFinite(sample)) return this.snapshot(); // non-finite input never enters state
+    if (sample.executionId !== this.delegationId) return this.snapshot(); // foreign/stale delegation
+    if (!this.sampleOrdered(sample)) return this.snapshot(); // replayed or out-of-order
 
     if (!this.scopeMatches(sample)) {
-      this.stopActive();
-      this.result = this.buildFailure('FAILED', 'the body left the delegation scope before arrival', {
+      this.terminate('FAILED', 'the body left the delegation scope before arrival', {
         kind: 'scope_changed',
         detail: 'sample world/dim/session does not match the delegation',
       });
       return this.snapshot();
     }
     if (this.lifecycleBroken(sample)) {
-      this.stopActive();
-      this.result = this.buildFailure('FAILED', 'the body became unavailable before arrival', {
+      this.terminate('FAILED', 'the body became unavailable before arrival', {
         kind: 'unavailable',
         detail: `alive=${sample.alive} connected=${sample.connected} observationReady=${sample.observationReady}`,
       });
@@ -297,11 +271,10 @@ export class WalkRouteExecutor {
     return this.snapshot();
   }
 
-  /** Host-driven timeout check; returns the current status (possibly terminal). */
+  /** Host-driven timeout check; runs the terminal guard. */
   checkTimeout(): WalkRouteStatus {
-    if (this.result !== null) return this.snapshot();
     this.requireRequest();
-    this.checkTimeouts();
+    this.guard();
     return this.snapshot();
   }
 
@@ -309,12 +282,16 @@ export class WalkRouteExecutor {
   cancel(by: CancelBy, reason: string): NavResult {
     if (this.result !== null) return cloneResult(this.result);
     this.requireRequest();
+    const generation = this.generation;
+    const message = `cancelled by ${by}${reason ? `: ${reason}` : ''}`;
+    const problem: NavProblem = { kind: 'cancelled', by, reason };
     this.stopActive();
-    this.result = this.buildFailure('CANCELLED', `cancelled by ${by}${reason ? `: ${reason}` : ''}`, {
-      kind: 'cancelled',
-      by,
-      reason,
-    });
+    if (generation !== this.generation) {
+      // A re-entrant start() replaced the delegation during the external stop/abort;
+      // do not mark the new delegation cancelled.
+      return this.result !== null ? cloneResult(this.result) : this.buildFailure('CANCELLED', message, problem);
+    }
+    this.result = this.buildFailure('CANCELLED', message, problem);
     return cloneResult(this.result);
   }
 
@@ -340,24 +317,54 @@ export class WalkRouteExecutor {
     return status;
   }
 
-  private sampleOrdered(sample: BodySample): boolean {
-    return sample.observedAt >= this.lastSampleObservedAt;
+  /** True when the sample's numeric fields are finite; non-finite input never enters evidence. */
+  private sampleFinite(sample: BodySample): boolean {
+    return (
+      Number.isFinite(sample.pos.x) &&
+      Number.isFinite(sample.pos.y) &&
+      Number.isFinite(sample.pos.z) &&
+      Number.isFinite(sample.observedAt) &&
+      Number.isFinite(sample.sequence)
+    );
   }
 
-  /** True when the total deadline or the per-move timeout expired, setting a terminal result. */
-  private checkTimeouts(): boolean {
+  /** Ordering: a strictly-increasing sequence rejects replayed samples; non-decreasing time allows same-ms. */
+  private sampleOrdered(sample: BodySample): boolean {
+    return sample.sequence > this.lastSampleSequence && sample.observedAt >= this.lastSampleObservedAt;
+  }
+
+  /**
+   * The unified terminal guard for every advancing entry. Returns true when the
+   * delegation is already terminal or becomes terminal (deadline, per-move
+   * timeout, or in-flight basis invalidation), releasing control first.
+   */
+  private guard(): boolean {
+    if (this.result !== null) return true;
     const now = this.currentNow();
     if (now >= this.request!.deadlineMs) {
-      this.stopActive();
-      this.result = this.buildFailure('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
+      this.terminate('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
       return true;
     }
     if (this.activeStepIndex !== null && this.activeStartedAt !== null && now - this.activeStartedAt >= this.request!.timeoutMs) {
-      this.stopActive();
-      this.result = this.buildFailure('TIMEOUT', 'move timed out', { kind: 'timeout' });
+      this.terminate('TIMEOUT', 'move timed out', { kind: 'timeout' });
+      return true;
+    }
+    if (this.activeStepIndex !== null && this.activeBasisInvalidated()) {
+      this.terminate('FAILED', 'the in-flight segment lost its OPEN verification basis', {
+        kind: 'route_invalidated',
+        detail: 'rule-version or TTL invalidation revoked the in-flight step',
+      });
       return true;
     }
     return false;
+  }
+
+  /** Stop the active move and, if the delegation is unchanged, record a terminal result. */
+  private terminate(outcome: FailureOutcome, message: string, problem: NavProblem): void {
+    const generation = this.generation;
+    this.stopActive();
+    if (generation !== this.generation) return; // re-entrant start() replaced the delegation
+    this.result = this.buildFailure(outcome, message, problem);
   }
 
   private scopeMatches(sample: BodySample): boolean {
@@ -385,11 +392,20 @@ export class WalkRouteExecutor {
     return false;
   }
 
-  private startMove(stepIndex: number, evaluation: StepEvaluation): void {
+  /** Re-read the latest step status and start the move only if it is still OPEN. */
+  private startMove(stepIndex: number): void {
+    const route = this.verifierStatus();
+    const step = route.steps[stepIndex];
+    if (step === undefined || step.kind !== 'verified') return; // pending: stay running, do not start
+    if (step.result.status !== 'OPEN') {
+      this.result = this.failForStep(stepIndex, step.result);
+      return;
+    }
+
+    const evaluation = step.result;
     const target = this.points[stepIndex + 1]!;
     const executionId = `${this.delegationId}-step-${stepIndex}`;
     const abort = new AbortController();
-    const route = this.verifierStatus();
     this.activeStepIndex = stepIndex;
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
@@ -421,16 +437,21 @@ export class WalkRouteExecutor {
 
   private handleMoveResult(generation: number, executionId: string, result: ExecutableMoveResult): void {
     if (generation !== this.generation) return; // stale delegation's late callback
-    if (this.result !== null) return; // already terminal (cancelled/timed out)
+    if (this.result !== null) return; // already terminal
     if (executionId !== this.activeExecutionId) return; // not the active move
 
-    const moveStartedAt = this.activeStartedAt;
-    this.clearActiveState();
+    if (this.guard()) return; // deadline / per-move timeout / basis invalidation
+
+    // Release the move's control (stop + abort) before clearing its handles, so the
+    // next step never runs concurrently with this one.
+    this.stopActive();
+    if (generation !== this.generation) return; // re-entrant start() replaced the delegation
 
     const sample = result.sample;
     const failure = result.failure;
 
-    if (sample !== undefined) {
+    let usable: BodySample | null = null;
+    if (sample !== undefined && this.sampleFinite(sample)) {
       if (!this.scopeMatches(sample)) {
         this.result = this.buildFailure('FAILED', 'the body left the delegation scope during execution', {
           kind: 'scope_changed',
@@ -445,22 +466,10 @@ export class WalkRouteExecutor {
         });
         return;
       }
-    }
-
-    // A usable sample must belong to this move and satisfy the ordering floor.
-    const usable =
-      sample !== undefined && sample.executionId === executionId && this.sampleOrdered(sample) ? sample : null;
-    if (usable !== null) this.recordSamplePosition(usable);
-
-    // Deadline / per-move timeout: a late result must not produce ARRIVED.
-    const now = this.currentNow();
-    if (now >= this.request!.deadlineMs) {
-      this.result = this.buildFailure('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
-      return;
-    }
-    if (moveStartedAt !== null && now - moveStartedAt >= this.request!.timeoutMs) {
-      this.result = this.buildFailure('TIMEOUT', 'move timed out', { kind: 'timeout' });
-      return;
+      if (sample.executionId === executionId && this.sampleOrdered(sample)) {
+        usable = sample;
+        this.recordSamplePosition(sample);
+      }
     }
 
     // Cancelled/timeout override a confirming sample; the displacement is already recorded.
@@ -542,6 +551,7 @@ export class WalkRouteExecutor {
     this.lastPosition = pos;
     this.lastSample = snapshotSample(sample);
     this.lastSampleObservedAt = sample.observedAt;
+    this.lastSampleSequence = sample.sequence;
     this.trace.push({ pos, ts: sample.observedAt });
     this.nextPointIndex += 1;
 
@@ -561,6 +571,7 @@ export class WalkRouteExecutor {
     this.lastPosition = { ...sample.pos };
     this.lastSample = snapshotSample(sample);
     this.lastSampleObservedAt = sample.observedAt;
+    this.lastSampleSequence = sample.sequence;
   }
 
   private clearActiveState(): void {
@@ -573,12 +584,15 @@ export class WalkRouteExecutor {
     this.activeStartedAt = null;
   }
 
+  /** Detach the active move's handles first, then release control with the captured refs. */
   private stopActive(): void {
-    if (this.activeExecutionId !== null && this.activeAbort !== null) {
-      this.executor.stop(this.activeExecutionId);
-      this.activeAbort.abort();
-    }
+    const executionId = this.activeExecutionId;
+    const abort = this.activeAbort;
     this.clearActiveState();
+    if (executionId !== null && abort !== null) {
+      this.executor.stop(executionId);
+      abort.abort();
+    }
   }
 
   private failForStep(stepIndex: number, evaluation: StepEvaluation): NavResult {

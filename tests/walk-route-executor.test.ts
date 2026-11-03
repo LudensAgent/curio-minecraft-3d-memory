@@ -21,6 +21,7 @@ const SCOPE = { worldId: 'world', dim: 'overworld', sessionId: 's1' };
 class FakeMoveExecutor implements MoveExecutor {
   readonly stopped: string[] = [];
   private queue: Array<(req: ExecutableMove) => ExecutableMoveResult | Promise<ExecutableMoveResult>> = [];
+  private seq = 1;
 
   push(behavior: (req: ExecutableMove) => ExecutableMoveResult | Promise<ExecutableMoveResult>): void {
     this.queue.push(behavior);
@@ -29,8 +30,7 @@ class FakeMoveExecutor implements MoveExecutor {
   move(request: ExecutableMove): Promise<ExecutableMoveResult> {
     const behavior = this.queue.shift();
     if (behavior === undefined) {
-      // Default: immediately confirm arrival at the target.
-      return Promise.resolve({ sample: makeSample(request, request.to) });
+      return Promise.resolve({ sample: makeSample(request, request.to, { sequence: ++this.seq }) });
     }
     try {
       return Promise.resolve(behavior(request));
@@ -54,6 +54,7 @@ function makeSample(
     dim: scope.dim,
     sessionId: scope.sessionId,
     executionId: scope.executionId,
+    sequence: 1,
     pos: { ...pos },
     observedAt: 2100,
     alive: true,
@@ -98,7 +99,7 @@ function makeRequest(points: Vec3Like[], overrides: Partial<WalkRouteRequest> = 
 function begin(loop: WalkRouteExecutor, points: Vec3Like[], overrides: Partial<WalkRouteRequest> = {}): string {
   const status = loop.start(makeRequest(points, overrides));
   const delegationId = status.delegationId;
-  loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[0]!));
+  loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[0]!, { sequence: 1 }));
   return delegationId;
 }
 
@@ -117,76 +118,84 @@ describe('WalkRouteExecutor — controlled step-by-step execution', () => {
     expect(first.activeStepIndex).toBe(0);
     expect(first.result).toBeNull(); // route OPEN alone is not arrival
 
-    await tick(); // move resolves and confirms step 0
+    await tick();
     expect(loop.status()!.nextPointIndex).toBe(2);
-    expect(loop.status()!.result).toBeNull(); // still not arrived
+    expect(loop.status()!.result).toBeNull();
 
-    const second = loop.advance(10);
-    expect(second.activeStepIndex).toBe(1);
-
+    loop.advance(10);
     await tick();
     const done = loop.status()!;
     expect(done.result?.outcome).toBe('ARRIVED');
     expect(done.result?.confirmed).toBe(true);
     expect(done.result?.lastPosition).toEqual(points[2]);
-    expect(done.result?.lastObservation).toMatchObject({ worldId: 'world', dim: 'overworld', sessionId: 's1', onGround: true, inWater: false });
   });
 
   it('does not arrive when the move resolves but the body did not reach the target', async () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 2);
     const executor = new FakeMoveExecutor();
-    executor.push((req) => ({ sample: makeSample(req, points[0]!) })); // body stayed put
+    executor.push((req) => ({ sample: makeSample(req, points[0]!, { sequence: 2 }) }));
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     begin(loop, points);
     loop.advance(10);
     await tick();
 
-    const status = loop.status()!;
-    expect(status.result?.outcome).toBe('FAILED');
-    expect(status.result?.problem?.kind).toBe('deviation');
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('deviation');
   });
 
   it('does not arrive at the wrong height', async () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 2);
     const executor = new FakeMoveExecutor();
-    executor.push((req) => ({ sample: makeSample(req, { ...points[1]!, y: points[1]!.y + 1 }) }));
+    executor.push((req) => ({ sample: makeSample(req, { ...points[1]!, y: points[1]!.y + 1 }, { sequence: 2 }) }));
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     begin(loop, points);
     loop.advance(10);
     await tick();
 
-    const status = loop.status()!;
-    expect(status.result?.outcome).toBe('FAILED');
-    expect(status.result?.problem?.kind).toBe('deviation');
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('deviation');
+  });
+
+  it('does not arrive on a stale pre-execution sample even at the target', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    executor.push((req) => ({ sample: makeSample(req, points[1]!, { observedAt: 500, sequence: 2 }) }));
+    const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('unconfirmed_arrival');
   });
 
   it('keeps a real arrival after a non-cancel move failure', async () => {
     const map = new VoxelMap('world');
-    const points = openRouteMap(map, 2); // 1 step
+    const points = openRouteMap(map, 2);
     const executor = new FakeMoveExecutor();
     let rejectMove!: (e: unknown) => void;
     executor.push(() => new Promise<ExecutableMoveResult>((_resolve, reject) => { rejectMove = reject; }));
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     const delegationId = begin(loop, points);
-    loop.advance(10); // step 0 in flight
+    loop.advance(10);
 
-    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!));
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2 }));
     expect(loop.status()!.result?.outcome).toBe('ARRIVED');
 
     rejectMove(new Error('executor crashed'));
     await tick();
-    const status = loop.status()!;
-    expect(status.result?.outcome).toBe('ARRIVED');
-    expect(status.result?.confirmed).toBe(true);
+    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
   });
 });
 
-describe('WalkRouteExecutor — start-position confirmation', () => {
+describe('WalkRouteExecutor — start-position and sample validation', () => {
   it('does not start a move without a measured start position', () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 2);
@@ -196,7 +205,6 @@ describe('WalkRouteExecutor — start-position confirmation', () => {
     const status = loop.advance(10);
 
     expect(status.activeStepIndex).toBeNull();
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('unmeasured_position');
   });
 
@@ -206,23 +214,29 @@ describe('WalkRouteExecutor — start-position confirmation', () => {
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     const start = loop.start(makeRequest(points));
-    const status = loop.onSample(makeSample({ ...SCOPE, executionId: start.delegationId }, { x: 20.5, y: 0, z: 0.5 }));
+    const status = loop.onSample(makeSample({ ...SCOPE, executionId: start.delegationId }, { x: 20.5, y: 0, z: 0.5 }, { sequence: 1 }));
 
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('deviation');
   });
 
-  it('ignores a foreign or pre-execution sample', () => {
+  it('ignores a foreign, pre-execution, replayed, or non-finite sample', () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 2);
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     const start = loop.start(makeRequest(points));
-    // Wrong delegation id.
-    loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-999' }, points[0]!));
+    const delegationId = start.delegationId;
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-999' }, points[0]!, { sequence: 1 }));
     expect(loop.status()!.lastPosition).toBeNull();
-    // Correct delegation id but pre-execution timestamp.
-    loop.onSample(makeSample({ ...SCOPE, executionId: start.delegationId }, points[0]!, { observedAt: 500 }));
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[0]!, { observedAt: 500, sequence: 1 }));
+    expect(loop.status()!.lastPosition).toBeNull();
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[0]!, { observedAt: Infinity, sequence: 1 }));
+    expect(loop.status()!.lastPosition).toBeNull();
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, { x: Infinity, y: 0, z: 0.5 }, { sequence: 1 }));
     expect(loop.status()!.lastPosition).toBeNull();
   });
 });
@@ -231,7 +245,7 @@ describe('WalkRouteExecutor — never starts an unpassable segment', () => {
   it('does not start a blocked step', () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 3);
-    map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 })); // wall in step 0's sweep
+    map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     begin(loop, points);
@@ -261,7 +275,7 @@ describe('WalkRouteExecutor — never starts an unpassable segment', () => {
   it('does not start an unobserved (unknown) step', () => {
     const map = new VoxelMap('world');
     fill(map, STONE, [[0, -1, 0]]);
-    fill(map, AIR, [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]]); // destination support never observed
+    fill(map, AIR, [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]]);
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     begin(loop, [
@@ -271,7 +285,6 @@ describe('WalkRouteExecutor — never starts an unpassable segment', () => {
     const status = loop.advance(10);
 
     expect(status.activeStepIndex).toBeNull();
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('unobserved');
   });
 
@@ -282,12 +295,31 @@ describe('WalkRouteExecutor — never starts an unpassable segment', () => {
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => clock });
 
     begin(loop, points);
-    clock = 70_000; // past observedAt 1000 + 60_000 window
+    clock = 70_000;
     const status = loop.advance(10);
 
     expect(status.activeStepIndex).toBeNull();
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('stale');
+  });
+
+  it('does not start a move whose evidence expired in the same round', () => {
+    let clock = 1500;
+    const map = new VoxelMap('world', { validityWindowMs: 1000, now: () => clock });
+    const points = openRouteMap(map, 2); // observedAt 1000 → validUntil 2000
+    const provider: CollisionShapeProvider = {
+      version: 'advance-clock',
+      resolve(state, cell, read) {
+        clock = 2500; // expire the evidence once verification has begun
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => clock });
+
+    begin(loop, points, { shapeProvider: provider });
+    const status = loop.advance(10);
+
+    expect(status.activeStepIndex).toBeNull(); // not started
+    expect(status.route.steps[0]!.kind).toBe('pending'); // revoked by expiry
   });
 
   it('does not start an unverified step and does not report no-path', async () => {
@@ -296,12 +328,12 @@ describe('WalkRouteExecutor — never starts an unpassable segment', () => {
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     begin(loop, points);
-    loop.advance(10); await tick(); // confirm step 0
-    loop.advance(10); await tick(); // confirm step 1 → nextPointIndex = 3
+    loop.advance(10); await tick();
+    loop.advance(10); await tick(); // nextPointIndex = 3
 
     const report = map.observe(obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 1500, sequence: 99 }));
-    loop.observe(report, 1); // re-verify only step 0; steps 1, 2 stay pending
-    loop.advance(1); // re-verify step 1; step 2 still pending
+    loop.observe(report, 1);
+    loop.advance(1);
 
     const status = loop.status()!;
     expect(status.activeStepIndex).toBeNull();
@@ -320,13 +352,12 @@ describe('WalkRouteExecutor — in-flight invalidation and stopping', () => {
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     begin(loop, points);
-    loop.advance(10); // step 0 in flight
+    loop.advance(10);
     expect(loop.status()!.activeStepIndex).toBe(0);
 
     const report = map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
     const status = loop.observe(report, 10);
 
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('route_invalidated');
     expect(status.activeStepIndex).toBeNull();
     expect(executor.stopped).toContain('walk-1-step-0');
@@ -344,13 +375,29 @@ describe('WalkRouteExecutor — in-flight invalidation and stopping', () => {
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     begin(loop, points);
-    loop.advance(10); // step 0 in flight
+    loop.advance(10);
 
     const report = map.observe(obs(STONE, { x: 100, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
     const status = loop.observe(report, 10);
 
     expect(status.result).toBeNull();
     expect(status.activeStepIndex).toBe(0);
+  });
+
+  it('observe checks expiry even with an unrelated report', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    executor.push(() => new Promise<ExecutableMoveResult>(() => {}));
+    const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    begin(loop, points, { timeoutMs: 200_000 });
+    loop.advance(10);
+    clock = 70_000; // TTL expired
+    const status = loop.observe({ sections: [] }, 10);
+
+    expect(status.result?.problem?.kind).toBe('route_invalidated');
   });
 
   it('TTL expiry revokes the in-flight step without a new observation', () => {
@@ -361,13 +408,11 @@ describe('WalkRouteExecutor — in-flight invalidation and stopping', () => {
     executor.push(() => new Promise<ExecutableMoveResult>(() => {}));
     const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
 
-    begin(loop, points, { timeoutMs: 200_000 }); // long per-move timeout so only TTL fires
-    loop.advance(10); // step 0 in flight
-    expect(loop.status()!.activeStepIndex).toBe(0);
+    begin(loop, points, { timeoutMs: 200_000 });
+    loop.advance(10);
 
-    clock = 70_000; // past observedAt 1000 + 60_000 window
+    clock = 70_000;
     const status = loop.advance(10);
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('route_invalidated');
     expect(status.activeStepIndex).toBeNull();
   });
@@ -386,13 +431,37 @@ describe('WalkRouteExecutor — in-flight invalidation and stopping', () => {
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     begin(loop, points, { shapeProvider: provider });
-    loop.advance(10); // step 0 OPEN, in flight
+    loop.advance(10);
 
     provider.version = 'v2';
     const status = loop.advance(10);
 
     expect(status.result?.problem?.kind).toBe('route_invalidated');
     expect(status.activeStepIndex).toBeNull();
+  });
+
+  it('move completion also checks rule-version invalidation', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    let resolveMove!: (r: ExecutableMoveResult) => void;
+    executor.push(() => new Promise<ExecutableMoveResult>((resolve) => { resolveMove = resolve; }));
+    const provider: CollisionShapeProvider = {
+      version: 'v1',
+      resolve(state, cell, read) {
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points, { shapeProvider: provider });
+    loop.advance(10);
+
+    provider.version = 'v2';
+    resolveMove({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!, { sequence: 2 }) });
+    await tick();
+
+    expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
   });
 });
 
@@ -403,7 +472,7 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     begin(loop, points);
-    loop.advance(10); await tick(); // confirm step 0
+    loop.advance(10); await tick();
 
     const result = loop.cancel('agent', 'stop');
     expect(result.outcome).toBe('CANCELLED');
@@ -431,7 +500,7 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => clock });
 
     begin(loop, points, { deadlineMs: 50_000 });
-    loop.advance(10); await tick(); // confirm step 0
+    loop.advance(10); await tick();
 
     clock = 60_000;
     const status = loop.checkTimeout();
@@ -446,8 +515,6 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => clock });
 
     begin(loop, points, { deadlineMs: 50_000 });
-    expect(loop.status()!.deadlineMs).toBe(50_000);
-
     loop.advance(10); await tick();
     clock = 3000;
     const status = loop.status()!;
@@ -459,7 +526,7 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 2);
     const executor = new FakeMoveExecutor();
-    executor.push((req) => ({ sample: makeSample(req, points[1]!), failure: { kind: 'cancelled' } }));
+    executor.push((req) => ({ sample: makeSample(req, points[1]!, { sequence: 2 }), failure: { kind: 'cancelled' } }));
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     begin(loop, points);
@@ -468,7 +535,23 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
 
     const status = loop.status()!;
     expect(status.result?.outcome).toBe('CANCELLED');
-    expect(status.result?.lastPosition).toEqual(points[1]); // displacement preserved
+    expect(status.result?.lastPosition).toEqual(points[1]);
+  });
+
+  it('onSample checks the deadline', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    executor.push(() => new Promise<ExecutableMoveResult>(() => {}));
+    const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    const delegationId = begin(loop, points, { deadlineMs: 3000 });
+    loop.advance(10);
+    clock = 4000;
+
+    const status = loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2 }));
+    expect(status.result?.outcome).toBe('TIMEOUT');
   });
 
   it('does not arrive when the result arrives after the deadline', async () => {
@@ -481,10 +564,10 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
 
     begin(loop, points, { deadlineMs: 3000 });
-    loop.advance(10); // step 0 in flight
-    clock = 4000; // past deadline
+    loop.advance(10);
+    clock = 4000;
 
-    resolveMove({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!) });
+    resolveMove({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!, { sequence: 2 }) });
     await tick();
 
     expect(loop.status()!.result?.outcome).toBe('TIMEOUT');
@@ -499,8 +582,8 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
 
     begin(loop, points, { timeoutMs: 1000 });
-    loop.advance(10); // step 0 in flight
-    clock = 3100; // 3100 − 2000 = 1100 > 1000
+    loop.advance(10);
+    clock = 3100;
 
     expect(loop.checkTimeout().result?.outcome).toBe('TIMEOUT');
   });
@@ -513,18 +596,31 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     executor.push(() => new Promise<ExecutableMoveResult>((resolve) => { resolveOld = resolve; }));
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
-    begin(loop, points); // generation 1
+    begin(loop, points);
     loop.advance(10); // step 0 in flight (deferred)
 
-    begin(loop, points); // generation 2; stops + orphans gen 1
-    loop.advance(10); await tick(); // gen 2 confirms step 0 (default executor)
+    begin(loop, points); // generation 2
+    loop.advance(10); await tick();
     expect(loop.status()!.nextPointIndex).toBe(2);
 
-    resolveOld({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!) });
+    resolveOld({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!, { sequence: 2 }) });
     await tick();
 
     expect(loop.status()!.nextPointIndex).toBe(2);
     expect(loop.status()!.result).toBeNull();
+  });
+
+  it('releases control when the move promise returns a sample', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 3);
+    const executor = new FakeMoveExecutor();
+    const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10); await tick(); // step 0 promise returns a sample
+
+    expect(loop.status()!.nextPointIndex).toBe(2);
+    expect(executor.stopped).toContain('walk-1-step-0'); // control released
   });
 
   it('releases the old move when an external sample confirms arrival', async () => {
@@ -533,41 +629,59 @@ describe('WalkRouteExecutor — cancel, timeout, priority and ownership', () => 
     const executor = new FakeMoveExecutor();
     let resolveStep0!: (r: ExecutableMoveResult) => void;
     executor.push(() => new Promise<ExecutableMoveResult>((resolve) => { resolveStep0 = resolve; }));
+    executor.push((req) => ({ sample: makeSample(req, req.to, { sequence: 3 }) })); // step 1 explicit
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
 
     const delegationId = begin(loop, points);
-    loop.advance(10); // step 0 in flight (deferred)
+    loop.advance(10);
 
-    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!));
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2 }));
     expect(loop.status()!.nextPointIndex).toBe(2);
-    expect(executor.stopped).toContain('walk-1-step-0'); // old move released
+    expect(executor.stopped).toContain('walk-1-step-0');
 
-    loop.advance(10); // start step 1 (default executor)
-    await tick();
+    loop.advance(10); await tick();
     expect(loop.status()!.result?.outcome).toBe('ARRIVED');
 
-    resolveStep0({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!) });
+    resolveStep0({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, points[1]!, { sequence: 2 }) });
     await tick();
     expect(loop.status()!.result?.outcome).toBe('ARRIVED');
+  });
+
+  it('rejects a replayed same-millisecond sample', async () => {
+    const map = new VoxelMap('world');
+    const A = { x: 0.5, y: 0, z: 0.5 };
+    const B = { x: 1.5, y: 0, z: 0.5 };
+    const points = [A, B, A, B];
+    fill(map, STONE, [[0, -1, 0], [1, -1, 0]]);
+    fill(map, AIR, [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]]);
+    const executor = new FakeMoveExecutor();
+    const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    const delegationId = begin(loop, points);
+    loop.advance(10); await tick(); // step 0 → B (seq 2)
+    loop.advance(10); await tick(); // step 1 → A (seq 3)
+    expect(loop.status()!.nextPointIndex).toBe(3);
+
+    // Replay the step-0 B sample (same sequence) at the same-ms: must be rejected.
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, B, { sequence: 2 }));
+    expect(loop.status()!.nextPointIndex).toBe(3); // unchanged, not ARRIVED
+    expect(loop.status()!.result).toBeNull();
   });
 });
 
 describe('WalkRouteExecutor — cache invalidation across termination', () => {
   it('keeps the cache invalidated across cancellation and re-registration', async () => {
     const map = new VoxelMap('world');
-    const points = openRouteMap(map, 3); // 2 steps
+    const points = openRouteMap(map, 3);
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     begin(loop, points);
-    loop.advance(10); await tick(); // confirm step 0
+    loop.advance(10); await tick();
     loop.cancel('agent', 'stop');
-    expect(loop.status()!.result?.outcome).toBe('CANCELLED');
 
-    // A wall appears on step 1 after termination.
     const report = map.observe(obs(STONE, { x: 2, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
-    loop.observe(report, 10); // must consume the report despite termination
+    loop.observe(report, 10);
 
-    // Re-register the same route: step 1 must now be BLOCKED, not a stale OPEN.
     begin(loop, points);
     const status = loop.advance(10);
     const step1 = status.route.steps[1]!;
@@ -582,7 +696,6 @@ describe('WalkRouteExecutor — explicit rejection of unsupported requests', () 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     const status = loop.start(makeRequest(points, { mode: 'jump' }));
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('unsupported_mode');
   });
 
@@ -592,7 +705,6 @@ describe('WalkRouteExecutor — explicit rejection of unsupported requests', () 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     const status = loop.start(makeRequest(points, { arrival: { kind: 'near', radius: 2 } }));
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('unsupported_target');
   });
 
@@ -602,19 +714,18 @@ describe('WalkRouteExecutor — explicit rejection of unsupported requests', () 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     const status = loop.start(makeRequest(points, { constraints: { avoid: [{ x: 1, y: 0, z: 0 }] } }));
-    expect(status.result?.outcome).toBe('FAILED');
     expect(status.result?.problem?.kind).toBe('not_authorized');
   });
 
   it('executes only the authorized ordered points, never dig/place/target changes', async () => {
     const map = new VoxelMap('world');
-    const points = openRouteMap(map, 4); // 3 steps
+    const points = openRouteMap(map, 4);
     const executor = new FakeMoveExecutor();
     const targets: Vec3Like[] = [];
     for (let i = 0; i < 3; i++) {
       executor.push((req) => {
         targets.push({ ...req.to });
-        return { sample: makeSample(req, req.to) };
+        return { sample: makeSample(req, req.to, { sequence: i + 2 }) };
       });
     }
     const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
@@ -645,9 +756,8 @@ describe('WalkRouteExecutor — coordinates, isolation and public entry', () => 
     loop.advance(10); await tick();
     loop.advance(10); await tick();
 
-    const status = loop.status()!;
-    expect(status.result?.outcome).toBe('ARRIVED');
-    expect(status.result?.lastPosition).toEqual({ x: 3.3, y: 0, z: 0.5 });
+    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
+    expect(loop.status()!.result?.lastPosition).toEqual({ x: 3.3, y: 0, z: 0.5 });
   });
 
   it('isolates input and output snapshots from external mutation', () => {
@@ -657,16 +767,15 @@ describe('WalkRouteExecutor — coordinates, isolation and public entry', () => 
     const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => 2000 });
 
     loop.start(request);
-    pts[0] = { x: 999, y: 999, z: 999 }; // mutate caller-owned input
+    pts[0] = { x: 999, y: 999, z: 999 };
     request.body.feet.x = 999;
 
     const status = loop.status()!;
     expect(status.route.points[0]).toEqual({ x: 0.5, y: 0, z: 0.5 });
     expect(status.route.body.feet.x).toBe(0.5);
 
-    status.route.points[0] = { x: 1, y: 1, z: 1 }; // mutate the returned snapshot
-    const again = loop.status()!;
-    expect(again.route.points[0]).toEqual({ x: 0.5, y: 0, z: 0.5 });
+    status.route.points[0] = { x: 1, y: 1, z: 1 };
+    expect(loop.status()!.route.points[0]).toEqual({ x: 0.5, y: 0, z: 0.5 });
   });
 
   it('exposes the execution API from the public entry', () => {

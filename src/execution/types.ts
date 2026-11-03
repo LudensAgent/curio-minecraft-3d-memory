@@ -36,6 +36,12 @@ export interface BodySample {
    * only trusts a sample whose identity matches — never by timestamp alone.
    */
   executionId: string;
+  /**
+   * Monotonic per-delegation receive order. Strictly increasing across accepted
+   * samples, so a replayed same-millisecond sample is rejected without relying on
+   * a strictly-increasing `observedAt`.
+   */
+  sequence: number;
 }
 
 /** Why a single move did not produce a confirming sample. */
