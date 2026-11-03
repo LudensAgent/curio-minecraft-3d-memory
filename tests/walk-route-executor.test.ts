@@ -1336,7 +1336,8 @@ describe('WalkRouteExecutor — release-time invalidation and handover evidence'
     executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
     await tick();
 
-    expect(loop.status()!.result?.outcome).toBe('BLOCKED');
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
   });
 
   it('a report invalidating the current step during the stop prevents arrival (external)', () => {
@@ -1355,7 +1356,8 @@ describe('WalkRouteExecutor — release-time invalidation and handover evidence'
 
     loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, points[1]!, { sequence: 2, observedAt: 2200 }));
 
-    expect(loop.status()!.result?.outcome).toBe('BLOCKED');
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
   });
 
   it('an unrelated section change during the stop still allows arrival', async () => {
@@ -1401,5 +1403,91 @@ describe('WalkRouteExecutor — release-time invalidation and handover evidence'
     expect(result.outcome).toBe('CANCELLED');
     expect(result.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 });
     expect(result.lastObservation?.observedAt).toBe(2200);
+  });
+});
+
+describe('WalkRouteExecutor — full handover snapshot and dependency invalidation', () => {
+  class HandoverExecutor implements MoveExecutor {
+    readonly stopped: string[] = [];
+    private onStop: (() => void) | null = null;
+    private seq = 1;
+    setOnStop(fn: () => void): void { this.onStop = fn; }
+    move(request: ExecutableMove): Promise<ExecutableMoveResult> {
+      return Promise.resolve({ sample: makeSample(request, request.to, { sequence: ++this.seq }) });
+    }
+    stop(executionId: string): void { this.stopped.push(executionId); this.onStop?.(); }
+  }
+
+  it('the old cancel preserves the confirmed trace after handover', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 3); // 2 steps
+    const pointsB = [{ x: 10.5, y: 0, z: 0.5 }, { x: 11.5, y: 0, z: 0.5 }];
+    fill(map, STONE, [[10, -1, 0], [11, -1, 0]]);
+    fill(map, AIR, [[10, 0, 0], [10, 1, 0], [11, 0, 0], [11, 1, 0]]);
+
+    const executor = new HandoverExecutor();
+    let loop!: WalkRouteExecutor;
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10); await tick(); // confirm step 0 (trace = [points[1]])
+    expect(loop.status()!.nextPointIndex).toBe(2);
+
+    executor.setOnStop(() => { loop.start(makeRequest(pointsB)); });
+    const result = loop.cancel('agent', 'stop');
+
+    expect(result.outcome).toBe('CANCELLED');
+    expect(result.lastPosition).toEqual(points[1]);
+    expect(result.trace).toEqual([{ pos: points[1], ts: 2100 }]); // confirmed trace preserved
+  });
+
+  it('the old cancel returns its own position, not a later handover', () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const pointsB = [{ x: 10.5, y: 0, z: 0.5 }, { x: 11.5, y: 0, z: 0.5 }];
+    const pointsC = [{ x: 20.5, y: 0, z: 0.5 }, { x: 21.5, y: 0, z: 0.5 }];
+    fill(map, STONE, [[10, -1, 0], [11, -1, 0], [20, -1, 0], [21, -1, 0]]);
+    fill(map, AIR, [[10, 0, 0], [10, 1, 0], [11, 0, 0], [11, 1, 0], [20, 0, 0], [20, 1, 0], [21, 0, 0], [21, 1, 0]]);
+
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.onSample(makeSample({ ...SCOPE, executionId: 'walk-1' }, { x: 1.0, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }));
+      const sB = loop.start(makeRequest(pointsB));
+      loop.onSample(makeSample({ ...SCOPE, executionId: sB.delegationId }, pointsB[0]!, { sequence: 1, observedAt: 2300 }));
+      loop.start(makeRequest(pointsC));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10); // A step 0 in flight
+
+    const result = loop.cancel('agent', 'stop');
+
+    expect(result.outcome).toBe('CANCELLED');
+    expect(result.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 }); // A's own position, not 10.5
+    expect(result.lastObservation?.observedAt).toBe(2200);
+  });
+
+  it('a support change (still passable) during the stop reports route_invalidated', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new CancelOnStopExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      // Change the destination support from stone to dirt (still supports → re-verify OPEN).
+      const report = map.observe(obs({ name: 'minecraft:dirt', properties: {} }, { x: 1, y: -1, z: 0 }, { observedAt: 1500, sequence: 2 }));
+      loop.observe(report, 1);
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+
+    executor.resolve({ sample: makeSample({ ...SCOPE, executionId: 'walk-1-step-0' }, { x: 1.5, y: 0, z: 0.5 }, { sequence: 2, observedAt: 2200 }) });
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('FAILED');
+    expect(loop.status()!.result?.problem?.kind).toBe('route_invalidated');
   });
 });

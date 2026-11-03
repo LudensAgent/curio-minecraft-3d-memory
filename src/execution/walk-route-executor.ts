@@ -62,6 +62,12 @@ interface TerminalReason {
   problem: NavProblem;
 }
 
+/** The previous delegation's last accepted evidence, preserved at handover. */
+interface HandoverSnapshot {
+  sample: BodySample;
+  trace: { pos: Vec3Like; ts: number }[];
+}
+
 /**
  * Controlled execution of an ordered walk route. One instance drives one
  * delegation at a time; `start` replaces (and orphans) any previous one.
@@ -84,8 +90,12 @@ export class WalkRouteExecutor {
   private nextPointIndex = 1;
   private lastPosition: Vec3Like | null = null;
   private lastSample: BodySample | null = null;
-  /** The previous delegation's last accepted sample, preserved at handover for its in-flight cancel/result. */
-  private handoverSample: BodySample | null = null;
+  /** Per-delegation handover snapshot, bound to the replaced delegation's identity. */
+  private handovers = new Map<number, HandoverSnapshot>();
+  /** Section dependencies of the action being released, kept until the final commit. */
+  private releasedDependencies: Set<string> | null = null;
+  /** True when a report invalidated the released action's dependencies during the stop. */
+  private releasedInvalidated = false;
   private activeStepIndex: number | null = null;
   private activeExecutionId: string | null = null;
   private activeAbort: AbortController | null = null;
@@ -137,11 +147,18 @@ export class WalkRouteExecutor {
     });
 
     // Orphan any in-flight move from the previous delegation before replacing state.
+    const previousGeneration = this.generation;
     this.generation += 1;
     const myGeneration = this.generation;
     this.delegationId = `walk-${myGeneration}`;
-    // Preserve the previous delegation's last accepted evidence for its in-flight cancel/result.
-    this.handoverSample = this.lastSample === null ? null : snapshotSample(this.lastSample);
+    // Preserve the previous delegation's last accepted evidence (position, time and
+    // confirmed trace) bound to its identity, for its in-flight cancel/result.
+    if (this.lastSample !== null) {
+      this.handovers.set(previousGeneration, {
+        sample: snapshotSample(this.lastSample),
+        trace: this.trace.map((t) => ({ pos: { ...t.pos }, ts: t.ts })),
+      });
+    }
     this.stopActive();
     if (this.generation !== myGeneration) {
       // A re-entrant start() (from the stop/abort callback) superseded this one.
@@ -157,6 +174,8 @@ export class WalkRouteExecutor {
     this.lastSample = null;
     this.trace = [];
     this.result = null;
+    this.releasedDependencies = null;
+    this.releasedInvalidated = false;
 
     if (request.mode !== 'walk') {
       this.result = this.buildFailure('FAILED', `mode "${request.mode}" is not supported by the walk executor`, {
@@ -235,6 +254,14 @@ export class WalkRouteExecutor {
     // Invalidate the cache BEFORE any stop/abort callback, so a re-entrant start()
     // cannot read a stale OPEN cached from before this report.
     this.verifier.invalidate(report);
+
+    // Mark a released action as invalidated when the report touches its dependencies.
+    if (this.releasedDependencies !== null) {
+      const touched = report.sections.some(
+        (section) => section.invalidated && this.releasedDependencies!.has(sectionKeyString(section.key)),
+      );
+      if (touched) this.releasedInvalidated = true;
+    }
 
     this.guard(); // may re-enter start() via the stop/abort callback
 
@@ -333,9 +360,10 @@ export class WalkRouteExecutor {
     const cancelled = this.buildFailure('CANCELLED', message, problem);
     this.stopActive();
     if (generation !== this.generation) {
-      // Superseded: report the previous delegation's last accepted evidence, if any.
-      if (this.handoverSample !== null) {
-        return this.buildFailureWithSample('CANCELLED', message, problem, this.handoverSample);
+      // Superseded: report this delegation's own last accepted evidence, if any.
+      const handover = this.handovers.get(generation);
+      if (handover !== undefined) {
+        return this.buildFailureWithSample('CANCELLED', message, problem, handover.sample, handover.trace);
       }
       return cancelled;
     }
@@ -539,6 +567,8 @@ export class WalkRouteExecutor {
     const moveStartedAt = this.activeStartedAt;
     const activeValidUntil = this.activeValidUntil;
     const activeRuleVersion = this.activeRuleVersion;
+    this.releasedDependencies = this.activeDependencies;
+    this.releasedInvalidated = false;
 
     const sample = result.sample;
     const failure = result.failure;
@@ -566,6 +596,17 @@ export class WalkRouteExecutor {
 
     this.stopActive();
     if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
+
+    // The released action's dependencies were invalidated by a report during the stop.
+    if (this.releasedInvalidated) {
+      this.result = this.buildFailure('FAILED', 'the in-flight segment was invalidated by an observed world change', {
+        kind: 'route_invalidated',
+        detail: 'a required section changed while the segment was executing',
+      });
+      this.releasedDependencies = null;
+      this.releasedInvalidated = false;
+      return;
+    }
 
     // A newer sample may have been accepted during the stop (via a re-entrant
     // onSample); this move's sample is then stale and must not update position,
@@ -686,8 +727,21 @@ export class WalkRouteExecutor {
     const startedAt = this.activeStartedAt;
     const validUntil = this.activeValidUntil;
     const ruleVersion = this.activeRuleVersion;
+    this.releasedDependencies = this.activeDependencies;
+    this.releasedInvalidated = false;
     this.stopActive(); // measured arrival and control release are separate confirmations
     if (!this.ownsDelegation(generation)) return; // re-entrant start()/cancel() superseded or terminated this delegation
+
+    // The released action's dependencies were invalidated by a report during the stop.
+    if (this.releasedInvalidated) {
+      this.result = this.buildFailure('FAILED', 'the in-flight segment was invalidated by an observed world change', {
+        kind: 'route_invalidated',
+        detail: 'a required section changed while the segment was executing',
+      });
+      this.releasedDependencies = null;
+      this.releasedInvalidated = false;
+      return;
+    }
 
     // Re-check the terminal conditions after release before committing arrival.
     const reason = this.recheckTerminal(startedAt, validUntil, ruleVersion);
@@ -797,19 +851,20 @@ export class WalkRouteExecutor {
     return { outcome, message, problem, confirmed: false, trace, ...tail };
   }
 
-  /** Build a failure result carrying a specific sample's position and observation (for handover). */
+  /** Build a failure result carrying a specific sample's position, observation and trace (for handover). */
   private buildFailureWithSample(
     outcome: FailureOutcome,
     message: string,
     problem: NavProblem,
     sample: BodySample,
+    trace: { pos: Vec3Like; ts: number }[],
   ): NavResult {
     return {
       outcome,
       message,
       problem,
       confirmed: false,
-      trace: this.trace.map((t) => ({ pos: { ...t.pos }, ts: t.ts })),
+      trace: trace.map((t) => ({ pos: { ...t.pos }, ts: t.ts })),
       lastPosition: { ...sample.pos },
       lastObservation: sampleToObservation(sample),
     };
