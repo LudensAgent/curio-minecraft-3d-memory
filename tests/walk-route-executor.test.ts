@@ -44,6 +44,25 @@ class FakeMoveExecutor implements MoveExecutor {
   }
 }
 
+/** Fake executor whose stop() synchronously invokes a callback (for re-entrancy tests). */
+class ReentrantExecutor implements MoveExecutor {
+  readonly stopped: string[] = [];
+  private onStop: (() => void) | null = null;
+
+  setOnStop(fn: () => void): void {
+    this.onStop = fn;
+  }
+
+  move(): Promise<ExecutableMoveResult> {
+    return new Promise<ExecutableMoveResult>(() => {}); // never resolves; control released only via stop
+  }
+
+  stop(executionId: string): void {
+    this.stopped.push(executionId);
+    this.onStop?.();
+  }
+}
+
 function makeSample(
   scope: { worldId: string; dim: string; sessionId: string; executionId: string },
   pos: Vec3Like,
@@ -782,5 +801,96 @@ describe('WalkRouteExecutor — coordinates, isolation and public entry', () => 
     expect(typeof WalkRouteExecutor).toBe('function');
     const loop = new WalkRouteExecutor(new VoxelMap('world'), new FakeMoveExecutor(), { now: () => 2000 });
     expect(loop.status()).toBeNull();
+  });
+});
+
+describe('WalkRouteExecutor — re-entrancy and terminal-ordering', () => {
+  it('re-checks the deadline after verification before starting a move', () => {
+    let clock = 1500;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    let moveCalled = false;
+    executor.push((req) => {
+      moveCalled = true;
+      return { sample: makeSample(req, req.to, { sequence: 2 }) };
+    });
+    const provider: CollisionShapeProvider = {
+      version: 'cross-deadline',
+      resolve(state, cell, read) {
+        clock = 2500; // cross the 2000 deadline during verification
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    begin(loop, points, { shapeProvider: provider, deadlineMs: 2000 });
+    const status = loop.advance(10);
+
+    expect(moveCalled).toBe(false);
+    expect(status.result?.outcome).toBe('TIMEOUT');
+    expect(status.activeStepIndex).toBeNull();
+  });
+
+  it('a re-entrant start during stop does not pollute the new delegation', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[0, -1, 0], [1, -1, 0], [10, -1, 0], [11, -1, 0]]);
+    fill(map, AIR, [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0], [10, 0, 0], [10, 1, 0], [11, 0, 0], [11, 1, 0]]);
+    const pointsA = [{ x: 0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }];
+    const pointsB = [{ x: 10.5, y: 0, z: 0.5 }, { x: 11.5, y: 0, z: 0.5 }];
+
+    const executor = new ReentrantExecutor();
+    let loop!: WalkRouteExecutor;
+    executor.setOnStop(() => {
+      loop.start(makeRequest(pointsB));
+    });
+    loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    const delegationIdA = begin(loop, pointsA);
+    loop.advance(10); // route A step 0 in flight
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationIdA }, pointsA[1]!, { sequence: 2 }));
+
+    const status = loop.status()!;
+    expect(status.delegationId).toBe('walk-2');
+    expect(status.result).toBeNull(); // route B running, not ARRIVED by route A
+    expect(status.nextPointIndex).toBe(1);
+    expect(status.lastPosition).toBeNull();
+  });
+
+  it('timeout preserves the measured displacement of a trusted sample', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    executor.push(() => new Promise<ExecutableMoveResult>(() => {}));
+    const loop = new WalkRouteExecutor(map, executor, { now: () => clock });
+
+    const delegationId = begin(loop, points, { deadlineMs: 3000 });
+    loop.advance(10); // step 0 in flight
+    clock = 4000; // past deadline
+
+    loop.onSample(makeSample({ ...SCOPE, executionId: delegationId }, { x: 1.0, y: 0, z: 0.5 }, { observedAt: 2500, sequence: 2 }));
+
+    const status = loop.status()!;
+    expect(status.result?.outcome).toBe('TIMEOUT');
+    expect(status.result?.lastPosition).toEqual({ x: 1.0, y: 0, z: 0.5 }); // not the old start
+  });
+
+  it('a foreign sample does not override an explicit cancel result', async () => {
+    const map = new VoxelMap('world');
+    const points = openRouteMap(map, 2);
+    const executor = new FakeMoveExecutor();
+    executor.push((req) => ({
+      sample: makeSample({ worldId: 'world', dim: 'nether', sessionId: 's1', executionId: 'other-execution' }, { x: 5, y: 0, z: 0.5 }, { sequence: 99 }),
+      failure: { kind: 'cancelled' },
+    }));
+    const loop = new WalkRouteExecutor(map, executor, { now: () => 2000 });
+
+    begin(loop, points);
+    loop.advance(10);
+    await tick();
+
+    expect(loop.status()!.result?.outcome).toBe('CANCELLED');
   });
 });

@@ -19,10 +19,11 @@
  * never by a "timestamp strictly greater than start" rule, which would drop
  * same-millisecond samples or accept replayed ones.
  *
- * Every entry that can advance state (`advance` / `observe` / `onSample` /
- * `checkTimeout`, plus the move-completion callback) runs the same terminal
- * guard: deadline + per-move timeout + in-flight basis invalidation, and revokes
- * control before clearing handles.
+ * The loop always records a trusted body sample's displacement *before* deciding
+ * the terminal state, so a timeout or invalidation preserves the measured partial
+ * effect without being turned into an ARRIVED. Every external stop/abort callback
+ * is treated as possibly re-entrant: handles are detached first and delegation
+ * ownership is re-checked before any later state write.
  */
 
 import type { LastObservation, NavProblem, NavResult } from '../navigation/types.js';
@@ -53,6 +54,13 @@ const POS_EPS = 1e-6;
 
 type FailureOutcome = 'NO_PATH' | 'BLOCKED' | 'CANCELLED' | 'TIMEOUT' | 'FAILED';
 type CancelBy = 'agent' | 'user' | 'scheduler' | 'lifecycle' | 'unknown';
+
+/** A terminal reason (deadline / per-move timeout / basis invalidation), not yet written to state. */
+interface TerminalReason {
+  outcome: FailureOutcome;
+  message: string;
+  problem: NavProblem;
+}
 
 /**
  * Controlled execution of an ordered walk route. One instance drives one
@@ -126,8 +134,13 @@ export class WalkRouteExecutor {
 
     // Orphan any in-flight move from the previous delegation before replacing state.
     this.generation += 1;
-    this.delegationId = `walk-${this.generation}`;
+    const myGeneration = this.generation;
+    this.delegationId = `walk-${myGeneration}`;
     this.stopActive();
+    if (this.generation !== myGeneration) {
+      // A re-entrant start() (from the stop/abort callback) superseded this one.
+      return this.snapshot();
+    }
 
     this.request = snapshotRequest(request, points, body);
     this.startedAt = this.currentNow();
@@ -166,7 +179,7 @@ export class WalkRouteExecutor {
     return this.snapshot();
   }
 
-  /** Advance one bounded round: run the terminal guard, re-verify within budget, then start at most one step. */
+  /** Advance one bounded round: run the terminal guard, re-verify within budget, re-guard, then start at most one step. */
   advance(budget: number): WalkRouteStatus {
     this.requireRequest();
     validateBudget(budget);
@@ -175,7 +188,10 @@ export class WalkRouteExecutor {
     // Bounded re-verify.
     this.verifier.advance(budget);
 
-    if (this.result !== null) return this.snapshot();
+    // Re-check the deadline and in-flight basis after verification: the clock may
+    // have crossed the deadline or a TTL/rule boundary during re-verification.
+    if (this.guard()) return this.snapshot();
+
     if (this.activeStepIndex !== null) return this.snapshot(); // still in flight
     if (this.nextPointIndex >= this.points.length) return this.snapshot();
 
@@ -219,6 +235,7 @@ export class WalkRouteExecutor {
     // Always consume the report (cache invalidation), even after termination, so a
     // stale OPEN cannot revive in a later re-registration.
     this.verifier.apply(report, budget);
+    this.guard();
 
     return this.snapshot();
   }
@@ -226,7 +243,7 @@ export class WalkRouteExecutor {
   /** Accept measured body feedback (host push). Handles boundary validation, association, ordering, scope, lifecycle and position. */
   onSample(sample: BodySample): WalkRouteStatus {
     this.requireRequest();
-    if (this.guard()) return this.snapshot();
+    if (this.result !== null) return this.snapshot();
 
     if (!this.sampleFinite(sample)) return this.snapshot(); // non-finite input never enters state
     if (sample.executionId !== this.delegationId) return this.snapshot(); // foreign/stale delegation
@@ -247,25 +264,28 @@ export class WalkRouteExecutor {
       return this.snapshot();
     }
 
+    // Record the trusted displacement before deciding the terminal state, so a
+    // timeout/invalidation preserves the measured partial effect.
+    this.recordSamplePosition(sample);
+
+    if (this.guard()) return this.snapshot(); // deadline / per-move timeout / basis
+
     if (this.activeStepIndex !== null) {
       const target = this.points[this.nextPointIndex];
       if (target !== undefined && positionsEqual(sample.pos, target)) {
         this.confirmArrival(sample);
-      } else {
-        this.recordSamplePosition(sample); // intermediate progress; the move result is authoritative
       }
+      // else: intermediate progress, already recorded.
     } else {
       const expected = this.points[this.nextPointIndex - 1]!;
       if (!positionsEqual(sample.pos, expected)) {
-        this.recordSamplePosition(sample);
         this.result = this.buildFailure('FAILED', 'the body deviated from the route', {
           kind: 'deviation',
           expected: { ...expected },
           actual: { ...sample.pos },
         });
-      } else {
-        this.recordSamplePosition(sample); // (re)confirms the current position
       }
+      // else: re-confirmed, already recorded.
     }
 
     return this.snapshot();
@@ -285,13 +305,12 @@ export class WalkRouteExecutor {
     const generation = this.generation;
     const message = `cancelled by ${by}${reason ? `: ${reason}` : ''}`;
     const problem: NavProblem = { kind: 'cancelled', by, reason };
+    // Build the cancellation snapshot before releasing, so a re-entrant start()
+    // cannot replace the displacement this cancellation reports.
+    const cancelled = this.buildFailure('CANCELLED', message, problem);
     this.stopActive();
-    if (generation !== this.generation) {
-      // A re-entrant start() replaced the delegation during the external stop/abort;
-      // do not mark the new delegation cancelled.
-      return this.result !== null ? cloneResult(this.result) : this.buildFailure('CANCELLED', message, problem);
-    }
-    this.result = this.buildFailure('CANCELLED', message, problem);
+    if (generation !== this.generation) return cancelled; // superseded; return the old snapshot
+    this.result = cancelled;
     return cloneResult(this.result);
   }
 
@@ -333,27 +352,31 @@ export class WalkRouteExecutor {
     return sample.sequence > this.lastSampleSequence && sample.observedAt >= this.lastSampleObservedAt;
   }
 
-  /**
-   * The unified terminal guard for every advancing entry. Returns true when the
-   * delegation is already terminal or becomes terminal (deadline, per-move
-   * timeout, or in-flight basis invalidation), releasing control first.
-   */
-  private guard(): boolean {
-    if (this.result !== null) return true;
+  /** Compute a terminal reason (deadline / per-move timeout / basis invalidation) without writing state. */
+  private terminalReason(): TerminalReason | null {
     const now = this.currentNow();
     if (now >= this.request!.deadlineMs) {
-      this.terminate('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
-      return true;
+      return { outcome: 'TIMEOUT', message: 'delegation deadline exceeded', problem: { kind: 'timeout' } };
     }
     if (this.activeStepIndex !== null && this.activeStartedAt !== null && now - this.activeStartedAt >= this.request!.timeoutMs) {
-      this.terminate('TIMEOUT', 'move timed out', { kind: 'timeout' });
-      return true;
+      return { outcome: 'TIMEOUT', message: 'move timed out', problem: { kind: 'timeout' } };
     }
     if (this.activeStepIndex !== null && this.activeBasisInvalidated()) {
-      this.terminate('FAILED', 'the in-flight segment lost its OPEN verification basis', {
-        kind: 'route_invalidated',
-        detail: 'rule-version or TTL invalidation revoked the in-flight step',
-      });
+      return {
+        outcome: 'FAILED',
+        message: 'the in-flight segment lost its OPEN verification basis',
+        problem: { kind: 'route_invalidated', detail: 'rule-version or TTL invalidation revoked the in-flight step' },
+      };
+    }
+    return null;
+  }
+
+  /** The unified terminal guard. Returns true when the delegation is or becomes terminal. */
+  private guard(): boolean {
+    if (this.result !== null) return true;
+    const reason = this.terminalReason();
+    if (reason !== null) {
+      this.terminate(reason.outcome, reason.message, reason.problem);
       return true;
     }
     return false;
@@ -440,36 +463,56 @@ export class WalkRouteExecutor {
     if (this.result !== null) return; // already terminal
     if (executionId !== this.activeExecutionId) return; // not the active move
 
-    if (this.guard()) return; // deadline / per-move timeout / basis invalidation
+    // Capture the terminal-relevant basis before releasing control (which clears it).
+    const moveStartedAt = this.activeStartedAt;
+    const basisInvalidated = this.activeBasisInvalidated();
 
-    // Release the move's control (stop + abort) before clearing its handles, so the
-    // next step never runs concurrently with this one.
     this.stopActive();
     if (generation !== this.generation) return; // re-entrant start() replaced the delegation
 
     const sample = result.sample;
     const failure = result.failure;
 
+    // Validate the sample, checking execution association BEFORE scope/lifecycle so
+    // a foreign sample cannot override an explicit cancel/timeout reason.
     let usable: BodySample | null = null;
     if (sample !== undefined && this.sampleFinite(sample)) {
-      if (!this.scopeMatches(sample)) {
+      if (sample.executionId !== executionId) {
+        // Foreign sample: ignore it, do not interpret its scope/lifecycle.
+      } else if (!this.scopeMatches(sample)) {
         this.result = this.buildFailure('FAILED', 'the body left the delegation scope during execution', {
           kind: 'scope_changed',
           detail: 'sample world/dim/session does not match the delegation',
         });
         return;
-      }
-      if (this.lifecycleBroken(sample)) {
+      } else if (this.lifecycleBroken(sample)) {
         this.result = this.buildFailure('FAILED', 'the body became unavailable during execution', {
           kind: 'unavailable',
           detail: `alive=${sample.alive} connected=${sample.connected} observationReady=${sample.observationReady}`,
         });
         return;
-      }
-      if (sample.executionId === executionId && this.sampleOrdered(sample)) {
+      } else if (this.sampleOrdered(sample)) {
         usable = sample;
         this.recordSamplePosition(sample);
       }
+    }
+
+    // Decide terminal (deadline / per-move timeout / basis), preserving the recorded displacement.
+    const now = this.currentNow();
+    if (now >= this.request!.deadlineMs) {
+      this.result = this.buildFailure('TIMEOUT', 'delegation deadline exceeded', { kind: 'timeout' });
+      return;
+    }
+    if (moveStartedAt !== null && now - moveStartedAt >= this.request!.timeoutMs) {
+      this.result = this.buildFailure('TIMEOUT', 'move timed out', { kind: 'timeout' });
+      return;
+    }
+    if (basisInvalidated) {
+      this.result = this.buildFailure('FAILED', 'the in-flight segment lost its OPEN verification basis', {
+        kind: 'route_invalidated',
+        detail: 'rule-version or TTL invalidation revoked the in-flight step',
+      });
+      return;
     }
 
     // Cancelled/timeout override a confirming sample; the displacement is already recorded.
@@ -546,7 +589,10 @@ export class WalkRouteExecutor {
 
   /** Confirm arrival at the next point. Releases the old move's control before advancing. */
   private confirmArrival(sample: BodySample): void {
+    const generation = this.generation;
     this.stopActive(); // measured arrival and control release are separate confirmations
+    if (generation !== this.generation) return; // re-entrant start() replaced the delegation
+
     const pos = { ...sample.pos };
     this.lastPosition = pos;
     this.lastSample = snapshotSample(sample);
