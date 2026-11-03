@@ -326,7 +326,9 @@ export class TopologyStore {
    * a `candidate` edge must not cite any evidence.
    */
   saveEdge(edge: TopologyEdge): SaveResult {
-    const stored = this.validateAndSnapshotEdge(edge);
+    const shape = this.validateEdgeShape(edge);
+    const refs = this.resolveRefs(edge, shape.fromPos, shape.toPos, shape.dim);
+    const stored = this.assembleStoredEdge(edge, refs);
     const existing = this.edgeMap.get(edge.id);
     if (existing !== undefined) {
       if (storedEdgesEqual(existing, stored)) return { status: 'unchanged' };
@@ -341,17 +343,25 @@ export class TopologyStore {
   }
 
   /**
-   * Explicitly change an existing edge. `id`/`from`/`to` are immutable. Changing
-   * `basis` to `traversed` (or altering `evidenceIds`) re-runs every validation;
-   * any failed check leaves the old edge and its indices intact.
+   * Explicitly change an existing edge. `id`/`from`/`to` are immutable. Only an
+   * explicit rebind — providing `evidenceIds` — re-resolves the evidence and
+   * replaces the binding snapshots; an empty update or an update of unrelated
+   * fields (`type`/`source`/`fragmentId`/`basis`) preserves the existing binding,
+   * so a re-imported-but-different evidence record stays `mismatch` rather than
+   * being silently re-bound to `resolved`.
    */
   updateEdge(id: string, changes: EdgeChanges): SaveResult {
     const existing = this.edgeMap.get(id);
     if (existing === undefined) {
       throw new Error(`unknown edge "${id}"`);
     }
+    const rebind = 'evidenceIds' in changes;
     const merged = applyEdgeChanges(existing, changes);
-    const stored = this.validateAndSnapshotEdge(merged);
+    const shape = this.validateEdgeShape(merged);
+    const refs = rebind
+      ? this.resolveRefs(merged, shape.fromPos, shape.toPos, shape.dim)
+      : this.preservedRefs(merged, existing);
+    const stored = this.assembleStoredEdge(merged, refs);
     if (storedEdgesEqual(existing, stored)) return { status: 'unchanged' };
     this.edgeMap.set(id, stored);
     return { status: 'updated' };
@@ -411,7 +421,7 @@ export class TopologyStore {
     return count;
   }
 
-  private validateAndSnapshotEdge(edge: TopologyEdge): StoredEdge {
+  private validateEdgeShape(edge: TopologyEdge): { fromPos: Vec3Like; toPos: Vec3Like; dim: string } {
     if (typeof edge.id !== 'string' || edge.id.length === 0) {
       throw new Error(`edge id must be a non-empty string`);
     }
@@ -451,30 +461,50 @@ export class TopologyStore {
     if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
       throw new Error(`edge endpoints must be exact locations, not regions`);
     }
-    const fromPos = fromNode.location.pos;
-    const toPos = toNode.location.pos;
-    const dim = fromNode.dim;
+    return { fromPos: fromNode.location.pos, toPos: toNode.location.pos, dim: fromNode.dim };
+  }
 
+  private resolveRefs(
+    edge: TopologyEdge,
+    fromPos: Vec3Like,
+    toPos: Vec3Like,
+    dim: string,
+  ): StoredEvidenceRef[] {
     const evidenceIds = edge.evidenceIds ?? [];
-    let refs: StoredEvidenceRef[] = [];
     if (edge.basis === 'candidate') {
       if (evidenceIds.length !== 0) {
         throw new Error(`candidate edges must not reference traversal evidence`);
       }
-    } else {
-      if (evidenceIds.length === 0) {
-        throw new Error(`traversed edges must reference at least one traversal evidence`);
-      }
-      if (evidenceIds.length > this.limits.maxEdgeEvidenceRefs) {
-        throw new Error(
-          `edge references ${evidenceIds.length} evidence, exceeding ${this.limits.maxEdgeEvidenceRefs}`,
-        );
-      }
-      refs = evidenceIds.map((evidenceId) =>
-        this.resolveEvidenceRef(evidenceId, edge.fragmentId, fromPos, toPos, dim),
+      return [];
+    }
+    if (evidenceIds.length === 0) {
+      throw new Error(`traversed edges must reference at least one traversal evidence`);
+    }
+    if (evidenceIds.length > this.limits.maxEdgeEvidenceRefs) {
+      throw new Error(
+        `edge references ${evidenceIds.length} evidence, exceeding ${this.limits.maxEdgeEvidenceRefs}`,
       );
     }
+    // Iterate by index rather than `map`: `map` skips holes, so a sparse array
+    // would silently pass the length check while resolving no evidence. Visiting
+    // each index makes every hole surface as a non-string id and be rejected.
+    const refs: StoredEvidenceRef[] = [];
+    for (let i = 0; i < evidenceIds.length; i++) {
+      refs.push(this.resolveEvidenceRef(evidenceIds[i], edge.fragmentId, fromPos, toPos, dim));
+    }
+    return refs;
+  }
 
+  /** Reuse the existing binding when the update does not rebind evidence. */
+  private preservedRefs(merged: TopologyEdge, existing: StoredEdge): StoredEvidenceRef[] {
+    if (merged.basis === 'candidate') return [];
+    if (existing.refs.length === 0) {
+      throw new Error(`traversed edges must reference at least one traversal evidence`);
+    }
+    return existing.refs;
+  }
+
+  private assembleStoredEdge(edge: TopologyEdge, refs: StoredEvidenceRef[]): StoredEdge {
     const stored: StoredEdge = {
       id: edge.id,
       from: edge.from,
@@ -489,7 +519,7 @@ export class TopologyStore {
   }
 
   private resolveEvidenceRef(
-    evidenceId: string,
+    evidenceId: string | undefined,
     edgeFragmentId: string | undefined,
     fromPos: Vec3Like,
     toPos: Vec3Like,
@@ -554,6 +584,26 @@ export class TopologyStore {
         status: 'missing',
         snapshot: cloneTraversalEvidence(ref.snapshot),
         current: null,
+      };
+    }
+    // Re-check the owning fragment, not just the traversal record: a history source
+    // that does not cascade (unlike FragmentStore) may still serve a traversal whose
+    // fragment is gone or whose scope has drifted. Either case must not read as resolved.
+    const fragment = this.history.getFragment(current.fragmentId);
+    if (fragment === null) {
+      return {
+        evidenceId: ref.evidenceId,
+        status: 'missing',
+        snapshot: cloneTraversalEvidence(ref.snapshot),
+        current: cloneTraversalEvidence(current),
+      };
+    }
+    if (fragment.worldId !== this.worldId || fragment.dim !== current.dim) {
+      return {
+        evidenceId: ref.evidenceId,
+        status: 'mismatch',
+        snapshot: cloneTraversalEvidence(ref.snapshot),
+        current: cloneTraversalEvidence(current),
       };
     }
     const matches = traversalEvidenceEqual(current, ref.snapshot);

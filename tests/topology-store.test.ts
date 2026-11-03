@@ -575,3 +575,97 @@ describe('TopologyStore — history vs current state separation', () => {
     expect(history.getFragment('frag-1')!.uses).toBe(1);
   });
 });
+
+describe('TopologyStore — regression: rebind, sparse refs, fragment scope', () => {
+  it('preserves the evidence binding on empty or unrelated-field updates (no silent rebind)', () => {
+    const { history, store } = setup();
+    store.saveEdge(traversedEdge());
+    expect(store.getEdge('e-ab')!.resolution).toBe('resolved');
+
+    // Delete the source fragment, then re-import the same evidence id with different content.
+    history.forgetFragment('frag-1');
+    history.saveFragment(fragment());
+    history.addTraversal(evidence({ observedAt: 2000 }));
+    expect(store.getEdge('e-ab')!.resolution).toBe('mismatch');
+
+    // An empty update stays idempotent and does not re-bind the evidence.
+    expect(store.updateEdge('e-ab', {}).status).toBe('unchanged');
+    expect(store.getEdge('e-ab')!.resolution).toBe('mismatch');
+
+    // An unrelated-field update also preserves the original binding.
+    expect(store.updateEdge('e-ab', { source: 'renamed' }).status).toBe('updated');
+    expect(store.getEdge('e-ab')!.source).toBe('renamed');
+    expect(store.getEdge('e-ab')!.resolution).toBe('mismatch');
+
+    // Only an explicit rebind re-resolves and re-snapshots.
+    expect(store.updateEdge('e-ab', { evidenceIds: ['ev-1'] }).status).toBe('updated');
+    expect(store.getEdge('e-ab')!.resolution).toBe('resolved');
+  });
+
+  it('rejects sparse evidence reference arrays instead of skipping their holes', () => {
+    const store = new TopologyStore(stubHistory());
+    store.saveNode(node({ id: 'a' }));
+    store.saveNode(node({ id: 'b', location: { kind: 'exact', pos: { ...POS_B } } }));
+
+    const sparse = new Array<string>(1); // length 1, one hole
+    expect(() =>
+      store.saveEdge({
+        id: 'e',
+        from: 'a',
+        to: 'b',
+        type: 'HORIZONTAL',
+        basis: 'traversed',
+        evidenceIds: sparse,
+      }),
+    ).toThrow(/non-empty string/);
+    expect(store.edges().total).toBe(0);
+
+    // The same guard applies on the update/rebind path.
+    store.saveEdge({ id: 'e', from: 'a', to: 'b', type: 'HORIZONTAL', basis: 'candidate', evidenceIds: [] });
+    expect(() => store.updateEdge('e', { basis: 'traversed', evidenceIds: sparse })).toThrow(
+      /non-empty string/,
+    );
+    expect(store.getEdge('e')!.basis).toBe('candidate');
+  });
+
+  it('reports missing when the owning fragment is gone but the traversal still resolves', () => {
+    const fragments = new Map<string, PathFragment>([['frag-1', fragment()]]);
+    const traversals = new Map<string, TraversalEvidence>([['ev-1', evidence()]]);
+    const history: TopologyHistorySource = {
+      worldId: WORLD,
+      getFragment: (id) => fragments.get(id) ?? null,
+      getTraversal: (id) => traversals.get(id) ?? null,
+    };
+    const store = new TopologyStore(history);
+    store.saveNode(node({ id: 'a' }));
+    store.saveNode(node({ id: 'b', location: { kind: 'exact', pos: { ...POS_B } } }));
+    store.saveEdge(traversedEdge());
+    expect(store.getEdge('e-ab')!.resolution).toBe('resolved');
+
+    // Delete only the fragment (a source that does not cascade).
+    fragments.delete('frag-1');
+    const view = store.getEdge('e-ab')!;
+    expect(view.resolution).toBe('missing');
+    expect(view.references[0]!.status).toBe('missing');
+  });
+
+  it('reports mismatch when the owning fragment scope drifts', () => {
+    const fragments = new Map<string, PathFragment>([['frag-1', fragment()]]);
+    const traversals = new Map<string, TraversalEvidence>([['ev-1', evidence()]]);
+    const history: TopologyHistorySource = {
+      worldId: WORLD,
+      getFragment: (id) => fragments.get(id) ?? null,
+      getTraversal: (id) => traversals.get(id) ?? null,
+    };
+    const store = new TopologyStore(history);
+    store.saveNode(node({ id: 'a' }));
+    store.saveNode(node({ id: 'b', location: { kind: 'exact', pos: { ...POS_B } } }));
+    store.saveEdge(traversedEdge());
+    expect(store.getEdge('e-ab')!.resolution).toBe('resolved');
+
+    fragments.get('frag-1')!.dim = 'nether'; // scope drift, no cascade
+    const view = store.getEdge('e-ab')!;
+    expect(view.resolution).toBe('mismatch');
+    expect(view.references[0]!.status).toBe('mismatch');
+  });
+});
