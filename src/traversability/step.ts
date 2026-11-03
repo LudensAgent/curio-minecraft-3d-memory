@@ -171,21 +171,56 @@ function cellsInAabb(aabb: Aabb): Vec3Like[] {
   return cells;
 }
 
-function boxOverlaps(cx: number, cy: number, cz: number, box: UnitBox, aabb: Aabb): boolean {
-  const minX = cx + box.minX;
-  const maxX = cx + box.maxX;
-  const minY = cy + box.minY;
-  const maxY = cy + box.maxY;
-  const minZ = cz + box.minZ;
-  const maxZ = cz + box.maxZ;
-  return (
-    maxX > aabb.minX &&
-    minX < aabb.maxX &&
-    maxY > aabb.minY &&
-    minY < aabb.maxY &&
-    maxZ > aabb.minZ &&
-    minZ < aabb.maxZ
-  );
+/**
+ * Time interval `[tMin, tMax] ⊆ [0, 1]` during which the linearly-moving interval
+ * `[min0 + d·t, max0 + d·t]` overlaps the static interval `[sMin, sMax]`, or null
+ * when there is no positive-length overlap. Overlap is strict (positive-area), so
+ * a merely touching contact yields null.
+ */
+function axisSweepOverlapTimes(
+  min0: number,
+  max0: number,
+  d: number,
+  sMin: number,
+  sMax: number,
+): [number, number] | null {
+  if (d === 0) {
+    return max0 > sMin && min0 < sMax ? [0, 1] : null;
+  }
+  const tA = (sMin - max0) / d;
+  const tB = (sMax - min0) / d;
+  const tMin = Math.max(0, Math.min(tA, tB));
+  const tMax = Math.min(1, Math.max(tA, tB));
+  return tMax > tMin ? [tMin, tMax] : null;
+}
+
+/**
+ * Exact swept collision of the moving body AABB (feet `from → to`, constant height)
+ * against one box. The body's X and Z overlaps must happen over a common time
+ * interval — a corner of the swept *envelope* that the body never actually enters is
+ * not a collision. The envelope (`cellsInAabb(sweep)`) is still used to filter
+ * candidate cells; this is the precise confirm.
+ */
+function boxSweepOverlaps(
+  cx: number,
+  cy: number,
+  cz: number,
+  box: UnitBox,
+  from: Vec3Like,
+  to: Vec3Like,
+  half: number,
+  height: number,
+): boolean {
+  const boxMinY = cy + box.minY;
+  const boxMaxY = cy + box.maxY;
+  if (from.y + height <= boxMinY || boxMaxY <= from.y) return false;
+
+  const xTimes = axisSweepOverlapTimes(from.x - half, from.x + half, to.x - from.x, cx + box.minX, cx + box.maxX);
+  if (xTimes === null) return false;
+  const zTimes = axisSweepOverlapTimes(from.z - half, from.z + half, to.z - from.z, cz + box.minZ, cz + box.maxZ);
+  if (zTimes === null) return false;
+
+  return Math.min(xTimes[1], zTimes[1]) > Math.max(xTimes[0], zTimes[0]);
 }
 
 function overlaps(min1: number, max1: number, min2: number, max2: number): boolean {
@@ -445,7 +480,7 @@ function evaluateWalkGeometry(
       continue;
     }
     for (const box of shape.shape.boxes) {
-      if (boxOverlaps(cell.x, cell.y, cell.z, box, sweep)) {
+      if (boxSweepOverlaps(cell.x, cell.y, cell.z, box, body.feet, to, half, body.height)) {
         if (acc.blocked === null) {
           const state = read.evidence.observation.state;
           acc.blocked = {

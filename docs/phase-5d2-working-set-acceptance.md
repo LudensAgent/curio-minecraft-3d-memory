@@ -127,7 +127,7 @@ better-sqlite3  → 12.11.1（native binding 实测通过）
 
 npm run typecheck  → 通过
 npm run build      → 通过
-npm test           → 552 passed（19 个测试文件；working-set 测试 42 项，另有并行合入的 grounded-walk-route 测试）
+npm test           → 556 passed（19 个测试文件；working-set 测试 44 项，另有并行合入的 grounded-walk-route 测试与 swept-collision 测试）
 npx tsx examples/working-set.ts → 正常运行（以公开包名与子路径导入，Fake 路线 ARRIVED）
 git diff --check   → 通过
 ```
@@ -215,6 +215,18 @@ whose lease is released late」用真实执行器验证任务替换与旧任务�
   `HangingExecutor`，断言旧动作确实在途（`activeStepIndex===0`）、`start` 触发替换后旧移动被 `stop`、新移动在途，再模拟旧
   任务迟到释放验证新租约仍有效。回归测试「a replaced task whose lease is released late does not drop the newer task
   protection」。
+
+## 评审修正（四轮，2 项 P2/P3 + 收窄建议）
+
+- **P2 关闭打断已接受的准备操作，留下虚假 loading**：`installSections` 的所有放弃路径（closing/closed/陈旧快照/安装失败）都
+  `markLoadFailed` 清理临时加载态；`prepare` 在异步 `measureSections` 返回后、淘汰前重查 `lifecycle`，会话不再 `open` 时直接
+  放弃（不淘汰已有缓存、把待安装段标为 `load_failed`）。回归测试「close does not leave a fake loading state nor evict the
+  existing cache」（A 不被驱逐、B 不卡在 `loading`）。
+- **P3 `residentBytesOf` 忽略 worldId**：公开入口复用 `assertSectionKey`，异世界同坐标键抛 `invalid_argument`。回归测试
+  「residentBytesOf rejects a foreign-world key」。
+- **建议（未实施）收窄公开 `installSections`**：当前 `revision` 校验拦截了 revision 提升的陈旧快照，但同值刷新（revision
+  不变、`observedAt` 前进）仍可能通过检查恢复旧观测时间。`installSections`/`measureSections` 只服务管理器，后续应内部化
+  （从公共 `SpatialSession` 面移除，改由管理器经内部接口访问），从根上消除任意快照安装的误用面。
 
 ## 本轮未实现
 

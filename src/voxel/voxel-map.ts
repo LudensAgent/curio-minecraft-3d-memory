@@ -591,6 +591,7 @@ export class VoxelMap {
   residentBytesOf(keys: readonly SectionKey[]): number {
     let total = 0;
     for (const key of keys) {
+      assertSectionKey(this.worldId, key);
       const section = this.residentSection(key);
       if (section !== undefined) total += estimateVoxelSectionResidentBytes(section);
     }

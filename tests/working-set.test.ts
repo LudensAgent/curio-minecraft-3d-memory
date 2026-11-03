@@ -672,6 +672,33 @@ describe('WorkingSetManager', () => {
     await session.close();
     expect(() => session.installSections(measured.sections)).toThrow(/closed/);
   });
+
+  it('close does not leave a fake loading state nor evict the existing cache', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 1 } });
+    const la = await manager.prepare([keyAt(0)]);
+    session.releasePins([la.lease.token]);
+
+    const pending = manager.prepare([keyAt(1)]); // measures B, awaits the worker
+    await session.close(); // closes while prepare's measure is in flight
+
+    const r = await pending;
+    expect(r.status).toBe('failed');
+    expect(r.capacity?.kind).toBe('closed');
+    expect(session.sectionResidency(keyAt(0)).residency).toBe('resident'); // A was NOT evicted
+    expect(session.sectionResidency(keyAt(1)).residency).toBe('load_failed'); // B not stuck 'loading'
+  });
+
+  it('residentBytesOf rejects a foreign-world key', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 1);
+    const { session } = await manualSession(dbPath);
+    expect(() =>
+      session.voxel.residentBytesOf([{ worldId: 'other-world', dim: DIM, cx: 0, cz: 0, sy: 4 }]),
+    ).toThrow(/worldId/);
+    await session.close();
+  });
 });
 
 // ==============================================================================

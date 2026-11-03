@@ -457,34 +457,39 @@ class SpatialSessionImpl implements SpatialSession {
     }
   }
 
-  /** Install already-measured snapshots; marks them load_failed and wraps a capacity refusal. */
+  /** Install already-measured snapshots; every abandon path marks them load_failed. */
   installSections(sections: readonly VoxelSectionSnapshot[]): SectionKey[] {
+    const keys: SectionKey[] = sections.map((s) => ({ worldId: this.worldId, dim: s.dim, cx: s.cx, cz: s.cz, sy: s.sy }));
+    const fail = (error: PersistenceError): never => {
+      this.voxel.markLoadFailed(keys);
+      throw error;
+    };
     if (this.lifecycleField === 'closing') {
-      throw new PersistenceError('closing', 'session is closing; installs are not accepted');
+      return fail(new PersistenceError('closing', 'session is closing; installs are not accepted'));
     }
     if (this.lifecycleField === 'closed') {
-      throw new PersistenceError('closed', 'session is closed; installs are not accepted');
+      return fail(new PersistenceError('closed', 'session is closed; installs are not accepted'));
     }
     // Reject a stale snapshot whose revision no longer matches the committed record,
     // so a caller cannot install an old measure over a newer saved fact.
     for (const raw of sections) {
       const committed = this.voxel.sectionResidency({ worldId: this.worldId, dim: raw.dim, cx: raw.cx, cz: raw.cz, sy: raw.sy }).committed;
       if (committed !== undefined && committed.revision !== raw.revision) {
-        throw new PersistenceError(
-          'data',
-          `stale section snapshot (${raw.dim}, ${raw.cx}, ${raw.cz}, ${raw.sy}): revision ${raw.revision} does not match committed revision ${committed.revision}`,
+        return fail(
+          new PersistenceError(
+            'data',
+            `stale section snapshot (${raw.dim}, ${raw.cx}, ${raw.cz}, ${raw.sy}): revision ${raw.revision} does not match committed revision ${committed.revision}`,
+          ),
         );
       }
     }
     try {
       return this.voxel.installLoadedSections(sections);
     } catch (err) {
-      const keys: SectionKey[] = sections.map((s) => ({ worldId: this.worldId, dim: s.dim, cx: s.cx, cz: s.cz, sy: s.sy }));
-      this.voxel.markLoadFailed(keys);
       const message = (err as Error).message;
       // `installLoadedSections` reports "would exceed maxResidentSections/Bytes"
       // (first person "exceed"), so match both spellings.
-      throw new PersistenceError(/exceed/.test(message) ? 'capacity' : 'data', message);
+      return fail(new PersistenceError(/exceed/.test(message) ? 'capacity' : 'data', message));
     }
   }
 

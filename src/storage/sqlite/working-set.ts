@@ -278,32 +278,40 @@ export class WorkingSetManager {
           const measured = await this.session.measureSections(toLoad);
           for (const missing of measured.missing) result.noRecord.push({ ...missing });
 
-          // Sound pre-fit byte check over the request's *own* footprint: the already-
-          // resident request sections (which cannot be evicted) plus the measured
-          // to-install cost. If this alone exceeds the byte budget, reject before
-          // evicting anything — a request that cannot fit even on an empty working set
-          // must not first evict the existing cache.
-          const residentRequestBytes = this.session.voxel.residentBytesOf(resident);
-          if (residentRequestBytes + measured.residentBytes > this.residency.maxResidentBytes) {
-            result.capacity = this.gap(
-              'byte_capacity',
-              `request needs ${residentRequestBytes + measured.residentBytes} resident bytes, exceeding maxResidentBytes (${this.residency.maxResidentBytes})`,
-            );
+          // A close() may have run while we awaited the measure; re-check before any
+          // eviction so a session that is no longer open never evicts its cache.
+          if (this.session.lifecycle !== 'open') {
+            result.capacity = this.gap('closed', 'session is closing or closed');
             hardFailure = true;
             this.session.voxel.markLoadFailed(toLoad); // abandon the measured, uninstalled sections
           } else {
-            const eviction = this.evictToFit(toLoad.length, measured.residentBytes, protectedSet, diagnostics);
-            result.evicted = eviction.evicted.map((k) => ({ ...k }));
-            result.evictionRejected = eviction.rejected.map((r) => ({ key: { ...r.key }, reason: r.reason }));
-            if (eviction.gap !== null) {
-              result.capacity = eviction.gap;
+            // Sound pre-fit byte check over the request's *own* footprint: the
+            // already-resident request sections (which cannot be evicted) plus the
+            // measured to-install cost. If this alone exceeds the byte budget, reject
+            // before evicting anything — a request that cannot fit even on an empty
+            // working set must not first evict the existing cache.
+            const residentRequestBytes = this.session.voxel.residentBytesOf(resident);
+            if (residentRequestBytes + measured.residentBytes > this.residency.maxResidentBytes) {
+              result.capacity = this.gap(
+                'byte_capacity',
+                `request needs ${residentRequestBytes + measured.residentBytes} resident bytes, exceeding maxResidentBytes (${this.residency.maxResidentBytes})`,
+              );
               hardFailure = true;
               this.session.voxel.markLoadFailed(toLoad); // abandon the measured, uninstalled sections
             } else {
-              const installed = this.session.installSections(measured.sections);
-              result.loaded = installed.map((k) => ({ ...k }));
-              for (const key of installed) this.lru.insert(sectionKeyString(key));
-              this.reconcile();
+              const eviction = this.evictToFit(toLoad.length, measured.residentBytes, protectedSet, diagnostics);
+              result.evicted = eviction.evicted.map((k) => ({ ...k }));
+              result.evictionRejected = eviction.rejected.map((r) => ({ key: { ...r.key }, reason: r.reason }));
+              if (eviction.gap !== null) {
+                result.capacity = eviction.gap;
+                hardFailure = true;
+                this.session.voxel.markLoadFailed(toLoad); // abandon the measured, uninstalled sections
+              } else {
+                const installed = this.session.installSections(measured.sections);
+                result.loaded = installed.map((k) => ({ ...k }));
+                for (const key of installed) this.lru.insert(sectionKeyString(key));
+                this.reconcile();
+              }
             }
           }
         } catch (err) {

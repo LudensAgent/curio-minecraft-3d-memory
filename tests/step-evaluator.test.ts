@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { evaluateWalkStep, VoxelMap } from '../src/index.js';
 import type { Section } from '../src/index.js';
 import type { CollisionShapeProvider } from '../src/traversability/collision-shape.js';
+import { evaluateGroundedWalkSegment } from '../src/traversability/step.js';
 import { AIR, bodyAt, fakeProvider, obs, SLAB, STONE, stepQuery, THIN } from './fakes.js';
 
 type Cell = [number, number, number];
@@ -515,5 +516,48 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     expect(result.problem?.kind).toBe('unobserved');
     expect(result.problem?.cells).toContainEqual({ x: 1, y: -1, z: 0 });
     expect(result.problem?.cells).not.toContainEqual({ x: -1, y: -1, z: 0 });
+  });
+});
+
+describe('evaluateGroundedWalkSegment — swept collision (diagonal correction)', () => {
+  function diagonalMap(): VoxelMap {
+    const map = new VoxelMap('world');
+    // Support under the whole diagonal footprint, air for the body height.
+    for (const x of [-1, 0, 1, 2]) for (const z of [-1, 0, 1, 2]) {
+      fill(map, STONE, [[x, -1, z]]);
+      fill(map, AIR, [[x, 0, z], [x, 1, z]]);
+    }
+    return map;
+  }
+
+  const sliverProvider: CollisionShapeProvider = {
+    version: 'swept-1',
+    resolve(state, cell, read) {
+      if (state.name === 'minecraft:sliver') {
+        return { kind: 'shape', shape: { boxes: [{ minX: 0.7, maxX: 0.9, minY: 0, maxY: 1, minZ: 0.25, maxZ: 0.5 }], supportFaces: [] } };
+      }
+      return fakeProvider.resolve(state, cell, read);
+    },
+  };
+
+  // from (0.5,0,1.0) → to (1.5,0,0.5): +X and −Z, a genuine diagonal correction.
+  const query = { worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk' as const, body: bodyAt(0.5, 0, 1.0), direction: { axis: 'x' as const, sign: 1 as const } };
+  const to = { x: 1.5, y: 0, z: 0.5 };
+
+  it('does not report a corner the body never actually sweeps', () => {
+    const map = diagonalMap();
+    // A sliver whose X overlap (t≈[0.9,1]) and Z overlap (t≈[0,0.1]) never coincide.
+    map.observe(obs({ name: 'minecraft:sliver', properties: {} }, { x: 1, y: 0, z: 1 }, { observedAt: 1500, sequence: 2 }));
+    const result = evaluateGroundedWalkSegment(map, query, to, sliverProvider, 2000, 0.05);
+    expect(result.status).toBe('OPEN');
+  });
+
+  it('reports a real swept collision as BLOCKED', () => {
+    const map = diagonalMap();
+    // A full cube the body actually passes through (cell (1,0,0): X∈[1,2], Z∈[0,1]).
+    map.observe(obs(STONE, { x: 1, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }));
+    const result = evaluateGroundedWalkSegment(map, query, to, sliverProvider, 2000, 0.05);
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('collision');
   });
 });
