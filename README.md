@@ -21,8 +21,9 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 - **Topology facts store** (`topology/`, phase 4B): `TopologyStore` records explicit spatial nodes and directional connections (`candidate` vs evidence-backed `traversed`), keeps per-edge evidence references, and reports whether those references still resolve — never whether the path is currently passable.
 - **Bounded historical graph queries** (`topology/`, phase 4C): `TopologyStore` adds bounded, read-only `adjacency`, `reachable`, and `route` queries over the recorded topology — finite work budgets, mode filtering, lightweight history reads, and precise `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` results — still never a current-traversability or executable-route claim.
 - **Bounded historical anchor queries** (`topology/`, phase 4D): `TopologyStore.historicalAnchorCandidates` finds the recorded, evidence-resolved anchors reachable from a node (filtered by source/tag/kind, sorted by `bfs`/`highest`/`deepest`, limited), with shared proof segments — never a current-passability, target-selection, or executable-route claim.
+- **Explicit history checkpoint persistence** (`storage/`, phase 5A): `openHistorySession` from the `curio-minecraft-3d-memory/storage/sqlite` subpath persists the four historical facts (`PathFragment`, `TraversalEvidence`, `SpatialNode`, topology edges with their original binding snapshots) through a single SQLite worker. `checkpoint()` is the only explicit save trigger; `flush()`/`close()` never implicitly save new memory changes. See `docs/phase-5a-history-checkpoint-acceptance.md`.
 
-These are validated **in-memory with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`). They do **not** yet wire a real mineflayer/Curio body, pathfinding, or SQLite persistence.
+The in-memory layers are validated **with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`); the checkpoint layer is validated against **real SQLite + a real worker** (see `tests/storage-checkpoint.test.ts` and `examples/history-checkpoint.ts`). They do **not** yet wire a real mineflayer/Curio body or pathfinding.
 
 ## Historical path store
 
@@ -159,6 +160,35 @@ Behavior:
 
 `highest`/`deepest` never claim a surface or a cave floor, and the query never proves current passability or selects an action target. See [`docs/phase-4d-historical-anchor-query-acceptance.md`](docs/phase-4d-historical-anchor-query-acceptance.md).
 
+## History checkpoint persistence
+
+`openHistorySession` (phase 5A, `curio-minecraft-3d-memory/storage/sqlite` subpath) persists the four historical facts through one SQLite worker. Callers keep using the in-memory `FragmentStore` / `TopologyStore` exactly as before; `checkpoint()` is the *only* explicit save trigger.
+
+```ts
+import { openHistorySession } from 'curio-minecraft-3d-memory/storage/sqlite';
+
+const session = await openHistorySession({ databasePath, worldId: 'world' });
+
+session.history.saveFragment({ /* … */ });
+session.topology.saveNode({ /* … */ });
+await session.checkpoint();   // capture + commit the full history in one transaction
+await session.close();        // stop accepting writes, shut the worker down within a bound
+
+const reopened = await openHistorySession({ databasePath, worldId: 'world' });
+reopened.history.fragments(); // committed state restored
+```
+
+Behavior:
+
+- **Explicit save.** Memory writes are queryable immediately; only `checkpoint()` persists them. There is no auto-save, incremental log, or background retry.
+- **Bounded, atomic.** One checkpoint replaces the world's four facts in a single transaction with hard, documented capacity limits (`SnapshotLimits`); over-capacity saves are rejected before any copy, leaving memory and the previous checkpoint intact.
+- **Original bindings.** Edges restore with their original evidence binding snapshots — never re-bound through `saveEdge` — so deleted/replaced evidence keeps reporting `missing`/`mismatch`, and insertion order (which 4C/4D queries depend on) is preserved.
+- **Lifecycle.** `checkpoint()` rejects `busy`/`closing`/`closed`; `flush()` waits only for an accepted checkpoint; `close()` reports the last confirmed checkpoint, unsaved changes, and unconfirmed requests.
+- **Failure semantics.** `PersistenceError` distinguishes capacity/argument rejection, SQL rollback, worker failure, `timeout_unconfirmed` (commit may have landed but was not confirmed), and schema/data validation — never fabricating a save or clearing later dirty state.
+- **Isolation.** `worldId` is explicit and isolated per database; an empty checkpoint clears only its own world.
+
+The native driver (`better-sqlite3` `^12`) is an **optional peer dependency**: the core `curio-minecraft-3d-memory` entry loads no native driver and works on Node `>=18`, while the SQLite subpath additionally requires `better-sqlite3` (Node `>=20`). See [`docs/phase-5a-history-checkpoint-acceptance.md`](docs/phase-5a-history-checkpoint-acceptance.md).
+
 ## Project structure
 
 ```
@@ -182,7 +212,8 @@ examples/
 ├── fragment-store-history.ts       # runnable Fake demo of historical facts vs current blockage
 ├── topology-facts.ts               # runnable Fake demo of explicit topology facts vs current blockage
 ├── historical-topology-query.ts    # runnable Fake demo of bounded historical graph queries
-└── historical-anchor-query.ts      # runnable Fake demo of bounded historical anchor queries
+├── historical-anchor-query.ts      # runnable Fake demo of bounded historical anchor queries
+└── history-checkpoint.ts           # runnable demo of the SQLite checkpoint lifecycle
 ```
 
 ## Development
@@ -197,11 +228,12 @@ npx tsx examples/fragment-store-history.ts  # run the Fake historical-facts demo
 npx tsx examples/topology-facts.ts          # run the Fake explicit-topology demo
 npx tsx examples/historical-topology-query.ts # run the Fake bounded-query demo
 npx tsx examples/historical-anchor-query.ts   # run the Fake bounded-anchor-query demo
+npx tsx examples/history-checkpoint.ts        # run the SQLite checkpoint-lifecycle demo
 ```
 
-> `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, and `examples/historical-anchor-query.ts` import the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
+> `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, `examples/historical-anchor-query.ts`, and `examples/history-checkpoint.ts` import the built package by its public name (`curio-minecraft-3d-memory`, with `history-checkpoint.ts` using the `curio-minecraft-3d-memory/storage/sqlite` subpath) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
 
-> The persistence driver (`better-sqlite3`) is wired in at phase 5 (design §9.2); `storage/` currently holds only the schema contract and worker interface, with no native dependency.
+> The persistence entry (`curio-minecraft-3d-memory/storage/sqlite`) uses `better-sqlite3` (an optional peer dependency) inside a single worker thread. The core entry (`curio-minecraft-3d-memory`) has no native dependency and never starts a worker.
 
 ## License
 

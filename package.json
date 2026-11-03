@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./storage/sqlite": {
+      "types": "./dist/storage/sqlite/index.d.ts",
+      "import": "./dist/storage/sqlite/index.js"
     }
   },
   "files": [
@@ -18,12 +22,23 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "pretypecheck": "npm run build",
+    "pretest": "npm run build",
+    "prepack": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx src/index.ts"
   },
   "engines": {
     "node": ">=18"
+  },
+  "peerDependencies": {
+    "better-sqlite3": "^12.0.0"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    }
   },
   "keywords": [
     "minecraft",
@@ -34,7 +49,9 @@
   ],
   "license": "UNLICENSED",
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.0.0",
+    "better-sqlite3": "^12.11.1",
     "tsx": "^4.19.0",
     "typescript": "^5.9.2",
     "vitest": "^2.1.0"

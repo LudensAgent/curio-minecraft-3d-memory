@@ -47,6 +47,31 @@ export interface FragmentScope {
   dim: string;
 }
 
+/**
+ * Measured size of the fragment store, used for the bounded checkpoint pre-flight.
+ * Every count is exact; `bytes` is a conservative estimate of the JSON-encoded
+ * snapshot size (computed without copying or stringifying the full dataset).
+ */
+export interface FragmentCheckpointMeasure {
+  fragments: number;
+  traversals: number;
+  polylinePoints: number;
+  entrancePoints: number;
+  linkPairs: number;
+  bytes: number;
+}
+
+/**
+ * A deep-copied, insertion-ordered snapshot of the store's full history, captured
+ * synchronously for a checkpoint. Mutating the returned arrays/objects never
+ * reaches the store.
+ */
+export interface FragmentCheckpointSnapshot {
+  worldId: string;
+  fragments: PathFragment[];
+  traversals: TraversalEvidence[];
+}
+
 /** Capacity limits. These are implementation capacities, not game rules. */
 export interface FragmentStoreOptions {
   /** Maximum fragments retained. Defaults to 1000. */
@@ -147,10 +172,21 @@ export class FragmentStore {
   private readonly traversalMap = new Map<string, TraversalEvidence>();
   /** fragmentId → traversal ids owned by that fragment (removed together on delete). */
   private readonly fragmentToTraversalIds = new Map<string, Set<string>>();
+  /**
+   * Session-local mutation revision, bumped only by writes that actually change a
+   * fact. Not a time, observation number, or traversal count; it is reset on
+   * `restoreSnapshot` and only exists to mark checkpoint cut-points and `dirty`.
+   */
+  private mutationRevision = 0;
 
   constructor(worldId: string, options: FragmentStoreOptions = {}) {
     this.worldId = worldId;
     this.limits = resolveLimits(options);
+  }
+
+  /** Current mutation revision (see `mutationRevision`). */
+  get revision(): number {
+    return this.mutationRevision;
   }
 
   /**
@@ -171,6 +207,7 @@ export class FragmentStore {
       );
     }
     this.fragmentMap.set(fragment.id, snapshot);
+    this.mutationRevision += 1;
     return { status: 'inserted' };
   }
 
@@ -188,6 +225,7 @@ export class FragmentStore {
     const snapshot = snapshotFragment(this.worldId, merged, this.limits);
     if (fragmentsEqual(existing, snapshot)) return { status: 'unchanged' };
     this.fragmentMap.set(id, snapshot);
+    this.mutationRevision += 1;
     return { status: 'updated' };
   }
 
@@ -214,11 +252,15 @@ export class FragmentStore {
    * is a stable no-op; evidence owned by other fragments is never touched.
    */
   forgetFragment(id: string): void {
-    this.fragmentMap.delete(id);
+    const existed = this.fragmentMap.delete(id);
     const owned = this.fragmentToTraversalIds.get(id);
-    if (owned === undefined) return;
-    for (const traversalId of owned) this.traversalMap.delete(traversalId);
-    this.fragmentToTraversalIds.delete(id);
+    if (owned !== undefined) {
+      for (const traversalId of owned) this.traversalMap.delete(traversalId);
+      this.fragmentToTraversalIds.delete(id);
+    }
+    // Deleting an unknown id (or an id whose cascade removed nothing) is a no-op;
+    // only an actual removal — including its cascade — counts as a change.
+    if (existed) this.mutationRevision += 1;
   }
 
   /** Paginated read of fragments. Read-only: never changes time, uses, or content. */
@@ -273,6 +315,7 @@ export class FragmentStore {
       this.fragmentToTraversalIds.set(evidence.fragmentId, owned);
     }
     owned.add(evidence.id);
+    this.mutationRevision += 1;
     return { status: 'inserted' };
   }
 
@@ -303,6 +346,100 @@ export class FragmentStore {
       total: ids.length,
       nextAfter,
     };
+  }
+
+  // --- checkpoint support (phase 5A): bounded export + validated restore ---
+
+  /**
+   * Exact size of the store's full history, used by the checkpoint pre-flight to
+   * reject over-capacity saves *before* any copy or message pass. Read-only; never
+   * refreshes time, uses, or any other fact.
+   */
+  checkpointMeasure(): FragmentCheckpointMeasure {
+    let polylinePoints = 0;
+    let entrancePoints = 0;
+    let linkPairs = 0;
+    let bytes = 0;
+    for (const fragment of this.fragmentMap.values()) {
+      polylinePoints += fragment.polyline.length;
+      entrancePoints += fragment.entrances.length;
+      linkPairs += fragment.links?.length ?? 0;
+      bytes += estimateFragmentBytes(fragment);
+    }
+    for (const evidence of this.traversalMap.values()) {
+      bytes += estimateTraversalBytes(evidence);
+    }
+    return {
+      fragments: this.fragmentMap.size,
+      traversals: this.traversalMap.size,
+      polylinePoints,
+      entrancePoints,
+      linkPairs,
+      bytes,
+    };
+  }
+
+  /**
+   * Deep-copied, insertion-ordered snapshot of the store's full history for a
+   * checkpoint. Read-only; the caller owns the returned objects.
+   */
+  checkpointSnapshot(): FragmentCheckpointSnapshot {
+    return {
+      worldId: this.worldId,
+      fragments: [...this.fragmentMap.values()].map(cloneFragment),
+      traversals: [...this.traversalMap.values()].map(cloneTraversalEvidence),
+    };
+  }
+
+  /**
+   * Narrow, validated restore entry (phase 5A). Replaces the store's full history
+   * from a previously captured snapshot and resets the mutation revision to its
+   * session baseline. It validates every record and the fragment→traversal
+   * ownership graph, but it does not go through the public write methods, so it
+   * never fabricates a traversal, never re-resolves evidence, and never bumps the
+   * revision for the restored facts themselves.
+   */
+  restoreSnapshot(snapshot: FragmentCheckpointSnapshot): void {
+    if (snapshot.worldId !== this.worldId) {
+      throw new Error(`snapshot worldId "${snapshot.worldId}" does not match store worldId "${this.worldId}"`);
+    }
+    const fragments = new Map<string, PathFragment>();
+    for (const raw of snapshot.fragments) {
+      const validated = snapshotFragment(this.worldId, raw, this.limits);
+      if (fragments.has(validated.id)) {
+        throw new Error(`duplicate fragment id "${validated.id}" in snapshot`);
+      }
+      fragments.set(validated.id, validated);
+    }
+    const traversals = new Map<string, TraversalEvidence>();
+    const fragmentToTraversalIds = new Map<string, Set<string>>();
+    for (const raw of snapshot.traversals) {
+      const validated = snapshotEvidence(this.worldId, raw);
+      if (traversals.has(validated.id)) {
+        throw new Error(`duplicate traversal id "${validated.id}" in snapshot`);
+      }
+      const owner = fragments.get(validated.fragmentId);
+      if (owner === undefined) {
+        throw new Error(`traversal "${validated.id}" references unknown fragment "${validated.fragmentId}"`);
+      }
+      if (owner.worldId !== validated.worldId || owner.dim !== validated.dim) {
+        throw new Error(`traversal "${validated.id}" world/dim does not match fragment "${validated.fragmentId}"`);
+      }
+      traversals.set(validated.id, validated);
+      let owned = fragmentToTraversalIds.get(validated.fragmentId);
+      if (owned === undefined) {
+        owned = new Set();
+        fragmentToTraversalIds.set(validated.fragmentId, owned);
+      }
+      owned.add(validated.id);
+    }
+    this.fragmentMap.clear();
+    for (const [id, value] of fragments) this.fragmentMap.set(id, value);
+    this.traversalMap.clear();
+    for (const [id, value] of traversals) this.traversalMap.set(id, value);
+    this.fragmentToTraversalIds.clear();
+    for (const [id, value] of fragmentToTraversalIds) this.fragmentToTraversalIds.set(id, value);
+    this.mutationRevision = 0;
   }
 }
 
@@ -358,7 +495,7 @@ function snapshotFragment(worldId: string, f: PathFragment, limits: ResolvedLimi
   return cloneFragment(f);
 }
 
-function snapshotEvidence(worldId: string, e: TraversalEvidence): TraversalEvidence {
+export function snapshotEvidence(worldId: string, e: TraversalEvidence): TraversalEvidence {
   if (e.worldId !== worldId) {
     throw new Error(`traversal worldId "${e.worldId}" does not match store worldId "${worldId}"`);
   }
@@ -533,4 +670,29 @@ function firstIndexAfter(sortedIds: string[], after: string): number {
   let i = 0;
   while (i < sortedIds.length && sortedIds[i]! <= after) i += 1;
   return i;
+}
+
+// --- checkpoint byte estimation (conservative; no full copy or stringify) ---
+
+const BYTES_PER_POINT = 48; // {x:±d.ddd,y:±d.ddd,z:±d.ddd} plus separators, worst-case double width
+const BYTES_PER_LINK = 96; // two points plus {a:{...},b:{...}} framing
+
+function estimateFragmentBytes(f: PathFragment): number {
+  let bytes = 64;
+  bytes += f.id.length + f.worldId.length + f.dim.length + f.kind.length + f.geometrySource.length;
+  bytes += f.polyline.length * BYTES_PER_POINT;
+  bytes += f.entrances.length * BYTES_PER_POINT;
+  bytes += (f.links?.length ?? 0) * BYTES_PER_LINK;
+  return bytes;
+}
+
+function estimateTraversalBytes(e: TraversalEvidence): number {
+  let bytes = 48;
+  bytes += e.id.length + e.fragmentId.length + e.worldId.length + e.dim.length + e.source.length;
+  bytes += e.sessionId?.length ?? 0;
+  bytes += e.executionId?.length ?? 0;
+  bytes += e.actionId?.length ?? 0;
+  bytes += e.mode?.length ?? 0;
+  bytes += 2 * BYTES_PER_POINT;
+  return bytes;
 }

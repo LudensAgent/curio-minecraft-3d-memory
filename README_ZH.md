@@ -21,8 +21,9 @@
 - **拓扑事实存储**（`topology/`，阶段 4B）：`TopologyStore` 记录显式空间节点与有向连接（`candidate` 候选 vs 有依据的 `traversed`），保留每条边的证据引用，并报告这些引用当前能否解析 —— 但从不回答当前是否可通行。
 - **有界历史图查询**（`topology/`，阶段 4C）：`TopologyStore` 新增有界、只读的 `adjacency` / `reachable` / `route` 查询 —— 有限工作预算、模式筛选、轻量历史读取，以及精确的 `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` 结果 —— 仍不声称当前可通行、不生成可执行路线。
 - **有界历史锚点查询**（`topology/`，阶段 4D）：`TopologyStore.historicalAnchorCandidates` 查询从节点出发、沿证据解析的历史连接可达且满足筛选（source/tag/kind）的锚点，按 `bfs`/`highest`/`deepest` 排序限流，附带共享证明 —— 不声称当前可通行、不选择行动目标、不生成可执行路线。
+- **显式历史 checkpoint 持久化**（`storage/`，阶段 5A）：通过 `curio-minecraft-3d-memory/storage/sqlite` 子路径的 `openHistorySession`，用单个 SQLite Worker 持久化四类历史事实（`PathFragment`、`TraversalEvidence`、`SpatialNode` 及带原始绑定快照的拓扑边）。`checkpoint()` 是唯一显式保存触发点；`flush()`/`close()` 不隐式保存新内存变化。见 `docs/phase-5a-history-checkpoint-acceptance.md`。
 
-以上均以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与可运行的 `examples/walk-route-execution.ts`）。**尚未**接入真实 mineflayer/Curio 身体、寻路或 SQLite 持久化。
+内存层以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与 `examples/walk-route-execution.ts`）；checkpoint 层以**真实 SQLite + 真实 Worker**验证（见 `tests/storage-checkpoint.test.ts` 与 `examples/history-checkpoint.ts`）。**尚未**接入真实 mineflayer/Curio 身体或寻路。
 
 ## 历史路径存储
 
@@ -176,6 +177,43 @@ r.disposition;    // 'complete' | 'evidence_gaps' | 'budget_exhausted'
 `highest`/`deepest` 不声称是地表或洞穴最深处，查询不证明当前可通行、不选择行动目标。见
 [`docs/phase-4d-historical-anchor-query-acceptance.md`](docs/phase-4d-historical-anchor-query-acceptance.md)。
 
+## 历史 checkpoint 持久化
+
+`openHistorySession`（阶段 5A，子路径 `curio-minecraft-3d-memory/storage/sqlite`）通过单个 SQLite
+Worker 持久化四类历史事实。调用者仍照旧使用内存 `FragmentStore` / `TopologyStore`；`checkpoint()`
+是**唯一**的显式保存触发点。
+
+```ts
+import { openHistorySession } from 'curio-minecraft-3d-memory/storage/sqlite';
+
+const session = await openHistorySession({ databasePath, worldId: 'world' });
+
+session.history.saveFragment({ /* … */ });
+session.topology.saveNode({ /* … */ });
+await session.checkpoint();   // 一次事务内捕获并提交完整历史
+await session.close();        // 停止接受写入，并有界关闭 Worker
+
+const reopened = await openHistorySession({ databasePath, worldId: 'world' });
+reopened.history.fragments(); // 已提交状态恢复
+```
+
+行为：
+
+- **显式保存**：内存写入立即可查询，只有 `checkpoint()` 才会落盘；不自动保存、不做增量日志、不后台重试。
+- **有界且原子**：一次 checkpoint 在单个事务内替换该 worldId 的四类事实，并有明确、有文档的容量
+  上限（`SnapshotLimits`）；超限在复制前拒绝，内存与上一份 checkpoint 均不变。
+- **原始绑定**：边连同其原始证据绑定快照一起恢复 —— 不经过 `saveEdge` 重绑 —— 因此被删除/替换的
+  证据继续报告 `missing`/`mismatch`，且 4C/4D 查询依赖的插入顺序得以保留。
+- **生命周期**：`checkpoint()` 在 `busy`/`closing`/`closed` 时拒绝；`flush()` 只等待已接受的
+  checkpoint；`close()` 报告最后确认的 checkpoint、未保存变化与未确认请求。
+- **失败语义**：`PersistenceError` 区分容量/参数拒绝、SQL 回滚、Worker 失败、`timeout_unconfirmed`
+  （提交可能已落盘但未确认）与 schema/数据校验 —— 不伪造保存、不清除后续 dirty。
+- **隔离**：`worldId` 显式且按库隔离；空 checkpoint 只清空自己的世界。
+
+原生驱动（`better-sqlite3` `^12`）是**可选 peer dependency**：核心 `curio-minecraft-3d-memory` 入口
+不加载原生驱动、支持 Node `>=18`；SQLite 子路径额外要求 `better-sqlite3`（Node `>=20`）。见
+[`docs/phase-5a-history-checkpoint-acceptance.md`](docs/phase-5a-history-checkpoint-acceptance.md)。
+
 ## 目录结构
 
 ```
@@ -199,7 +237,8 @@ examples/
 ├── fragment-store-history.ts       # 可运行的 Fake 历史事实与当前阻塞对照示例
 ├── topology-facts.ts               # 可运行的 Fake 显式拓扑事实与当前阻塞对照示例
 ├── historical-topology-query.ts    # 可运行的 Fake 有界历史图查询示例
-└── historical-anchor-query.ts      # 可运行的 Fake 有界历史锚点查询示例
+├── historical-anchor-query.ts      # 可运行的 Fake 有界历史锚点查询示例
+└── history-checkpoint.ts           # 可运行的 SQLite checkpoint 生命周期示例
 ```
 
 ## 开发
@@ -214,11 +253,12 @@ npx tsx examples/fragment-store-history.ts  # 运行 Fake 历史事实示例
 npx tsx examples/topology-facts.ts          # 运行 Fake 显式拓扑示例
 npx tsx examples/historical-topology-query.ts # 运行 Fake 有界历史图查询示例
 npx tsx examples/historical-anchor-query.ts   # 运行 Fake 有界历史锚点查询示例
+npx tsx examples/history-checkpoint.ts        # 运行 SQLite checkpoint 生命周期示例
 ```
 
-> `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts` 与 `examples/historical-anchor-query.ts` 以公开包名（`curio-minecraft-3d-memory`）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
+> `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts`、`examples/historical-anchor-query.ts` 与 `examples/history-checkpoint.ts` 以公开包名（`curio-minecraft-3d-memory`，其中 `history-checkpoint.ts` 使用 `curio-minecraft-3d-memory/storage/sqlite` 子路径）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
 
-> 持久化驱动（`better-sqlite3`）按设计 §9.2 在阶段 5 接入，本阶段 `storage/` 仅含接口与 schema 契约，未引入原生依赖。
+> 持久化入口（`curio-minecraft-3d-memory/storage/sqlite`）在单个 Worker 线程内使用 `better-sqlite3`（可选 peer dependency）。核心入口（`curio-minecraft-3d-memory`）无原生依赖、从不启动 Worker。
 
 ## License
 

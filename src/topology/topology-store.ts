@@ -32,6 +32,7 @@ import type { ConnectionType, LandmarkTag, NodeKind, NodeSource, SpatialNode } f
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
 import { assertValidMode, cloneTraversalEvidence, traversalEvidenceEqual } from './path-fragment.js';
 import type { FragmentScope, SaveResult } from './fragment-store.js';
+import { snapshotEvidence } from './fragment-store.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 
 /** How a topology edge is justified. */
@@ -351,6 +352,44 @@ export interface EdgeChanges {
   evidenceIds?: string[];
 }
 
+/** One preserved evidence binding: the id plus the immutable snapshot it was bound to. */
+export interface TopologyEvidenceRefSnapshot {
+  evidenceId: string;
+  snapshot: TraversalEvidence;
+}
+
+/**
+ * Persistent form of a stored edge: the public fields plus the binding snapshots.
+ * This is the checkpoint/restore shape — distinct from `TopologyEdge` (query
+ * projection) and `EdgeView` (resolution), and never from the derived
+ * `current`/`resolution` of a read.
+ */
+export interface TopologyEdgeSnapshot {
+  id: string;
+  from: string;
+  to: string;
+  type: ConnectionType;
+  fragmentId?: string;
+  basis: EdgeBasis;
+  source?: string;
+  refs: TopologyEvidenceRefSnapshot[];
+}
+
+/** Measured size of the topology store, used for the bounded checkpoint pre-flight. */
+export interface TopologyCheckpointMeasure {
+  nodes: number;
+  edges: number;
+  edgeEvidenceRefs: number;
+  bytes: number;
+}
+
+/** A deep-copied, insertion-ordered snapshot of the store's full topology. */
+export interface TopologyCheckpointSnapshot {
+  worldId: string;
+  nodes: SpatialNode[];
+  edges: TopologyEdgeSnapshot[];
+}
+
 /** Internal edge record: the public shape plus the immutable binding snapshots. */
 interface StoredEdge {
   id: string;
@@ -425,11 +464,22 @@ export class TopologyStore {
   private readonly edgeMap = new Map<string, StoredEdge>();
   /** node id → edge ids that reference it (for location-update and delete guards). */
   private readonly nodeToEdgeIds = new Map<string, Set<string>>();
+  /**
+   * Session-local mutation revision, bumped only by writes that actually change a
+   * fact. Not a time, observation number, or traversal count; it is reset on
+   * `restoreSnapshot` and only exists to mark checkpoint cut-points and `dirty`.
+   */
+  private mutationRevision = 0;
 
   constructor(history: TopologyHistorySource, options: TopologyStoreOptions = {}) {
     this.worldId = history.worldId;
     this.history = history;
     this.limits = resolveLimits(options);
+  }
+
+  /** Current mutation revision (see `mutationRevision`). */
+  get revision(): number {
+    return this.mutationRevision;
   }
 
   // --- nodes ---
@@ -454,6 +504,7 @@ export class TopologyStore {
       );
     }
     this.nodeMap.set(node.id, snapshot);
+    this.mutationRevision += 1;
     return { status: 'inserted' };
   }
 
@@ -475,6 +526,7 @@ export class TopologyStore {
     const snapshot = snapshotNode(this.worldId, merged);
     if (nodesEqual(existing, snapshot)) return { status: 'unchanged' };
     this.nodeMap.set(id, snapshot);
+    this.mutationRevision += 1;
     return { status: 'updated' };
   }
 
@@ -490,8 +542,9 @@ export class TopologyStore {
     if (refs !== undefined && refs.size > 0) {
       throw new Error(`node "${id}" is referenced by ${refs.size} edge(s); remove them first`);
     }
-    this.nodeMap.delete(id);
+    const existed = this.nodeMap.delete(id);
     this.nodeToEdgeIds.delete(id);
+    if (existed) this.mutationRevision += 1;
   }
 
   /** Paginated, read-only node listing (id-ordered, exclusive cursor, clamped limit). */
@@ -536,6 +589,7 @@ export class TopologyStore {
     }
     this.edgeMap.set(edge.id, stored);
     this.indexEdge(stored);
+    this.mutationRevision += 1;
     return { status: 'inserted' };
   }
 
@@ -561,6 +615,7 @@ export class TopologyStore {
     const stored = this.assembleStoredEdge(merged, refs);
     if (storedEdgesEqual(existing, stored)) return { status: 'unchanged' };
     this.edgeMap.set(id, stored);
+    this.mutationRevision += 1;
     return { status: 'updated' };
   }
 
@@ -579,6 +634,7 @@ export class TopologyStore {
     if (stored === undefined) return;
     this.edgeMap.delete(id);
     this.unindexEdge(stored);
+    this.mutationRevision += 1;
   }
 
   /**
@@ -608,6 +664,82 @@ export class TopologyStore {
       total: ids.length,
       nextAfter,
     };
+  }
+
+  // --- checkpoint support (phase 5A): bounded export + validated restore ---
+
+  /**
+   * Exact size of the store's full topology, used by the checkpoint pre-flight to
+   * reject over-capacity saves before any copy or message pass. Read-only.
+   */
+  checkpointMeasure(): TopologyCheckpointMeasure {
+    let edgeEvidenceRefs = 0;
+    let bytes = 0;
+    for (const node of this.nodeMap.values()) bytes += estimateNodeBytes(node);
+    for (const edge of this.edgeMap.values()) {
+      edgeEvidenceRefs += edge.refs.length;
+      bytes += estimateEdgeBytes(edge);
+    }
+    return {
+      nodes: this.nodeMap.size,
+      edges: this.edgeMap.size,
+      edgeEvidenceRefs,
+      bytes,
+    };
+  }
+
+  /**
+   * Deep-copied, insertion-ordered snapshot of the store's full topology for a
+   * checkpoint. Edges are exported with their binding snapshots (via
+   * `TopologyEdgeSnapshot`), in edge insertion order — never the id-sorted
+   * `edges()` projection, so the 4C/4D query order survives a restore.
+   */
+  checkpointSnapshot(): TopologyCheckpointSnapshot {
+    return {
+      worldId: this.worldId,
+      nodes: [...this.nodeMap.values()].map(cloneNode),
+      edges: [...this.edgeMap.values()].map(toEdgeSnapshot),
+    };
+  }
+
+  /**
+   * Narrow, validated restore entry (phase 5A). Replaces the store's full topology
+   * from a previously captured snapshot and resets the mutation revision to its
+   * session baseline. It validates structure, IDs, scope, endpoints and binding
+   * internal consistency, but it does *not* require the current authoritative
+   * evidence to exist or match — so `missing`/`mismatch` edges restore as-is and
+   * are re-resolved later by the normal read path, never silently re-bound.
+   */
+  restoreSnapshot(snapshot: TopologyCheckpointSnapshot): void {
+    if (snapshot.worldId !== this.worldId) {
+      throw new Error(`snapshot worldId "${snapshot.worldId}" does not match store worldId "${this.worldId}"`);
+    }
+    const nodes = new Map<string, SpatialNode>();
+    for (const raw of snapshot.nodes) {
+      const validated = snapshotNode(this.worldId, raw);
+      if (nodes.has(validated.id)) {
+        throw new Error(`duplicate node id "${validated.id}" in snapshot`);
+      }
+      nodes.set(validated.id, validated);
+    }
+    const edges = new Map<string, StoredEdge>();
+    const nodeToEdgeIds = new Map<string, Set<string>>();
+    for (const raw of snapshot.edges) {
+      const stored = this.restoreEdge(raw, nodes);
+      if (edges.has(stored.id)) {
+        throw new Error(`duplicate edge id "${stored.id}" in snapshot`);
+      }
+      edges.set(stored.id, stored);
+      addToNodeEdgeIndex(nodeToEdgeIds, stored.from, stored.id);
+      addToNodeEdgeIndex(nodeToEdgeIds, stored.to, stored.id);
+    }
+    this.nodeMap.clear();
+    for (const [id, value] of nodes) this.nodeMap.set(id, value);
+    this.edgeMap.clear();
+    for (const [id, value] of edges) this.edgeMap.set(id, value);
+    this.nodeToEdgeIds.clear();
+    for (const [id, value] of nodeToEdgeIds) this.nodeToEdgeIds.set(id, value);
+    this.mutationRevision = 0;
   }
 
   // --- bounded historical graph queries (phase 4C) ---
@@ -1144,6 +1276,89 @@ export class TopologyStore {
   private unindexEdge(stored: StoredEdge): void {
     removeFromNodeEdgeIndex(this.nodeToEdgeIds, stored.from, stored.id);
     removeFromNodeEdgeIndex(this.nodeToEdgeIds, stored.to, stored.id);
+  }
+
+  /**
+   * Restore one edge from its checkpoint form without going through `saveEdge`.
+   * Validates shape, endpoint existence/scope, and binding internal consistency,
+   * but never reads or requires the authoritative history, so a binding whose
+   * evidence has since been deleted or replaced is preserved verbatim.
+   */
+  private restoreEdge(raw: TopologyEdgeSnapshot, nodes: Map<string, SpatialNode>): StoredEdge {
+    if (typeof raw.id !== 'string' || raw.id.length === 0) {
+      throw new Error(`edge id must be a non-empty string`);
+    }
+    if (raw.type === 'PORTAL') {
+      throw new Error(`PORTAL edges are not supported in this phase`);
+    }
+    if (!NON_PORTAL_CONNECTION_TYPES.includes(raw.type)) {
+      throw new Error(`edge type "${String(raw.type)}" is not a known connection type`);
+    }
+    if (raw.basis !== 'candidate' && raw.basis !== 'traversed') {
+      throw new Error(`edge basis "${String(raw.basis)}" is not known (candidate|traversed)`);
+    }
+    if (typeof raw.from !== 'string' || raw.from.length === 0) {
+      throw new Error(`edge from must be a non-empty node id`);
+    }
+    if (typeof raw.to !== 'string' || raw.to.length === 0) {
+      throw new Error(`edge to must be a non-empty node id`);
+    }
+    if (raw.fragmentId !== undefined && (typeof raw.fragmentId !== 'string' || raw.fragmentId.length === 0)) {
+      throw new Error(`edge fragmentId must be a non-empty string when present`);
+    }
+    if (raw.source !== undefined && (typeof raw.source !== 'string' || raw.source.length === 0)) {
+      throw new Error(`edge source must be a non-empty string when present`);
+    }
+
+    const fromNode = nodes.get(raw.from);
+    const toNode = nodes.get(raw.to);
+    if (fromNode === undefined) {
+      throw new Error(`edge "${raw.id}" references unknown node "${raw.from}"`);
+    }
+    if (toNode === undefined) {
+      throw new Error(`edge "${raw.id}" references unknown node "${raw.to}"`);
+    }
+    if (fromNode.dim !== toNode.dim) {
+      throw new Error(`edge "${raw.id}" endpoints span dimensions "${fromNode.dim}" and "${toNode.dim}"`);
+    }
+    if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
+      throw new Error(`edge "${raw.id}" endpoints must be exact locations, not regions`);
+    }
+
+    const refs: StoredEvidenceRef[] = [];
+    const rawRefs = raw.refs;
+    if (!Array.isArray(rawRefs)) {
+      throw new Error(`edge "${raw.id}" refs must be an array`);
+    }
+    if (raw.basis === 'candidate') {
+      if (rawRefs.length !== 0) {
+        throw new Error(`candidate edges must not reference traversal evidence`);
+      }
+    } else {
+      if (rawRefs.length === 0) {
+        throw new Error(`traversed edges must reference at least one traversal evidence`);
+      }
+      if (rawRefs.length > this.limits.maxEdgeEvidenceRefs) {
+        throw new Error(
+          `edge "${raw.id}" references ${rawRefs.length} evidence, exceeding ${this.limits.maxEdgeEvidenceRefs}`,
+        );
+      }
+    }
+    for (let i = 0; i < rawRefs.length; i++) {
+      refs.push(restoreEvidenceRef(this.worldId, raw.id, rawRefs[i], fromNode, toNode));
+    }
+
+    const stored: StoredEdge = {
+      id: raw.id,
+      from: raw.from,
+      to: raw.to,
+      type: raw.type,
+      basis: raw.basis,
+      refs,
+    };
+    if (raw.fragmentId !== undefined) stored.fragmentId = raw.fragmentId;
+    if (raw.source !== undefined) stored.source = raw.source;
+    return stored;
   }
 }
 
@@ -1683,4 +1898,81 @@ function buildProofSegments(
       evidence: cloneTraversalEvidence(entry.witness.evidence),
     };
   });
+}
+
+// --- checkpoint restore + byte estimation (phase 5A) ---
+
+/** Project a stored edge to its public checkpoint form, deep-copying binding snapshots. */
+function toEdgeSnapshot(edge: StoredEdge): TopologyEdgeSnapshot {
+  const out: TopologyEdgeSnapshot = {
+    id: edge.id,
+    from: edge.from,
+    to: edge.to,
+    type: edge.type,
+    basis: edge.basis,
+    refs: edge.refs.map((ref) => ({
+      evidenceId: ref.evidenceId,
+      snapshot: cloneTraversalEvidence(ref.snapshot),
+    })),
+  };
+  if (edge.fragmentId !== undefined) out.fragmentId = edge.fragmentId;
+  if (edge.source !== undefined) out.source = edge.source;
+  return out;
+}
+
+/**
+ * Validate one restored binding reference against the restored edge endpoints
+ * only — structural validity plus internal consistency (scope + endpoint match),
+ * never a read of the current authoritative history. The snapshot is the binding's
+ * own immutable copy, so a deleted/replaced evidence record still restores verbatim.
+ */
+function restoreEvidenceRef(
+  worldId: string,
+  edgeId: string,
+  raw: unknown,
+  fromNode: SpatialNode,
+  toNode: SpatialNode,
+): StoredEvidenceRef {
+  if (raw === null || typeof raw !== 'object') {
+    throw new Error(`edge "${edgeId}" binding reference must be an object`);
+  }
+  const evidenceId = (raw as { evidenceId?: unknown }).evidenceId;
+  if (typeof evidenceId !== 'string' || evidenceId.length === 0) {
+    throw new Error(`edge "${edgeId}" binding evidence id must be a non-empty string`);
+  }
+  const snapshot = (raw as { snapshot?: unknown }).snapshot;
+  // `snapshotEvidence` re-validates structure and world scope and returns a clone.
+  const validated = snapshotEvidence(worldId, snapshot as TraversalEvidence);
+  if (validated.dim !== fromNode.dim) {
+    throw new Error(`edge "${edgeId}" binding "${evidenceId}" dim does not match endpoint dim`);
+  }
+  if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
+    throw new Error(`edge "${edgeId}" endpoints must be exact locations`);
+  }
+  if (!pointsEqual(validated.from, fromNode.location.pos) || !pointsEqual(validated.to, toNode.location.pos)) {
+    throw new Error(`edge "${edgeId}" binding "${evidenceId}" endpoints do not match edge from→to`);
+  }
+  return { evidenceId, snapshot: validated };
+}
+
+const BYTES_PER_POINT = 48;
+const BYTES_PER_REF = 96;
+
+function estimateNodeBytes(n: SpatialNode): number {
+  let bytes = 48;
+  bytes += n.id.length + n.worldId.length + n.dim.length + n.kind.length + n.source.length;
+  bytes += n.tag?.length ?? 0;
+  bytes += n.label?.length ?? 0;
+  bytes += n.location.kind === 'exact' ? BYTES_PER_POINT : BYTES_PER_POINT + 16;
+  return bytes;
+}
+
+function estimateEdgeBytes(e: StoredEdge): number {
+  let bytes = 64;
+  bytes += e.id.length + e.from.length + e.to.length + e.type.length + e.basis.length;
+  bytes += e.fragmentId?.length ?? 0;
+  bytes += e.source?.length ?? 0;
+  bytes += e.refs.length * BYTES_PER_REF;
+  for (const ref of e.refs) bytes += ref.evidenceId.length;
+  return bytes;
 }

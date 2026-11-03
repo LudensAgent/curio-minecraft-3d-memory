@@ -8,10 +8,16 @@
  */
 
 export const TABLE_NAMES = {
+  /** Format/schema metadata (single authority for the database schema version). */
+  schemaMeta: 'schema_meta',
+  /** Per-world checkpoint metadata (checkpoint id, world, captured revisions, order). */
+  checkpoints: 'checkpoints',
   /** Sparse section recent state + evidence: palette, bit-pack, bitmaps, per-cell metadata. */
   spatialSections: 'spatial_sections',
   /** Historical path geometry (delta-encoded polylines). */
   pathFragments: 'path_fragments',
+  /** Confirmed traversal evidence records (phase 5A; a separate table, not stored as evidence ids only). */
+  traversalEvidence: 'traversal_evidence',
   /** Place anchors and route connections. */
   spatialNodes: 'spatial_nodes',
   spatialEdges: 'spatial_edges',

@@ -10,6 +10,8 @@ export type {
 export { FragmentStore } from './fragment-store.js';
 export type {
   FragmentChanges,
+  FragmentCheckpointMeasure,
+  FragmentCheckpointSnapshot,
   FragmentPage,
   FragmentQuery,
   FragmentScope,
@@ -47,7 +49,11 @@ export type {
   SearchDiagnostic,
   SearchDisposition,
   SearchGapKind,
+  TopologyCheckpointMeasure,
+  TopologyCheckpointSnapshot,
   TopologyEdge,
+  TopologyEdgeSnapshot,
+  TopologyEvidenceRefSnapshot,
   TopologyHistorySource,
   TopologyQueryOptions,
   TopologyStoreOptions,
