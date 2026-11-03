@@ -36,6 +36,10 @@ export interface PathFragment {
  * A record is directional (`from` → `to`): confirming A→B never implies B→A,
  * and two distinct real traversals that happen to share coordinates are kept as
  * separate records — identity is the caller-supplied `id`, not the coordinates.
+ *
+ * Attribution (`executionId` / `actionId`) is optional and only records what the
+ * caller already knows; it is never inferred, and its absence is "unknown", not a
+ * license to back-fill a current execution or action.
  */
 export interface TraversalEvidence {
   /** Stable identity; re-delivering the same id is idempotent, a different id is a distinct traversal. */
@@ -53,4 +57,15 @@ export interface TraversalEvidence {
   observedAt: number | null;
   /** Caller-supplied provenance label (e.g. `"confirmed_walk"`); opaque to the library. */
   source: string;
+  /**
+   * Execution identity that actually performed this traversal (matches the
+   * execution layer's `executionId`). Absent = unknown — never inferred or
+   * back-filled from a current execution.
+   */
+  executionId?: string;
+  /**
+   * Host action id for a confirmed own-action effect (matches `Observation.actionId`).
+   * Absent = unknown — never inferred from temporal proximity.
+   */
+  actionId?: string;
 }

@@ -94,6 +94,8 @@ npx tsx examples/walk-route-execution.ts    # 运行 Fake 执行示例
 npx tsx examples/fragment-store-history.ts  # 运行 Fake 历史事实示例
 ```
 
+> `examples/fragment-store-history.ts` 以公开包名（`curio-minecraft-3d-memory`）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。
+
 > 持久化驱动（`better-sqlite3`）按设计 §9.2 在阶段 5 接入，本阶段 `storage/` 仅含接口与 schema 契约，未引入原生依赖。
 
 ## License

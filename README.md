@@ -94,6 +94,8 @@ npx tsx examples/walk-route-execution.ts    # run the Fake execution demo
 npx tsx examples/fragment-store-history.ts  # run the Fake historical-facts demo
 ```
 
+> `examples/fragment-store-history.ts` imports the built package by its public name (`curio-minecraft-3d-memory`) rather than the source path, so it exercises the package `exports` entry — run `npm run build` first.
+
 > The persistence driver (`better-sqlite3`) is wired in at phase 5 (design §9.2); `storage/` currently holds only the schema contract and worker interface, with no native dependency.
 
 ## License

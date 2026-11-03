@@ -9,17 +9,21 @@
  *   4. block the current map;
  *   5. history is still there while current traversability reports BLOCKED.
  *
- * Run with: `npx tsx examples/fragment-store-history.ts`
+ * This example imports the built package by its public name (not the source
+ * path), so it exercises the package `exports` entry. Build first, then run:
+ *
+ *   npm run build
+ *   npx tsx examples/fragment-store-history.ts
  */
 
-import { FragmentStore, VoxelMap, evaluateWalkStep } from '../src/index.js';
+import { FragmentStore, VoxelMap, evaluateWalkStep } from 'curio-minecraft-3d-memory';
 import type {
   CollisionShapeProvider,
   Observation,
   PathFragment,
   TraversalEvidence,
   Vec3Like,
-} from '../src/index.js';
+} from 'curio-minecraft-3d-memory';
 
 const SCOPE = { worldId: 'world', dim: 'overworld', sessionId: 's1' };
 

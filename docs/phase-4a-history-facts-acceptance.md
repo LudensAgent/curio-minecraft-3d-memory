@@ -32,8 +32,11 @@ deepestY / createdAt / lastUsedAt / uses` 及其含义。保存几何不证明�
 
 **B. 已确认经过证据（`TraversalEvidence`）** —— 由调用者显式提交哪些位置之间
 实际连续经过。字段：`id / fragmentId / from / to / worldId / dim / sessionId /
-observedAt / source`。方向性：A→B 不证明 B→A；同坐标的不同真实经过按 `id` 区分，
-不按坐标去重；`sessionId`/`observedAt` 可为 `null` 以显式表达缺失，不伪造时间。
+observedAt / source`，以及可选的执行/动作关联 `executionId` / `actionId`（匹配
+执行层的 `executionId` 与 `Observation.actionId`；缺省 = 未知，不补造归属）。
+方向性：A→B 不证明 B→A；同坐标的不同真实经过按 `id` 区分，不按坐标去重；
+`sessionId`/`observedAt` 可为 `null` 以显式表达缺失，不伪造时间；关联字段参与
+幂等比较与冲突判断。
 
 **C. 旧数据（`PathFragment.links` + `geometrySource: 'legacy'`）** —— 原样保留
 `{a,b}` 结构与已知历史含义；不为其补造 session / executionId / 观测时间 / 默认
@@ -67,10 +70,15 @@ observedAt / source`。方向性：A→B 不证明 B→A；同坐标的不同真
 
 ```text
 npm run typecheck  → 通过
-npm run build      → 通过（见下方构建产物验证）
-npm test           → 233 passed（含新增 27 项，基线 206 项全部保持通过）
-npx tsx examples/fragment-store-history.ts → 正常运行，输出 OPEN → BLOCKED 且历史仍在
+npm run build      → 通过
+npm test           → 240 passed（含新增 34 项 fragment-store 测试，基线 206 项全部保持通过）
+npx tsx examples/fragment-store-history.ts → 正常运行（以公开包名导入，需先 build）
+独立安装验证       → npm pack 后安装到全新目录，node 运行 + tsc 类型检查均通过
 ```
+
+示例 `examples/fragment-store-history.ts` 以公开包名 `curio-minecraft-3d-memory`
+导入（非源码路径），实际走包的 `exports` 入口；独立安装验证为：`npm pack` →
+全新消费者目录 `npm install <tgz>` → `node` 运行与 `tsc` 类型检查均通过。
 
 ## 已知限制与后续接缝
 

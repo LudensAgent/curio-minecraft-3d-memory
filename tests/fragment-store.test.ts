@@ -151,6 +151,17 @@ describe('FragmentStore — write semantics', () => {
     expect(store.fragments().total).toBe(1);
     expect(store.getFragment('bad')).toBeNull();
   });
+
+  it('update failure leaves the original record intact', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment({ deepestY: 12 }));
+    expect(() => store.updateFragment('frag-1', { polyline: [pt(0, 0, NaN)] })).toThrow();
+    expect(() => store.updateFragment('frag-1', { uses: -1 })).toThrow();
+    const got = store.getFragment('frag-1')!;
+    expect(got.deepestY).toBe(12);
+    expect(got.uses).toBe(1);
+    expect(got.polyline).toEqual([pt(0.5, 64, 0.5), pt(1.5, 64, 0.5)]);
+  });
 });
 
 describe('FragmentStore — traversal evidence', () => {
@@ -210,6 +221,67 @@ describe('FragmentStore — traversal evidence', () => {
     // A polyline with a large gap (simulating a disconnect / teleport) yields no evidence.
     store.saveFragment(fragment({ polyline: [pt(0, 64, 0), pt(1000, 64, 1000)] }));
     expect(store.traversals().total).toBe(0);
+  });
+
+  it('preserves execution/action association and treats a changed association as a conflict', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    expect(store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-1' })).status).toBe('inserted');
+    // Re-delivery with the same association is idempotent.
+    expect(store.addTraversal(evidence({ executionId: 'exec-1', actionId: 'act-1' })).status).toBe('unchanged');
+    // A different association for the same id is a conflict, not a silent merge.
+    expect(() => store.addTraversal(evidence({ executionId: 'exec-2' }))).toThrow(/different content/);
+    const got = store.traversals().items[0]!;
+    expect(got.executionId).toBe('exec-1');
+    expect(got.actionId).toBe('act-1');
+  });
+
+  it('keeps association absent when the caller does not provide it', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    store.addTraversal(evidence());
+    const got = store.traversals().items[0]!;
+    expect(got.executionId).toBeUndefined();
+    expect(got.actionId).toBeUndefined();
+  });
+
+  it('isolates evidence from mutation of the input and of returned snapshots', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment());
+    const e = evidence();
+    store.addTraversal(e);
+    e.from.x = 999;
+    e.to.z = 999;
+    const got = store.traversals().items[0]!;
+    expect(got.from).toEqual(pt(0.5, 64, 0.5));
+    expect(got.to).toEqual(pt(1.5, 64, 0.5));
+    got.from.x = -1;
+    got.to.z = -1;
+    expect(store.traversals().items[0]!.from).toEqual(pt(0.5, 64, 0.5));
+    expect(store.traversals().items[0]!.to).toEqual(pt(1.5, 64, 0.5));
+  });
+
+  it('paginates traversal evidence by id with filters, count, and cursor', () => {
+    const store = new FragmentStore('world');
+    store.saveFragment(fragment({ id: 'f1' }));
+    store.saveFragment(fragment({ id: 'f2', dim: 'nether' }));
+    store.addTraversal(evidence({ id: 'e-a', fragmentId: 'f1' }));
+    store.addTraversal(
+      evidence({ id: 'e-b', fragmentId: 'f1', from: pt(1.5, 64, 0.5), to: pt(2.5, 64, 0.5) }),
+    );
+    store.addTraversal(evidence({ id: 'e-c', fragmentId: 'f2', dim: 'nether' }));
+
+    expect(store.traversals().items.map((e) => e.id)).toEqual(['e-a', 'e-b', 'e-c']);
+    expect(store.traversals().total).toBe(3);
+    expect(store.traversals({ fragmentId: 'f1' }).items.map((e) => e.id)).toEqual(['e-a', 'e-b']);
+    expect(store.traversals({ dim: 'nether' }).items.map((e) => e.id)).toEqual(['e-c']);
+
+    const page1 = store.traversals({ limit: 2 });
+    expect(page1.items.map((e) => e.id)).toEqual(['e-a', 'e-b']);
+    expect(page1.nextAfter).toBe('e-b');
+    const page2 = store.traversals({ limit: 2, after: page1.nextAfter });
+    expect(page2.items.map((e) => e.id)).toEqual(['e-c']);
+    expect(page2.nextAfter).toBeUndefined();
   });
 });
 
@@ -322,6 +394,32 @@ describe('FragmentStore — capacity', () => {
     expect(() => store.addTraversal(evidence({ id: 'e2', from: pt(1.5, 64, 0.5), to: pt(2.5, 64, 0.5) }))).toThrow(
       /capacity/,
     );
+    expect(store.traversals().total).toBe(1);
+  });
+
+  it('re-delivering existing evidence at capacity stays idempotent, not a capacity error', () => {
+    const store = new FragmentStore('world', { maxTraversals: 1 });
+    store.saveFragment(fragment());
+    store.addTraversal(evidence({ id: 'e1' }));
+    expect(store.addTraversal(evidence({ id: 'e1' })).status).toBe('unchanged');
+    expect(store.traversals().total).toBe(1);
+  });
+
+  it('frees capacity when a fragment and its evidence are deleted', () => {
+    const store = new FragmentStore('world', { maxTraversals: 1 });
+    store.saveFragment(fragment({ id: 'f1' }));
+    store.saveFragment(fragment({ id: 'f2' }));
+    store.addTraversal(evidence({ id: 'e1', fragmentId: 'f1' }));
+    expect(() =>
+      store.addTraversal(evidence({ id: 'e2', fragmentId: 'f2', from: pt(1.5, 64, 0.5), to: pt(2.5, 64, 0.5) })),
+    ).toThrow(/capacity/);
+
+    store.forgetFragment('f1');
+    expect(store.traversals().total).toBe(0);
+    expect(
+      store.addTraversal(evidence({ id: 'e2', fragmentId: 'f2', from: pt(1.5, 64, 0.5), to: pt(2.5, 64, 0.5) }))
+        .status,
+    ).toBe('inserted');
     expect(store.traversals().total).toBe(1);
   });
 });

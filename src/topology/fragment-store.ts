@@ -350,6 +350,12 @@ function snapshotEvidence(worldId: string, e: TraversalEvidence): TraversalEvide
   if (typeof e.source !== 'string' || e.source.length === 0) {
     throw new Error(`traversal source must be a non-empty string`);
   }
+  if (e.executionId !== undefined && (typeof e.executionId !== 'string' || e.executionId.length === 0)) {
+    throw new Error(`traversal executionId must be a non-empty string when present`);
+  }
+  if (e.actionId !== undefined && (typeof e.actionId !== 'string' || e.actionId.length === 0)) {
+    throw new Error(`traversal actionId must be a non-empty string when present`);
+  }
   assertFinitePoint(e.from, 'traversal.from');
   assertFinitePoint(e.to, 'traversal.to');
   return cloneEvidence(e);
@@ -429,6 +435,8 @@ function evidencesEqual(a: TraversalEvidence, b: TraversalEvidence): boolean {
     a.sessionId === b.sessionId &&
     a.observedAt === b.observedAt &&
     a.source === b.source &&
+    a.executionId === b.executionId &&
+    a.actionId === b.actionId &&
     pointsEqual(a.from, b.from) &&
     pointsEqual(a.to, b.to)
   );
