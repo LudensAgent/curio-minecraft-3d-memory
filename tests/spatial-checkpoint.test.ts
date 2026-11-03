@@ -8,6 +8,7 @@ import { FragmentStore, TopologyStore, VoxelMap } from '../src/index.js';
 import type { CellView, Observation, PathFragment, VoxelCheckpointSnapshot } from '../src/index.js';
 import { openHistorySession, openSpatialSession, PersistenceError } from '../dist/storage/sqlite/index.js';
 import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from '../src/storage/sqlite/types.js';
+import * as distBytes from '../dist/bytes.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -564,22 +565,30 @@ describe('SQLite combined spatial persistence', () => {
       worldId: 'w'.repeat(1024 * 1024),
       snapshotLimits: { maxBytes: 1024 },
     });
-    // The cheap worldId lower-bound must reject *before* any store is measured or
-    // snapshotted: neither the per-record scan nor the deep copy should run.
+    // The cheap worldId `.length` bound must reject *before* the escaped UTF-8
+    // string scan and before any store is measured or snapshotted. The escaped-byte
+    // scan (`jsonEscapedByteLength`) is the full per-character pass; observing that
+    // it never runs pins the early stop to the cheap length check rather than to the
+    // later envelope check or the store measures.
+    const escapedSpy = vi.spyOn(distBytes, 'jsonEscapedByteLength');
     const measureSpies = [
       vi.spyOn(session.voxel, 'checkpointMeasure'),
+      vi.spyOn(session.voxel, 'checkpointDirtyMeasure'),
       vi.spyOn(session.history, 'checkpointMeasure'),
       vi.spyOn(session.topology, 'checkpointMeasure'),
     ];
     const snapshotSpies = [
       vi.spyOn(session.voxel, 'checkpointSnapshot'),
+      vi.spyOn(session.voxel, 'captureDirtySections'),
       vi.spyOn(session.history, 'checkpointSnapshot'),
       vi.spyOn(session.topology, 'checkpointSnapshot'),
     ];
 
     await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
 
+    expect(escapedSpy).not.toHaveBeenCalled();
     for (const spy of [...measureSpies, ...snapshotSpies]) expect(spy).not.toHaveBeenCalled();
+    escapedSpy.mockRestore();
     await session.close();
   });
 

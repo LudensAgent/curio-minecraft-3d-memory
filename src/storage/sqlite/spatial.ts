@@ -36,6 +36,7 @@ import type {
   SpatialCheckpointResult,
   SpatialPersistenceState,
   SpatialSession,
+  VoxelSaveMode,
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
@@ -101,6 +102,8 @@ class SpatialSessionImpl implements SpatialSession {
   private confirmedTopologyRevision = 0;
   private baselineCheckpointId: string | null = null;
   private voxelBaselineCheckpointId: string | null = null;
+  /** Whether a voxel save baseline exists (restored, or established this session). */
+  private voxelBaselineEstablished = false;
   private lastConfirmedCheckpointId: string | null = null;
   private lastError: PersistenceError | null = null;
   private unconfirmedCheckpointId: string | null = null;
@@ -167,6 +170,7 @@ class SpatialSessionImpl implements SpatialSession {
     }
     this.baselineCheckpointId = result.baselineCheckpointId;
     this.voxelBaselineCheckpointId = result.voxelBaselineCheckpointId;
+    this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
     this.confirmedFragmentRevision = this.history.revision;
     this.confirmedTopologyRevision = this.topology.revision;
     this.confirmedVoxelRevision = this.voxel.saveRevision;
@@ -208,21 +212,53 @@ class SpatialSessionImpl implements SpatialSession {
     const afterHistory = shared - historyMeasure.bytes;
     const topologyMeasure = this.topology.checkpointMeasure(Math.max(0, afterHistory));
     const afterTopology = afterHistory - topologyMeasure.bytes;
-    const voxelMeasure = this.voxel.checkpointMeasure(Math.max(0, afterTopology));
 
-    const totalBytes =
-      historyEnvelope +
-      voxelEnvelope +
-      interRecordCommas(
-        historyMeasure.fragments,
-        historyMeasure.traversals,
-        topologyMeasure.nodes,
-        topologyMeasure.edges,
-      ) +
-      Math.max(0, voxelMeasure.sections - 1) +
-      historyMeasure.bytes +
-      topologyMeasure.bytes +
-      voxelMeasure.bytes;
+    const historyCommas = interRecordCommas(
+      historyMeasure.fragments,
+      historyMeasure.traversals,
+      topologyMeasure.nodes,
+      topologyMeasure.edges,
+    );
+
+    // First save (no voxel baseline yet) replaces the whole set; once a baseline
+    // exists, only the pending sections are copied, encoded and written.
+    const voxelMode: VoxelSaveMode = this.voxelBaselineEstablished ? 'incremental' : 'full';
+
+    // Bounded pre-flight: full-set counts (cheap) + the batch actually being sent.
+    // `bytes` is the *batch* size — the worker still re-checks the post-increment
+    // full set against the same limits before commit.
+    let totalBytes: number;
+    let voxelSections: number;
+    let observedCells: number;
+    let paletteEntries: number;
+    if (voxelMode === 'full') {
+      const voxelMeasure = this.voxel.checkpointMeasure(Math.max(0, afterTopology));
+      totalBytes =
+        historyEnvelope +
+        voxelEnvelope +
+        historyCommas +
+        Math.max(0, voxelMeasure.sections - 1) +
+        historyMeasure.bytes +
+        topologyMeasure.bytes +
+        voxelMeasure.bytes;
+      voxelSections = voxelMeasure.sections;
+      observedCells = voxelMeasure.observedCells;
+      paletteEntries = voxelMeasure.paletteEntries;
+    } else {
+      const counts = this.voxel.checkpointCounts();
+      const dirtyMeasure = this.voxel.checkpointDirtyMeasure(Math.max(0, afterTopology));
+      totalBytes =
+        historyEnvelope +
+        voxelEnvelope +
+        historyCommas +
+        Math.max(0, dirtyMeasure.count - 1) +
+        historyMeasure.bytes +
+        topologyMeasure.bytes +
+        dirtyMeasure.bytes;
+      voxelSections = counts.sections;
+      observedCells = counts.observedCells;
+      paletteEntries = counts.paletteEntries;
+    }
 
     this.assertWithinLimits(
       historyMeasure.fragments,
@@ -234,9 +270,9 @@ class SpatialSessionImpl implements SpatialSession {
         entrancePoints: historyMeasure.entrancePoints,
         linkPairs: historyMeasure.linkPairs,
         edgeEvidenceRefs: topologyMeasure.edgeEvidenceRefs,
-        voxelSections: voxelMeasure.sections,
-        observedCells: voxelMeasure.observedCells,
-        paletteEntries: voxelMeasure.paletteEntries,
+        voxelSections,
+        observedCells,
+        paletteEntries,
         bytes: totalBytes,
       },
     );
@@ -250,7 +286,11 @@ class SpatialSessionImpl implements SpatialSession {
       nodes: topologySnapshot.nodes,
       edges: topologySnapshot.edges,
     };
-    const voxelSnapshot: VoxelCheckpointSnapshot = this.voxel.checkpointSnapshot();
+    // Deep copy only after the bounded pre-flight passed (before copy/postMessage).
+    const voxelSnapshot: VoxelCheckpointSnapshot =
+      voxelMode === 'full'
+        ? this.voxel.checkpointSnapshot()
+        : { worldId: this.worldId, sections: this.voxel.captureDirtySections() };
 
     const checkpointId = randomUUID();
     const promise = new Promise<SpatialCheckpointResult>((resolve, reject) => {
@@ -274,7 +314,7 @@ class SpatialSessionImpl implements SpatialSession {
         fragmentRevision,
         topologyRevision,
         snapshot,
-        hasVoxel: true,
+        voxelMode,
         voxelRevision,
         voxelSnapshot,
       } satisfies WorkerRequest);
@@ -483,6 +523,10 @@ class SpatialSessionImpl implements SpatialSession {
     } else if (entry.kind === 'checkpoint') {
       const okMsg = msg as WorkerResponse & { type: 'checkpoint_ok' };
       this.inFlight = null;
+      // Clear only pending sections captured at (or before) this revision; a
+      // section re-dirtied during the save keeps its newer pending entry.
+      this.voxel.confirmSections(entry.voxelRevision!);
+      this.voxelBaselineEstablished = true;
       this.confirmedVoxelRevision = entry.voxelRevision!;
       this.confirmedFragmentRevision = entry.fragmentRevision!;
       this.confirmedTopologyRevision = entry.topologyRevision!;

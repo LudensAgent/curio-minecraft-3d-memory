@@ -30,7 +30,13 @@ import {
   snapshotVoxelSection,
   voxelSectionLowerBound,
 } from './snapshot.js';
-import type { VoxelCheckpointMeasure, VoxelCheckpointSnapshot } from './snapshot.js';
+import type {
+  VoxelCheckpointCounts,
+  VoxelCheckpointMeasure,
+  VoxelCheckpointSnapshot,
+  VoxelDirtyMeasure,
+  VoxelSectionSnapshot,
+} from './snapshot.js';
 
 /** What one accepted update did to its cell. */
 export type CellChangeKind = 'inserted' | 'changed' | 'refreshed' | 'staled' | 'restored';
@@ -104,6 +110,14 @@ export class VoxelMap {
    * Not a time, observation number, or traversal count.
    */
   private saveRevisionCount = 0;
+  /**
+   * Sections changed since the last confirmed save, keyed by the live `Section`
+   * object with the `saveRevision` at which it was last changed. A section is
+   * pending whenever its recorded revision leads the last confirmed save. This is
+   * independent of `Section.revision`: a refresh-only update advances the save
+   * revision (and thus the pending entry) without advancing the section revision.
+   */
+  private readonly pendingSections = new Map<Section, number>();
 
   constructor(worldId: string, options: VoxelMapOptions = {}) {
     this.worldId = worldId;
@@ -175,7 +189,7 @@ export class VoxelMap {
     validateObservation(this.worldId, observation);
     const applied = this.applyValidated(observation);
     if (applied === null) return { sections: [] };
-    this.saveRevisionCount += 1;
+    this.recordSaveChange(applied.section);
     return {
       sections: [
         {
@@ -198,17 +212,15 @@ export class VoxelMap {
       validateObservation(this.worldId, observation);
     }
     const bySection = new Map<Section, SectionChange>();
-    let changed = 0;
     for (const observation of batch.observations) {
       const applied = this.applyValidated(observation);
       if (applied === null) continue;
-      changed += 1;
+      this.recordSaveChange(applied.section);
       addChange(bySection, applied.section, {
         pos: { x: applied.x, y: applied.y, z: applied.z },
         kind: applied.kind,
       });
     }
-    if (changed > 0) this.saveRevisionCount += changed;
     return { sections: [...bySection.values()] };
   }
 
@@ -285,6 +297,61 @@ export class VoxelMap {
     return { worldId: this.worldId, sections: out };
   }
 
+  /** Cheap full-map counts (no serialization), for the full-set capacity check. */
+  checkpointCounts(): VoxelCheckpointCounts {
+    let sections = 0;
+    let observedCells = 0;
+    let paletteEntries = 0;
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        sections += 1;
+        observedCells += section.evidence.size;
+        paletteEntries += section.palette.length;
+      }
+    }
+    return { sections, observedCells, paletteEntries };
+  }
+
+  /**
+   * Conservative escaped-byte estimate of only the pending (dirty) sections — the
+   * incremental batch — with a cheap lower-bound early stop. Never re-estimates or
+   * re-serializes the unchanged sections, so measuring a small increment does not
+   * scan the whole map.
+   */
+  checkpointDirtyMeasure(maxBytes = Number.POSITIVE_INFINITY): VoxelDirtyMeasure {
+    const pending = [...this.pendingSections.keys()];
+    let lowerBound = 0;
+    for (const section of pending) lowerBound += voxelSectionLowerBound(section);
+    if (lowerBound > maxBytes) return { count: pending.length, bytes: lowerBound };
+
+    let bytes = 0;
+    for (const section of pending) {
+      bytes += estimateVoxelSectionBytes(section);
+      if (bytes > maxBytes) break;
+    }
+    return { count: pending.length, bytes };
+  }
+
+  /**
+   * Deep-copied snapshots of only the pending sections, in first-dirty order. The
+   * caller owns the returned snapshots; mutating them never reaches the store.
+   */
+  captureDirtySections(): VoxelSectionSnapshot[] {
+    return [...this.pendingSections.keys()].map(snapshotVoxelSection);
+  }
+
+  /**
+   * Confirm that everything changed up to `capturedRevision` has been persisted.
+   * A section is cleared only when its latest change is at or before the captured
+   * revision; any section re-dirtied (or newly dirtied) after capture stays
+   * pending, so a late ACK never clears newer unsaved changes.
+   */
+  confirmSections(capturedRevision: number): void {
+    for (const [section, revision] of this.pendingSections) {
+      if (revision <= capturedRevision) this.pendingSections.delete(section);
+    }
+  }
+
   /**
    * Narrow, validated restore entry (phase 5B). Rebuilds the map from a previously
    * captured snapshot, re-marking saved `FRESH` evidence as `STALE`. It only
@@ -329,6 +396,9 @@ export class VoxelMap {
     for (const [dim, dimMap] of restored) this.sections.set(dim, dimMap);
     this.currentSessionId = null;
     this.staleBoundaries.clear();
+    // Restore establishes a clean baseline: nothing is pending, and the confirmed
+    // revision is the post-restore revision (set by the session initializer).
+    this.pendingSections.clear();
     // Restore is a baseline-establishing mutation (mirrors FragmentStore): only a
     // session initializer, which then sets the confirmed baseline to the
     // post-restore revision, treats it as clean.
@@ -360,7 +430,7 @@ export class VoxelMap {
       });
       section.revision += 1;
       setBit(section.stale, index, true);
-      this.saveRevisionCount += 1;
+      this.recordSaveChange(section);
       addChange(bySection, section, { pos, kind: 'staled' });
     }
   }
@@ -513,6 +583,17 @@ export class VoxelMap {
   /** Statistics-only last-observation time; never proof the whole section is fresh. */
   private touch(section: Section, observedAt: number): void {
     section.lastObservedAt = Math.max(section.lastObservedAt ?? Number.NEGATIVE_INFINITY, observedAt);
+  }
+
+  /**
+   * Bump the global save revision and record `section` as pending at the new
+   * revision. Called for every accepted update that changes a fact the next
+   * checkpoint would persist (including refresh-only updates). Rejected/idempotent
+   * input and read-only queries never reach here.
+   */
+  private recordSaveChange(section: Section): void {
+    this.saveRevisionCount += 1;
+    this.pendingSections.set(section, this.saveRevisionCount);
   }
 }
 

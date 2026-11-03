@@ -43,8 +43,10 @@ export type {
   SectionKey,
   StaleReason,
   VoxelCellSnapshot,
+  VoxelCheckpointCounts,
   VoxelCheckpointMeasure,
   VoxelCheckpointSnapshot,
+  VoxelDirtyMeasure,
   VoxelMapOptions,
   VoxelSectionSnapshot,
 } from './voxel/index.js';

@@ -233,7 +233,7 @@ class HistorySessionImpl implements HistorySession {
         fragmentRevision,
         topologyRevision,
         snapshot,
-        hasVoxel: false,
+        voxelMode: 'none',
         voxelRevision: 0,
         voxelSnapshot: { worldId: this.worldId, sections: [] },
       } satisfies WorkerRequest);

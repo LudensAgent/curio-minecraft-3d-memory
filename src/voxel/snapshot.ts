@@ -32,6 +32,21 @@ export interface VoxelCheckpointMeasure {
   bytes: number;
 }
 
+/** Cheap full-map counts (no serialization), for the full-set capacity check. */
+export interface VoxelCheckpointCounts {
+  sections: number;
+  observedCells: number;
+  paletteEntries: number;
+}
+
+/** Measured size of the pending (dirty) incremental batch. */
+export interface VoxelDirtyMeasure {
+  /** Number of pending sections. */
+  count: number;
+  /** Conservative escaped-byte estimate of the pending-section payloads. */
+  bytes: number;
+}
+
 /** Deep-copied evidence at one local cell index. */
 export interface VoxelCellSnapshot {
   index: number;

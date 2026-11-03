@@ -163,5 +163,7 @@ SQLite 原生模块。未进行真实 mineflayer/Curio 游戏验收。
 - **保留宿主配置对象的属性读取语义**：`openSpatialSession` 不再用对象展开复制 `voxelOptions`（对象展开只复制
   自有可枚举属性，会丢失类原型 getter），改为显式读取 `validityWindowMs` / `now` 再强制 `requireSession: true`。
   回归测试用类原型 getter 验证 `validUntil` 使用 `validityWindowMs=100`（而非默认 60000）且 `now=1500` 生效。
-- **加强早停测试断言**：世界 ID 早停测试补充 `vi.spyOn`，断言 `checkpointMeasure` / `checkpointSnapshot` 均未被
-  调用，锁定「未扫描字符串、未复制快照」的性能修复，而非仅断言最终报 `capacity`。
+- **加强早停测试断言**：世界 ID 早停测试补充 `vi.spyOn`，断言 `checkpointMeasure` / `checkpointDirtyMeasure` /
+  `checkpointSnapshot` / `captureDirtySections` 均未被调用，并 spy `jsonEscapedByteLength`（完整转义字符串
+  扫描）断言其未被调用，锁定「超大 worldId 在廉价长度检查处被拒绝、未进入完整字符串扫描、未复制快照」的性能
+  修复，而非仅断言最终报 `capacity`。已手动临时移除长度早停并确认该测试确实失败（测试对早停敏感）。

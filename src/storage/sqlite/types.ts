@@ -291,6 +291,17 @@ export interface SpatialSession {
 /** Which facts a worker session persists (history-only vs combined spatial). */
 export type WorkerSessionKind = 'history' | 'spatial';
 
+/**
+ * How a checkpoint persists voxel state.
+ *
+ * - `none`: history-only; the checkpoint never touches `spatial_sections`.
+ * - `full`: complete replacement — delete all of this world's sections, then insert
+ *   the full set. Used to establish the first voxel save baseline.
+ * - `incremental`: upsert only the included sections, leaving all others untouched.
+ *   An empty `sections` array means "no voxel change", never "clear the voxel data".
+ */
+export type VoxelSaveMode = 'none' | 'full' | 'incremental';
+
 /** Wire request messages sent from the session to the worker. */
 export type WorkerRequest =
   | {
@@ -309,9 +320,10 @@ export type WorkerRequest =
       fragmentRevision: number;
       topologyRevision: number;
       snapshot: HistorySnapshot;
-      /** Whether this checkpoint includes voxel state (even an empty set). */
-      hasVoxel: boolean;
+      /** How this checkpoint persists voxel state (history-only / full / incremental). */
+      voxelMode: VoxelSaveMode;
       voxelRevision: number;
+      /** The full set for `full`, the changed set for `incremental`; ignored for `none`. */
       voxelSnapshot: VoxelCheckpointSnapshot;
     }
   | { type: 'close'; requestId: number };

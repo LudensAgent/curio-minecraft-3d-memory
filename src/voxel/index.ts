@@ -13,8 +13,10 @@ export {
 export type { Section, SectionKey } from './section.js';
 export type {
   VoxelCellSnapshot,
+  VoxelCheckpointCounts,
   VoxelCheckpointMeasure,
   VoxelCheckpointSnapshot,
+  VoxelDirtyMeasure,
   VoxelSectionSnapshot,
 } from './snapshot.js';
 export { VoxelMap } from './voxel-map.js';

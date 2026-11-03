@@ -23,6 +23,7 @@
 - **有界历史锚点查询**（`topology/`，阶段 4D）：`TopologyStore.historicalAnchorCandidates` 查询从节点出发、沿证据解析的历史连接可达且满足筛选（source/tag/kind）的锚点，按 `bfs`/`highest`/`deepest` 排序限流，附带共享证明 —— 不声称当前可通行、不选择行动目标、不生成可执行路线。
 - **显式历史 checkpoint 持久化**（`storage/`，阶段 5A）：通过 `curio-minecraft-3d-memory/storage/sqlite` 子路径的 `openHistorySession`，用单个 SQLite Worker 持久化四类历史事实（`PathFragment`、`TraversalEvidence`、`SpatialNode` 及带原始绑定快照的拓扑边）。`checkpoint()` 是唯一显式保存触发点；`flush()`/`close()` 不隐式保存新内存变化。见 `docs/phase-5a-history-checkpoint-acceptance.md`。
 - **显式组合空间 checkpoint 持久化**（`storage/`，阶段 5B）：通过同一子路径的 `openSpatialSession`，用单个 SQLite Worker 与单个事务把最近观测地图（`VoxelMap`）与历史事实一起持久化。启动时恢复完整观测状态并统一转 `STALE`；新观测只刷新实际观察到的格。见 `docs/phase-5b-spatial-checkpoint-acceptance.md`。
+- **体素增量 checkpoint**（`storage/`，阶段 5C）：已有体素保存基线后，`checkpoint()` 只复制、编码并写入自上次确认保存以来事实发生变化的 Section，而不是整份替换。首次保存仍建立完整基线；空增量绝不清库；Worker 复核增量后的完整集合，使连续小增量无法累积出无法重新打开的数据库。见 `docs/phase-5c-voxel-incremental-checkpoint-acceptance.md`。
 
 内存层以**内存地图 + Fake 执行器**验证（见 `tests/walk-route-executor.test.ts` 与 `examples/walk-route-execution.ts`）；checkpoint 层以**真实 SQLite + 真实 Worker**验证（见 `tests/storage-checkpoint.test.ts`、`tests/spatial-checkpoint.test.ts`、`examples/history-checkpoint.ts` 与 `examples/spatial-checkpoint.ts`）。**尚未**接入真实 mineflayer/Curio 身体或寻路。
 
@@ -244,6 +245,8 @@ reopened.voxel.cellAt('overworld', x, y, z); // 已提交事实，统一转 STAL
   `STALE` —— 宿主命名新观测会话并重新观察以恢复新鲜度；重观察只刷新被观察的那一格。
 - **有界且原子**：一次 checkpoint 在单个事务内、在统一字节预算与有限体素上限（`maxVoxelSections`、
   `maxObservedCells`、`maxPaletteEntries`、`maxBytes`）下替换该世界的体素与历史；超限在复制前拒绝。
+- **基线后增量（5C）**：首次 `checkpoint()` 写完整体素集合；之后只复制、编码并写入发生变化的
+  Section（`voxelMode: 'incremental'`），未变化的 Section payload 保持字节级不变。历史本轮仍为完整快照。
 - **schema 升级**：v1 数据库升级到 v2（新增 `spatial_sections` 与体素 checkpoint 列），带一致备份与事务
   回滚；既有历史、ID、顺序与绑定被保留。历史入口 `openHistorySession` 的写入只替换历史，不触碰体素。
 - **生命周期**：`checkpoint()` 在 `busy`/`closing`/`closed` 时拒绝；`flush()` 只等待已接受的 checkpoint；
@@ -276,7 +279,8 @@ examples/
 ├── historical-topology-query.ts    # 可运行的 Fake 有界历史图查询示例
 ├── historical-anchor-query.ts      # 可运行的 Fake 有界历史锚点查询示例
 ├── history-checkpoint.ts           # 可运行的 SQLite 历史 checkpoint 生命周期示例
-└── spatial-checkpoint.ts           # 可运行的组合空间 checkpoint 生命周期示例
+├── spatial-checkpoint.ts           # 可运行的组合空间 checkpoint 生命周期示例
+└── spatial-checkpoint-incremental.ts # 可运行的体素增量 checkpoint 示例
 ```
 
 ## 开发
@@ -293,6 +297,7 @@ npx tsx examples/historical-topology-query.ts # 运行 Fake 有界历史图查�
 npx tsx examples/historical-anchor-query.ts   # 运行 Fake 有界历史锚点查询示例
 npx tsx examples/history-checkpoint.ts        # 运行 SQLite checkpoint 生命周期示例
 npx tsx examples/spatial-checkpoint.ts        # 运行组合空间 checkpoint 生命周期示例
+npx tsx examples/spatial-checkpoint-incremental.ts # 运行体素增量 checkpoint 示例
 ```
 
 > `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts`、`examples/historical-anchor-query.ts` 与 `examples/history-checkpoint.ts` 以公开包名（`curio-minecraft-3d-memory`，其中 `history-checkpoint.ts` 使用 `curio-minecraft-3d-memory/storage/sqlite` 子路径）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。

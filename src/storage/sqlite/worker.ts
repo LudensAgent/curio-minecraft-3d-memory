@@ -16,6 +16,7 @@ import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from './types.js';
 import type {
   HistorySnapshot,
   ResolvedSnapshotLimits,
+  VoxelSaveMode,
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
@@ -432,7 +433,8 @@ function writeCheckpoint(
   fragmentRevision: number,
   topologyRevision: number,
   prepared: PreparedSnapshot,
-  voxel: { hasVoxel: boolean; voxelRevision: number; sections: { id: string; payload: string }[] },
+  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: { id: string; payload: string }[] },
+  resolved: ResolvedSnapshotLimits,
 ): void {
   const tx = connection.transaction(() => {
     const nextSeqRow = connection
@@ -463,14 +465,24 @@ function writeCheckpoint(
     prepared.nodes.forEach((n, i) => insertNode.run(wId, i, n.id, n.payload));
     prepared.edges.forEach((e, i) => insertEdge.run(wId, i, e.id, e.payload));
 
-    // A history-only checkpoint never touches spatial_sections, so an existing
-    // voxel baseline survives; a combined checkpoint replaces it entirely.
-    if (voxel.hasVoxel) {
+    // `none` never touches spatial_sections, so an existing voxel baseline
+    // survives. `full` replaces the whole set (first save baseline). `incremental`
+    // upserts only the included sections — a missing key is never a deletion.
+    if (voxel.mode === 'full') {
       connection.prepare('DELETE FROM spatial_sections WHERE world_id = ?').run(wId);
       const insertSection = connection.prepare(
         'INSERT INTO spatial_sections (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
       );
       voxel.sections.forEach((s, i) => insertSection.run(wId, i, s.id, s.payload));
+    } else if (voxel.mode === 'incremental') {
+      const upsertSection = connection.prepare(
+        'INSERT INTO spatial_sections (world_id, seq, id, payload) VALUES (?, ?, ?, ?) ' +
+          'ON CONFLICT(world_id, id) DO UPDATE SET seq = excluded.seq, payload = excluded.payload',
+      );
+      voxel.sections.forEach((s, i) => upsertSection.run(wId, i, s.id, s.payload));
+      // The resulting full set must still re-open under the same limits: reject
+      // (and roll back) before commit if the increments accumulate past capacity.
+      assertVoxelFullSetWithinLimits(connection, wId, prepared.bytes, resolved);
     }
 
     connection
@@ -482,12 +494,39 @@ function writeCheckpoint(
         wId,
         fragmentRevision,
         topologyRevision,
-        voxel.hasVoxel ? voxel.voxelRevision : 0,
-        voxel.hasVoxel ? 1 : 0,
+        voxel.mode === 'none' ? 0 : voxel.voxelRevision,
+        voxel.mode === 'none' ? 0 : 1,
         nextSeq,
       );
   });
   tx();
+}
+
+/**
+ * Verify the *post-increment* full voxel set still fits within the same limits a
+ * fresh open would enforce, so a sequence of small increments can never build a
+ * database that fails to re-open. Runs inside the checkpoint transaction; a throw
+ * rolls back history + voxel + metadata together.
+ */
+function assertVoxelFullSetWithinLimits(
+  connection: Database.Database,
+  wId: string,
+  historyBytes: number,
+  resolved: ResolvedSnapshotLimits,
+): void {
+  const sections = countRows(connection, 'spatial_sections', wId);
+  if (sections > resolved.maxVoxelSections) {
+    throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
+  }
+  const voxelBytes =
+    sumPayloadBytes(connection, 'spatial_sections', wId) +
+    VOXEL_FRAME_BYTES +
+    Buffer.byteLength(JSON.stringify(wId), 'utf8') +
+    Math.max(0, sections - 1);
+  const total = historyBytes + voxelBytes;
+  if (total > resolved.maxBytes) {
+    throw new Error(`snapshot exceeds maxBytes (${total})`);
+  }
 }
 
 function countRows(connection: Database.Database, table: string, wId: string): number {
@@ -762,7 +801,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   try {
     prepared = prepareSnapshot(msg.snapshot);
     assertWithinLimits(prepared, limits);
-    if (msg.hasVoxel) {
+    if (msg.voxelMode !== 'none') {
       if (msg.voxelSnapshot.worldId !== worldId) {
         throw new Error('voxel snapshot worldId does not match session worldId');
       }
@@ -786,12 +825,15 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   }
   try {
     writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, prepared, {
-      hasVoxel: msg.hasVoxel,
+      mode: msg.voxelMode,
       voxelRevision: msg.voxelRevision,
       sections: preparedVoxel?.sections ?? [],
-    });
+    }, limits);
   } catch (err) {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'sql', message: (err as Error).message });
+    // Capacity rejections raised inside the transaction (the post-increment full-set
+    // check) roll the whole batch back and must read as `capacity`, not a SQL fault.
+    const message = (err as Error).message;
+    respond({ type: 'error', requestId: msg.requestId, kind: /exceeds/.test(message) ? 'capacity' : 'sql', message });
     return;
   }
   respond({ type: 'checkpoint_ok', requestId: msg.requestId, checkpointId: msg.checkpointId });
