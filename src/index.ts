@@ -179,6 +179,7 @@ export type {
 } from './adapter/index.js';
 
 // Navigation
+export { WalkRouteSearch } from './navigation/index.js';
 export type {
   ActionRecord,
   ArrivalSpec,
@@ -189,6 +190,20 @@ export type {
   NavOutcome,
   NavProblem,
   NavResult,
+  WalkSearchArrival,
+  WalkSearchCandidate,
+  WalkSearchCounters,
+  WalkSearchDiagnostic,
+  WalkSearchFrontier,
+  WalkSearchLimits,
+  WalkSearchOptions,
+  WalkSearchProblem,
+  WalkSearchRequest,
+  WalkSearchSnapshot,
+  WalkSearchState,
+  WalkSearchUnavailableEvidence,
+  WalkSearchUnavailableResidency,
+  WalkSearchUnavailableSection,
 } from './navigation/index.js';
 
 // Execution — controlled walk-route execution loop (design §7 first step, phase 3)
