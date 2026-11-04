@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { RouteVerifier, VoxelMap, WalkRouteSearch } from '../src/index.js';
 import type {
+  CollisionShapeProvider,
   SectionKey,
   WalkSearchRequest,
   WalkSearchSnapshot,
@@ -171,9 +172,29 @@ describe('WalkRouteSearch — arrival semantics', () => {
       distanceToTarget: 0,
       validUntil: Number.POSITIVE_INFINITY,
     });
+    expect(result.candidate!.points).toHaveLength(1); // too short for RouteVerifier
     expect(result.reason).toMatch(/zero-edge candidate/);
     expect(result.reason).toMatch(/not ARRIVED/);
     expect(result.counters.edgesEvaluated).toBe(0);
+  });
+
+  it('preserves a zero-edge geometric candidate across evidence expiry (no evidence was used)', () => {
+    let clock = 2000;
+    const map = new VoxelMap('world', { now: () => clock });
+    const search = new WalkRouteSearch(map, { now: () => clock });
+    const started = search.start(
+      request({
+        body: bodyAt(0.5, 0, 0.5),
+        target: { x: 0.5, y: 0, z: 0.5 },
+      }),
+    );
+    expect(started.state).toBe('FOUND');
+
+    clock = 10_000_000;
+    const again = search.status();
+    expect(again?.state).toBe('FOUND');
+    expect(again?.candidate!.edgeCount).toBe(0);
+    expect(again?.candidate!.validUntil).toBe(Number.POSITIVE_INFINITY);
   });
 
   it('checks near completion with full XYZ distance at each reached stance', () => {
@@ -272,7 +293,22 @@ describe('WalkRouteSearch — arrival semantics', () => {
 });
 
 describe('WalkRouteSearch — unknown, stale and unsupported evidence', () => {
-  it('distinguishes never-observed frontier evidence from blocked terrain', () => {
+  it('reports no frontier from an empty map: the caller-given start is not proof', () => {
+    const map = new VoxelMap('world');
+
+    const search = new WalkRouteSearch(map, { now: () => 2000 });
+    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    const result = search.advance(8);
+
+    expect(result.state).toBe('INSUFFICIENT_EVIDENCE');
+    expect(result.counters.edgesUnknown).toBe(4);
+    expect(result.frontiers).toEqual([]);
+    expect(result.frontiers.some((frontier) => frontier.reachability === 'OPEN')).toBe(false);
+    expect(result.unavailableHistorical).toEqual([]);
+    expect(result.diagnostics.every((d) => d.status === 'UNKNOWN')).toBe(true);
+  });
+
+  it('does not turn a few center-cell observations into OPEN frontier proof', () => {
     const map = new VoxelMap('world');
     floorCells(map, [0], [0]);
 
@@ -288,9 +324,72 @@ describe('WalkRouteSearch — unknown, stale and unsupported evidence', () => {
       unsupportedEdges: 0,
     });
     expect(result.counters.edgesUnknown).toBe(4);
-    expect(result.frontiers).toHaveLength(4);
+    expect(result.frontiers).toEqual([]);
+    expect(result.counters.frontiersReported).toBe(0);
     expect(result.unavailableHistorical).toEqual([]);
     expect(result.diagnostics.every((d) => d.status === 'UNKNOWN')).toBe(true);
+  });
+
+  it('reports a frontier only for a stance an OPEN evaluator step proved reachable', () => {
+    const map = new VoxelMap('world');
+    floorCells(map, [0, 1], [0]);
+
+    const search = new WalkRouteSearch(map, { now: () => 2000 });
+    search.start(request({ target: { x: 3.5, y: 0, z: 0.5 } }));
+    const result = drain(search);
+
+    expect(result.state).toBe('INSUFFICIENT_EVIDENCE');
+    expect(result.frontiers.length).toBeGreaterThan(0);
+    // x=1.5 was reached through the OPEN +X step; it has a genuine frontier.
+    const validated = result.frontiers.filter(
+      (frontier) => frontier.stance.x === 1.5 && frontier.stance.z === 0.5,
+    );
+    expect(validated.length).toBeGreaterThan(0);
+    for (const frontier of validated) {
+      expect(frontier.reachability).toBe('OPEN');
+      expect(frontier.basis.length).toBeGreaterThan(0);
+    }
+    for (const frontier of result.frontiers) {
+      expect(frontier.to).not.toEqual(frontier.stance);
+    }
+    expect(result.counters.frontiersReported).toBe(result.frontiers.length);
+  });
+
+  it('keeps a fully observed but state-incomplete required cell as a diagnostic, not a frontier', () => {
+    const map = new VoxelMap('world');
+    floorCells(map, [0], [0]);
+    // A genuinely OPEN +Z step so the start stance is evaluator-validated.
+    fill(map, STONE, [[0, -1, 1]]);
+    fill(map, AIR, [[0, 0, 1], [0, 1, 1]]);
+    // +X: every required cell is observed; the feet cell is just incomplete.
+    fill(map, STONE, [[1, -1, 0]]);
+    fill(map, AIR, [[1, 1, 0]]);
+    map.observe(obs(AIR, { x: 1, y: 0, z: 0 }, { stateComplete: false }));
+    // Other sides are fully observed stone walls.
+    fill(map, STONE, [[-1, 0, 0], [-1, 1, 0], [0, 0, -1], [0, 1, -1]]);
+
+    const search = new WalkRouteSearch(map, { now: () => 2000 });
+    search.start(request({ target: { x: 0.5, y: 0, z: 3.5 } }));
+    const result = drain(search);
+
+    expect(result.state).toBe('INSUFFICIENT_EVIDENCE');
+    // The validated stance still produces real frontiers in other directions.
+    expect(result.frontiers.length).toBeGreaterThan(0);
+    const incompleteEdge = result.diagnostics.find(
+      (d) =>
+        d.status === 'UNKNOWN' &&
+        d.to.x === 1.5 &&
+        d.to.z === 0.5 &&
+        d.problem?.cells.some((cell) => cell.x === 1 && cell.y === 0 && cell.z === 0),
+    );
+    expect(incompleteEdge).toBeDefined();
+    expect(
+      result.frontiers.some(
+        (frontier) =>
+          (frontier.to.x === 1.5 && frontier.to.z === 0.5) ||
+          frontier.gap.some((cell) => cell.x === 1 && cell.y === 0 && cell.z === 0),
+      ),
+    ).toBe(false);
   });
 
   it('reports stale evidence separately and never as a new frontier', () => {
@@ -333,17 +432,19 @@ describe('WalkRouteSearch — unknown, stale and unsupported evidence', () => {
 
   it('carries a reachable stance, an unentered gap, observed basis and validity for a frontier', () => {
     const map = new VoxelMap('world');
-    floorCells(map, [0], [0]);
+    floorCells(map, [0, 1], [0]);
 
     const search = new WalkRouteSearch(map, { now: () => 2000 });
-    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    search.start(request({ target: { x: 3.5, y: 0, z: 0.5 } }));
     const result = drain(search);
 
     expect(result.candidate).toBeNull();
     expect(result.frontiers.length).toBeGreaterThan(0);
     for (const frontier of result.frontiers) {
       expect(frontier.reachability).toBe('OPEN'); // the stance only
-      expect(frontier.stance).toEqual({ x: 0.5, y: 0, z: 0.5 });
+      expect([0.5, 1.5]).toContain(frontier.stance.x); // both are OPEN-validated stances
+      expect(frontier.stance.y).toBe(0);
+      expect(frontier.stance.z).toBe(0.5);
       expect(frontier.to).not.toEqual(frontier.stance); // the gap itself is not claimed reachable
       expect(frontier.gap.length).toBeGreaterThan(0);
       expect(frontier.basis.length).toBeGreaterThan(0); // observed stance cells
@@ -358,15 +459,15 @@ describe('WalkRouteSearch — unknown, stale and unsupported evidence', () => {
 
   it('bounds frontier and diagnostic output without continuing work past the caps', () => {
     const map = new VoxelMap('world');
-    floorCells(map, [0], [0]);
+    floorCells(map, [0, 1], [0]);
 
     const search = new WalkRouteSearch(map, { now: () => 2000, maxFrontiers: 1, maxDiagnostics: 2 });
-    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    search.start(request({ target: { x: 3.5, y: 0, z: 0.5 } }));
     const result = drain(search);
 
     expect(result.state).toBe('INSUFFICIENT_EVIDENCE');
     expect(result.frontiers).toHaveLength(1);
-    expect(result.counters.frontierCandidates).toBe(4);
+    expect(result.counters.frontierCandidates).toBe(6);
     expect(result.counters.frontiersReported).toBe(1);
     expect(result.counters.frontierLimitReached).toBe(true);
     expect(result.diagnostics).toHaveLength(2);
@@ -643,6 +744,155 @@ describe('WalkRouteSearch — evidence invalidation and expiry', () => {
     expect(invalidated?.state).toBe('INVALIDATED');
     expect(invalidated?.reason).toMatch(/rule version/);
   });
+
+  it('expires a terminal NO_VERIFIED_PATH when the blocked evidence it used is stale', () => {
+    let clock = 1500;
+    const map = new VoxelMap('world', { validityWindowMs: 1000, now: () => clock });
+    floorCells(map, [0], [0]);
+    fill(map, STONE, [
+      [1, 0, 0],
+      [1, 1, 0],
+      [-1, 0, 0],
+      [-1, 1, 0],
+      [0, 0, 1],
+      [0, 1, 1],
+      [0, 0, -1],
+      [0, 1, -1],
+    ]);
+
+    const search = new WalkRouteSearch(map, { now: () => clock });
+    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    const result = drain(search);
+
+    expect(result.state).toBe('NO_VERIFIED_PATH');
+    expect(result.validUntil).toBe(2000); // the BLOCKED proof, not Infinity
+
+    clock = 3000;
+    const expired = search.advance(1);
+    expect(expired.state).toBe('INVALIDATED');
+    expect(expired.problem).toMatchObject({ kind: 'invalidated' });
+    expect(expired.candidate).toBeNull();
+    // No automatic retry: no new edges were evaluated.
+    expect(expired.counters.edgesEvaluated).toBe(result.counters.edgesEvaluated);
+  });
+
+  it('invalidates a terminal negative result when the rule version changes', () => {
+    const map = new VoxelMap('world');
+    floorCells(map, [0], [0]);
+    fill(map, STONE, [
+      [1, 0, 0],
+      [1, 1, 0],
+      [-1, 0, 0],
+      [-1, 1, 0],
+      [0, 0, 1],
+      [0, 1, 1],
+      [0, 0, -1],
+      [0, 1, -1],
+    ]);
+    const provider = { ...fakeProvider };
+
+    const search = new WalkRouteSearch(map, { now: () => 2000 });
+    search.start(
+      request({ target: { x: 1.5, y: 0, z: 0.5 }, shapeProvider: provider }),
+    );
+    expect(drain(search).state).toBe('NO_VERIFIED_PATH');
+
+    provider.version = 'fake-2';
+    const invalidated = search.status();
+    expect(invalidated?.state).toBe('INVALIDATED');
+    expect(invalidated?.reason).toMatch(/rule version/);
+  });
+
+  it('invalidates a terminal negative result when a dependency section changes residency', () => {
+    const map = new VoxelMap('world', { manualResidency: true, now: () => 2000 });
+    floorCells(map, [0], [0]);
+    fill(map, STONE, [
+      [1, 0, 0],
+      [1, 1, 0],
+      [-1, 0, 0],
+      [-1, 1, 0],
+      [0, 0, 1],
+      [0, 1, 1],
+      [0, 0, -1],
+      [0, 1, -1],
+    ]);
+    map.commitDirectory('full', map.captureDirtySections(), []);
+    map.confirmSections(map.saveRevision);
+
+    const search = new WalkRouteSearch(map, { now: () => 2000 });
+    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    expect(drain(search).state).toBe('NO_VERIFIED_PATH');
+
+    const unloaded = map.unloadSections([sectionKey(0, 0), sectionKey(0, -1)]);
+    expect(unloaded.unloaded).toHaveLength(2);
+
+    const invalidated = search.status();
+    expect(invalidated?.state).toBe('INVALIDATED');
+    expect(invalidated?.problem).toMatchObject({ kind: 'invalidated' });
+    expect(invalidated?.reason).toMatch(/residency/);
+  });
+
+  it('invalidates an expired-derived search when the same cells are refreshed (refresh-only report)', () => {
+    const map = new VoxelMap('world', { validityWindowMs: 1000 });
+    floorCells(map, [0, 1], [0]);
+
+    const search = new WalkRouteSearch(map, { now: () => 3000 });
+    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    const exhausted = drain(search);
+
+    expect(exhausted.state).toBe('INSUFFICIENT_EVIDENCE');
+    expect(exhausted.counters.edgesStale).toBeGreaterThan(0);
+
+    // Reobserve exactly the same floor/air content, now with a fresh timestamp.
+    const reports = [];
+    for (const x of [0, 1]) {
+      reports.push(
+        map.observe(obs(STONE, { x, y: -1, z: 0 }, { observedAt: 3000, sequence: 2 })),
+      );
+      reports.push(
+        map.observe(obs(AIR, { x, y: 0, z: 0 }, { observedAt: 3000, sequence: 2 })),
+      );
+      reports.push(
+        map.observe(obs(AIR, { x, y: 1, z: 0 }, { observedAt: 3000, sequence: 2 })),
+      );
+    }
+    const refreshSections = reports.flatMap((report) => report.sections);
+    expect(refreshSections.length).toBeGreaterThan(0);
+    expect(refreshSections.every((section) => !section.invalidated)).toBe(true);
+
+    for (const report of reports) search.invalidate(report);
+    const after = search.status();
+    expect(after?.state).toBe('INVALIDATED');
+    expect(after?.problem).toMatchObject({ kind: 'invalidated' });
+    expect(after?.reason).toMatch(/refreshed/);
+    expect(after?.candidate).toBeNull();
+
+    // No automatic search/retry: the caller must issue a new start request.
+    const retry = search.advance(10);
+    expect(retry.state).toBe('INVALIDATED');
+    expect(retry.counters.edgesEvaluated).toBe(exhausted.counters.edgesEvaluated);
+  });
+
+  it('keeps a FOUND candidate across a safe ordinary OPEN-only refresh', () => {
+    const map = new VoxelMap('world');
+    floorCells(map, [0, 1], [0]);
+
+    const search = new WalkRouteSearch(map, { now: () => 2000 });
+    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    const found = drain(search);
+    expect(found.state).toBe('FOUND');
+    expect(found.candidate).not.toBeNull();
+
+    const report = map.observe(
+      obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 1500, sequence: 2 }),
+    );
+    expect(report.sections.every((section) => !section.invalidated)).toBe(true);
+    search.invalidate(report);
+
+    const after = search.status();
+    expect(after?.state).toBe('FOUND');
+    expect(after?.candidate).not.toBeNull();
+  });
 });
 
 describe('WalkRouteSearch — read-only and snapshot isolation', () => {
@@ -663,6 +913,36 @@ describe('WalkRouteSearch — read-only and snapshot isolation', () => {
     expect(map.sectionAt('overworld', 0, 0, 0)).toEqual(sectionBefore);
     expect(map.cellAt('overworld', 0, 0, 0)).toEqual(cellBefore);
     expect(map.cellAt('overworld', 50, 0, 50)).toEqual({ observed: false });
+  });
+
+  it('rechecks the clock before publishing so a slice cannot outlive the evidence it used', () => {
+    let clock = 1500;
+    const map = new VoxelMap('world', { validityWindowMs: 1000, now: () => clock });
+    floorCells(map, [0, 1], [0]);
+    const revisionBefore = map.saveRevision;
+    const cellBefore = map.cellAt('overworld', 0, 0, 0);
+
+    // The injected provider advances the shared clock while the evaluator is
+    // still using the slice's entry time. Map evidence stays pure.
+    const provider: CollisionShapeProvider = {
+      version: 'fake-1',
+      resolve(state, cell, read) {
+        clock = 3000;
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+
+    const search = new WalkRouteSearch(map, { now: () => clock });
+    search.start(
+      request({ target: { x: 1.5, y: 0, z: 0.5 }, shapeProvider: provider }),
+    );
+    const result = search.advance(1);
+
+    expect(result.state).toBe('INVALIDATED');
+    expect(result.candidate).toBeNull();
+    expect(result.problem).toMatchObject({ kind: 'invalidated' });
+    expect(map.saveRevision).toBe(revisionBefore);
+    expect(map.cellAt('overworld', 0, 0, 0)).toEqual(cellBefore);
   });
 
   it('snapshots the request and never aliases returned snapshots', () => {
@@ -705,10 +985,10 @@ describe('WalkRouteSearch — read-only and snapshot isolation', () => {
 
   it('snapshots frontier basis, gap and diagnostic problem cells', () => {
     const map = new VoxelMap('world');
-    floorCells(map, [0], [0]);
+    floorCells(map, [0, 1], [0]);
 
     const search = new WalkRouteSearch(map, { now: () => 2000 });
-    search.start(request({ target: { x: 1.5, y: 0, z: 0.5 } }));
+    search.start(request({ target: { x: 3.5, y: 0, z: 0.5 } }));
     const result = drain(search);
     expect(result.frontiers.length).toBeGreaterThan(0);
     const originalGapX = result.frontiers[0]!.gap[0]!.x;

@@ -25,10 +25,20 @@
  *
  * Evidence invalidation is explicit. The caller feeds each `ChangeReport` from
  * `VoxelMap.observe`/`observeBatch`/`beginSession`/`markStale` to `invalidate`,
- * and section residency changes to `invalidateSections`. A relevant change, an
- * expired evidence window, a shape-rule version change, or a residency change
- * moves the search to `INVALIDATED`; it is never resumed on a mix of old and new
- * evidence. There is no automatic retry. Unrelated section changes are ignored.
+ * and section residency changes to `invalidateSections`. A relevant change, a
+ * refresh-only report that extends evidence a STALE/UNSUPPORTED conclusion
+ * depended on, an expired evidence window, a shape-rule version change, or a
+ * residency change moves the search to `INVALIDATED`; it is never resumed on a
+ * mix of old and new evidence. There is no automatic retry. Unrelated section
+ * changes and refresh-only reports that only touch currently OPEN/BLOCKED/UNKNOWN
+ * evidence are ignored.
+ *
+ * A frontier is only reported for a stance the evaluator actually proved
+ * reachable with an `OPEN` step (its swept collision and support checks cover
+ * both stances). The caller-given start coordinate alone is not observation
+ * proof: an empty map, or a start surrounded by unobserved cells, yields no
+ * frontiers even though the boundary edges are UNKNOWN. Unknown gaps caused by
+ * observed-but-state-incomplete evidence are diagnostics, not new frontiers.
  */
 
 import type { CellEvidence, Observation } from '../observation/types.js';
@@ -116,10 +126,13 @@ export interface WalkSearchUnavailableSection {
 }
 
 /**
- * A never-observed gap adjacent to a currently OPEN-reachable stance. The
+ * A never-observed gap adjacent to a stance the evaluator proved reachable with
+ * an `OPEN` step. The caller-given start coordinate alone is not proof, so a
+ * stance with no `OPEN` evaluation behind it never yields a frontier. The
  * reachable side is `stance`; `to` and `gap` are not claimed reachable and were
  * not entered. `basis` contains the locally observed stance cells
- * (feet/head/support) that make the boundary interpretable.
+ * (feet/head/support) that make the boundary interpretable; it is a local
+ * summary, not by itself proof of arbitrary body clearance or support.
  */
 export interface WalkSearchFrontier {
   stance: Vec3Like;
@@ -159,6 +172,11 @@ export interface WalkSearchDiagnostic {
   computedAt: number;
 }
 
+/** Internal frontier record carrying the stance node whose validation gates reporting. */
+interface StoredFrontier extends WalkSearchFrontier {
+  stanceKey: string;
+}
+
 export interface WalkSearchCounters {
   nodesReached: number;
   nodesExpanded: number;
@@ -170,7 +188,9 @@ export interface WalkSearchCounters {
   edgesUnsupported: number;
   /** Edges skipped because the neighbour was already reached (no duplicate work). */
   edgesSkippedReached: number;
+  /** Never-observed boundary candidates classified during expansion (before validation gating). */
   frontierCandidates: number;
+  /** Candidates whose stance an OPEN evaluation actually validated. */
   frontiersReported: number;
   frontierLimitReached: boolean;
   unavailableHistoricalCandidates: number;
@@ -226,7 +246,12 @@ export interface WalkSearchSnapshot {
   reason: string;
   problem?: WalkSearchProblem;
   computedAt: number;
-  /** Candidate path validity when FOUND; otherwise the accumulated search-evidence window. */
+  /**
+   * Candidate path validity when FOUND; otherwise the earliest `validUntil` over
+   * every evaluation the conclusion used (OPEN, BLOCKED, UNKNOWN, STALE or
+   * UNSUPPORTED). Infinity for a zero-edge geometric candidate, which used no
+   * evaluator evidence.
+   */
   validUntil: number;
   cancellation?: { reason: string };
 }
@@ -288,11 +313,15 @@ interface ActiveSearch {
   problem: WalkSearchProblem | undefined;
   candidate: WalkSearchCandidate | null;
   /** Keyed by the adjacent neighbour lattice key. */
-  frontiers: Map<string, WalkSearchFrontier>;
+  frontiers: Map<string, StoredFrontier>;
   unavailable: Map<string, WalkSearchUnavailableEvidence>;
   diagnostics: WalkSearchDiagnostic[];
+  /** Lattice keys whose stance an `OPEN` evaluation actually proved reachable. */
+  validatedNodes: Set<string>;
   dependencySections: Set<string>;
   dependencyResidency: Map<string, { key: SectionKey; generation: number }>;
+  /** Sections whose evidence produced a STALE/UNSUPPORTED conclusion a refresh can recover. */
+  recoverableSections: Set<string>;
   nodesExpanded: number;
   edgesEvaluated: number;
   edgesOpen: number;
@@ -327,10 +356,18 @@ interface ActiveSearch {
  * const search = new WalkRouteSearch(map, { now, maxNodes: 512 });
  * search.start({ worldId, dim, sessionId, mode: 'walk', body, target, arrival: { kind: 'near', radius: 2 }, shapeProvider });
  * while (search.status()?.state === 'PENDING') search.advance(32);
- * const result = search.status();
- * if (result?.state === 'FOUND') {
- *   verifier.register({ worldId, dim, sessionId, mode: 'walk', body, shapeProvider, points: result.candidate.points });
- *   verifier.advance(1024); // candidate is still only a candidate
+ *
+ * const result = search.status(); // null only when no search was started
+ * const candidate = result?.state === 'FOUND' ? result.candidate : null;
+ * if (candidate !== null && candidate.points.length >= 2) {
+ *   // RouteVerifier requires at least two points: one registered step per edge.
+ *   verifier.register({ worldId, dim, sessionId, mode: 'walk', body, shapeProvider, points: candidate.points });
+ *   verifier.advance(1024); // a candidate is still only a candidate
+ * } else if (candidate !== null) {
+ *   // Zero-edge geometric satisfaction: the start already meets the target
+ *   // condition. There is no route to verify, but this is still not ARRIVED;
+ *   // the caller must confirm the completion condition from a real measured
+ *   // body position before reporting success.
  * }
  * // After every map.observe(...) the caller forwards its ChangeReport:
  * // search.invalidate(report);
@@ -362,9 +399,9 @@ export class WalkRouteSearch {
     if (request.worldId !== this.map.worldId) {
       throw new Error(`request worldId "${request.worldId}" does not match map worldId "${this.map.worldId}"`);
     }
-    const body = snapshotBody(request.body);
+    const body = cloneBody(request.body);
     validateBody(body);
-    const target = snapshotVec(request.target);
+    const target = { x: request.target.x, y: request.target.y, z: request.target.z };
     assertFinite(target.x, 'target.x');
     assertFinite(target.y, 'target.y');
     assertFinite(target.z, 'target.z');
@@ -396,8 +433,10 @@ export class WalkRouteSearch {
       frontiers: new Map(),
       unavailable: new Map(),
       diagnostics: [],
+      validatedNodes: new Set(),
       dependencySections: new Set(),
       dependencyResidency: new Map(),
+      recoverableSections: new Set(),
       nodesExpanded: 0,
       edgesEvaluated: 0,
       edgesOpen: 0,
@@ -490,7 +529,9 @@ export class WalkRouteSearch {
    */
   advance(budget: number): WalkSearchSnapshot {
     const search = this.requireSearch();
-    validateBudget(budget);
+    if (!Number.isSafeInteger(budget) || budget <= 0) {
+      throw new Error(`budget must be a positive integer: ${budget}`);
+    }
     const now = this.currentNow();
     this.checkValidity(search, now);
     if (search.state !== 'PENDING') {
@@ -522,8 +563,14 @@ export class WalkRouteSearch {
       }
     }
 
-    search.computedAt = now;
-    return this.snapshot(now);
+    // Evaluations in this slice used the clock read at entry, but an injected
+    // rule provider may have advanced the real clock while resolving shapes.
+    // Re-read it before publishing so a candidate whose evidence expired during
+    // the slice is not described as currently OPEN.
+    const publishedAt = this.currentNow();
+    this.checkValidity(search, publishedAt);
+    search.computedAt = publishedAt;
+    return this.snapshot(publishedAt);
   }
 
   /**
@@ -545,18 +592,31 @@ export class WalkRouteSearch {
   }
 
   /**
-   * Consume a `ChangeReport`. If any section the search already read changed in
-   * content, the accumulated conclusions are invalidated. Refresh-only reports
-   * and unrelated sections are ignored (the caller may still register a fresh
-   * search when it wants refreshed evidence).
+   * Consume a `ChangeReport`. A content change in any section the search already
+   * read invalidates the accumulated conclusions. A refresh-only report is
+   * normally ignored, but it can recover a STALE/UNSUPPORTED conclusion (for
+   * example evidence that had merely expired): if it touches a section that
+   * produced such a conclusion, the search is invalidated too, because the old
+   * derived result was computed against evidence that is no longer the same
+   * generation. There is no automatic re-search. Unrelated sections and
+   * refresh-only reports that only touch OPEN/BLOCKED/UNKNOWN evidence are
+   * ignored.
    */
   invalidate(report: ChangeReport): void {
     const search = this.search;
     if (search === null || !evidenceBasedState(search.state)) return;
     for (const section of report.sections) {
-      if (!section.invalidated) continue;
-      if (search.dependencySections.has(sectionKeyString(section.key))) {
-        this.invalidateSearch(search, `section ${sectionKeyString(section.key)} changed after the search read it`);
+      const key = sectionKeyString(section.key);
+      if (section.invalidated) {
+        if (search.dependencySections.has(key)) {
+          this.invalidateSearch(search, `section ${key} changed after the search read it`);
+          return;
+        }
+      } else if (search.recoverableSections.has(key)) {
+        this.invalidateSearch(
+          search,
+          `section ${key} was refreshed after the search relied on its stale or unsupported evidence`,
+        );
         return;
       }
     }
@@ -650,6 +710,7 @@ export class WalkRouteSearch {
     };
     const evaluation = evaluateWalkStep(this.map, query, search.shapeProvider, now);
     search.edgesEvaluated += 1;
+    const recoverable = evaluation.status === 'STALE' || evaluation.status === 'UNSUPPORTED';
     for (const dep of evaluation.dependencies) {
       const ks = sectionKeyString(dep.key);
       search.dependencySections.add(ks);
@@ -657,10 +718,20 @@ export class WalkRouteSearch {
         key: { ...dep.key },
         generation: this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy),
       });
+      if (recoverable) search.recoverableSections.add(ks);
     }
+    // Every spatial conclusion — including a BLOCKED/UNKNOWN/STALE/UNSUPPORTED
+    // boundary that supports a terminal negative result — rests on the evidence
+    // this evaluation actually read. Expiry must invalidate it, not only expiry
+    // of an OPEN path.
+    search.searchValidUntil = Math.min(search.searchValidUntil, evaluation.validUntil);
 
     if (evaluation.status === 'OPEN') {
       search.edgesOpen += 1;
+      // The OPEN step proved both swept stances: the collision sweep covers the
+      // start and destination AABBs, and support covers the whole move segment.
+      search.validatedNodes.add(nodeKey);
+      search.validatedNodes.add(neighborKey);
       if (search.nodes.size >= this.maxNodes) {
         search.nodeLimitReached = true;
         return;
@@ -736,9 +807,18 @@ export class WalkRouteSearch {
   }
 
   /**
-   * An UNKNOWN edge is either a genuine never-observed frontier or a gap in old
-   * evidence whose section is saved but not resident. The latter is reported
-   * separately and never labelled as a new frontier.
+   * Classify the UNKNOWN edge's required cells from their actual cell view:
+   *
+   * - a cell in a saved section that is not resident/loading/load_failed is old
+   *   evidence that is currently unavailable, never a new frontier;
+   * - a required cell with no evidence at all (and no saved record) is a genuine
+   *   never-observed frontier cell;
+   * - a cell that does have evidence but is state-incomplete (or otherwise known)
+   *   remains a diagnostic gap only. It is not a newly discovered unobserved area.
+   *
+   * Frontier reporting is additionally gated on evaluator proof of the stance:
+   * only a node reached through an `OPEN` step (or the source of one) is a
+   * validated reachable stance. The caller-given start coordinate is not proof.
    */
   private recordUnknownBoundary(
     search: ActiveSearch,
@@ -750,8 +830,15 @@ export class WalkRouteSearch {
     now: number,
   ): void {
     const gap = dedupeCells(evaluation.problem?.cells ?? []);
-    const cells = gap.length > 0 ? gap : [feetCell(to)];
+    const cells = gap.length > 0
+      ? gap
+      : [{
+          x: Math.floor(to.x + EPS),
+          y: Math.floor(to.y + EPS),
+          z: Math.floor(to.z + EPS),
+        }];
     const unavailableSections = new Map<string, WalkSearchUnavailableSection>();
+    const neverObserved: Vec3Like[] = [];
     for (const cell of cells) {
       const { cx, cz, sy } = blockToSection(cell.x, cell.y, cell.z);
       const key: SectionKey = { worldId: search.worldId, dim: search.dim, cx, cz, sy };
@@ -765,7 +852,10 @@ export class WalkRouteSearch {
             committedRevision: info.committed?.revision,
           });
         }
+        continue;
       }
+      const view = this.map.cellAt(search.dim, cell.x, cell.y, cell.z);
+      if (!view.observed) neverObserved.push({ ...cell });
     }
 
     const basis = this.stanceBasis(search, node, now);
@@ -796,6 +886,8 @@ export class WalkRouteSearch {
       return;
     }
 
+    if (neverObserved.length === 0) return; // observed-but-incomplete evidence: diagnostic only
+
     search.frontierCandidates += 1;
     if (search.frontiers.has(neighborKey)) return;
     if (search.frontiers.size >= this.maxFrontiers) {
@@ -805,12 +897,13 @@ export class WalkRouteSearch {
     search.frontiers.set(neighborKey, {
       stance: { ...stance },
       to: { ...to },
-      gap: cells.map((cell) => ({ ...cell })),
+      gap: neverObserved.map((cell) => ({ ...cell })),
       reachability: 'OPEN',
       basis: basis.observations,
       reason,
       computedAt: now,
       validUntil,
+      stanceKey: node.key,
     });
   }
 
@@ -899,11 +992,14 @@ export class WalkRouteSearch {
     }
 
     if (search.edgesUnknown > 0 || search.edgesStale > 0 || search.edgesUnsupported > 0) {
+      const reportedFrontiers = [...search.frontiers.values()].filter((frontier) =>
+        search.validatedNodes.has(frontier.stanceKey),
+      ).length;
       search.state = 'INSUFFICIENT_EVIDENCE';
       search.reason =
         `search could not prove a current route: ${search.edgesUnknown} UNKNOWN, ` +
         `${search.edgesStale} STALE and ${search.edgesUnsupported} UNSUPPORTED boundary edge(s); ` +
-        `${search.frontiers.size} never-observed frontier(s) and ${search.unavailable.size} unavailable saved-section gap(s)`;
+        `${reportedFrontiers} never-observed frontier(s) and ${search.unavailable.size} unavailable saved-section gap(s)`;
       search.problem = {
         kind: 'insufficient_evidence',
         unknownEdges: search.edgesUnknown,
@@ -931,7 +1027,18 @@ export class WalkRouteSearch {
    * is no automatic re-search; the caller must start a fresh request.
    */
   private checkValidity(search: ActiveSearch, now: number): void {
-    if (search.state !== 'PENDING' && search.state !== 'FOUND') return;
+    if (!evidenceBasedState(search.state)) return;
+    // A zero-edge FOUND candidate is geometric only: the caller supplied the
+    // start and the target condition already holds there. It read no evaluator
+    // evidence, so evidence expiry, rule-version changes and residency cannot
+    // revoke it.
+    if (
+      search.state === 'FOUND' &&
+      search.candidate !== null &&
+      search.candidate.edgeCount === 0
+    ) {
+      return;
+    }
     if (search.shapeProvider.version !== search.ruleVersion) {
       this.invalidateSearch(
         search,
@@ -971,6 +1078,9 @@ export class WalkRouteSearch {
   private snapshot(now: number): WalkSearchSnapshot {
     const search = this.search;
     if (search === null) throw new Error('no walk search started');
+    const reportedFrontiers = [...search.frontiers.values()].filter((frontier) =>
+      search.validatedNodes.has(frontier.stanceKey),
+    );
     return {
       state: search.state,
       worldId: search.worldId,
@@ -998,7 +1108,7 @@ export class WalkRouteSearch {
               target: { ...search.candidate.target },
               arrival: cloneArrival(search.candidate.arrival),
             },
-      frontiers: [...search.frontiers.values()].map(cloneFrontier),
+      frontiers: reportedFrontiers.map(cloneFrontier),
       unavailableHistorical: [...search.unavailable.values()].map(cloneUnavailable),
       diagnostics: search.diagnostics.map((diagnostic) => ({
         ...diagnostic,
@@ -1017,7 +1127,7 @@ export class WalkRouteSearch {
         edgesUnsupported: search.edgesUnsupported,
         edgesSkippedReached: search.edgesSkippedReached,
         frontierCandidates: search.frontierCandidates,
-        frontiersReported: search.frontiers.size,
+        frontiersReported: reportedFrontiers.length,
         frontierLimitReached: search.frontierLimitReached,
         unavailableHistoricalCandidates: search.unavailableCandidates,
         unavailableHistoricalReported: search.unavailable.size,
@@ -1108,14 +1218,6 @@ function distance3d(a: Vec3Like, b: Vec3Like): number {
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-function feetCell(pos: Vec3Like): Vec3Like {
-  return {
-    x: Math.floor(pos.x + EPS),
-    y: Math.floor(pos.y + EPS),
-    z: Math.floor(pos.z + EPS),
-  };
-}
-
 function dedupeCells(cells: readonly Vec3Like[]): Vec3Like[] {
   const seen = new Set<string>();
   const out: Vec3Like[] = [];
@@ -1146,12 +1248,6 @@ function resolveLimit(value: number | undefined, fallback: number, label: string
   return value;
 }
 
-function validateBudget(budget: number): void {
-  if (!Number.isSafeInteger(budget) || budget <= 0) {
-    throw new Error(`budget must be a positive integer: ${budget}`);
-  }
-}
-
 function validateBody(body: BodyContext): void {
   if (
     !Number.isFinite(body.feet.x) ||
@@ -1169,14 +1265,6 @@ function validateBody(body: BodyContext): void {
 
 function assertFinite(value: number, label: string): void {
   if (!Number.isFinite(value)) throw new Error(`${label} must be a finite number: ${value}`);
-}
-
-function snapshotVec(value: Vec3Like): Vec3Like {
-  return { x: value.x, y: value.y, z: value.z };
-}
-
-function snapshotBody(body: BodyContext): BodyContext {
-  return { feet: { ...body.feet }, width: body.width, height: body.height, pose: body.pose };
 }
 
 function cloneBody(body: BodyContext): BodyContext {
@@ -1214,12 +1302,17 @@ function cloneProblem(problem: StepProblem): StepProblem {
 }
 
 function cloneFrontier(frontier: WalkSearchFrontier): WalkSearchFrontier {
+  // Explicit fields only: the internal record also carries `stanceKey`, which is
+  // not part of the public snapshot.
   return {
-    ...frontier,
     stance: { ...frontier.stance },
     to: { ...frontier.to },
     gap: frontier.gap.map((cell) => ({ ...cell })),
+    reachability: frontier.reachability,
     basis: frontier.basis.map(cloneObservation),
+    reason: frontier.reason,
+    computedAt: frontier.computedAt,
+    validUntil: frontier.validUntil,
   };
 }
 
