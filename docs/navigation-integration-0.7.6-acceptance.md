@@ -10,7 +10,7 @@
 ## 结论
 
 在隔离分支 `codex/spatial-library-followups-20261104` 上，已把两路已审查导航源码分支整合到
-基线 `B05417465` 之上，并完成 `0.7.6` 的全新构建、打包、独立安装与消费者验收。
+基线 `05417465a4542017e4cb6ea41177ec3de7503c6a` 之上，并完成 `0.7.6` 的全新构建、打包、独立安装与消费者验收。
 
 `node acceptance/run.mjs --execute` 由协调员独立执行，顶层 exit 0；正向消费者全部断言通过，
 两个负向对照均在预期断言处失败并被判定为 PASS，安装后公开类型 `tsc` exit 0。执行前后源码绑定
@@ -19,7 +19,7 @@
 
 ## 整合范围与提交
 
-- **基线**：`B05417465`。
+- **基线**：`05417465a4542017e4cb6ea41177ec3de7503c6a`。
 - **搜索分支原始链**：`12daaed3f2442178fb44403e20cd534647386f3c` →
   `fb186731f117ba57e78d1abcf2d49c6eee14b962` →
   `ebbd9fd7eb6a2956cc4d6d68607df2534eb457ce`。
@@ -29,12 +29,12 @@
   边界的修正），随后是 `d009194` 的包消费者验证提交。
 - 两个 barrel 导出冲突在本地解决，旧导出与两路新导出均保留；实现、测试与文档文件与各自审查后的
   最终分支逐字节一致。
-- 本报告加入前，相对 `B05417465` 的差异为 **13 个文件，+3820 / -10**。
+- 本报告加入前，相对 `05417465a4542017e4cb6ea41177ec3de7503c6a` 的差异为 **13 个文件，+3820 / -10**。
 
 ## 公共 API 与契约
 
 根入口新增并完整导出值 `WalkRouteSearch`、`startKnownWalkRoute` 及两路新增的全部类型；没有新增
-包子路径。新增能力仍属于库侧事实与执行辅助，不注册宿主动作。
+包子路径。新增能力仍属于库侧事实与执行辅助，不会把这些新增能力注册为 Curio 新动作。
 
 ### `WalkRouteSearch`
 
@@ -58,9 +58,10 @@
 
 ### 边界
 
-- 未接入 Curio 宿主动作目录、嵌套技能或仲裁注册。
-- 未做真实游戏 / Bot 对上述新 API 的物理验证。
-- 不自动探索、不选目标、不采集/搭建、不增加材料支出，也不生成玩法策略。
+- 上述两个新 API 未接入 Curio 宿主动作目录、嵌套技能或仲裁注册；Curio 既有的 `walk_route`
+  与共享宿主注册在其他工作中完成，本记录不否定其存在。
+- 未做真实游戏 / Bot 对上述两个新 API 的物理验证。
+- 上述新 API 不自动探索、不选目标、不采集/搭建、不增加材料支出，也不生成玩法策略。
 
 ## 版本与不可变产物
 
@@ -116,7 +117,8 @@
 - 空搜索：`INSUFFICIENT_EVIDENCE`，`frontiers = 0`。
 - 已知路线：`STARTED` → 同一执行器以实际 Fake 身体确认 `ARRIVED`（在指定目标处断言）；
   历史库 revision 仍为 `1`，`traversals = 0` 未改变。
-- 类型消费者从已安装 `dist` 解析全部新类型，并完成带类型的实际构造。
+- 已安装 `dist` 可解析全部新类型，构造/调用均通过类型检查；只有 `consumer.mjs` 实际执行
+  运行时 API，不声称仅经 `tsc` 检查的函数已运行。
 
 ### 既有 L1–L5 流
 
@@ -154,8 +156,7 @@
 额外的 `consumer-types` 精确命令最初不在 CLI allowlist；协调员独立运行
 
 ```text
-node node_modules/typescript/bin/tsc --noEmit --strict --target ES2022 --module NodeNext \
-  --moduleResolution NodeNext --skipLibCheck --types node acceptance/consumer-types.ts
+node node_modules/typescript/bin/tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --types node acceptance/consumer-types.ts
 ```
 
 exit 0。最终安装后 `tsc` 的 exit 0 已覆盖此临时说明，没有未解决类型阻塞。
@@ -168,7 +169,9 @@ exit 0。最终安装后 `tsc` 的 exit 0 已覆盖此临时说明，没有未�
 - 包可安装不等于宿主已启用；消费者已演示手动 API 使用，但 Curio 当前仍是 eager 驻留，
   未接入 Curio 的自动 manual 驻留/按需加载。
 - 未做旧 `WorldMemory` 迁移。
-- 未注册 Curio 宿主动作、参数校验、仲裁或嵌套技能，也没有新 API 的游戏内实测。
+- 上述两个新 API（`WalkRouteSearch`、`startKnownWalkRoute`）未注册 Curio 宿主动作、参数校验、
+  仲裁或嵌套技能；Curio 既有的 `walk_route` 与共享宿主注册不在本记录的否定范围内。也没有这两个
+  新 API 的游戏内实测。
 
 ## 关键提交
 
