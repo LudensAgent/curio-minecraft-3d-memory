@@ -43,6 +43,7 @@ import {
 } from 'curio-minecraft-3d-memory';
 import {
   openSpatialSession,
+  PersistenceError,
   WorkingSetManager,
 } from 'curio-minecraft-3d-memory/storage/sqlite';
 
@@ -211,6 +212,133 @@ function routeRequest(sessionId) {
     shapeProvider,
     points: POINTS,
   };
+}
+
+// ===== Journal fixtures =====
+// Explicitly Fake library-only fixtures. They exercise the public journal API;
+// they are not evidence that a game action happened or that a host now emits
+// journal records. The original NavResult keeps outcome, partial effects and its
+// `memoryWrite` marker verbatim.
+const JOURNAL_SESSION = 'journal-session';
+const JOURNAL_EARLIER_SESSION = 'journal-earlier-session';
+
+function journalObservation(overrides = {}) {
+  return {
+    pos: { x: -1, y: 0, z: 2 },
+    state: { name: 'minecraft:dirt', properties: {} },
+    stateComplete: true,
+    evidence: 'seen',
+    observedAt: 2000,
+    source: 'vision',
+    sessionId: JOURNAL_SESSION,
+    sequence: 7,
+    worldId: WORLD,
+    dim: DIM,
+    ...overrides,
+  };
+}
+
+/** A full ActionRecord carrying its original cancelled NavResult and partial effects. */
+function journalActionRecord() {
+  return {
+    id: 'journal-action-1',
+    ts: 2000,
+    worldId: WORLD,
+    dim: DIM,
+    sessionId: JOURNAL_SESSION,
+    delegationId: 'journal-delegation-1',
+    delegation: {
+      requestedTarget: 'the journal fixture target',
+      target: { x: 1, y: 0, z: 2 },
+      allowedModes: ['walk'],
+      arrival: { kind: 'near', radius: 1 },
+      allowDigging: false,
+      allowPlacing: true,
+      allowTower: false,
+      materials: [{ name: 'minecraft:dirt', maxCount: 2 }],
+      exploration: 'known_only',
+    },
+    subActions: [
+      {
+        kind: 'place',
+        at: { x: 1, y: 0, z: 2 },
+        block: 'minecraft:dirt',
+        origin: 'execution_helper',
+        targetRole: 'support',
+        outcome: 'cancelled',
+        effects: [],
+      },
+    ],
+    from: { x: 0.5, y: 0, z: 0.5 },
+    to: { x: 1.5, y: 0, z: 0.5 },
+    trace: [
+      { pos: { x: 0.5, y: 0, z: 0.5 }, ts: 2000 },
+      { pos: { x: 1.5, y: 0, z: 0.5 }, ts: 2100 },
+    ],
+    consumption: { placed: [{ pos: { x: 1, y: 0, z: 2 }, name: 'minecraft:dirt' }], durabilityLost: 2, digMs: 8 },
+    observedChanges: [journalObservation({ observedAt: 2100, sequence: 8 })],
+    failureAt: { x: 1.5, y: 0, z: 0.5 },
+    failureReason: 'fake fixture cancellation',
+    confirmed: false,
+    result: {
+      outcome: 'CANCELLED',
+      message: 'fake library-only cancelled result with a partial effect',
+      trace: [
+        { pos: { x: 0.5, y: 0, z: 0.5 }, ts: 2000 },
+        { pos: { x: 1.5, y: 0, z: 0.5 }, ts: 2100 },
+      ],
+      consumption: { placed: [{ pos: { x: 1, y: 0, z: 2 }, name: 'minecraft:dirt' }], durabilityLost: 2, digMs: 8 },
+      memoryWrite: 'pending',
+      lastPosition: { x: 1.5, y: 0, z: 0.5 },
+      lastObservation: {
+        worldId: WORLD,
+        dim: DIM,
+        sessionId: JOURNAL_SESSION,
+        observedAt: 2100,
+        onGround: true,
+        inWater: false,
+      },
+      confirmed: false,
+      problem: { kind: 'cancelled', by: 'agent', reason: 'fake fixture; no host action was performed' },
+    },
+  };
+}
+
+/** A legal observed change; only `current` must share the event session/time. */
+function journalChangeEvent(currentOverrides = {}) {
+  return {
+    kind: 'observed_cell_change',
+    id: 'journal-event-change-1',
+    observedAt: 2000,
+    worldId: WORLD,
+    dim: DIM,
+    sessionId: JOURNAL_SESSION,
+    pos: { x: -1, y: 0, z: 2 },
+    previous: journalObservation({
+      sessionId: JOURNAL_EARLIER_SESSION,
+      observedAt: 500,
+      sequence: 3,
+      state: { name: 'minecraft:stone', properties: {} },
+    }),
+    current: journalObservation(currentOverrides),
+  };
+}
+
+function journalGapEvent() {
+  return {
+    kind: 'observation_gap',
+    id: 'journal-event-gap-1',
+    observedAt: 2500,
+    worldId: WORLD,
+    dim: DIM,
+    sessionId: JOURNAL_SESSION,
+    reason: 'paused',
+  };
+}
+
+/** Assert a synchronous public persistence error with an exact kind. */
+function assertPersistenceKind(fn, kind, message) {
+  assert.throws(fn, (err) => err instanceof PersistenceError && err.kind === kind, message);
 }
 
 function collectDeps(status) {
@@ -520,6 +648,270 @@ async function run() {
           traversals: history.checkpointSnapshot().traversals.length,
         },
       });
+    }
+
+    // ===== 1c. Journal: Fake library-only fixtures through the public API =====
+    {
+      // A separate DB inside the same mkdtemp directory. Every session below is
+      // opened and closed sequentially through the existing `open`/`close`
+      // owners, so no two workers ever write one database file at the same time.
+      const journalDbPath = join(dir, 'journal.db');
+
+      const actionFixture = journalActionRecord();
+      const changeFixture = journalChangeEvent();
+      const gapFixture = journalGapEvent();
+      const expectedAction = structuredClone(actionFixture);
+      const expectedChange = structuredClone(changeFixture);
+      const expectedGap = structuredClone(gapFixture);
+
+      const s = await open({
+        databasePath: journalDbPath,
+        journalLimits: { maxBatchRecords: 1, maxPageRecords: 1 },
+      });
+
+      // Acceptance is synchronous and local: it is pending+dirty, never saved.
+      const acceptedAction = s.journal.recordAction(actionFixture);
+      const acceptedChange = s.journal.recordEvent(changeFixture);
+      const acceptedGap = s.journal.recordEvent(gapFixture);
+      assert.equal(acceptedAction.accepted, true, 'journal action accepted');
+      assert.equal(acceptedAction.duplicate, false, 'journal action is not a duplicate');
+      assert.equal(acceptedAction.pendingRecords, 1, 'accepted action is pending, not saved');
+      assert.equal(acceptedChange.accepted, true, 'journal change event accepted');
+      assert.equal(acceptedGap.accepted, true, 'journal gap event accepted');
+      assert.equal(acceptedGap.pendingRecords, 3, 'all three known records are pending');
+
+      let state = s.getPersistenceState();
+      const currentRevision = state.journalRevision;
+      evidence('journal.accept', {
+        fixture: 'fake-library-only',
+        hostEnabled: false,
+        accepted: [acceptedAction.accepted, acceptedChange.accepted, acceptedGap.accepted],
+        revision: currentRevision,
+        confirmedRevision: state.confirmedJournalRevision,
+        pendingRecords: state.pendingJournalRecords,
+        pendingBytes: state.pendingJournalBytes,
+        committedRecords: state.committedJournalRecords,
+        dirty: state.dirty,
+      });
+      assert.equal(state.pendingJournalRecords, 3, 'acceptance only fills the pending queue');
+      assert.equal(state.confirmedJournalRevision, 0, 'acceptance confirms no save');
+      assert.equal(state.committedJournalRecords, 0, 'acceptance commits no rows');
+      assert.equal(state.dirty, true, 'pending journal records make the session dirty');
+
+      // Public negatives: a mismatched current session, a mismatched current
+      // observation time, and a batch whose valid first event is followed by a
+      // bad one. Every rejection is atomic and leaves the queue byte-for-byte and
+      // revision-for-revision unchanged.
+      const pendingBeforeReject = s.journal.readPending();
+      const stateBeforeReject = s.getPersistenceState();
+      assertPersistenceKind(
+        () => s.journal.recordEvent(journalChangeEvent({ sessionId: 'stale-journal-session' })),
+        'invalid_argument',
+        'current observation from another session is rejected',
+      );
+      assertPersistenceKind(
+        () => s.journal.recordEvent(journalChangeEvent({ observedAt: 1999 })),
+        'invalid_argument',
+        'current observation with a different time is rejected',
+      );
+      assertPersistenceKind(
+        () =>
+          s.journal.recordBatch({
+            events: [
+              {
+                kind: 'observation_gap',
+                id: 'journal-event-rejected-normal',
+                observedAt: 2600,
+                worldId: WORLD,
+                dim: DIM,
+                sessionId: JOURNAL_SESSION,
+                reason: 'paused',
+              },
+              journalChangeEvent({ sessionId: 'stale-journal-session' }),
+            ],
+          }),
+        'invalid_argument',
+        'a valid leading event then a mismatched current rejects the whole batch',
+      );
+      const pendingAfterReject = s.journal.readPending();
+      const stateAfterReject = s.getPersistenceState();
+      assert.deepEqual(pendingAfterReject, pendingBeforeReject, 'rejections preserve pending actions, events, bytes and revision');
+      assert.equal(stateAfterReject.journalRevision, stateBeforeReject.journalRevision, 'rejections do not advance the journal revision');
+      assert.equal(stateAfterReject.pendingJournalBytes, stateBeforeReject.pendingJournalBytes, 'rejections preserve pending bytes');
+      assert.equal(stateAfterReject.dirty, true, 'rejections do not clean the session');
+      assert.deepEqual(pendingAfterReject.actions, [expectedAction], 'the original action is not rewritten');
+      assert.deepEqual(pendingAfterReject.events, [expectedChange, expectedGap], 'the original events are not rewritten');
+      evidence('journal.reject', {
+        kinds: ['invalid_argument', 'invalid_argument', 'invalid_argument'],
+        revision: stateAfterReject.journalRevision,
+        pendingRecords: stateAfterReject.pendingJournalRecords,
+        pendingBytes: stateAfterReject.pendingJournalBytes,
+        dirty: stateAfterReject.dirty,
+      });
+
+      // maxBatchRecords=1 forces three separate prefix confirmations.
+      const first = await s.checkpoint();
+      state = s.getPersistenceState();
+      evidence('journal.checkpoint', {
+        step: 1,
+        capturedRevision: first.journalRevision,
+        confirmedRevision: state.confirmedJournalRevision,
+        currentRevision: state.journalRevision,
+        pendingRecords: state.pendingJournalRecords,
+        pendingBytes: state.pendingJournalBytes,
+        committedRecords: state.committedJournalRecords,
+        dirty: state.dirty,
+      });
+      assert.equal(first.journalRevision, acceptedAction.revision, 'first checkpoint captures only the action revision');
+      assert.ok(first.journalRevision < currentRevision, 'a truncated checkpoint never claims the whole queue');
+      assert.equal(state.confirmedJournalRevision, first.journalRevision, 'first ACK confirms exactly its captured prefix');
+      assert.equal(state.journalRevision, currentRevision, 'later records keep their current revision');
+      assert.equal(state.pendingJournalRecords, 2, 'the two later events remain pending');
+      assert.equal(state.committedJournalRecords, 1, 'only the captured prefix is committed');
+      assert.equal(state.dirty, true, 'a later pending record keeps the session dirty');
+
+      const savedActionPage = await s.queryActions();
+      assert.equal(savedActionPage.records.length, 1, 'the first checkpoint committed one action');
+      assert.equal(savedActionPage.records[0].result.memoryWrite, 'pending', 'save does not rewrite the original memoryWrite marker');
+
+      const second = await s.checkpoint();
+      state = s.getPersistenceState();
+      evidence('journal.checkpoint', {
+        step: 2,
+        capturedRevision: second.journalRevision,
+        confirmedRevision: state.confirmedJournalRevision,
+        currentRevision: state.journalRevision,
+        pendingRecords: state.pendingJournalRecords,
+        pendingBytes: state.pendingJournalBytes,
+        committedRecords: state.committedJournalRecords,
+        dirty: state.dirty,
+      });
+      assert.equal(second.journalRevision, acceptedChange.revision, 'second checkpoint captures the change event revision');
+      assert.equal(state.confirmedJournalRevision, second.journalRevision, 'second ACK confirms exactly its captured prefix');
+      assert.equal(state.journalRevision, currentRevision, 'the final record still owns the current revision');
+      assert.equal(state.pendingJournalRecords, 1, 'the gap event remains pending');
+      assert.equal(state.dirty, true, 'still dirty with one pending record');
+
+      const third = await s.checkpoint();
+      state = s.getPersistenceState();
+      evidence('journal.saved', {
+        step: 3,
+        capturedRevision: third.journalRevision,
+        confirmedRevision: state.confirmedJournalRevision,
+        currentRevision: state.journalRevision,
+        pendingRecords: state.pendingJournalRecords,
+        pendingBytes: state.pendingJournalBytes,
+        committedRecords: state.committedJournalRecords,
+        dirty: state.dirty,
+        memoryWrite: savedActionPage.records[0].result.memoryWrite,
+      });
+      assert.equal(third.journalRevision, acceptedGap.revision, 'third checkpoint captures the final revision');
+      assert.equal(third.journalRevision, currentRevision, 'the final checkpoint covers the queue at capture time');
+      assert.equal(state.confirmedJournalRevision, currentRevision, 'all known records are confirmed');
+      assert.equal(state.pendingJournalRecords, 0, 'no records remain pending');
+      assert.equal(state.pendingJournalBytes, 0, 'no pending bytes remain');
+      assert.equal(state.dirty, false, 'the finite known journal queue is fully saved');
+      assert.equal(state.committedJournalRecords, 3, 'all three records are committed');
+      assert.deepEqual(s.journal.readPending(), { revision: currentRevision, actions: [], events: [], bytes: 0 }, 'pending queue is empty');
+      assert.deepEqual(actionFixture, expectedAction, 'the accepted action fixture was never rewritten');
+      assert.deepEqual(changeFixture, expectedChange, 'the accepted change fixture was never rewritten');
+      assert.deepEqual(gapFixture, expectedGap, 'the accepted gap fixture was never rewritten');
+      assert.equal(expectedAction.result.memoryWrite, 'pending', 'the original result keeps its memoryWrite marker');
+
+      const closed = await close(s);
+      assert.equal(closed.completed, true, 'journal session closes cleanly');
+      assert.equal(closed.dirty, false, 'nothing is dirty at journal close');
+      assert.equal(closed.unconfirmedRequest, false, 'no unconfirmed journal request at close');
+      assert.equal(closed.error, null, 'no journal close error');
+
+      // Reopen and read the committed journal back through bounded pages.
+      const s2 = await open({ databasePath: journalDbPath });
+      const stateBeforeRead = s2.getPersistenceState();
+      assert.equal(stateBeforeRead.pendingJournalRecords, 0, 'reopen has no pending journal records');
+      assert.equal(stateBeforeRead.committedJournalRecords, 3, 'reopen restores the committed journal count');
+      assert.equal(stateBeforeRead.journalRevision, currentRevision, 'reopen restores the committed journal revision');
+      assert.equal(stateBeforeRead.confirmedJournalRevision, currentRevision, 'reopen baseline is confirmed');
+      assert.equal(stateBeforeRead.journalBaselineCheckpointId, third.checkpointId, 'journal baseline names the final checkpoint');
+      assert.equal(stateBeforeRead.dirty, false, 'reopen starts clean');
+
+      const actionPage = await s2.queryActions();
+      assert.equal(actionPage.records.length, 1, 'one committed action is read back');
+      assert.equal(actionPage.hasMore, false, 'the single action page has no more records');
+      assert.equal(actionPage.nextCursor, null, 'the single action page has no cursor');
+      assert.deepEqual(actionPage.records[0], expectedAction, 'action scope, time, trace, partial effects and NavResult round-trip');
+
+      const eventPage1 = await s2.queryEvents({ maxRecords: 1 });
+      assert.equal(eventPage1.records.length, 1, 'first event page respects maxRecords=1');
+      assert.equal(eventPage1.hasMore, true, 'first event page reports more records');
+      assert.notEqual(eventPage1.nextCursor, null, 'first event page carries a cursor');
+      const eventPage2 = await s2.queryEvents({ maxRecords: 1, cursor: eventPage1.nextCursor });
+      assert.equal(eventPage2.records.length, 1, 'second event page respects maxRecords=1');
+      assert.equal(eventPage2.hasMore, false, 'second event page is the last');
+      assert.equal(eventPage2.nextCursor, null, 'last event page has no cursor');
+      const events = [...eventPage1.records, ...eventPage2.records];
+      assert.deepEqual(events, [expectedChange, expectedGap], 'events round-trip in insertion order');
+      const [change, gap] = events;
+      assert.equal(change.kind, 'observed_cell_change', 'observed change kind preserved');
+      assert.equal(change.current.sessionId, JOURNAL_SESSION, 'current observation session preserved');
+      assert.equal(change.current.observedAt, 2000, 'current observation time preserved');
+      assert.equal(change.current.source, 'vision', 'current observation source preserved');
+      assert.equal(change.previous.sessionId, JOURNAL_EARLIER_SESSION, 'previous observation keeps its older session');
+      assert.equal(change.previous.observedAt, 500, 'previous observation keeps its older real time');
+      assert.equal(gap.kind, 'observation_gap', 'gap event kind preserved');
+      assert.equal(gap.reason, 'paused', 'gap reason preserved');
+
+      // Reads do not refresh times, dirty the session, move revisions or add facts.
+      const stateAfterRead = s2.getPersistenceState();
+      assert.deepEqual(
+        {
+          journalRevision: stateAfterRead.journalRevision,
+          confirmedJournalRevision: stateAfterRead.confirmedJournalRevision,
+          pendingJournalRecords: stateAfterRead.pendingJournalRecords,
+          pendingJournalBytes: stateAfterRead.pendingJournalBytes,
+          committedJournalRecords: stateAfterRead.committedJournalRecords,
+          committedJournalBytes: stateAfterRead.committedJournalBytes,
+          dirty: stateAfterRead.dirty,
+        },
+        {
+          journalRevision: stateBeforeRead.journalRevision,
+          confirmedJournalRevision: stateBeforeRead.confirmedJournalRevision,
+          pendingJournalRecords: stateBeforeRead.pendingJournalRecords,
+          pendingJournalBytes: stateBeforeRead.pendingJournalBytes,
+          committedJournalRecords: stateBeforeRead.committedJournalRecords,
+          committedJournalBytes: stateBeforeRead.committedJournalBytes,
+          dirty: stateBeforeRead.dirty,
+        },
+        'journal queries change no revision, pending count or dirty flag',
+      );
+      assert.deepEqual(s2.voxel.cellAt(DIM, -1, 0, 2), { observed: false }, 'journal reads add no voxel fact');
+
+      evidence('journal.reopen', {
+        fixture: 'fake-library-only',
+        hostEnabled: false,
+        journalRevision: stateBeforeRead.journalRevision,
+        confirmedRevision: stateBeforeRead.confirmedJournalRevision,
+        pendingRecords: stateBeforeRead.pendingJournalRecords,
+        pendingBytes: stateBeforeRead.pendingJournalBytes,
+        committedRecords: stateBeforeRead.committedJournalRecords,
+        dirty: stateBeforeRead.dirty,
+        actionPage: {
+          records: actionPage.records.length,
+          hasMore: actionPage.hasMore,
+          nextCursor: actionPage.nextCursor,
+        },
+        eventPages: [
+          { records: eventPage1.records.length, hasMore: eventPage1.hasMore, nextCursor: eventPage1.nextCursor },
+          { records: eventPage2.records.length, hasMore: eventPage2.hasMore, nextCursor: eventPage2.nextCursor },
+        ],
+        current: { sessionId: change.current.sessionId, observedAt: change.current.observedAt, source: change.current.source },
+        previous: { sessionId: change.previous.sessionId, observedAt: change.previous.observedAt, source: change.previous.source },
+        memoryWrite: actionPage.records[0].result.memoryWrite,
+        voxelCellObserved: s2.voxel.cellAt(DIM, -1, 0, 2).observed,
+      });
+
+      const closed2 = await close(s2);
+      assert.equal(closed2.completed, true, 'reopened journal session closes cleanly');
+      assert.equal(closed2.dirty, false, 'reopened journal session stays clean');
     }
 
     // ===== 2. Save & restore (baseline at observedAt=1000) =====

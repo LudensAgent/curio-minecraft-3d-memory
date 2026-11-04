@@ -15,6 +15,7 @@ import {
 } from 'curio-minecraft-3d-memory';
 import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
 import type {
+  ActionRecord,
   BlockState,
   BodyContext,
   CollisionShapeProvider,
@@ -23,6 +24,8 @@ import type {
   KnownWalkRouteSnapshot,
   KnownWalkRouteStart,
   MoveExecutor,
+  NavResult,
+  Observation,
   PathFragment,
   SectionKey,
   Vec3Like,
@@ -42,9 +45,18 @@ import type {
   WalkSearchUnavailableSection,
 } from 'curio-minecraft-3d-memory';
 import type {
+  JournalAcceptResult,
+  JournalBatchAcceptResult,
+  JournalController,
+  JournalLimits,
+  JournalPage,
+  JournalWithdrawalResult,
   OpenSpatialSessionOptions,
+  PendingJournalSnapshot,
   PrepareResult,
   SpatialCheckpointResult,
+  SpatialEvent,
+  SpatialPersistenceState,
   SpatialSession,
 } from 'curio-minecraft-3d-memory/storage/sqlite';
 
@@ -60,9 +72,12 @@ export function makePos(): Vec3Like {
   return { x: 0.5, y: 0, z: 0.5 };
 }
 
+export const journalLimits: JournalLimits = { maxBatchRecords: 1, maxPageRecords: 1 };
+
 export const sessionOptions: OpenSpatialSessionOptions = {
   databasePath: '/tmp/consumer.db',
   worldId: 'world',
+  journalLimits,
 };
 
 export async function useSession(s: SpatialSession): Promise<string> {
@@ -170,6 +185,158 @@ export function recordFragment(history: FragmentStore): void {
 
 export function startKnownOn(history: FragmentStore, map: VoxelMap, move: MoveExecutor): KnownWalkRouteStart {
   return startKnownWalkRoute(history, new WalkRouteExecutor(map, move, { now: () => 0 }), knownRequest);
+}
+
+// Public journal types: Fake library-only fixtures and calls resolved from the
+// installed root + storage/sqlite declarations (no relative src import, no `any`).
+export const journalObservation: Observation = {
+  pos: { x: -1, y: 0, z: 2 },
+  state: { name: 'minecraft:dirt', properties: {} },
+  stateComplete: true,
+  evidence: 'seen',
+  observedAt: 2000,
+  source: 'vision',
+  sessionId: 'types-journal',
+  sequence: 7,
+  worldId: 'world',
+  dim: 'overworld',
+};
+
+export const journalNavResult: NavResult = {
+  outcome: 'CANCELLED',
+  message: 'types-only cancelled result with a partial effect',
+  trace: [{ pos: { x: 0.5, y: 0, z: 0.5 }, ts: 2000 }],
+  consumption: {
+    placed: [{ pos: { x: 1, y: 0, z: 2 }, name: 'minecraft:dirt' }],
+    durabilityLost: 1,
+    digMs: 4,
+  },
+  memoryWrite: 'pending',
+  lastPosition: { x: 0.5, y: 0, z: 0.5 },
+  lastObservation: {
+    worldId: 'world',
+    dim: 'overworld',
+    sessionId: 'types-journal',
+    observedAt: 2000,
+    onGround: true,
+    inWater: false,
+  },
+  confirmed: false,
+  problem: { kind: 'cancelled', by: 'agent', reason: 'types-only fixture' },
+};
+
+export const journalAction: ActionRecord = {
+  id: 'types-journal-action',
+  ts: 2000,
+  worldId: 'world',
+  dim: 'overworld',
+  sessionId: 'types-journal',
+  delegationId: 'types-journal-delegation',
+  delegation: {
+    requestedTarget: 'types-only target',
+    target: { x: 1, y: 0, z: 2 },
+    allowedModes: ['walk'],
+    arrival: { kind: 'near', radius: 1 },
+    allowDigging: false,
+    allowPlacing: true,
+    allowTower: false,
+    materials: [{ name: 'minecraft:dirt', maxCount: 1 }],
+    exploration: 'known_only',
+  },
+  subActions: [],
+  from: { x: 0.5, y: 0, z: 0.5 },
+  to: { x: 1.5, y: 0, z: 0.5 },
+  trace: [{ pos: { x: 0.5, y: 0, z: 0.5 }, ts: 2000 }],
+  consumption: { placed: [{ pos: { x: 1, y: 0, z: 2 }, name: 'minecraft:dirt' }] },
+  observedChanges: [journalObservation],
+  confirmed: false,
+  result: journalNavResult,
+};
+
+export const journalChangeEvent: SpatialEvent = {
+  kind: 'observed_cell_change',
+  id: 'types-journal-change',
+  observedAt: 2000,
+  worldId: 'world',
+  dim: 'overworld',
+  sessionId: 'types-journal',
+  pos: { x: -1, y: 0, z: 2 },
+  previous: {
+    ...journalObservation,
+    state: { name: 'minecraft:stone', properties: {} },
+    sessionId: 'types-journal-earlier',
+    observedAt: 500,
+  },
+  current: journalObservation,
+};
+
+export const journalGapEvent: SpatialEvent = {
+  kind: 'observation_gap',
+  id: 'types-journal-gap',
+  observedAt: 2500,
+  worldId: 'world',
+  dim: 'overworld',
+  sessionId: 'types-journal',
+  reason: 'paused',
+};
+
+export function journalController(s: SpatialSession): JournalController {
+  return s.journal;
+}
+
+export function recordJournalAction(journal: JournalController): JournalAcceptResult {
+  return journal.recordAction(journalAction);
+}
+
+export function recordJournalEvent(journal: JournalController): JournalAcceptResult {
+  return journal.recordEvent(journalChangeEvent);
+}
+
+export function recordJournalBatch(journal: JournalController): JournalBatchAcceptResult {
+  return journal.recordBatch({ actions: [journalAction], events: [journalChangeEvent, journalGapEvent] });
+}
+
+export function readPendingJournal(journal: JournalController): PendingJournalSnapshot {
+  return journal.readPending();
+}
+
+export function withdrawJournal(journal: JournalController): JournalWithdrawalResult {
+  return journal.withdraw({ actions: [{ sessionId: 'types-journal', id: 'types-journal-action' }] });
+}
+
+export function pageJournalActions(s: SpatialSession): Promise<JournalPage<ActionRecord>> {
+  return s.queryActions({ maxRecords: 1 });
+}
+
+export function pageJournalEvents(s: SpatialSession): Promise<JournalPage<SpatialEvent>> {
+  return s.queryEvents({ kind: 'observed_cell_change', maxRecords: 1 });
+}
+
+export function checkpointJournal(s: SpatialSession): Promise<SpatialCheckpointResult> {
+  return s.checkpoint();
+}
+
+export function journalStateFields(s: SpatialSession): {
+  journalRevision: number;
+  confirmedJournalRevision: number;
+  journalBaselineCheckpointId: string | null;
+  pendingJournalRecords: number;
+  pendingJournalBytes: number;
+  committedJournalRecords: number;
+  committedJournalBytes: number;
+  dirty: boolean;
+} {
+  const state: SpatialPersistenceState = s.getPersistenceState();
+  return {
+    journalRevision: state.journalRevision,
+    confirmedJournalRevision: state.confirmedJournalRevision,
+    journalBaselineCheckpointId: state.journalBaselineCheckpointId,
+    pendingJournalRecords: state.pendingJournalRecords,
+    pendingJournalBytes: state.pendingJournalBytes,
+    committedJournalRecords: state.committedJournalRecords,
+    committedJournalBytes: state.committedJournalBytes,
+    dirty: state.dirty,
+  };
 }
 
 // Barrel regression protection: every added public type must remain re-exported
