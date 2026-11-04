@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { VoxelMap } from '../dist/index.js';
 import { PersistenceError } from '../dist/storage/sqlite/index.js';
@@ -14,6 +15,7 @@ import {
   runPrimaryLifecycle,
   seedCorridor,
   startConn1Walk,
+  writeRunReport,
 } from '../examples/shared-session-lifecycle.js';
 
 function freshMap(): VoxelMap {
@@ -27,36 +29,21 @@ describe('shared-session lifecycle — disconnect wiring (L1)', () => {
     assertDisconnected(runDisconnectScenario());
   });
 
-  it('negative A: without report dispatch the readonly verifier stays OPEN', () => {
-    const map = freshMap();
-    seedCorridor(map);
-    const verifier = registerConn1Verifier(map, () => NOW);
-    const { walk } = startConn1Walk(map, () => NOW);
-
-    // Disconnect WITHOUT dispatching lifecycle reports to the readonly verifier.
-    walk.cancel('lifecycle', 'connection lost');
-    map.markStale(DIM, 'observation_gap');
-    map.beginSession('conn-2');
-
-    // The walk is cancelled, but the untouched verifier still reads OPEN — the bug
-    // this control identifies is independent of the executor cancel.
-    expect(walk.status()!.result?.outcome).toBe('CANCELLED');
-    expect(verifier.status()!.verdict).toBe('OPEN');
+  it('negative A: the shared invariant fails when the verifier report is omitted', () => {
+    // Omit only the report dispatch to the readonly verifier and run the *shared*
+    // invariant — the verifier stays OPEN, so the success assertion must throw.
+    expect(() => assertDisconnected(runDisconnectScenario(() => NOW, { skipVerifierReport: true }))).toThrow(
+      'old verifier must no longer be OPEN',
+    );
   });
 
-  it('negative B: an empty lifecycle report and no cancel leaves the walk pending', () => {
-    const map = freshMap();
-    seedCorridor(map);
-    const { walk } = startConn1Walk(map, () => NOW);
-
-    // Disconnect with no cancel and no body frames; the lifecycle report is empty
-    // (a dimension with no observed sections), so dispatch cannot end the walk.
-    const empty = map.markStale('nether', 'observation_gap');
-    expect(empty.sections.length).toBe(0);
-    walk.observe(empty, 10);
-
-    expect(walk.status()!.activeStepIndex).not.toBeNull();
-    expect(walk.status()!.result).toBeNull();
+  it('negative B: the shared invariant fails when the cancel is omitted', () => {
+    // Omit only the cancel (reports and body frames still flow) and run the *shared*
+    // invariant — report-driven invalidation may end the walk, but its outcome is not
+    // CANCELLED, so the shared success assertion must throw.
+    expect(() => assertDisconnected(runDisconnectScenario(() => NOW, { skipCancel: true }))).toThrow(
+      'old walk must be cancelled',
+    );
   });
 
   it('late old body frame cannot reactivate control or rewrite the result', () => {
@@ -83,9 +70,44 @@ describe('shared-session lifecycle — disconnect wiring (L1)', () => {
 });
 
 describe('shared-session lifecycle — save, close, restore (L2)', () => {
-  it('normal save and close report confirmed, clean fields', async () => {
+  it('normal save and close report confirmed, clean fields, and the dir is cleaned up', async () => {
     // The same boundary `main` uses; the shared assertion checks the full close fields.
-    assertCleanSaveRun(await runPrimaryLifecycle());
+    const run = await runPrimaryLifecycle();
+    assertCleanSaveRun(run);
+    expect(existsSync(run.dir)).toBe(false); // cleaned up only after known clean closure
+  });
+
+  it('reopen happens only after the primary session is closed', async () => {
+    const order: string[] = [];
+    const run = await runPrimaryLifecycle({
+      closeSession: async (session) => {
+        const real = await session.close();
+        order.push('close');
+        return real;
+      },
+      afterReopen: () => order.push('reopen'),
+    });
+    // primary close → reopen → boundary closes the reopened session.
+    expect(order).toEqual(['close', 'reopen', 'close']);
+    assertCleanSaveRun(run);
+  });
+
+  it('a non-clean primary close prevents reopen', async () => {
+    let reopened = false;
+    const run = await runPrimaryLifecycle({
+      closeSession: async (session) => {
+        const real = await session.close(); // still terminate the real worker
+        return { ...real, completed: false, error: new PersistenceError('worker_communication', 'injected close failure') };
+      },
+      afterReopen: () => {
+        reopened = true;
+      },
+    });
+
+    expect(reopened).toBe(false); // failure prevents reopen
+    expect(run.closes.length).toBe(1); // only the primary close happened
+    expect(run.primary).toBeInstanceOf(Error);
+    expect(run.retained).toBe(true);
   });
 
   it('capacity rejection keeps the primary PersistenceError; cleanup failure is secondary', async () => {
@@ -100,10 +122,11 @@ describe('shared-session lifecycle — save, close, restore (L2)', () => {
     expect((run.primary as PersistenceError).message).toContain('maxVoxelSections');
     expect(run.cleanupError).toBeInstanceOf(Error);
     expect(run.retained).toBe(true);
+    expect(existsSync(run.dir)).toBe(true); // retained directory still on disk
     expect(run.closes[0]!.dirty).toBe(true); // unsaved observations remain
   });
 
-  it('cleanup failure alone is a failure', async () => {
+  it('cleanup failure alone is a failure and retains the directory', async () => {
     const run = await runPrimaryLifecycle({
       cleanupDir: () => {
         throw new Error('injected cleanup failure');
@@ -114,9 +137,10 @@ describe('shared-session lifecycle — save, close, restore (L2)', () => {
     expect(run.primary).toBeNull(); // no domain error: the cleanup failure is the failure
     expect(run.cleanupError).toBeInstanceOf(Error);
     expect(run.retained).toBe(true);
+    expect(existsSync(run.dir)).toBe(true);
   });
 
-  it('close failure after a primary error retains the directory and preserves the primary', async () => {
+  it('a non-clean close after a primary error retains the directory and preserves the primary', async () => {
     const run = await runCapacityLifecycle({
       closeSession: async (session) => {
         const real = await session.close(); // still terminate the worker (no leak)
@@ -128,6 +152,39 @@ describe('shared-session lifecycle — save, close, restore (L2)', () => {
     expect((run.primary as PersistenceError).kind).toBe('capacity');
     expect(run.closes[0]!.completed).toBe(false);
     expect(run.retained).toBe(true); // shutdown not clean: directory retained
+    expect(existsSync(run.dir)).toBe(true);
+  });
+
+  it('a thrown close after a primary error is secondary (no fabricated CloseResult) and retains the dir', async () => {
+    const run = await runCapacityLifecycle({
+      closeSession: async (session) => {
+        await session.close(); // still terminate the real worker
+        throw new Error('injected close throw');
+      },
+    });
+
+    expect(run.primary).toBeInstanceOf(PersistenceError);
+    expect((run.primary as PersistenceError).kind).toBe('capacity');
+    expect(run.closes).toHaveLength(0); // no fabricated close record
+    expect(run.closeErrors).toHaveLength(1); // the original close exception, secondary
+    expect(run.retained).toBe(true);
+  });
+
+  it('the shared report keeps the capacity primary and shows the retained directory', async () => {
+    const run = await runCapacityLifecycle({
+      closeSession: async (session) => {
+        const real = await session.close();
+        return { ...real, completed: false, error: new PersistenceError('worker_communication', 'injected close failure') };
+      },
+    });
+
+    const lines: string[] = [];
+    writeRunReport((line) => lines.push(line), 'L2 capacity', run);
+    const text = lines.join('\n');
+    expect(text).toContain('capacity');
+    expect(text).toContain('maxVoxelSections');
+    expect(text).toContain('retainedDir=');
+    expect(text).toContain(run.dir);
   });
 
   it('an injected assertion failure after reopen still closes the reopened session', async () => {

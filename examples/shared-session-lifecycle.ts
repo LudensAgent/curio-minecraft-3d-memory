@@ -22,10 +22,14 @@
  * cannot reactivate control or rewrite the cancellation.
  *
  * The save/close path is owned by a small resource boundary (`runOwned`) that
- * guarantees a bounded `close()` for every opened session (primary, reopened,
- * capacity) before the temp directory is removed, and preserves the original
- * (primary) error while recording close/cleanup failures as secondary
- * diagnostics. If shutdown is not clean the temp directory is retained.
+ * guarantees a bounded `close()` for every opened session — on success, on a
+ * thrown primary error, and on a later assertion failure — before the temp
+ * directory is removed. Only one session (Worker) is open for a shared path at a
+ * time: `runPrimaryLifecycle` closes the primary session (awaited, and checked
+ * clean) before it reopens the same path, so there are never two open Workers on
+ * one database. The boundary preserves the original (primary) error while
+ * recording close/cleanup failures as secondary diagnostics; a close that throws
+ * or is not clearly clean retains the directory.
  *
  * It uses the default `eager` voxel loading, which restores every committed
  * section at open and is only appropriate when the world fits the session's
@@ -41,7 +45,7 @@
 
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RouteVerifier, VoxelMap, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
 import type {
@@ -204,21 +208,32 @@ export interface DisconnectResult {
   lastMoveExecutionId: string | null;
 }
 
+/** Negative-control channel omissions; only the tests use these to prove the shared invariant depends on each channel. */
+export interface DisconnectOptions {
+  skipCancel?: boolean;
+  skipVerifierReport?: boolean;
+}
+
 /**
  * The real disconnect channel: cancel the old delegation first, then dispatch the
  * lifecycle reports, then show that old evidence (observation and body frame) can
  * no longer refresh or reactivate anything. `main` and the positive test both call
- * this exact wiring.
+ * this exact wiring; the negative controls omit a single channel to show the shared
+ * invariant fails without it.
  */
-export function runDisconnect(map: VoxelMap, clock: () => number): DisconnectResult {
+export function runDisconnect(map: VoxelMap, clock: () => number, options: DisconnectOptions = {}): DisconnectResult {
   const verifier = registerConn1Verifier(map, clock);
   const { walk, body } = startConn1Walk(map, clock);
 
-  walk.cancel('lifecycle', 'connection lost');
+  if (!options.skipCancel) {
+    walk.cancel('lifecycle', 'connection lost');
+  }
   const stale = map.markStale(DIM, 'observation_gap');
   const switched = map.beginSession('conn-2');
-  verifier.apply(stale, 10);
-  verifier.apply(switched, 10);
+  if (!options.skipVerifierReport) {
+    verifier.apply(stale, 10);
+    verifier.apply(switched, 10);
+  }
   walk.observe(stale, 10);
   walk.observe(switched, 10);
 
@@ -259,14 +274,17 @@ export function assertDisconnected(r: DisconnectResult): void {
 }
 
 /** Run the disconnect scenario end-to-end on a fresh in-memory map. */
-export function runDisconnectScenario(clock: () => number = () => NOW): DisconnectResult {
+export function runDisconnectScenario(
+  clock: () => number = () => NOW,
+  options: DisconnectOptions = {},
+): DisconnectResult {
   const map = new VoxelMap(WORLD, { now: clock, requireSession: true });
   seedCorridor(map);
-  return runDisconnect(map, clock);
+  return runDisconnect(map, clock, options);
 }
 
 // ---------------------------------------------------------------------------
-// Resource boundary: owns one temp directory and every session opened through it.
+// Resource boundary: owns one temp directory and the single current session.
 // ---------------------------------------------------------------------------
 
 export interface OwnedRunHooks {
@@ -281,28 +299,38 @@ export interface OwnedRun<T> {
   value: T | null;
   /** First failure thrown by the body; its identity/kind/message are preserved. */
   primary: unknown;
-  /** Bounded close result for every opened session, in reverse-open order. */
+  /** Real close result for every session that actually closed (reverse order). */
   closes: CloseResult[];
+  /** Secondary: close exceptions (never fabricated into a CloseResult). */
+  closeErrors: unknown[];
   /** Secondary: temp-dir cleanup failure (never replaces `primary`). */
   cleanupError: unknown;
-  /** True when the temp dir was retained because a close or cleanup failed. */
+  /** True when the temp dir was retained because a close/cleanup was not clean. */
   retained: boolean;
   dir: string;
 }
 
-/** Remove only a direct child of the OS temp root — never the temp root itself. */
-export function removeTaskDir(dir: string): void {
+/** A close outcome is clearly clean only when it completed, reported no error, and no request was left unconfirmed. */
+function isCleanClose(c: CloseResult): boolean {
+  return c.completed && c.error === null && !c.unconfirmedRequest;
+}
+
+/** Remove only the exact temp directory this run created; it is always a direct child of the temp root. */
+function cleanupOwnedDir(dir: string): void {
   const root = resolve(dir);
   const tmp = resolve(tmpdir());
-  if (dirname(root) !== tmp) {
+  if (root === tmp || dirname(root) !== tmp) {
     throw new Error(`refusing to remove a directory that is not a direct child of the temp root: ${root}`);
   }
   rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
+/** Tracks the single current session (one Worker per shared path) and the real close outcomes. */
 export class OwnedSessions {
   readonly dir: string;
-  private readonly opened: SpatialSession[] = [];
+  private current: SpatialSession | null = null;
+  readonly closes: CloseResult[] = [];
+  readonly closeErrors: unknown[] = [];
 
   constructor(dir: string) {
     this.dir = dir;
@@ -313,30 +341,34 @@ export class OwnedSessions {
   }
 
   async open(options: OpenSpatialSessionOptions): Promise<SpatialSession> {
+    if (this.current !== null) {
+      throw new Error('a session is already open; close it before opening another');
+    }
     const session = await openSpatialSession(options);
-    this.opened.push(session);
+    this.current = session;
     return session;
   }
 
-  async closeAll(hooks: OwnedRunHooks = {}): Promise<CloseResult[]> {
+  /** Close the current session. A thrown close is recorded as a secondary error and re-thrown. */
+  async close(hooks: OwnedRunHooks = {}): Promise<CloseResult> {
+    const session = this.current;
+    if (session === null) throw new Error('no session is open');
+    this.current = null;
     const close = hooks.closeSession ?? ((s) => s.close());
-    const closes: CloseResult[] = [];
-    for (let i = this.opened.length - 1; i >= 0; i--) {
-      const session = this.opened[i]!;
-      try {
-        closes.push(await close(session));
-      } catch (err) {
-        closes.push({
-          completed: false,
-          lastConfirmedCheckpointId: null,
-          unconfirmedRequest: false,
-          dirty: true,
-          error: err instanceof PersistenceError ? err : new PersistenceError('worker_communication', String(err)),
-        });
-      }
+    try {
+      const result = await close(session);
+      this.closes.push(result);
+      return result;
+    } catch (err) {
+      this.closeErrors.push(err);
+      throw err;
     }
-    this.opened.length = 0;
-    return closes;
+  }
+
+  /** Close whatever session is still open (boundary cleanup); a thrown close stays secondary. */
+  async closeIfOpen(hooks: OwnedRunHooks = {}): Promise<void> {
+    if (this.current === null) return;
+    await this.close(hooks).catch(() => {});
   }
 }
 
@@ -355,27 +387,28 @@ export async function runOwned<T>(
     primary = err;
   }
 
-  const closes = await sessions.closeAll(hooks);
-  const clean = closes.every((c) => c.completed);
+  await sessions.closeIfOpen(hooks);
+  const closeFailed = sessions.closeErrors.length > 0 || sessions.closes.some((c) => !isCleanClose(c));
 
   let cleanupError: unknown = null;
   let retained = false;
-  if (clean) {
+  if (closeFailed) {
+    retained = true; // shutdown not clean: retain the directory and diagnostics
+  } else {
     try {
-      (hooks.cleanupDir ?? removeTaskDir)(dir);
+      (hooks.cleanupDir ?? cleanupOwnedDir)(dir);
     } catch (err) {
       cleanupError = err;
       retained = true;
     }
-  } else {
-    retained = true; // shutdown not clean: retain the directory and diagnostics
   }
 
   return {
-    ok: primary === null && cleanupError === null && clean,
+    ok: primary === null && !closeFailed && cleanupError === null,
     value,
     primary,
-    closes,
+    closes: sessions.closes,
+    closeErrors: sessions.closeErrors,
     cleanupError,
     retained,
     dir,
@@ -391,17 +424,27 @@ export interface LifecycleHooks extends OwnedRunHooks {
   afterReopen?: (reopened: SpatialSession) => void;
 }
 
-/** Normal save → close → reopen → restore, with the save fields asserted. */
+function assertCleanClose(c: CloseResult, label: string): void {
+  if (!c.completed) throw new Error(`${label} did not complete`);
+  if (c.error !== null) throw c.error;
+  if (c.unconfirmedRequest) throw new Error(`${label} reports an unconfirmed request`);
+}
+
+/** Normal save → close primary → reopen → restore, with the save fields asserted. */
 export async function runPrimaryLifecycle(hooks: LifecycleHooks = {}): Promise<OwnedRun<void>> {
   return runOwned<void>('shared-session', async (sessions) => {
-    const session = await sessions.open({ databasePath: sessions.databasePath('spatial.db'), worldId: WORLD });
-    seedCorridor(session.voxel);
+    const primary = await sessions.open({ databasePath: sessions.databasePath('spatial.db'), worldId: WORLD });
+    seedCorridor(primary.voxel);
 
-    const cp = await session.checkpoint();
-    const state = session.getPersistenceState();
+    const cp = await primary.checkpoint();
+    const state = primary.getPersistenceState();
     assert(cp.checkpointId === state.lastConfirmedCheckpointId, 'checkpoint id must equal last confirmed');
     assert(cp.voxelRevision === state.confirmedVoxelRevision, 'voxel revision must equal confirmed');
     assert(state.dirty === false, 'save must not be dirty');
+
+    // Close the primary session (awaited, and checked clean) before reopening:
+    // one Worker at a time for the shared path; a non-clean close prevents reopen.
+    assertCleanClose(await sessions.close(hooks), 'primary session close');
 
     const reopened = await sessions.open({ databasePath: sessions.databasePath('spatial.db'), worldId: WORLD });
     if (hooks.afterReopen) hooks.afterReopen(reopened);
@@ -410,12 +453,11 @@ export async function runPrimaryLifecycle(hooks: LifecycleHooks = {}): Promise<O
   }, hooks);
 }
 
-/** The shared post-conditions of a clean normal save run (both sessions close clean). */
+/** The shared post-conditions of a clean normal save run; the original error is re-thrown, never replaced. */
 export function assertCleanSaveRun(run: OwnedRun<unknown>): void {
-  assert(run.ok, 'normal save lifecycle must succeed');
-  assert(run.primary === null, 'no primary error expected');
-  assert(run.cleanupError === null, 'no cleanup error expected');
-  assert(!run.retained, 'temp dir must be cleaned up');
+  if (run.primary !== null) throw run.primary;
+  if (run.closeErrors.length > 0) throw run.closeErrors[0];
+  if (run.cleanupError !== null) throw run.cleanupError;
   assert(run.closes.length === 2, 'primary and reopened sessions must both close');
   for (const c of run.closes) {
     assert(c.completed, 'every session close must complete');
@@ -423,6 +465,7 @@ export function assertCleanSaveRun(run: OwnedRun<unknown>): void {
     assert(!c.unconfirmedRequest, 'close must report no unconfirmed request');
     assert(c.error === null, 'close must report no error');
   }
+  assert(!run.retained, 'temp dir must be cleaned up');
 }
 
 /** Real public snapshotLimits capacity rejection; the error propagates as primary. */
@@ -440,33 +483,50 @@ export async function runCapacityLifecycle(hooks: OwnedRunHooks = {}): Promise<O
   }, hooks);
 }
 
+function describeError(err: unknown): string {
+  if (err instanceof PersistenceError) return `PersistenceError(kind=${err.kind}) ${err.message}`;
+  if (err instanceof Error) return `${err.constructor.name}: ${err.message}`;
+  return String(err);
+}
+
+/**
+ * The single structured reporting path shared by `main` and the tests: prints the
+ * primary kind/message, every real close result, secondary close/cleanup errors, and
+ * the retained directory. Tests inject a capturing writer so they assert exactly what
+ * the CLI prints.
+ */
+export function writeRunReport(write: (line: string) => void, name: string, run: OwnedRun<unknown>): void {
+  write(`[${name}] ok=${run.ok} retained=${run.retained}`);
+  if (run.primary !== null) {
+    write(`[${name}] primary ${describeError(run.primary)}`);
+  }
+  run.closes.forEach((c, i) => {
+    const err = c.error === null ? 'null' : describeError(c.error);
+    write(`[${name}] close[${i}] completed=${c.completed} dirty=${c.dirty} unconfirmedRequest=${c.unconfirmedRequest} lastConfirmedCheckpointId=${c.lastConfirmedCheckpointId} error=${err}`);
+  });
+  run.closeErrors.forEach((e, i) => {
+    write(`[${name}] closeError[${i}] ${describeError(e)}`);
+  });
+  if (run.cleanupError !== null) {
+    write(`[${name}] cleanupError ${describeError(run.cleanupError)}`);
+  }
+  if (run.retained) {
+    write(`[${name}] retainedDir=${run.dir}`);
+  }
+}
+
 async function main(): Promise<void> {
-  const failures: [string, unknown][] = [];
+  assertDisconnected(runDisconnectScenario());
 
-  try {
-    assertDisconnected(runDisconnectScenario());
-  } catch (err) {
-    failures.push(['L1 disconnect', err]);
-  }
+  const normal = await runPrimaryLifecycle();
+  writeRunReport((line) => console.log(line), 'L2 normal save', normal);
+  assertCleanSaveRun(normal);
 
-  try {
-    assertCleanSaveRun(await runPrimaryLifecycle());
-  } catch (err) {
-    failures.push(['L2 normal save', err]);
-  }
+  const cap = await runCapacityLifecycle();
+  writeRunReport((line) => console.log(line), 'L2 capacity', cap);
+  assert(cap.primary instanceof PersistenceError && cap.primary.kind === 'capacity', 'capacity rejection expected');
+  assert(cap.cleanupError === null && !cap.retained, 'capacity cleanup should be clean');
 
-  try {
-    const cap = await runCapacityLifecycle();
-    assert(cap.primary instanceof PersistenceError && cap.primary.kind === 'capacity', 'capacity rejection expected');
-    assert(cap.cleanupError === null && !cap.retained, 'capacity cleanup should be clean');
-  } catch (err) {
-    failures.push(['L2 capacity', err]);
-  }
-
-  if (failures.length > 0) {
-    for (const [name, err] of failures) console.error(`${name} failed:`, err);
-    throw new Error('one or more lifecycle checks failed');
-  }
   console.log('shared-session-lifecycle: all checks passed.');
 }
 

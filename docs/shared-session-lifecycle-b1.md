@@ -1,72 +1,94 @@
-# Shared-session lifecycle — B1 evidence (revised)
+# Shared-session lifecycle — B1 evidence (final review fix)
 
-Scope: `examples/shared-session-lifecycle.ts` and `tests/shared-session-lifecycle.test.ts`.
-No `src`, package manifest, acceptance, existing design doc, or unrelated worktree
-file was changed.
+Scope: `examples/shared-session-lifecycle.ts`, `tests/shared-session-lifecycle.test.ts`,
+and this document. No `src`, package manifest, acceptance, existing design doc, or
+unrelated worktree file was changed by this task.
 
 ## What changed
 
-The example now owns the disconnect wiring and the save/close/resource boundary in
-one reusable surface, and the tests call that same surface instead of re-implementing
-it.
-
-1. **Disconnect order (L1).** `runDisconnect` cancels the old delegation first
-   (`WalkRouteExecutor.cancel('lifecycle', …)`), then dispatches the `markStale` /
-   `beginSession` `ChangeReport`s to both the readonly `RouteVerifier` and the
-   executor, then shows a late old-session observation is rejected and a late old
-   body frame cannot reactivate control or rewrite the cancellation. `main` and the
-   positive test both call `runDisconnectScenario()` and the shared
-   `assertDisconnected`, so deleting the cancel or the report-dispatch channel fails
-   the assertion.
-2. **Resource boundary (L2).** `runOwned`/`OwnedSessions` own one temp directory and
-   every session opened through them (primary, reopened, capacity). It always
-   performs a bounded `close()` for every session — on success, on a thrown primary
-   error, and on a later assertion failure — before any cleanup, and preserves the
-   original `PersistenceError` identity/kind/message as primary while recording
-   close/cleanup failures as secondary. Cleanup runs only after close outcomes; a
-   non-clean close or a cleanup failure retains the temp directory.
-3. **Save/close assertions (L2).** `runPrimaryLifecycle` asserts `checkpointId ===
-   lastConfirmedCheckpointId`, `voxelRevision === confirmedVoxelRevision`, and
-   `dirty === false`; `assertCleanSaveRun` checks the full close fields
-   (`completed`/`dirty`/`unconfirmedRequest`/`error`) for both sessions.
-4. **Capacity (L2).** `runCapacityLifecycle` exercises the real public
-   `snapshotLimits: { maxVoxelSections: 1 }` rejection; the `PersistenceError(kind:
-   'capacity')` propagates as primary and is never replaced by close/cleanup.
-5. **Cleanup guard (L2).** `removeTaskDir` now removes only a direct child of the OS
-   temp root (`dirname(dir) === tmpdir()`), rejecting the temp root itself and any
-   unrelated child; no generic directory-deletion API was introduced.
+1. **Close-before-reopen (L2).** `runPrimaryLifecycle` now follows primary open →
+   checkpoint/assert → awaited real `close()` (checked clean via `assertCleanClose`) →
+   only then reopen → restore. `OwnedSessions.open` refuses a second session while one
+   is still open (`a session is already open`), so a shared path never has two Workers
+   at once. A non-clean or thrown primary close propagates as primary and prevents
+   reopen. The boundary still closes the *current* session after any body/assertion
+   failure.
+2. **No fabricated close results (L2).** `OwnedSessions.close` records only real
+   `CloseResult` values into `closes`; a thrown `close()` is kept separately in
+   `closeErrors` (secondary) and never turned into an invented
+   `{completed:false, dirty:true, …}` record. The original primary error
+   object/kind/message is preserved. A close that throws, reports `completed:false`,
+   an `error`, or an `unconfirmedRequest` is not clean and retains the directory; the
+   capacity scenario's `dirty:true` is unsaved data, not a shutdown failure, so it does
+   not force retention.
+3. **Structured CLI reporting (L2).** `writeRunReport` is the single reporting path
+   shared by `main` and the tests. It prints the primary `kind`/message, every real
+   close result, secondary close/cleanup errors, and the retained directory. `main`
+   runs the same `runPrimaryLifecycle`/`runCapacityLifecycle` entries and the shared
+   `assertCleanSaveRun`, which re-throws the original primary error instead of a
+   generic `'normal lifecycle must succeed'`. The CLI exits naturally (exit code 0) —
+   no `process.exit`.
+4. **Cleanup helper removed.** The exported `removeTaskDir` was deleted. Cleanup is an
+   internal `cleanupOwnedDir` that removes only the exact `mkdtempSync`-created
+   directory owned by the run, guarded by a simple direct-child-of-temp-root check. No
+   general path-safety framework was added.
+5. **Real negative controls (L1).** The two negative controls now run the shared
+   `assertDisconnected` invariant against `runDisconnectScenario` with a single channel
+   omitted (`skipVerifierReport` / `skipCancel`) and assert it *throws*. This proves the
+   shared success invariant actually depends on each channel, instead of asserting a
+   hand-rewritten broken setup. The `skipCancel` control keeps real reports and body
+   frames flowing, so report-driven invalidation cannot hide the missing cancel — the
+   shared `walkOutcome === 'CANCELLED'` check still fails.
 
 ## Validation
 
-Commands (cwd = worktree root), all exited 0:
+Commands (cwd = worktree root):
 
-- `npm run build` → 0
-- `npm run typecheck` → 0
-- `npx vitest run tests/shared-session-lifecycle.test.ts` → 9 passed
-- `node --import tsx examples/shared-session-lifecycle.ts` → prints
-  `shared-session-lifecycle: all checks passed.` and exits naturally (no
-  `process.exit`; `process.exitCode` is set on failure only).
+- `npx vitest run tests/shared-session-lifecycle.test.ts` → 13 passed (exit 0)
+- `npm run typecheck` → 0 (runs `npm run build` then `tsc --noEmit`)
+- `node --import tsx examples/shared-session-lifecycle.ts` → prints the structured
+  reports below and exits naturally 0
 
-Test evidence (9 tests):
+CLI output (excerpt):
+
+```
+[L2 normal save] ok=true retained=false
+[L2 normal save] close[0] completed=true dirty=false unconfirmedRequest=false lastConfirmedCheckpointId=… error=null
+[L2 normal save] close[1] completed=true dirty=false unconfirmedRequest=false lastConfirmedCheckpointId=null error=null
+[L2 capacity] ok=false retained=false
+[L2 capacity] primary PersistenceError(kind=capacity) maxVoxelSections exceeds limit 1 (2)
+[L2 capacity] close[0] completed=true dirty=true unconfirmedRequest=false lastConfirmedCheckpointId=null error=null
+shared-session-lifecycle: all checks passed.
+```
+
+Test evidence (13 tests):
 
 - Positive disconnect: shared `assertDisconnected` over `runDisconnectScenario`.
-- Negative A: report dispatch omitted → readonly verifier still `OPEN` while the walk
-  is cancelled (independent of executor cancel).
-- Negative B: empty lifecycle report + no cancel → walk stays pending.
-- Late old body frame: cancelled result is not rewritten, the step is not
-  reactivated, and `body.stop` targeted the old move execution exactly once.
-- Normal save/close: `assertCleanSaveRun` over `runPrimaryLifecycle`.
+- Negative A: `skipVerifierReport` → `assertDisconnected` throws
+  `old verifier must no longer be OPEN`.
+- Negative B: `skipCancel` → `assertDisconnected` throws `old walk must be cancelled`
+  (report invalidation cannot hide the missing cancel).
+- Late old body frame: cancelled result not rewritten, step not reactivated, `body.stop`
+  targeted the old move exactly once.
+- Normal save/close: `assertCleanSaveRun` over `runPrimaryLifecycle`; temp dir removed
+  after known clean closure.
+- Reopen only after primary close: close → reopen → close order asserted via hooks.
+- Non-clean primary close prevents reopen: `afterReopen` never runs, `closes.length === 1`.
 - Capacity + cleanup failure: primary `kind === 'capacity'`/message preserved,
-  `cleanupError` secondary, directory retained.
-- Cleanup failure alone: `ok === false`, no primary, `cleanupError` reported.
-- Close failure after primary: `completed === false`, directory retained, primary
-  preserved.
-- Injected assertion failure after reopen: both primary and reopened sessions are
-  still closed by the boundary.
+  `cleanupError` secondary, directory retained and present on disk, `dirty:true`.
+- Cleanup failure alone: `ok === false`, no primary, `cleanupError`, directory retained.
+- Non-clean close after primary: `completed === false`, primary preserved, directory
+  retained and present on disk.
+- Thrown close after primary: `closes` empty (no fabricated record), `closeErrors`
+  length 1, primary preserved, directory retained.
+- Shared report: `writeRunReport` output contains `capacity`, `maxVoxelSections`, and
+  `retainedDir=<dir>`.
+- Injected assertion failure after reopen: both sessions still closed by the boundary,
+  `retained === false`.
 
 ## Remaining limitations
 
-- The `runPrimaryLifecycle` reopen is performed while the primary session is still
-  open (the boundary closes all sessions afterwards); this is validated on the
-  current Windows/Node via the CLI run and tests. A game-server integration run
-  (real mineflayer/pathfinder perception and body) is out of scope for this change.
+- No real game-server integration (mineflayer/pathfinder perception and body) is run;
+  the example uses Fake perception and a Fake body, as documented.
+- The example uses default `eager` voxel loading, appropriate only when the world fits
+  the session's working-set budget (see `examples/working-set.ts`).
