@@ -16,6 +16,8 @@ See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design
 
 - **Voxel map** (`voxel/`): sparse, versioned observation state with per-cell evidence, session/interruption handling and localized `ChangeReport`s.
 - **Traversability** (`traversability/`): read-only single-step walk evaluation, an invalidation-friendly cache, and bounded route verification over an ordered point list.
+- **Bounded land transition and route verification** (`traversability/`): `evaluateLandTransition` checks one caller-declared transition (`step`, `drop`, `jump`, `ladder`) between exact feet positions against current `VoxelMap` evidence, and `LandRouteVerifier` re-verifies an ordered transition list under per-call work budgets. Results carry `assurance: 'geometry_only'` and `executable: false`; `jump` requires an injected versioned `LandMotionModel`, `ladder` an injected versioned `ClimbRegionProvider`, and nothing here searches, snaps coordinates, moves the body, digs, places, or executes. See `docs/land-route-validation.md`.
+- **Water-surface and mounted-boat validation** (`water/`, `curio-minecraft-3d-memory/water` subpath): `evaluateWaterRoute` sweeps a caller-selected constant-height swimmer or boat route against an injected solid `CollisionShapeProvider` plus a separate versioned `FluidShapeProvider`, and `checkWaterArrival` separately confirms surface / dry-shore / dock goals from measured samples. Neither searches a route, executes a controller, mounts or dismounts a boat, builds or recovers one, or applies a rescue strategy. See `docs/water-validation.md`.
 - **Controlled walk-route execution** (`execution/`): `WalkRouteExecutor` connects a verified route to an injectable single-step `MoveExecutor` with measured body feedback. It only executes the caller's ordered points (same height, ±1 along X/Z), never starts a step without current OPEN evidence, requires a measured `exact` position for `ARRIVED`, and revokes an in-flight segment when its evidence changes.
 - **Historical path store** (`topology/`, phase 4A): `FragmentStore` keeps historical path geometry (`PathFragment`) and confirmed traversal evidence (`TraversalEvidence`) strictly separated from current world state — with idempotent writes, explicit update, delete, paginated reads, capacity limits, and snapshot isolation.
 - **Topology facts store** (`topology/`, phase 4B): `TopologyStore` records explicit spatial nodes and directional connections (`candidate` vs evidence-backed `traversed`), keeps per-edge evidence references, and reports whether those references still resolve — never whether the path is currently passable.
@@ -297,6 +299,63 @@ Behavior:
 
 The route-pin closed loop is demonstrated in `examples/working-set.ts`: prepare a route's actual dependency sections → restore current evidence → verify → protect the dependencies → execute a Fake walk route → release → free. This phase adds bounded working-set management only — no predictive prefetch, background eviction, automatic checkpoint, observation overlay, new pathfinding, or real mineflayer/Curio wiring.
 
+## Land and water validation
+
+Both validators are read-only and bounded. They consume evidence already accepted by a `VoxelMap` and never scan,
+load, generate, search a route, execute movement, dig, place, build, mount or dismount a boat, or apply a rescue
+strategy.
+
+### Land transitions and routes
+
+```ts
+import {
+  evaluateLandTransition,
+  LandRouteVerifier,
+  resolveLandLimits,
+} from 'curio-minecraft-3d-memory';
+
+const evaluation = evaluateLandTransition(
+  map,
+  { worldId, dim, sessionId, body, transition }, // transition.kind is explicit
+  { shapeProvider, jumpModel, climbProvider },  // jumpModel / climbProvider only for those kinds
+  Date.now(),
+  resolveLandLimits({ maxWork: 4096 }),
+);
+
+const verifier = new LandRouteVerifier(map, { limits: { maxWork: 8192 } });
+verifier.register({ worldId, dim, sessionId, body, rules, transitions });
+```
+
+`body.feet` must exactly equal `transition.from`; coordinates are never rounded or snapped. Result and snapshot
+types expose `assurance: 'geometry_only'` and `executable: false`. `step` / `drop` / `jump` / `ladder` are the only
+supported geometry subsets; `jump` requires an injected versioned `LandMotionModel` and `ladder` an injected
+versioned `ClimbRegionProvider`. A missing model or provider yields `UNSUPPORTED`, never an inferred traversal. See
+[`docs/land-route-validation.md`](docs/land-route-validation.md).
+
+### Water surface and mounted boat
+
+```ts
+import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
+
+const route = evaluateWaterRoute(map, {
+  worldId, dim, sessionId,
+  points,                // caller-selected, ordered, exactly the same Y
+  profile,               // surface_swim | mounted_boat
+  solidShapeProvider,
+  fluidShapeProvider,
+}, Date.now());
+
+const arrival = checkWaterArrival({ goal, scope, map, samples, now, maxSampleAgeMs });
+```
+
+Routes must be constant-height with a fixed 90° orientation; vertical transitions and arbitrary yaw return
+`UNSUPPORTED`. Solid collision and fluid/surface interpretation are separate versioned authorities, and every
+provider neighbour read is budgeted and recorded as a Section dependency. `OPEN` covers only the bounded
+geometry/evidence contract — never arrival, authorization, executor support, or absence of risk.
+`checkWaterArrival` is a separate completion check over measured, ordered samples and returns `ARRIVED` or
+`UNCONFIRMED`. Neither function searches, controls the body, or manipulates a boat. See
+[`docs/water-validation.md`](docs/water-validation.md).
+
 ## Install & consume
 
 ```bash
@@ -309,19 +368,26 @@ Consumers install the real `.tgz` into their own project and import by package n
 (never a source path, `../dist`, `npm link`, or a dev-machine directory alias):
 
 ```json
-{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.7.4.tgz", "better-sqlite3": "^12.0.0" } }
+{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.8.0.tgz", "better-sqlite3": "^12.0.0" } }
 ```
 
 ```ts
-import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
+import {
+  LandRouteVerifier,
+  RouteVerifier,
+  WalkRouteExecutor,
+  evaluateLandTransition,
+} from 'curio-minecraft-3d-memory';
 import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
+import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
 ```
 
-Requires Node `>= 18`. The core entry (`curio-minecraft-3d-memory`) has no native dependency and never starts a
-worker; the SQLite entry (`curio-minecraft-3d-memory/storage/sqlite`) uses `better-sqlite3` (an optional peer
-dependency) inside a single worker thread, so SQLite consumers must install `better-sqlite3@^12` explicitly. The
-one-shot independent-install acceptance is `node acceptance/run.mjs` (pack → throwaway install → runtime
-assertions + type-check; any failure exits non-zero).
+Requires Node `>= 18`. The core entry (`curio-minecraft-3d-memory`), the water entry
+(`curio-minecraft-3d-memory/water`) and the land validators re-exported from the core entry have no native
+dependency and never start a worker; the SQLite entry (`curio-minecraft-3d-memory/storage/sqlite`) uses
+`better-sqlite3` (an optional peer dependency) inside a single worker thread, so SQLite consumers must install
+`better-sqlite3@^12` explicitly. The one-shot independent-install acceptance is `node acceptance/run.mjs`
+(pack → throwaway install → runtime assertions + type-check; any failure exits non-zero).
 
 ## Host shared session lifecycle
 
@@ -356,7 +422,8 @@ src/
 ├── types.ts            # base primitives (Vec3Like / BlockState / WorldScope / MoveMode)
 ├── observation/        # World Observer: Observation / evidence / freshness (§3.2)
 ├── voxel/              # Spatial Mapper: Section / Palette / bit-packing (§4)
-├── traversability/     # derived traversability: Traversability / HazardFact (§3.3)
+├── traversability/     # derived traversability + bounded land transition/route validation (§3.3)
+├── water/              # read-only water-surface and mounted-boat validation (subpath /water)
 ├── topology/           # Topology Manager: path fragments / nodes / edges (§3.1, §5)
 ├── adapter/            # WorldAdapter target surface (§2.1)
 ├── navigation/         # L2 navigation primitives and result envelope (§7)
@@ -397,12 +464,13 @@ npx tsx examples/spatial-checkpoint-incremental.ts # run the incremental voxel c
 npx tsx examples/spatial-residency.ts         # run the manual on-demand section residency demo
 npx tsx examples/working-set.ts               # run the bounded working-set + Fake route demo
 npx tsx examples/shared-session-lifecycle.ts  # run the host shared-session lifecycle reference
+npx vitest run tests/land-transition.test.ts tests/land-route.test.ts tests/water-validation.test.ts
 node acceptance/run.mjs                       # run the independent consumer acceptance (pack + install + assertions + type-check)
 ```
 
 > `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, `examples/historical-anchor-query.ts`, and `examples/history-checkpoint.ts` import the built package by its public name (`curio-minecraft-3d-memory`, with `history-checkpoint.ts` using the `curio-minecraft-3d-memory/storage/sqlite` subpath) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
 
-> The persistence entry (`curio-minecraft-3d-memory/storage/sqlite`) uses `better-sqlite3` (an optional peer dependency) inside a single worker thread. The core entry (`curio-minecraft-3d-memory`) has no native dependency and never starts a worker.
+> The persistence entry (`curio-minecraft-3d-memory/storage/sqlite`) uses `better-sqlite3` (an optional peer dependency) inside a single worker thread. The core entry (`curio-minecraft-3d-memory`) and the `curio-minecraft-3d-memory/water` entry have no native dependency and never start a worker.
 
 ## License
 

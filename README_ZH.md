@@ -16,6 +16,8 @@
 
 - **体素地图**（`voxel/`）：稀疏、版本化的观测状态，含逐格证据、会话/中断处理与局部 `ChangeReport`。
 - **通行性**（`traversability/`）：只读单步行走评估、可失效缓存，以及对有序点列的受限路线验证。
+- **有界陆地转换与路线验证**（`traversability/`）：`evaluateLandTransition` 针对一条由调用方显式声明、带精确脚位的转换（`step` / `drop` / `jump` / `ladder`），在 `VoxelMap` 已有证据上检查声明的连续通道与必要支撑/接触；`LandRouteVerifier` 在有序转换列表上按每次调用的工作预算复验。结果固定带 `assurance: 'geometry_only'` 与 `executable: false`；`jump` 必须注入版本化 `LandMotionModel`，`ladder` 必须注入版本化 `ClimbRegionProvider`。不做搜索、坐标取整/吸附、身体移动、挖掘或放置。见 `docs/land-route-validation.md`。
+- **水面与已乘船验证**（`water/`，子路径 `curio-minecraft-3d-memory/water`）：`evaluateWaterRoute` 对调用方选定、等高的游泳/乘船路线，用注入的实心 `CollisionShapeProvider` 与独立的版本化 `FluidShapeProvider` 做扫掠检查；`checkWaterArrival` 基于实测有序采样单独确认水面 / 干岸 / 停靠目标。两者都不搜索路线、不执行控制器、不上下船、不造船/回收船，也不接管救援策略。见 `docs/water-validation.md`。
 - **受控 walk 路线执行**（`execution/`）：`WalkRouteExecutor` 把已验证路线连接到可注入的单步 `MoveExecutor` 与实测身体反馈。它只执行调用者提供的点列（同高度、沿 X/Z 单轴一格），无有效 OPEN 证据不启动路段，`ARRIVED` 必须以实测 `exact` 位置为依据，并会在路段证据变化时撤销执行中的控制。
 - **历史路径存储**（`topology/`，阶段 4A）：`FragmentStore` 将历史路径几何（`PathFragment`）与已确认经过证据（`TraversalEvidence`）与当前世界状态严格分离 —— 支持幂等写入、明确更新、删除、分页读取、容量上限与快照隔离。
 - **拓扑事实存储**（`topology/`，阶段 4B）：`TopologyStore` 记录显式空间节点与有向连接（`candidate` 候选 vs 有依据的 `traversed`），保留每条边的证据引用，并报告这些引用当前能否解析 —— 但从不回答当前是否可通行。
@@ -353,7 +355,8 @@ src/
 ├── types.ts            # 基础原语（Vec3Like / BlockState / WorldScope / MoveMode）
 ├── observation/        # World Observer：Observation / 证据 / 新鲜度（§3.2）
 ├── voxel/              # Spatial Mapper：Section / Palette / 位打包（§4）
-├── traversability/     # 派生通行性：Traversability / HazardFact（§3.3）
+├── traversability/     # 派生通行性 + 有界陆地转换/路线验证（§3.3）
+├── water/              # 只读水面与已乘船验证（子路径 /water）
 ├── topology/           # Topology Manager：路径片段 / 节点 / 边（§3.1、§5）
 ├── adapter/            # WorldAdapter 目标适配面（§2.1）
 ├── navigation/         # L2 导航原语与结果信封（§7）
@@ -376,6 +379,51 @@ examples/
 └── shared-session-lifecycle.ts     # 可运行的宿主共享会话生命周期参考示例
 ```
 
+## 陆地与水面验证
+
+两个验证器都是只读、有界的。它们只消费 `VoxelMap` 已接受的证据，不扫描、不加载、不生成、不搜索路线、不执行移动、不挖、不放、不建造、不上下船，也不接管救援策略。
+
+### 陆地转换与路线
+
+```ts
+import {
+  evaluateLandTransition,
+  LandRouteVerifier,
+  resolveLandLimits,
+} from 'curio-minecraft-3d-memory';
+
+const evaluation = evaluateLandTransition(
+  map,
+  { worldId, dim, sessionId, body, transition }, // transition.kind 必须显式给出
+  { shapeProvider, jumpModel, climbProvider },  // jumpModel / climbProvider 仅对应类型需要
+  Date.now(),
+  resolveLandLimits({ maxWork: 4096 }),
+);
+
+const verifier = new LandRouteVerifier(map, { limits: { maxWork: 8192 } });
+verifier.register({ worldId, dim, sessionId, body, rules, transitions });
+```
+
+`body.feet` 必须与 `transition.from` 精确相等，坐标不取整、不吸附。结果与快照固定带 `assurance: 'geometry_only'` 与 `executable: false`。仅支持 `step` / `drop` / `jump` / `ladder` 四类几何子集；`jump` 必须提供注入的版本化 `LandMotionModel`，`ladder` 必须提供注入的版本化 `ClimbRegionProvider`；缺失时返回 `UNSUPPORTED`，绝不推断为可通行。见 [`docs/land-route-validation.md`](docs/land-route-validation.md)。
+
+### 水面与已乘船
+
+```ts
+import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
+
+const route = evaluateWaterRoute(map, {
+  worldId, dim, sessionId,
+  points,                // 调用方选定、有序、Y 完全相同
+  profile,               // surface_swim | mounted_boat
+  solidShapeProvider,
+  fluidShapeProvider,
+}, Date.now());
+
+const arrival = checkWaterArrival({ goal, scope, map, samples, now, maxSampleAgeMs });
+```
+
+路线必须等高且姿态固定为 90° 的整数倍；竖直转换或任意偏航返回 `UNSUPPORTED`。实心碰撞与流体/水面解释是两套独立的版本化权威；Provider 的每次邻格读取都受预算约束并记录为 Section 依赖。`OPEN` 只表示有限几何/证据契约成立，从不表示已经到达、已获授权、执行器支持或无风险。`checkWaterArrival` 是基于实测有序采样的独立完成确认，返回 `ARRIVED` 或 `UNCONFIRMED`。两者都不搜索、不控制身体、不操作船。见 [`docs/water-validation.md`](docs/water-validation.md)。
+
 ## 安装与消费
 
 ```bash
@@ -387,15 +435,22 @@ npm pack                                  # 产出 curio-minecraft-3d-memory-<ve
 消费者在独立项目中安装实际 `.tgz`，用包名与公开子路径引入（不用源码路径、`../dist`、`npm link` 或开发机目录别名）：
 
 ```json
-{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.7.4.tgz", "better-sqlite3": "^12.0.0" } }
+{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.8.0.tgz", "better-sqlite3": "^12.0.0" } }
 ```
 
 ```ts
-import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
+import {
+  LandRouteVerifier,
+  RouteVerifier,
+  WalkRouteExecutor,
+  evaluateLandTransition,
+} from 'curio-minecraft-3d-memory';
 import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
+import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
 ```
 
-运行时要求 Node `>= 18`。核心入口（`curio-minecraft-3d-memory`）无原生依赖、不启动 Worker；SQLite 子入口
+运行时要求 Node `>= 18`。核心入口（`curio-minecraft-3d-memory`）、`water` 子入口
+（`curio-minecraft-3d-memory/water`）以及核心入口导出的陆地验证器均无原生依赖、不启动 Worker；SQLite 子入口
 （`curio-minecraft-3d-memory/storage/sqlite`）在单个 Worker 线程内使用 `better-sqlite3`（可选 peer dependency），
 使用 SQLite 的消费者须显式安装 `better-sqlite3@^12`。独立安装验收一键命令：`node acceptance/run.mjs`
 （打包 → 临时安装 → 运行时断言 + 类型检查，任一失败非零退出）。
