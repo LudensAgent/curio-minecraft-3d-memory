@@ -635,7 +635,14 @@ export class LandRouteVerifier {
       segments,
       validUntil,
       computedAt: now,
-      budgetGap: this.budgetGap === undefined ? undefined : { ...this.budgetGap },
+      budgetGap:
+        this.budgetGap === undefined
+          ? undefined
+          : {
+              ...this.budgetGap,
+              diagnostic: cloneReason(this.budgetGap.diagnostic),
+              transitionWork: { ...this.budgetGap.transitionWork },
+            },
     };
   }
 }

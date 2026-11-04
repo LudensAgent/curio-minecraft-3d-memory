@@ -225,6 +225,33 @@ describe('LandRouteVerifier — mixed route and bounded advance', () => {
     expect(done.budgetGap).toBeUndefined();
   });
 
+  it('isolates nested budget-gap diagnostics and work from later status reads', () => {
+    const map = new VoxelMap('world');
+    fillMixed(map);
+    const verifier = new LandRouteVerifier(map, { now: () => 2000 });
+    verifier.register(request(MIXED, rules));
+
+    const first = verifier.advance(1);
+    const gap = first.budgetGap;
+    if (gap === undefined) throw new Error('expected a budget gap');
+    const original = {
+      detail: gap.diagnostic.detail,
+      cells: gap.diagnostic.cells.map((cell) => ({ ...cell })),
+      work: { ...gap.transitionWork },
+    };
+
+    gap.diagnostic.detail = 'externally modified';
+    gap.diagnostic.cells.push({ x: 99, y: 99, z: 99 });
+    gap.transitionWork.used = 12345;
+    gap.transitionWork.exhausted = false;
+
+    const later = statusOf(verifier).budgetGap;
+    if (later === undefined) throw new Error('expected the retained budget gap');
+    expect(later.diagnostic.detail).toBe(original.detail);
+    expect(later.diagnostic.cells).toEqual(original.cells);
+    expect(later.transitionWork).toEqual(original.work);
+  });
+
   it('distinguishes the configured maxWork ceiling from a per-call budget shortfall', () => {
     const map = new VoxelMap('world');
     fillOpenStep(map);
