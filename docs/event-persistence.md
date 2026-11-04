@@ -35,9 +35,10 @@ Public surface (from `storage/sqlite`):
 - `ActionRecord.result?: NavResult` — an optional, verbatim original navigation
   result for existing and new callers.
 
-Acceptance is **not** a save. A record becomes durable only when a later
-`checkpoint()` captures it, the single existing SQLite worker commits it in the
-same transaction as history/topology/voxel, and the ACK arrives.
+Acceptance is **not** a save. A save is confirmed only after a later
+`checkpoint()` captures the record, the single existing SQLite worker commits it in
+the same transaction as history/topology/voxel, and the ACK arrives; if that ACK is
+lost, the transaction may nevertheless have committed.
 
 ## Supported event variants
 
@@ -135,7 +136,7 @@ into the voxel map, and no event is inferred from map contents.
 
 ## Explicit recovery and withdrawal
 
-- `readPending()` returns isolated copies of all accepted-but-uncommitted
+- `readPending()` returns isolated copies of all accepted but not yet ACK-confirmed
   records, bounded by the pending queue limits. It works after a failed or closed
   session; it never reads committed rows.
 - `withdraw({ actions?, events? })` removes only exact pending
@@ -175,7 +176,7 @@ defaults live in `DEFAULT_JOURNAL_LIMITS`:
 
 | Limit | Default | Meaning |
 |---|---:|---|
-| `maxPendingRecords` | 10,000 | accepted-but-uncommitted actions + events |
+| `maxPendingRecords` | 10,000 | accepted but not yet ACK-confirmed actions + events |
 | `maxPendingBytes` | 16 MiB | pending canonical JSON bytes |
 | `maxRecordBytes` | 1 MiB | one record's canonical JSON bytes |
 | `maxRecordArrayLength` | 100,000 | any nested array / object key count |
@@ -282,6 +283,10 @@ New focused suite `tests/event-persistence.test.ts` (**28 tests**, real
   checkpoint;
 - v3→v4 upgrade preserves history/voxel facts, writes a backup and starts with an
   empty journal; a failed v4 migration rolls back to v3 with a backup.
+
+The combined case of a disk commit that succeeded while its ACK was lost was not
+separately exercised; the timeout test establishes retention and stable-ID replay,
+not that SQLite had committed before the ACK was lost.
 
 Directly affected existing suites were run together with the new suite
 (`--no-cache`, 178 passed total):

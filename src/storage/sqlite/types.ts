@@ -127,9 +127,9 @@ export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
  * bytes (SQL framing/index overhead is excluded).
  */
 export interface JournalLimits {
-  /** Maximum accepted-but-not-checkpointed records across actions + events. Default 10000. */
+  /** Maximum accepted but not yet ACK-confirmed records across actions + events. Default 10000. */
   maxPendingRecords?: number;
-  /** Maximum accepted-but-not-checkpointed canonical payload bytes. Default 16 MiB. */
+  /** Maximum accepted but not yet ACK-confirmed canonical payload bytes. Default 16 MiB. */
   maxPendingBytes?: number;
   /** Maximum canonical payload bytes of one record. Default 1 MiB. */
   maxRecordBytes?: number;
@@ -290,9 +290,10 @@ export interface JournalBatchAcceptResult {
 }
 
 /**
- * Bounded snapshot of caller-accepted but not yet checkpointed records, for
- * explicit recovery. Entries are isolated copies; mutating them cannot change
- * the session's pending queue.
+ * Bounded snapshot of caller-accepted records not yet confirmed by a checkpoint
+ * ACK, for explicit recovery. A timed-out checkpoint may already have committed
+ * while its confirmation was lost. Entries are isolated copies; mutating them
+ * cannot change the session's pending queue.
  */
 export interface PendingJournalSnapshot {
   revision: number;
@@ -325,9 +326,15 @@ export interface JournalQueryBase {
   dim?: string;
   /** Exact original sessionId filter. */
   sessionId?: string;
-  /** Page row bound; capped by the resolved maxPageRecords. */
+  /**
+   * Page row bound; must not exceed the resolved maxPageRecords (larger values are
+   * rejected with `invalid_argument`, never clamped).
+   */
   maxRecords?: number;
-  /** Page decoded-payload byte bound; capped by the resolved maxPageBytes. */
+  /**
+   * Page decoded-payload byte bound; must not exceed the resolved maxPageBytes
+   * (larger values are rejected with `invalid_argument`, never clamped).
+   */
   maxBytes?: number;
   /** Opaque continuation from a previous page. */
   cursor?: string;
@@ -561,9 +568,12 @@ export interface SpatialPersistenceState {
   confirmedJournalRevision: number;
   /** Journal restore baseline checkpoint id (null when no journal baseline exists). */
   journalBaselineCheckpointId: string | null;
-  /** Accepted-but-not-checkpointed journal records. */
+  /**
+   * Accepted but not yet ACK-confirmed journal records (a timed-out checkpoint may
+   * already have committed).
+   */
   pendingJournalRecords: number;
-  /** Accepted-but-not-checkpointed canonical payload bytes. */
+  /** Accepted but not yet ACK-confirmed canonical payload bytes. */
   pendingJournalBytes: number;
   /** Committed journal rows for this world (metadata known without loading payloads). */
   committedJournalRecords: number;
