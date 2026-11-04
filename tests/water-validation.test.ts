@@ -6,6 +6,8 @@ import { VoxelMap } from '../src/voxel/voxel-map.js';
 import { checkWaterArrival, evaluateWaterRoute } from '../src/water/index.js';
 import type {
   BoatDockGoal,
+  BoatMeasurement,
+  Box3,
   DryShoreGoal,
   FluidShape,
   FluidShapeProvider,
@@ -140,6 +142,7 @@ const boatProfile: MountedBoatProfile = {
   orientation: { quarterTurns: 0 },
   hull: { width: 1.0, length: 2.0, height: 0.6 },
   passengerClearance: [{ minX: -0.35, minY: 0.6, minZ: -0.7, maxX: 0.35, maxY: 1.8, maxZ: 0.7 }],
+  passengerBreathing: [{ minX: -0.3, minY: 1.1, minZ: -0.3, maxX: 0.3, maxY: 1.4, maxZ: 0.3 }],
   surfaceBand: { minY: 0.375, maxY: 0.375 },
 };
 
@@ -232,7 +235,7 @@ function scope() {
 }
 
 function sample(overrides: Partial<WaterBodySample> = {}): WaterBodySample {
-  return {
+  const base: WaterBodySample = {
     worldId: 'world',
     dim: 'overworld',
     sessionId: 's1',
@@ -247,6 +250,37 @@ function sample(overrides: Partial<WaterBodySample> = {}): WaterBodySample {
     inWater: true,
     executionId: 'exec-1',
     boatId: 'boat-7',
+    ...overrides,
+  };
+  // A normal host receipt carries boat telemetry bound to the same sample. Tests
+  // that need missing/mismatched telemetry override `boatMeasurement` explicitly.
+  if (!('boatMeasurement' in overrides) && base.boatId !== undefined) {
+    base.boatMeasurement = {
+      boatId: base.boatId,
+      pos: { ...base.pos },
+      velocity: { ...(base.velocity ?? { x: 0, y: 0, z: 0 }) },
+      observedAt: base.observedAt,
+      sequence: base.sequence,
+      executionId: base.executionId,
+      worldId: base.worldId,
+      dim: base.dim,
+      sessionId: base.sessionId,
+    };
+  }
+  return base;
+}
+
+function boatMeasurement(overrides: Partial<BoatMeasurement> = {}): BoatMeasurement {
+  return {
+    boatId: 'boat-7',
+    pos: { x: 4.5, y: 0, z: 0.5 },
+    velocity: { x: 0, y: 0, z: 0 },
+    observedAt: 1000,
+    sequence: 1,
+    executionId: 'exec-1',
+    worldId: 'world',
+    dim: 'overworld',
+    sessionId: 's1',
     ...overrides,
   };
 }
@@ -267,12 +301,23 @@ function arrivalRequest(
   };
 }
 
+function surfaceTargetMap(): VoxelMap {
+  const map = new VoxelMap('world');
+  map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+  map.observe(observation(AIR, { x: 0, y: 1, z: 0 }));
+  map.observe(observation(AIR, { x: 0, y: 2, z: 0 }));
+  return map;
+}
+
 function swimTargetGoal(overrides: Partial<{ x: number; y: number; z: number }> = {}) {
   return {
     kind: 'surface_target' as const,
     target: { x: 0.5, y: 0.5, z: 0.5, ...overrides },
     horizontalTolerance: 0.1,
     verticalTolerance: 0.1,
+    profile: swimProfile,
+    solidShapeProvider: solidProvider,
+    fluidShapeProvider: waterProvider,
   };
 }
 
@@ -284,6 +329,7 @@ function dockGoal(overrides: Partial<BoatDockGoal> = {}): BoatDockGoal {
     verticalTolerance: 0.1,
     boatId: 'boat-7',
     stableWindowMs: 300,
+    maxSampleGapMs: 500,
     maxHorizontalSpeed: 0.01,
     maxVerticalSpeed: 0.1,
     minStableSamples: 2,
@@ -528,6 +574,238 @@ describe('water route validation', () => {
     expect(result.hazards.some((hazard) => hazard.kind === 'current')).toBe(true);
     expect(result.hazards.some((hazard) => hazard.kind === 'bubble_column')).toBe(true);
   });
+
+  it('does not leak one segment surface coverage into later segments', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+    fill(map, { x: 0, y: 1, z: 0 }, { x: 2, y: 2, z: 0 }, AIR);
+    fill(map, { x: 1, y: 0, z: 0 }, { x: 2, y: 0, z: 0 }, AIR);
+
+    const direct = evaluateWaterRoute(map, swimQuery(swimRoute), 1000);
+    expect(direct.status).toBe('BLOCKED');
+    expect(direct.problem?.kind).toBe('missing_surface');
+
+    const repeated = evaluateWaterRoute(
+      map,
+      swimQuery([swimRoute[0]!, { ...swimRoute[0]! }, swimRoute[1]!]),
+      1000,
+    );
+    expect(repeated.status).toBe('BLOCKED');
+    expect(repeated.problem?.kind).toBe('missing_surface');
+  });
+
+  it('accepts a repeated point when the surface actually covers both segment intervals', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery([swimRoute[0]!, { ...swimRoute[0]! }, swimRoute[1]!]),
+      1000,
+    );
+
+    expect(result.status).toBe('OPEN');
+  });
+
+  it('uses the declared contact waterline inside a broad band', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery(swimRoute, {
+        profile: { ...swimProfile, surfaceBand: { minY: 0, maxY: 3 } },
+      }),
+      1000,
+    );
+
+    expect(result.status).toBe('OPEN');
+  });
+
+  it('does not accept a surface above the body/hull as contact even in a broad band', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(AIR, { x: 0, y: 0, z: 0 }));
+    map.observe(observation(WATER, { x: 0, y: 1, z: 0 }));
+    const highThinWater: FluidShapeProvider = {
+      version: 'high-thin',
+      resolve(state, cell) {
+        if (state.name === 'minecraft:water' && cell.y === 1) {
+          return {
+            kind: 'shape',
+            shape: {
+              water: {
+                kind: 'water',
+                box: { minX: 0, minY: 0.4, minZ: 0, maxX: 1, maxY: 0.5, maxZ: 1 },
+                motion: 'still',
+                surface: { y: 0.5, minX: 0, minZ: 0, maxX: 1, maxZ: 1 },
+              },
+              lava: null,
+              risks: [],
+            },
+          };
+        }
+        return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+      },
+    };
+    const profile: SurfaceSwimProfile = {
+      ...swimProfile,
+      body: { width: 0.6, height: 1.0 },
+      breathing: { minY: 1.0, width: 0.5, height: 0.3 },
+      surfaceBand: { minY: 0, maxY: 3 },
+    };
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery(swimRoute, { profile, fluidShapeProvider: highThinWater }),
+      1000,
+    );
+
+    expect(result.status).toBe('BLOCKED');
+    expect(result.problem?.kind).toBe('missing_surface');
+  });
+
+  it('reports a submerged swimmer as an unsupported surface posture', () => {
+    const map = new VoxelMap('world');
+    fill(map, { x: 0, y: 0, z: 0 }, { x: 2, y: 1, z: 0 }, WATER);
+    const layeredWater: FluidShapeProvider = {
+      version: 'layered-water',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: { water: waterVolume(cell.y === 1 ? 0.75 : 0.875), lava: null, risks: [] },
+        };
+      },
+    };
+    const profile: SurfaceSwimProfile = {
+      ...swimProfile,
+      body: { width: 0.6, height: 2.0 },
+      breathing: { minY: 1.0, width: 0.5, height: 0.5 },
+      surfaceBand: { minY: 0, maxY: 3 },
+    };
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery(swimRoute, { profile, fluidShapeProvider: layeredWater }),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem?.kind).toBe('submerged_posture');
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
+  });
+
+  it('reports a wet passenger breathing volume as an unsupported boat posture', () => {
+    const map = new VoxelMap('world');
+    fill(map, { x: 2, y: 0, z: -1 }, { x: 4, y: 1, z: 1 }, WATER);
+    const layeredWater: FluidShapeProvider = {
+      version: 'layered-boat-water',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: { water: waterVolume(cell.y === 1 ? 0.4 : 0.375), lava: null, risks: [] },
+        };
+      },
+    };
+    const profile: MountedBoatProfile = {
+      ...boatProfile,
+      hull: { width: 1.0, length: 2.0, height: 2.0 },
+      surfaceBand: { minY: 0, maxY: 3 },
+    };
+
+    const result = evaluateWaterRoute(
+      map,
+      boatQuery(boatRoute, { profile, fluidShapeProvider: layeredWater }),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem?.kind).toBe('submerged_posture');
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
+  });
+
+  it('preflights profile volume counts before reading entries', () => {
+    const evilPassengers = new Array(1000);
+    Object.defineProperty(evilPassengers, 0, {
+      get() {
+        throw new Error('profile entries must not be read after a budget rejection');
+      },
+    });
+    const counting = countingSolid();
+    const profile: MountedBoatProfile = {
+      ...boatProfile,
+      passengerClearance: evilPassengers as unknown as Box3[],
+    };
+
+    const result = evaluateWaterRoute(
+      new VoxelMap('world'),
+      boatQuery(boatRoute, { profile, solidShapeProvider: counting.provider }),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxProfileVolumes' });
+    expect(counting.calls()).toBe(0);
+  });
+
+  it('bounds provider risk facts before enumerating them', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+    const evilRisks = new Array(1000);
+    Object.defineProperty(evilRisks, 0, {
+      get() {
+        throw new Error('risk facts must not be enumerated after a budget rejection');
+      },
+    });
+    const risky: FluidShapeProvider = {
+      version: 'huge-risk-list',
+      resolve(state) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: { water: waterVolume(0.875), lava: null, risks: evilRisks as never },
+        };
+      },
+    };
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery(swimRoute, { fluidShapeProvider: risky, limits: { maxRiskFacts: 10 } }),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxRiskFacts' });
+  });
+
+  it('rejects unsafe enumerable coordinates before any provider work', () => {
+    const huge = 2 ** 53;
+    const counting = countingSolid();
+
+    const result = evaluateWaterRoute(
+      new VoxelMap('world'),
+      swimQuery(
+        [
+          { x: huge, y: 0, z: 0.5 },
+          { x: huge, y: 0, z: 0.5 },
+        ],
+        { solidShapeProvider: counting.provider },
+      ),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem?.kind).toBe('unsupported_range');
+    expect(result.budget.candidateCells).toBe(0);
+    expect(counting.calls()).toBe(0);
+  });
 });
 
 // --- evidence, dependencies and budgets ---
@@ -685,11 +963,11 @@ describe('water evidence and budgets', () => {
         if (state.name !== 'minecraft:water') {
           return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
         }
-        for (let i = 0; i < 4; i++) {
-          read.cell(cell.x, cell.y, cell.z);
+        // An uncooperative infinite loop is stopped by the controlled-read sentinel.
+        for (;;) {
           reads += 1;
+          read.cell(cell.x, cell.y, cell.z);
         }
-        return { kind: 'shape', shape: { water: waterVolume(0.875), lava: null, risks: [] } };
       },
     };
 
@@ -701,10 +979,23 @@ describe('water evidence and budgets', () => {
 
     expect(result.status).toBe('UNSUPPORTED');
     expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxNeighborReads' });
-    // The provider still issued its fourth call after the third crossed the budget;
-    // the count reports the work actually attempted, not a clamped value.
-    expect(result.budget.neighborReads).toBe(4);
-    expect(reads).toBeGreaterThanOrEqual(3);
+    expect(result.budget.neighborReads).toBe(3);
+    expect(reads).toBe(3);
+  });
+
+  it('propagates non-budget provider errors unchanged', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+    const exploding: FluidShapeProvider = {
+      version: 'exploding-fluid',
+      resolve() {
+        throw new Error('provider exploded');
+      },
+    };
+
+    expect(() =>
+      evaluateWaterRoute(map, swimQuery(swimRoute, { fluidShapeProvider: exploding }), 1000),
+    ).toThrow('provider exploded');
   });
 
   it('bounds cell reads and geometry work', () => {
@@ -745,23 +1036,32 @@ describe('water evidence and budgets', () => {
 // --- completion verification ---
 
 describe('water arrival completion', () => {
-  it('accepts an in-water surface target without requiring dry land', () => {
+  it('accepts an in-water surface target without requiring dry land or shore', () => {
     const result = checkWaterArrival(
-      arrivalRequest(swimTargetGoal(), [
-        sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, inWater: true, onGround: false }),
-      ]),
+      arrivalRequest(
+        swimTargetGoal(),
+        [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, inWater: true, onGround: false })],
+        { map: surfaceTargetMap() },
+      ),
     );
 
     expect(result.status).toBe('ARRIVED');
     expect(result.goal.target).toEqual({ x: 0.5, y: 0.5, z: 0.5 });
     expect(result.lastObservedAt).toBe(1000);
+    expect(result.surfaceGeometry?.status).toBe('OPEN');
+    expect(result.dependencies?.length).toBeGreaterThan(0);
+    expect(result.validUntil).toBe(6000);
+    // No shore support is invented for a water target.
+    expect(result.shoreSupport).toBeUndefined();
   });
 
-  it('does not accept a dry body at a surface target', () => {
+  it('does not accept a dry body at a surface target even with OPEN water geometry', () => {
     const result = checkWaterArrival(
-      arrivalRequest(swimTargetGoal(), [
-        sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, inWater: false, onGround: true }),
-      ]),
+      arrivalRequest(
+        swimTargetGoal(),
+        [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, inWater: false, onGround: true })],
+        { map: surfaceTargetMap() },
+      ),
     );
 
     expect(result.status).toBe('UNCONFIRMED');
@@ -770,14 +1070,76 @@ describe('water arrival completion', () => {
 
   it('preserves target height and tolerances', () => {
     const result = checkWaterArrival(
-      arrivalRequest(swimTargetGoal(), [
-        sample({ pos: { x: 0.5, y: 0.7, z: 0.5 } }),
-      ]),
+      arrivalRequest(
+        swimTargetGoal(),
+        [sample({ pos: { x: 0.5, y: 0.7, z: 0.5 } })],
+        { map: surfaceTargetMap() },
+      ),
     );
 
     expect(result.status).toBe('UNCONFIRMED');
     expect(result.problem?.kind).toBe('outside_target');
     expect(result.goal.target).toEqual({ x: 0.5, y: 0.5, z: 0.5 });
+  });
+
+  it('rejects a fully submerged surface target even though inWater is true', () => {
+    const map = new VoxelMap('world');
+    fill(map, { x: 0, y: 0, z: 0 }, { x: 0, y: 2, z: 0 }, WATER);
+    const submergedProvider: FluidShapeProvider = {
+      version: 'submerged-fluid',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        const surfaceY = cell.y === 2 ? 0.5 : 0.875;
+        return {
+          kind: 'shape',
+          shape: { water: waterVolume(surfaceY), lava: null, risks: [] },
+        };
+      },
+    };
+    const goal = {
+      ...swimTargetGoal(),
+      profile: { ...swimProfile, surfaceBand: { minY: 0, maxY: 3 } },
+      fluidShapeProvider: submergedProvider,
+    };
+
+    const result = checkWaterArrival(
+      arrivalRequest(
+        goal,
+        [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, inWater: true })],
+        { map },
+      ),
+    );
+
+    expect(result.status).toBe('UNCONFIRMED');
+    expect(result.problem?.kind).toBe('surface_geometry');
+    expect(result.surfaceGeometry?.status).toBe('UNSUPPORTED');
+    expect(result.surfaceGeometry?.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
+  });
+
+  it('rejects missing or stale surface geometry', () => {
+    const missing = checkWaterArrival(
+      arrivalRequest(
+        swimTargetGoal(),
+        [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, inWater: true })],
+        { map: new VoxelMap('world') },
+      ),
+    );
+    expect(missing.status).toBe('UNCONFIRMED');
+    expect(missing.problem?.kind).toBe('surface_geometry');
+    expect(missing.surfaceGeometry?.status).toBe('UNKNOWN');
+
+    const stale = checkWaterArrival(
+      arrivalRequest(
+        swimTargetGoal(),
+        [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, observedAt: 69000, inWater: true })],
+        { map: surfaceTargetMap(), now: 70000 },
+      ),
+    );
+    expect(stale.status).toBe('UNCONFIRMED');
+    expect(stale.problem?.kind).toBe('surface_geometry');
+    expect(stale.surfaceGeometry?.status).toBe('STALE');
   });
 
   it('requires measured dry/grounded evidence and geometry-confirmed shore support', () => {
@@ -804,6 +1166,8 @@ describe('water arrival completion', () => {
     expect(result.status).toBe('ARRIVED');
     expect(result.shoreSupport?.status).toBe('OPEN');
     expect(result.goal).toEqual(goal);
+    expect(result.dependencies?.length).toBeGreaterThan(0);
+    expect(result.validUntil).toBe(6000);
   });
 
   it('does not accept the original shore when a different shore is the target', () => {
@@ -882,6 +1246,117 @@ describe('water arrival completion', () => {
     expect(result.problem?.kind).toBe('not_dry_grounded');
   });
 
+  it('preflights a huge shore body before map or provider work', () => {
+    class CountingMap extends VoxelMap {
+      reads = 0;
+      override sectionAt(dim: string, x: number, y: number, z: number) {
+        this.reads += 1;
+        return super.sectionAt(dim, x, y, z);
+      }
+    }
+    const map = new CountingMap('world');
+    const counting = countingSolid();
+    const goal: DryShoreGoal = {
+      kind: 'dry_shore',
+      target: { x: 2.5, y: 1, z: 0.5 },
+      horizontalTolerance: 0.1,
+      verticalTolerance: 0.05,
+      body: { width: 1_000_000, height: 1.8 },
+      shapeProvider: counting.provider,
+      feetTolerance: 0.05,
+    };
+
+    const result = checkWaterArrival(
+      arrivalRequest(goal, [
+        sample({ pos: { x: 2.5, y: 1, z: 0.5 }, inWater: false, onGround: true }),
+      ], { map }),
+    );
+
+    expect(result.status).toBe('UNCONFIRMED');
+    expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxShoreCells' });
+    expect(map.reads).toBe(0);
+    expect(counting.calls()).toBe(0);
+  });
+
+  it('bounds excessive shore shape parts before the old evaluator iterates them', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(STONE, { x: 2, y: 0, z: 0 }));
+    map.observe(observation(AIR, { x: 2, y: 1, z: 0 }));
+    map.observe(observation(AIR, { x: 2, y: 2, z: 0 }));
+    const hugeBoxes = new Array(5000);
+    Object.defineProperty(hugeBoxes, 0, {
+      get() {
+        throw new Error('shore shape boxes must not be iterated after a budget rejection');
+      },
+    });
+    const provider: CollisionShapeProvider = {
+      version: 'huge-shore-shape',
+      resolve(state, cell, read) {
+        if (state.name === 'minecraft:stone') {
+          return {
+            kind: 'shape',
+            shape: { boxes: hugeBoxes as never, supportFaces: FULL_CUBE.supportFaces },
+          };
+        }
+        return solidProvider.resolve(state, cell, read);
+      },
+    };
+    const goal: DryShoreGoal = {
+      kind: 'dry_shore',
+      target: { x: 2.5, y: 1, z: 0.5 },
+      horizontalTolerance: 0.1,
+      verticalTolerance: 0.05,
+      body: { width: 0.6, height: 1.8 },
+      shapeProvider: provider,
+      feetTolerance: 0.05,
+    };
+
+    const result = checkWaterArrival(
+      arrivalRequest(goal, [
+        sample({ pos: { x: 2.5, y: 1, z: 0.5 }, inWater: false, onGround: true }),
+      ], { map, limits: { maxShoreShapeParts: 100 } }),
+    );
+
+    expect(result.status).toBe('UNCONFIRMED');
+    expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxShoreShapeParts' });
+  });
+
+  it('stops runaway shore neighbour reads at the controlled budget', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(STONE, { x: 2, y: 0, z: 0 }));
+    map.observe(observation(AIR, { x: 2, y: 1, z: 0 }));
+    map.observe(observation(AIR, { x: 2, y: 2, z: 0 }));
+    let reads = 0;
+    const provider: CollisionShapeProvider = {
+      version: 'noisy-shore',
+      resolve(state, cell, read) {
+        for (;;) {
+          reads += 1;
+          read.cell(cell.x, cell.y, cell.z);
+        }
+      },
+    };
+    const goal: DryShoreGoal = {
+      kind: 'dry_shore',
+      target: { x: 2.5, y: 1, z: 0.5 },
+      horizontalTolerance: 0.1,
+      verticalTolerance: 0.05,
+      body: { width: 0.6, height: 1.8 },
+      shapeProvider: provider,
+      feetTolerance: 0.05,
+    };
+
+    const result = checkWaterArrival(
+      arrivalRequest(goal, [
+        sample({ pos: { x: 2.5, y: 1, z: 0.5 }, inWater: false, onGround: true }),
+      ], { map, limits: { maxShoreNeighborReads: 2 } }),
+    );
+
+    expect(result.status).toBe('UNCONFIRMED');
+    expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxShoreNeighborReads' });
+    expect(reads).toBeLessThanOrEqual(3);
+  });
+
   it('accepts a docked boat after an ordered stable low-speed window', () => {
     const goal = dockGoal();
     const result = checkWaterArrival(
@@ -899,16 +1374,126 @@ describe('water arrival completion', () => {
     expect(result.goal).toEqual(goal);
   });
 
-  it('rejects a moving boat', () => {
+  it('rejects a moving boat measured independently of the stationary player', () => {
     const result = checkWaterArrival(
       arrivalRequest(dockGoal(), [
         sample({ observedAt: 1000, sequence: 1 }),
-        sample({ observedAt: 1200, sequence: 2, velocity: { x: 0.5, y: 0, z: 0 } }),
+        sample({
+          observedAt: 1200,
+          sequence: 2,
+          velocity: { x: 0, y: 0, z: 0 },
+          boatMeasurement: boatMeasurement({
+            observedAt: 1200,
+            sequence: 2,
+            velocity: { x: 0.5, y: 0, z: 0 },
+          }),
+        }),
       ]),
     );
 
     expect(result.status).toBe('UNCONFIRMED');
     expect(result.problem?.kind).toBe('moving');
+  });
+
+  it('rejects a sparse stable window even when the endpoint samples match', () => {
+    const result = checkWaterArrival(
+      arrivalRequest(
+        dockGoal({ stableWindowMs: 60000, maxSampleGapMs: 1000 }),
+        [
+          sample({ observedAt: 1000, sequence: 1 }),
+          sample({ observedAt: 61000, sequence: 2, boatMeasurement: boatMeasurement({ observedAt: 61000, sequence: 2 }) }),
+        ],
+        { now: 62000, maxSampleAgeMs: 120000 },
+      ),
+    );
+
+    expect(result.status).toBe('UNCONFIRMED');
+    expect(result.problem?.kind).toBe('insufficient_stable_window');
+  });
+
+  it('restarts the stable window after a declared evidence gap', () => {
+    const result = checkWaterArrival(
+      arrivalRequest(
+        dockGoal({ stableWindowMs: 300, maxSampleGapMs: 5000 }),
+        [
+          sample({ observedAt: 1000, sequence: 1 }),
+          sample({ observedAt: 2000, sequence: 2, boatMeasurement: boatMeasurement({ observedAt: 2000, sequence: 2 }) }),
+          sample({ observedAt: 52000, sequence: 3, boatMeasurement: boatMeasurement({ observedAt: 52000, sequence: 3 }) }),
+          sample({ observedAt: 52200, sequence: 4, boatMeasurement: boatMeasurement({ observedAt: 52200, sequence: 4 }) }),
+          sample({ observedAt: 52400, sequence: 5, boatMeasurement: boatMeasurement({ observedAt: 52400, sequence: 5 }) }),
+        ],
+        { now: 53000, maxSampleAgeMs: 120000 },
+      ),
+    );
+
+    expect(result.status).toBe('ARRIVED');
+    expect(result.stableSince).toBe(52000);
+    expect(result.stableSamples).toBe(3);
+  });
+
+  it('bounds validUntil by the oldest relied-on dock witness', () => {
+    const result = checkWaterArrival(
+      arrivalRequest(
+        dockGoal(),
+        [
+          sample({ observedAt: 1000, sequence: 1 }),
+          sample({ observedAt: 1200, sequence: 2, boatMeasurement: boatMeasurement({ observedAt: 1200, sequence: 2 }) }),
+          sample({ observedAt: 1400, sequence: 3, boatMeasurement: boatMeasurement({ observedAt: 1400, sequence: 3 }) }),
+        ],
+        { now: 2000, maxSampleAgeMs: 1000 },
+      ),
+    );
+
+    expect(result.status).toBe('ARRIVED');
+    expect(result.validUntil).toBe(2000);
+  });
+
+  it('uses boat telemetry for dock position and speed', () => {
+    const result = checkWaterArrival(
+      arrivalRequest(dockGoal(), [
+        sample({
+          pos: { x: 4.5, y: 0, z: 0.5 },
+          boatMeasurement: boatMeasurement({ pos: { x: 7.5, y: 0, z: 0.5 } }),
+        }),
+      ]),
+    );
+
+    expect(result.status).toBe('UNCONFIRMED');
+    expect(result.problem?.kind).toBe('outside_target');
+    expect(result.lastPosition).toEqual({ x: 4.5, y: 0, z: 0.5 });
+    expect(result.lastBoatPosition).toEqual({ x: 7.5, y: 0, z: 0.5 });
+  });
+
+  it('requires same-receipt boat telemetry for a dock', () => {
+    const missing = checkWaterArrival(
+      arrivalRequest(dockGoal(), [sample({ boatMeasurement: undefined })]),
+    );
+    expect(missing.status).toBe('UNCONFIRMED');
+    expect(missing.problem?.kind).toBe('boat_measurement_missing');
+
+    const unbound = checkWaterArrival(
+      arrivalRequest(dockGoal(), [
+        sample({ boatMeasurement: boatMeasurement({ sequence: 99 }) }),
+      ]),
+    );
+    expect(unbound.status).toBe('UNCONFIRMED');
+    expect(unbound.problem?.kind).toBe('boat_measurement');
+
+    const wrongExecution = checkWaterArrival(
+      arrivalRequest(dockGoal(), [
+        sample({ boatMeasurement: boatMeasurement({ executionId: 'exec-2' }) }),
+      ]),
+    );
+    expect(wrongExecution.status).toBe('UNCONFIRMED');
+    expect(wrongExecution.problem?.kind).toBe('boat_measurement');
+
+    const wrongScope = checkWaterArrival(
+      arrivalRequest(dockGoal(), [
+        sample({ boatMeasurement: boatMeasurement({ dim: 'the_nether' }) }),
+      ]),
+    );
+    expect(wrongScope.status).toBe('UNCONFIRMED');
+    expect(wrongScope.problem?.kind).toBe('boat_measurement');
   });
 
   it('rejects a forced unmount and never infers identity from a riding label', () => {
@@ -1017,7 +1602,7 @@ describe('water arrival completion', () => {
     const samples = Array.from({ length: 3 }, (_, index) =>
       sample({ observedAt: 1000 + index * 100, sequence: index + 1 }),
     );
-    const result = checkWaterArrival(arrivalRequest(dockGoal(), samples, { maxSamples: 2 }));
+    const result = checkWaterArrival(arrivalRequest(dockGoal(), samples, { limits: { maxSamples: 2 } }));
 
     expect(result.status).toBe('UNCONFIRMED');
     expect(result.problem).toMatchObject({ kind: 'budget_exceeded', limit: 'maxSamples' });

@@ -81,18 +81,30 @@ fluid volume/surface participates in hazards and water-surface coverage.
   kind: 'mounted_boat',
   orientation: { quarterTurns: 0 },                        // fixed orientation only
   hull: { width: 1.0, length: 2.0, height: 0.6 },          // route point = hull bottom center
-  passengerClearance: [                                    // not the player AABB
+  passengerClearance: [                                    // whole-body headroom, not the player AABB
     { minX: -0.35, minY: 0.6, minZ: -0.7, maxX: 0.35, maxY: 1.8, maxZ: 0.7 }
+  ],
+  passengerBreathing: [                                    // separate air/breathing volumes
+    { minX: -0.3, minY: 1.1, minZ: -0.3, maxX: 0.3, maxY: 1.4, maxZ: 0.3 }
   ],
   surfaceBand: { minY: 0.375, maxY: 0.375 }
 }
 ```
 
-The declared `surfaceBand` is the waterline/contact contract. The observed
-surface must lie in that absolute band at every point of the route; a surface
-outside it is not silently clipped. The band must intersect the body's or
-hull's vertical span, otherwise the profile is rejected as internally
-inconsistent.
+The declared `surfaceBand` is the waterline/contact contract, but it is not
+enough for a surface to merely fall anywhere inside it. Every adopted water
+surface must **cross** the body/hull vertical span (strictly above its bottom
+and below its top). A surface elsewhere in a wide band, including entirely
+above the body or head, is not surface contact. For the swimmer, the declared
+`breathing` volume must stay water/lava-free; for the boat, each explicit
+`passengerBreathing` volume has the same contract (whole-body
+`passengerClearance` is not used as an air probe). If a breathing volume is
+wet or the body/hull is under an observed surface, the route is reported as
+`UNSUPPORTED` with `submerged_posture` and a `submersion` hazard rather than
+silently extending this slice into underwater navigation.
+
+The band must intersect the body's or hull's vertical span, otherwise the
+profile is rejected as internally inconsistent.
 
 ### Constant height, fixed orientation
 
@@ -146,14 +158,26 @@ possible:
 | Limit | Meaning |
 | --- | --- |
 | `maxPoints` | route point count |
+| `maxProfileVolumes` | declared body/breathing/hull/passenger boxes |
 | `maxCandidateCells` | combined swept envelope cell count |
 | `maxReadCells` | distinct evidence-map cell reads |
 | `maxNeighborReads` | provider `read.cell()` calls, including duplicates |
 | `maxShapeChecks` | geometric box/interval checks |
+| `maxRiskFacts` | provider current/falling/bubble facts collected |
+
+Profile array lengths are checked before any element is inspected or copied, and
+provider risk lists and solid box lists are charged before enumeration.
+Envelope bounds/counts must be finite safe integers whose loop increments
+advance exactly; otherwise the result is `UNSUPPORTED` with `unsupported_range`
+before any map or provider work. This is arithmetic capability validation, not
+a world-border rule.
 
 Exceeding a limit returns `UNSUPPORTED` with a structured `budget_exceeded`
-problem and actual work counts. Duplicate neighbour reads still count, so a
-provider cannot bypass the budget by re-reading one cell.
+problem and actual work counts. Provider neighbour reads use a private
+controlled-read sentinel, so an over-budget read stops the provider's own loop
+promptly; duplicate reads still count and cannot bypass the budget. Other
+provider errors propagate. The library bounds its own work, not arbitrary
+third-party provider CPU that catches and ignores the sentinel.
 
 Each actual cell/provider read contributes its section revision and validity
 ceiling to `dependencies` / `validUntil`. Reads never mutate the map, evidence
@@ -167,25 +191,44 @@ exposed dependencies and `validUntil` for their own local invalidation.
 original goal, scope, execution identity, and measured ordered samples.
 
 - `surface_target` requires the measured position within the original
-  horizontal/vertical tolerances and `inWater=true`. It does not require dry
-  land or ground support.
+  horizontal/vertical tolerances, `inWater=true`, **and** current surface
+  geometry confirmation. Geometry is checked by reusing `evaluateWaterRoute`
+  with two identical points at the measured position, the goal's explicit
+  `surface_swim` profile and providers, and the completion call's evidence time
+  and limits. The actual `WaterRouteEvaluation` is returned as
+  `surfaceGeometry`, with its dependencies and TTL. Being in water alone does
+  not prove surfacing: a fully submerged sample fails even with `inWater=true`.
+  Dry land is not required.
 - `dry_shore` requires the measured position within the original tolerances,
   actual `onGround=true` / `inWater=false` evidence, and an `OPEN` result from
   the existing read-only `evaluateGroundedWalkSegment` stationary check at that
-  position. The actual `StepEvaluation` is returned as `shoreSupport`; the
-  water layer does not invent a `supportConfirmed` boolean.
-- `boat_dock` requires an explicit stable `boatId` that matches on the final
-  sample, simulated/measured velocity within the declared limits, and ordered
-  stable samples spanning `stableWindowMs` (at least `minStableSamples`, default
-  2). A display `ridingLabel` is never parsed for identity.
+  position. A preflight bounds the stationary cell envelope, and a wrapper caps
+  provider resolutions, neighbour reads and total shape parts before the old
+  loops can traverse them. The actual `StepEvaluation` is returned as
+  `shoreSupport`; the water layer does not invent a `supportConfirmed` boolean.
+  Budget rejection is `UNCONFIRMED` + `budget_exceeded`.
+- `boat_dock` requires an explicit stable body-side `boatId`, **separate
+  same-receipt boat telemetry** (`boatMeasurement`) with matching
+  identity/scope/time/sequence/execution, measured boat position within the
+  original tolerances, measured boat velocity within the declared limits, and
+  ordered stable samples spanning `stableWindowMs` with consecutive gaps no
+  larger than `maxSampleGapMs` (at least `minStableSamples`, default 2). Goal
+  position and speed use the boat measurement; the parent player velocity is
+  never relabelled as boat motion. A display `ridingLabel` is never parsed for
+  identity. `validUntil` is bounded by the earliest stable witness, not the
+  latest sample.
+
+Completion budgets (`limits.maxSamples`, `maxShoreCells`,
+`maxShoreShapeResolutions`, `maxShoreNeighborReads`, `maxShoreShapeParts`) have
+explicit defaults and return `UNCONFIRMED` + `budget_exceeded` when exceeded.
 
 Absence, stale samples, replayed/out-of-order samples, wrong world/dim/session,
 wrong execution identity, server position correction, forced unmount, identity
-mismatch, movement, or an incomplete stable window return `UNCONFIRMED` with a
-factual reason. The original sample observation time is preserved in
-`lastObservedAt` / `stableSince`; the query time is never substituted. No
-dismount, mount, boat construction/recovery, lily-pad clearing or rescue action
-is performed.
+mismatch, missing/unbound boat telemetry, movement, a sparse stable window, or
+missing/stale surface geometry return `UNCONFIRMED` with a factual reason. The
+original sample observation time is preserved in `lastObservedAt` /
+`stableSince`; the query time is never substituted. No dismount, mount, boat
+construction/recovery, lily-pad clearing or rescue action is performed.
 
 ## Runnable example
 
@@ -311,13 +354,18 @@ const arrival = checkWaterArrival({
     target: { x: 0.5, y: 0.5, z: 0.5 },
     horizontalTolerance: 0.1,
     verticalTolerance: 0.1,
+    // Current surface geometry must also be OPEN at the measured position.
+    profile,
+    solidShapeProvider: solid,
+    fluidShapeProvider: fluid,
   },
   scope: { worldId: 'demo-world', dim: 'overworld', sessionId: 's1', executionId: 'exec-1' },
+  map,
   samples: [sample],
   now: 1000,
   maxSampleAgeMs: 5000,
 });
-console.log(arrival.status); // "ARRIVED" for the measured in-water sample
+console.log(arrival.status); // "ARRIVED" only with measured water + OPEN surface geometry
 ```
 
 ## Not implemented by this slice
@@ -332,9 +380,14 @@ console.log(arrival.status); // "ARRIVED" for the measured in-water sample
 - No arbitrary boat rotation/yaw dynamics; only a fixed quarter-turn
   orientation.
 - No varying waterline dynamics, flowing-fluid propagation, or 3D underwater
-  navigation.
+  navigation. Waterlines must cross the declared body/hull span and leave the
+  declared breathing volumes clear; otherwise the slice reports
+  `submerged_posture`/`submersion` instead of pretending to support diving.
 - No shore enter/exit trajectory execution; only a separate stationary dry-shore
   completion check over measured samples.
+- No completion when a surface target lacks current geometry evidence or when
+  dock boat position/velocity are not measured on the same receipt. The caller
+  must supply host telemetry; no telemetry/controller is wired here.
 - No mount, dismount, boat construction, boat recovery, lily-pad clearing, water
   blocking, equipment change or rescue strategy.
 - No automatic memory update or persistence. Evaluations are read-only and
@@ -343,12 +396,17 @@ console.log(arrival.status); // "ARRIVED" for the measured in-water sample
 ## Validation evidence
 
 `tests/water-validation.test.ts` covers clear and dry routes, thin obstructions,
-exact corner contact, waterlogged solid+fluid cells, narrow surface gaps, boat
-hull and passenger headroom, negative/cross-section coordinates, missing /
-expired / wrong-session / state-incomplete / neighbour-gap evidence, same-state
-refresh and content-change re-evaluation, unrelated-cell dependency isolation,
-route/cell/read/neighbour/shape budgets, map immutability, package export shape,
-and the surface/shore/dock completion contracts.
+exact corner contact, waterlogged solid+fluid cells, narrow surface gaps,
+repeated-point segment clamping, broad-band waterline contact, submerged
+swimmer/boat posture, boat hull and passenger breathing/headroom,
+negative/cross-section coordinates, unsafe enumerable ranges, missing / expired
+/ wrong-session / state-incomplete / neighbour-gap evidence, same-state refresh
+and content-change re-evaluation, unrelated-cell dependency isolation,
+route/cell/read/neighbour/shape/profile/risk budgets with throwing getters,
+prompt sentinel read stopping, map immutability, package export shape, and the
+surface/shore/dock completion contracts (including geometry-confirmed surface
+arrival, bounded dry-shore geometry, dense dock gaps, oldest-witness TTL and
+same-receipt boat telemetry).
 
 These are in-memory fake-rule tests. They do not prove real mineflayer,
 Pathfinder, server-correction or in-game boat behaviour, and they do not mean

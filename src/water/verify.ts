@@ -25,18 +25,23 @@ import type {
   CollisionShape,
   CollisionShapeProvider,
   NeighborCellView,
+  NeighborRead,
   UnitBox,
 } from '../traversability/collision-shape.js';
 import { evaluateGroundedWalkSegment } from '../traversability/step.js';
+import type { StepEvaluation } from '../traversability/step.js';
 import type { HazardFact, ObstacleEvidence } from '../traversability/types.js';
 import type {
   BoatDockGoal,
+  BoatMeasurement,
   Box3,
   ControlledNeighborRead,
   FluidShape,
   FluidShapeResolution,
   FluidSurfacePatch,
   WaterArrivalGoal,
+  WaterArrivalLimits,
+  WaterArrivalLimitsInput,
   WaterArrivalProblem,
   WaterArrivalRequest,
   WaterArrivalResult,
@@ -53,20 +58,36 @@ import type {
 /** Epsilon for treating exact-boundary contact as non-overlap / zero-width gaps as none. */
 const EPS = 1e-9;
 
+/** Private sentinel: stop a provider's controlled-read loop without a partial shape. */
+const CONTROLLED_READ_BUDGET_EXCEEDED = Symbol('water-controlled-read-budget-exceeded');
+
+/** Private sentinel: stop the bounded shore provider loop. */
+const SHORE_BUDGET_EXCEEDED = Symbol('water-shore-budget-exceeded');
+
 const DEFAULT_LIMITS: WaterValidationLimits = {
   maxPoints: 256,
+  maxProfileVolumes: 64,
   maxCandidateCells: 4096,
   maxReadCells: 8192,
   maxNeighborReads: 16384,
   maxShapeChecks: 131072,
+  maxRiskFacts: 64,
 };
 
-const DEFAULT_MAX_SAMPLES = 512;
+const DEFAULT_ARRIVAL_LIMITS: WaterArrivalLimits = {
+  maxSamples: 512,
+  maxShoreCells: 4096,
+  maxShoreShapeResolutions: 8192,
+  maxShoreNeighborReads: 16384,
+  maxShoreShapeParts: 4096,
+};
 
 /** One declared collision/clearance volume, in world-axis offsets from the route point. */
 interface WorldVolume extends Box3 {
-  name: 'body' | 'breathing' | 'hull' | 'passenger';
+  name: 'body' | 'breathing' | 'hull' | 'passenger' | 'passengerBreathing';
   clearance: boolean;
+  /** True for explicit head/breathing volumes that must stay air/lava-free. */
+  breathing: boolean;
 }
 
 interface RouteGeometry {
@@ -74,6 +95,11 @@ interface RouteGeometry {
   contactHalfX: number;
   contactHalfZ: number;
   surfaceBand: { minY: number; maxY: number };
+  /** Relative vertical span of the body/hull that water must actually contact. */
+  contactMinY: number;
+  contactMaxY: number;
+  /** Lowest relative breathing-volume bottom, if any. */
+  breathingMinY: number | null;
 }
 
 type CellRead =
@@ -163,10 +189,12 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   const to = { ...query.points[query.points.length - 1]! };
   const budget: WaterBudgetReport = {
     points: query.points.length,
+    profileVolumes: 0,
     candidateCells: 0,
     readCells: 0,
     neighborReads: 0,
     shapeChecks: 0,
+    riskFacts: 0,
     limits,
   };
 
@@ -211,6 +239,21 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     }
   }
 
+  // Bound declared profile volume counts by length only, before inspecting or
+  // copying any entry (an over-long array may contain throwing getters).
+  const profileVolumes = profileVolumeCount(query.profile);
+  if (!profileVolumes.safe || profileVolumes.count > limits.maxProfileVolumes) {
+    return preBudget({
+      limit: 'maxProfileVolumes',
+      used: profileVolumes.count,
+      max: limits.maxProfileVolumes,
+      detail: profileVolumes.safe
+        ? `profile declares ${profileVolumes.count} volumes, exceeding maxProfileVolumes (${limits.maxProfileVolumes})`
+        : 'profile volume counts are not safe integers',
+    });
+  }
+  budget.profileVolumes = profileVolumes.count;
+
   validateProfile(query.profile);
   const routeY = query.points[0]!.y;
   if (query.points.some((point) => point.y !== routeY)) {
@@ -246,6 +289,31 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   }
 
   const envelope = computeEnvelope(query.points, geometry);
+  if (!envelope.safe) {
+    return {
+      status: 'UNSUPPORTED',
+      profileKind,
+      ruleVersions,
+      worldId: query.worldId,
+      dim: query.dim,
+      sessionId: query.sessionId,
+      points: [],
+      from,
+      to,
+      reason: 'the swept envelope is outside the safely enumerable integer range',
+      problem: {
+        kind: 'unsupported_range',
+        cells: [],
+        detail: 'envelope bounds/count are non-finite, unsafe integers, or would not advance monotonically',
+      },
+      hazards: [],
+      obstacles: [],
+      dependencies: [],
+      budget,
+      computedAt: now,
+      validUntil: Number.POSITIVE_INFINITY,
+    };
+  }
   if (envelope.count > limits.maxCandidateCells) {
     return preBudget({
       limit: 'maxCandidateCells',
@@ -372,6 +440,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       return budgetProblem !== null;
     },
     cell(x: number, y: number, z: number): NeighborCellView {
+      if (budgetProblem !== null) throw CONTROLLED_READ_BUDGET_EXCEEDED;
       budget.neighborReads += 1;
       if (budget.neighborReads > limits.maxNeighborReads) {
         failBudget(
@@ -380,7 +449,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
           limits.maxNeighborReads,
           `provider neighbour reads exceeded maxNeighborReads (${limits.maxNeighborReads})`,
         );
-        return { pos: { x, y, z }, kind: 'unobserved' };
+        throw CONTROLLED_READ_BUDGET_EXCEEDED;
       }
       if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
         // A provider must ask for integer grid cells; a malformed request is a
@@ -388,6 +457,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
         return { pos: { x, y, z }, kind: 'unobserved' };
       }
       const read = readCell(x, y, z);
+      if (read.kind === 'budget') throw CONTROLLED_READ_BUDGET_EXCEEDED;
       const pos = { x, y, z };
       switch (read.kind) {
         case 'observed':
@@ -401,10 +471,23 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
         case 'session':
           return { pos, kind: 'stale', reason: 'session' };
         case 'unobserved':
-        case 'budget':
           return { pos, kind: 'unobserved' };
       }
     },
+  };
+
+  /**
+   * Call an injected provider and stop its controlled neighbour loop promptly
+   * when this library's own read budget is exhausted. Other provider errors
+   * propagate unchanged.
+   */
+  const callProvider = <T>(call: () => T): T | null => {
+    try {
+      return call();
+    } catch (error) {
+      if (error === CONTROLLED_READ_BUDGET_EXCEEDED) return null;
+      throw error;
+    }
   };
 
   const records: CellRecord[] = [];
@@ -423,15 +506,15 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
         let solid: SolidResolved | null = null;
         let fluid: FluidResolved | null = null;
         if (read.kind === 'observed') {
-          const resolution = query.solidShapeProvider.resolve(read.evidence.observation.state, cell, neighborRead);
-          if (budgetProblem !== null) return budgetEvaluation();
-          solid = toSolidResolution(resolution);
-          const fluidResolution = query.fluidShapeProvider.resolve(
-            read.evidence.observation.state,
-            cell,
-            neighborRead,
+          const resolution = callProvider(() =>
+            query.solidShapeProvider.resolve(read.evidence.observation.state, cell, neighborRead),
           );
-          if (budgetProblem !== null) return budgetEvaluation();
+          if (resolution === null || budgetProblem !== null) return budgetEvaluation();
+          solid = toSolidResolution(resolution);
+          const fluidResolution = callProvider(() =>
+            query.fluidShapeProvider.resolve(read.evidence.observation.state, cell, neighborRead),
+          );
+          if (fluidResolution === null || budgetProblem !== null) return budgetEvaluation();
           fluid = toFluidResolution(fluidResolution);
         }
         records.push({
@@ -483,6 +566,17 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     }
     if (blocked !== null) continue;
     const observation = record.read.evidence.observation;
+    const boxes = record.solid.shape.boxes;
+    // Charge the provider's declared shape list before retrieving any element.
+    if (!Number.isSafeInteger(boxes.length) || boxes.length > limits.maxShapeChecks - budget.shapeChecks) {
+      failBudget(
+        'maxShapeChecks',
+        budget.shapeChecks + boxes.length,
+        limits.maxShapeChecks,
+        `solid shape parts exceeded the remaining maxShapeChecks (${limits.maxShapeChecks})`,
+      );
+      return budgetEvaluation();
+    }
 
     for (const volume of geometry.volumes) {
       for (const segment of segments) {
@@ -547,6 +641,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
 
   const observedSurfaceIntervals: Array<[number, number]> = [];
   const surfaceContributors = new Set<string>();
+  const breathingViolationCells: Vec3Like[] = [];
+  let breathingViolation = false;
   for (const record of records) {
     const shape = observedFluid(record);
     const water = shape?.water;
@@ -554,6 +650,21 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     const absoluteSurfaceY = record.cell.y + water.surface.y;
     if (absoluteSurfaceY < geometry.surfaceBand.minY - EPS || absoluteSurfaceY > geometry.surfaceBand.maxY + EPS) {
       continue;
+    }
+    // The surface must cross the body/hull vertical range, not merely touch its
+    // bottom or top. A surface elsewhere inside a broad band is not a valid
+    // waterline for this profile.
+    if (
+      absoluteSurfaceY <= routeY + geometry.contactMinY + EPS ||
+      absoluteSurfaceY >= routeY + geometry.contactMaxY - EPS
+    ) {
+      continue;
+    }
+    // The adopted surface may still leave the declared breathing volume wet;
+    // that is a surface-only capability gap, reported as a submersion fact.
+    if (geometry.breathingMinY !== null && absoluteSurfaceY > routeY + geometry.breathingMinY + EPS) {
+      breathingViolation = true;
+      breathingViolationCells.push({ ...record.cell });
     }
     for (let i = 0; i < segments.length; i++) {
       if (!chargeShape()) return budgetEvaluation();
@@ -565,8 +676,9 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
         record.cell,
         water.surface,
       );
-      if (interval === null) continue;
-      observedSurfaceIntervals.push([i + interval[0], i + interval[1]]);
+      const bounded = interval === null ? null : clampSegmentInterval(interval);
+      if (bounded === null) continue;
+      observedSurfaceIntervals.push([i + bounded[0], i + bounded[1]]);
       surfaceContributors.add(cellKey(record.cell));
     }
   }
@@ -595,7 +707,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
           record.cell,
           FULL_PATCH,
         );
-        if (interval !== null) intervals.push([i + interval[0], i + interval[1]]);
+        const bounded = interval === null ? null : clampSegmentInterval(interval);
+        if (bounded !== null) intervals.push([i + bounded[0], i + bounded[1]]);
       }
       if (intervals.length > 0) potentials.push({ ...potential, intervals });
     }
@@ -638,17 +751,19 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     if (shape === null) continue;
 
     let waterContact = false;
+    let waterBreathingContact = false;
     let lavaContact = false;
+    let lavaBreathingContact = false;
     if (shape.water !== null) {
       for (const volume of geometry.volumes) {
         for (const segment of segments) {
           if (!chargeShape()) return budgetEvaluation();
           if (boxSweepOverlaps(volume, segment.from, segment.to, record.cell, shape.water.box)) {
             waterContact = true;
+            if (volume.breathing) waterBreathingContact = true;
             break;
           }
         }
-        if (waterContact) break;
       }
       if (waterContact) {
         addHazard({
@@ -658,6 +773,32 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
           detail: 'observed water volume intersects the declared body/hull/clearance sweep',
         });
       }
+      const surfaceY = typeof shape.water.surface === 'object' ? shape.water.surface.y : null;
+      if (
+        waterContact &&
+        surfaceY !== null &&
+        record.cell.y + surfaceY > routeY + geometry.contactMaxY + EPS
+      ) {
+        // The body/hull is under an observed surface: this is not surface travel.
+        breathingViolation = true;
+        breathingViolationCells.push({ ...record.cell });
+        addHazard({
+          kind: 'submersion',
+          pos: { ...record.cell },
+          basis: 'derived',
+          detail: 'observed water surface lies above the declared body/hull top',
+        });
+      }
+      if (waterBreathingContact) {
+        breathingViolation = true;
+        breathingViolationCells.push({ ...record.cell });
+        addHazard({
+          kind: 'submersion',
+          pos: { ...record.cell },
+          basis: 'derived',
+          detail: 'observed water volume intersects a declared breathing volume',
+        });
+      }
     }
     if (shape.lava !== null) {
       for (const volume of geometry.volumes) {
@@ -665,10 +806,10 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
           if (!chargeShape()) return budgetEvaluation();
           if (boxSweepOverlaps(volume, segment.from, segment.to, record.cell, shape.lava.box)) {
             lavaContact = true;
+            if (volume.breathing) lavaBreathingContact = true;
             break;
           }
         }
-        if (lavaContact) break;
       }
       if (lavaContact) {
         addHazard({
@@ -678,10 +819,28 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
           detail: 'observed lava volume intersects the declared body/hull/clearance geometry',
         });
       }
+      if (lavaBreathingContact) {
+        breathingViolation = true;
+        breathingViolationCells.push({ ...record.cell });
+      }
     }
 
     if (waterContact || lavaContact || surfaceContributors.has(cellKey(record.cell))) {
-      for (const risk of shape.risks) {
+      const risks = shape.risks;
+      if (!Array.isArray(risks)) throw new Error('fluid provider returned a non-array risks value');
+      // Charge provider facts before enumerating them; an over-long list is
+      // rejected without touching its elements.
+      if (!Number.isSafeInteger(risks.length) || budget.riskFacts + risks.length > limits.maxRiskFacts) {
+        failBudget(
+          'maxRiskFacts',
+          budget.riskFacts + risks.length,
+          limits.maxRiskFacts,
+          `fluid risk facts exceeded maxRiskFacts (${limits.maxRiskFacts})`,
+        );
+        return budgetEvaluation();
+      }
+      budget.riskFacts += risks.length;
+      for (const risk of risks) {
         addHazard({
           kind: risk.kind === 'falling' ? 'fall' : risk.kind,
           pos: { ...record.cell },
@@ -730,6 +889,21 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       status: 'BLOCKED',
       reason: blocked.problem.detail,
       problem: blocked.problem,
+    };
+  }
+  if (breathingViolation) {
+    const cells = dedupeCells(
+      breathingViolationCells.map((cell) => ({ category: 'unknown' as const, cell, viaNeighborGap: false })),
+    );
+    return {
+      ...base,
+      status: 'UNSUPPORTED',
+      reason: 'the adopted waterline/water volume does not leave the declared breathing volume clear',
+      problem: {
+        kind: 'submerged_posture',
+        cells,
+        detail: 'surface-only travel is not supported when a breathing volume is submerged or wet',
+      },
     };
   }
   if (missingSurface !== null) {
@@ -798,19 +972,20 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     }
 
     let surfaceRelevant = false;
-    if (cell.y + 1 >= geometry.surfaceBand.minY - EPS && cell.y <= geometry.surfaceBand.maxY + EPS) {
+    const contactSurfaceMinY = Math.max(geometry.surfaceBand.minY, routeY + geometry.contactMinY);
+    const contactSurfaceMaxY = Math.min(geometry.surfaceBand.maxY, routeY + geometry.contactMaxY);
+    if (cell.y + 1 > contactSurfaceMinY + EPS && cell.y < contactSurfaceMaxY - EPS) {
       for (const segment of segments) {
         if (!chargeShape()) return { collisionRelevant, surfaceRelevant: false };
-        if (
-          footprintInterval(
-            segment.from,
-            segment.to,
-            geometry.contactHalfX,
-            geometry.contactHalfZ,
-            cell,
-            FULL_PATCH,
-          ) !== null
-        ) {
+        const interval = footprintInterval(
+          segment.from,
+          segment.to,
+          geometry.contactHalfX,
+          geometry.contactHalfZ,
+          cell,
+          FULL_PATCH,
+        );
+        if (interval !== null && clampSegmentInterval(interval) !== null) {
           surfaceRelevant = true;
           break;
         }
@@ -900,6 +1075,32 @@ function resolveLimits(limits: WaterLimits | undefined): WaterValidationLimits {
   return resolved;
 }
 
+/** Length-only profile volume count, safe against throwing element getters. */
+function profileVolumeCount(profile: WaterProfile): { safe: boolean; count: number } {
+  if (profile.kind === 'surface_swim') return { safe: true, count: 2 };
+  const clearance = profile.passengerClearance;
+  const breathing = profile.passengerBreathing;
+  if (!Array.isArray(clearance) || !Array.isArray(breathing)) {
+    return { safe: false, count: 0 };
+  }
+  const count = 1 + clearance.length + breathing.length;
+  return { safe: Number.isSafeInteger(count), count };
+}
+
+function resolveArrivalLimits(limits: WaterArrivalLimitsInput | undefined): WaterArrivalLimits {
+  const resolved: WaterArrivalLimits = { ...DEFAULT_ARRIVAL_LIMITS };
+  if (limits === undefined) return resolved;
+  for (const key of Object.keys(DEFAULT_ARRIVAL_LIMITS) as Array<keyof WaterArrivalLimits>) {
+    const value = limits[key];
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`${key} must be a positive safe integer: ${value}`);
+    }
+    resolved[key] = value;
+  }
+  return resolved;
+}
+
 function validateProfile(profile: WaterProfile): void {
   validateOrientation(profile.orientation);
   validateBand(profile.surfaceBand);
@@ -919,6 +1120,12 @@ function validateProfile(profile: WaterProfile): void {
   }
   for (const box of profile.passengerClearance) {
     assertBox(box, 'passengerClearance');
+  }
+  if (profile.passengerBreathing.length === 0) {
+    throw new Error('mounted_boat requires at least one declared passengerBreathing volume');
+  }
+  for (const box of profile.passengerBreathing) {
+    assertBox(box, 'passengerBreathing');
   }
 }
 
@@ -970,6 +1177,7 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
     const body: WorldVolume = {
       name: 'body',
       clearance: false,
+      breathing: false,
       minX: -profile.body.width / 2,
       maxX: profile.body.width / 2,
       minY: 0,
@@ -980,6 +1188,7 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
     const breathing: WorldVolume = {
       name: 'breathing',
       clearance: true,
+      breathing: true,
       minX: -profile.breathing.width / 2,
       maxX: profile.breathing.width / 2,
       minY: profile.breathing.minY,
@@ -998,6 +1207,9 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
       contactHalfX: profile.body.width / 2,
       contactHalfZ: profile.body.width / 2,
       surfaceBand: { ...profile.surfaceBand },
+      contactMinY: body.minY,
+      contactMaxY: body.maxY,
+      breathingMinY: breathing.minY,
     };
   }
 
@@ -1012,13 +1224,22 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
     },
     profile.orientation.quarterTurns,
   );
+  const passengerClearance = profile.passengerClearance.map<WorldVolume>((box) => ({
+    ...rotateLocalBox(box, profile.orientation.quarterTurns),
+    name: 'passenger',
+    clearance: true,
+    breathing: false,
+  }));
+  const passengerBreathing = profile.passengerBreathing.map<WorldVolume>((box) => ({
+    ...rotateLocalBox(box, profile.orientation.quarterTurns),
+    name: 'passengerBreathing',
+    clearance: true,
+    breathing: true,
+  }));
   const volumes: WorldVolume[] = [
-    { ...hull, name: 'hull', clearance: false },
-    ...profile.passengerClearance.map<WorldVolume>((box) => ({
-      ...rotateLocalBox(box, profile.orientation.quarterTurns),
-      name: 'passenger',
-      clearance: true,
-    })),
+    { ...hull, name: 'hull', clearance: false, breathing: false },
+    ...passengerClearance,
+    ...passengerBreathing,
   ];
   if (
     profile.surfaceBand.maxY < routeY + hull.minY - EPS ||
@@ -1031,6 +1252,12 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
     contactHalfX: Math.max(Math.abs(hull.minX), Math.abs(hull.maxX)),
     contactHalfZ: Math.max(Math.abs(hull.minZ), Math.abs(hull.maxZ)),
     surfaceBand: { ...profile.surfaceBand },
+    contactMinY: hull.minY,
+    contactMaxY: hull.maxY,
+    breathingMinY: passengerBreathing.reduce<number | null>(
+      (lowest, volume) => (lowest === null ? volume.minY : Math.min(lowest, volume.minY)),
+      null,
+    ),
   };
 }
 
@@ -1070,6 +1297,8 @@ interface Envelope {
   zMin: number;
   zMax: number;
   count: number;
+  /** False when bounds/count are non-finite, unsafe, or cannot advance by 1. */
+  safe: boolean;
 }
 
 function computeEnvelope(points: readonly Vec3Like[], geometry: RouteGeometry): Envelope {
@@ -1107,7 +1336,15 @@ function computeEnvelope(points: readonly Vec3Like[], geometry: RouteGeometry): 
   const yMax = Math.max(collisionYMax, bandYMax);
 
   const count = (xMax - xMin + 1) * (yMax - yMin + 1) * (zMax - zMin + 1);
-  return { xMin, xMax, yMin, yMax, zMin, zMax, count };
+  const bounds = [xMin, xMax, yMin, yMax, zMin, zMax];
+  const safe =
+    bounds.every(isSafeEnumeratedBound) &&
+    Number.isSafeInteger(xMax - xMin) &&
+    Number.isSafeInteger(yMax - yMin) &&
+    Number.isSafeInteger(zMax - zMin) &&
+    Number.isSafeInteger(count) &&
+    count >= 0;
+  return { xMin, xMax, yMin, yMax, zMin, zMax, count, safe };
 }
 
 function cellRange(min: number, max: number): [number, number] {
@@ -1115,6 +1352,14 @@ function cellRange(min: number, max: number): [number, number] {
   const hi = Math.floor(max - EPS);
   if (hi < lo) return [Math.floor(min), Math.floor(min)];
   return [lo, hi];
+}
+
+/**
+ * A bound that is a safe integer and whose successor still advances exactly.
+ * This is arithmetic capability validation, not a world-border rule.
+ */
+function isSafeEnumeratedBound(value: number): boolean {
+  return Number.isSafeInteger(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER - 2;
 }
 
 /**
@@ -1206,6 +1451,17 @@ function footprintInterval(
 }
 
 /**
+ * Clamp a segment-local interval to [0, 1] before it is globalized. Without
+ * this, one segment's extended supporting line could cover unrelated later
+ * segments.
+ */
+function clampSegmentInterval(interval: readonly [number, number]): [number, number] | null {
+  const lo = Math.max(0, interval[0]);
+  const hi = Math.min(1, interval[1]);
+  return hi - lo > EPS ? [lo, hi] : null;
+}
+
+/**
  * Maximal closed sub-intervals of [segMin, segMax] not covered by any interval.
  * Intervals are open (positive-length contact only), so touching endpoints do
  * not cover a gap and zero-width gaps are never reported.
@@ -1263,14 +1519,12 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
   if (!Number.isFinite(request.maxSampleAgeMs) || request.maxSampleAgeMs <= 0) {
     throw new Error(`maxSampleAgeMs must be a positive finite number: ${request.maxSampleAgeMs}`);
   }
-  const maxSamples = request.maxSamples ?? DEFAULT_MAX_SAMPLES;
-  if (!Number.isSafeInteger(maxSamples) || maxSamples <= 0) {
-    throw new Error(`maxSamples must be a positive safe integer: ${maxSamples}`);
-  }
+  const limits = resolveArrivalLimits(request.limits);
   validateGoal(request.goal);
-  if (request.goal.kind === 'dry_shore') {
+  const needsMap = request.goal.kind === 'dry_shore' || request.goal.kind === 'surface_target';
+  if (needsMap) {
     if (request.map === undefined) {
-      throw new Error('dry_shore completion requires a VoxelMap for the grounded geometry check');
+      throw new Error(`${request.goal.kind} completion requires a VoxelMap for geometry confirmation`);
     }
     if (request.map.worldId !== request.scope.worldId) {
       throw new Error(
@@ -1287,8 +1541,8 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
     computedAt: request.now,
   };
 
-  if (request.samples.length > maxSamples) {
-    const detail = `sample set has ${request.samples.length} samples, exceeding maxSamples (${maxSamples})`;
+  if (request.samples.length > limits.maxSamples) {
+    const detail = `sample set has ${request.samples.length} samples, exceeding maxSamples (${limits.maxSamples})`;
     return {
       ...base,
       status: 'UNCONFIRMED',
@@ -1298,7 +1552,7 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
         detail,
         limit: 'maxSamples',
         used: request.samples.length,
-        max: maxSamples,
+        max: limits.maxSamples,
       },
     };
   }
@@ -1307,6 +1561,15 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
   let lastAcceptedIndex = -1;
   let stableSince: number | null = null;
   let stableSamples = 0;
+  let lastBoatMeasurement: BoatMeasurement | null = null;
+  let previousObservedAt: number | null = null;
+
+  const evidenceValidUntil = (): number | undefined => {
+    if (lastAccepted === null) return undefined;
+    const earliest =
+      goal.kind === 'boat_dock' && stableSince !== null ? stableSince : lastAccepted.observedAt;
+    return earliest + request.maxSampleAgeMs;
+  };
 
   for (let index = 0; index < request.samples.length; index++) {
     const sample = request.samples[index]!;
@@ -1320,7 +1583,13 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
         : { lastPosition: { ...lastAccepted.pos }, lastObservedAt: lastAccepted.observedAt }),
       ...(stableSince === null ? {} : { stableSince }),
       ...(goal.kind === 'boat_dock' ? { stableSamples } : {}),
-      validUntil: lastAccepted === null ? undefined : lastAccepted.observedAt + request.maxSampleAgeMs,
+      ...(goal.kind === 'boat_dock' && lastBoatMeasurement !== null
+        ? {
+            lastBoatPosition: { ...lastBoatMeasurement.pos },
+            lastBoatObservedAt: lastBoatMeasurement.observedAt,
+          }
+        : {}),
+      validUntil: evidenceValidUntil(),
     });
 
     if (!sampleFinite(sample)) {
@@ -1388,7 +1657,18 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
     lastAcceptedIndex = index;
 
     if (goal.kind === 'boat_dock') {
-      const stable = stableDockSample(sample, goal);
+      // A sparse receipt cannot prove the unobserved interval was stable. Break
+      // the run at the caller-declared cadence boundary before starting a new one.
+      if (
+        previousObservedAt !== null &&
+        sample.observedAt - previousObservedAt > goal.maxSampleGapMs
+      ) {
+        stableSince = null;
+        stableSamples = 0;
+      }
+      const bound = dockBoatMeasurement(sample, scope);
+      if (bound.kind === 'ok') lastBoatMeasurement = bound.measurement;
+      const stable = stableDockSample(sample, goal, scope);
       if (!stable) {
         stableSince = null;
         stableSamples = 0;
@@ -1399,6 +1679,7 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
         stableSamples += 1;
       }
     }
+    previousObservedAt = sample.observedAt;
   }
 
   if (lastAccepted === null) {
@@ -1412,32 +1693,38 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
 
   const lastPosition = { ...lastAccepted.pos };
   const lastObservedAt = lastAccepted.observedAt;
-  const validUntil = lastObservedAt + request.maxSampleAgeMs;
+  const sampleValidUntil = lastObservedAt + request.maxSampleAgeMs;
   const common = {
     ...base,
     lastPosition,
     lastObservedAt,
     ...(stableSince === null ? {} : { stableSince }),
     ...(goal.kind === 'boat_dock' ? { stableSamples } : {}),
+    ...(goal.kind === 'boat_dock' && lastBoatMeasurement !== null
+      ? {
+          lastBoatPosition: { ...lastBoatMeasurement.pos },
+          lastBoatObservedAt: lastBoatMeasurement.observedAt,
+        }
+      : {}),
   };
 
-  const outsideTarget = (): WaterArrivalResult => ({
+  const outsideTarget = (actual: Vec3Like, source: string): WaterArrivalResult => ({
     ...common,
     status: 'UNCONFIRMED',
-    reason: 'the measured position is outside the original target tolerances',
+    reason: `the measured ${source} position is outside the original target tolerances`,
     problem: {
       kind: 'outside_target',
       sampleIndex: lastAcceptedIndex,
       expected: { ...goal.target },
-      actual: { ...lastAccepted!.pos },
-      detail: 'horizontal/vertical position does not satisfy the original goal',
+      actual: { ...actual },
+      detail: `horizontal/vertical ${source} position does not satisfy the original goal`,
     },
-    validUntil,
+    validUntil: evidenceValidUntil(),
   });
 
   if (goal.kind === 'surface_target') {
     if (!positionMatches(lastAccepted.pos, goal, goal.horizontalTolerance, goal.verticalTolerance)) {
-      return outsideTarget();
+      return outsideTarget(lastAccepted.pos, 'body');
     }
     if (!lastAccepted.inWater) {
       return {
@@ -1449,20 +1736,72 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
           sampleIndex: lastAcceptedIndex,
           detail: 'inWater=false; a surface target does not require dry land, but it does require water contact',
         },
-        validUntil,
+        validUntil: sampleValidUntil,
+      };
+    }
+    const surface = evaluateWaterRoute(
+      request.map!,
+      {
+        worldId: scope.worldId,
+        dim: scope.dim,
+        sessionId: scope.sessionId,
+        points: [{ ...lastAccepted.pos }, { ...lastAccepted.pos }],
+        profile: goal.profile,
+        solidShapeProvider: goal.solidShapeProvider,
+        fluidShapeProvider: goal.fluidShapeProvider,
+        limits: goal.geometryLimits,
+      },
+      request.now,
+    );
+    const dependencies = surface.dependencies.map((dep) => ({ key: { ...dep.key }, revision: dep.revision }));
+    const combinedValidUntil = Math.min(sampleValidUntil, surface.validUntil);
+    if (surface.status !== 'OPEN') {
+      const reason = surface.reason ?? `surface geometry returned ${surface.status}`;
+      if (surface.problem?.kind === 'budget_exceeded') {
+        return {
+          ...common,
+          status: 'UNCONFIRMED',
+          reason,
+          problem: {
+            kind: 'budget_exceeded',
+            detail: surface.problem.detail,
+            limit: surface.problem.limit,
+            used: surface.problem.used,
+            max: surface.problem.max,
+          },
+          surfaceGeometry: surface,
+          dependencies,
+          validUntil: combinedValidUntil,
+        };
+      }
+      return {
+        ...common,
+        status: 'UNCONFIRMED',
+        reason,
+        problem: {
+          kind: 'surface_geometry',
+          sampleIndex: lastAcceptedIndex,
+          detail: `current-position surface geometry returned ${surface.status}`,
+          evaluation: surface,
+        },
+        surfaceGeometry: surface,
+        dependencies,
+        validUntil: combinedValidUntil,
       };
     }
     return {
       ...common,
       status: 'ARRIVED',
-      reason: `measured in-water position satisfies ${fmt(goal.target)}`,
-      validUntil,
+      reason: `measured in-water position and current surface geometry satisfy ${fmt(goal.target)}`,
+      surfaceGeometry: surface,
+      dependencies,
+      validUntil: combinedValidUntil,
     };
   }
 
   if (goal.kind === 'dry_shore') {
     if (!positionMatches(lastAccepted.pos, goal, goal.horizontalTolerance, goal.verticalTolerance)) {
-      return outsideTarget();
+      return outsideTarget(lastAccepted.pos, 'body');
     }
     if (!lastAccepted.onGround || lastAccepted.inWater) {
       return {
@@ -1474,29 +1813,40 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
           sampleIndex: lastAcceptedIndex,
           detail: `onGround=${lastAccepted.onGround} inWater=${lastAccepted.inWater}`,
         },
-        validUntil,
+        validUntil: sampleValidUntil,
       };
     }
-    const support = evaluateGroundedWalkSegment(
+    const shore = evaluateBoundedShoreSupport(
       request.map!,
-      {
-        worldId: scope.worldId,
-        dim: scope.dim,
-        sessionId: scope.sessionId,
-        mode: 'walk',
-        body: {
-          feet: { ...lastAccepted.pos },
-          width: goal.body.width,
-          height: goal.body.height,
-          pose: 'standing',
-        },
-        direction: { axis: 'x', sign: 1 },
-      },
-      { ...lastAccepted.pos },
+      scope,
+      lastAccepted.pos,
+      goal.body,
       goal.shapeProvider,
       request.now,
       goal.feetTolerance,
+      limits,
     );
+    if (shore.kind === 'budget') {
+      return {
+        ...common,
+        status: 'UNCONFIRMED',
+        reason: shore.problem.detail,
+        problem: shore.problem,
+        validUntil: sampleValidUntil,
+      };
+    }
+    if (shore.kind === 'unsupported_range') {
+      return {
+        ...common,
+        status: 'UNCONFIRMED',
+        reason: shore.detail,
+        problem: { kind: 'unsupported_range', detail: shore.detail },
+        validUntil: sampleValidUntil,
+      };
+    }
+    const support = shore.evaluation;
+    const dependencies = support.dependencies.map((dep) => ({ key: { ...dep.key }, revision: dep.revision }));
+    const combinedValidUntil = Math.min(sampleValidUntil, support.validUntil);
     if (support.status !== 'OPEN') {
       return {
         ...common,
@@ -1509,7 +1859,8 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
           evaluation: support,
         },
         shoreSupport: support,
-        validUntil: Math.min(validUntil, support.validUntil),
+        dependencies,
+        validUntil: combinedValidUntil,
       };
     }
     return {
@@ -1517,7 +1868,8 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
       status: 'ARRIVED',
       reason: `measured dry/grounded position and geometry-confirmed support at ${fmt(goal.target)}`,
       shoreSupport: support,
-      validUntil: Math.min(validUntil, support.validUntil),
+      dependencies,
+      validUntil: combinedValidUntil,
     };
   }
 
@@ -1533,14 +1885,14 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
         sampleIndex: lastAcceptedIndex,
         detail: 'boatId is absent; a display riding label is never treated as identity',
       },
-      validUntil,
+      validUntil: evidenceValidUntil(),
     };
   }
   if (lastAccepted.boatId !== dock.boatId) {
     return {
       ...common,
       status: 'UNCONFIRMED',
-      reason: 'the measured boat identity does not match the dock goal',
+      reason: 'the measured body mount identity does not match the dock goal',
       problem: {
         kind: 'boat_identity_mismatch',
         sampleIndex: lastAcceptedIndex,
@@ -1548,13 +1900,56 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
         actual: lastAccepted.boatId,
         detail: 'the body is mounted on a different boat or was dismounted and moved',
       },
-      validUntil,
+      validUntil: evidenceValidUntil(),
     };
   }
-  if (!positionMatches(lastAccepted.pos, dock, dock.horizontalTolerance, dock.verticalTolerance)) {
-    return outsideTarget();
+  const bound = dockBoatMeasurement(lastAccepted, scope);
+  if (bound.kind === 'missing') {
+    return {
+      ...common,
+      status: 'UNCONFIRMED',
+      reason: 'the final measured sample has no same-receipt boat measurement',
+      problem: {
+        kind: 'boat_measurement_missing',
+        sampleIndex: lastAcceptedIndex,
+        detail: 'boat position/velocity were not measured for this receipt',
+      },
+      validUntil: evidenceValidUntil(),
+    };
   }
-  if (lastAccepted.velocity === undefined || !velocityAtRest(lastAccepted.velocity, dock)) {
+  if (bound.kind === 'mismatch') {
+    return {
+      ...common,
+      status: 'UNCONFIRMED',
+      reason: 'the boat measurement is not bound to this sample receipt and scope',
+      problem: {
+        kind: 'boat_measurement',
+        sampleIndex: lastAcceptedIndex,
+        detail: bound.detail,
+      },
+      validUntil: evidenceValidUntil(),
+    };
+  }
+  const boat = bound.measurement;
+  if (boat.boatId !== dock.boatId) {
+    return {
+      ...common,
+      status: 'UNCONFIRMED',
+      reason: 'the measured boat entity identity does not match the dock goal',
+      problem: {
+        kind: 'boat_identity_mismatch',
+        sampleIndex: lastAcceptedIndex,
+        expected: dock.boatId,
+        actual: boat.boatId,
+        detail: 'the measured boat entity is not the dock goal boat',
+      },
+      validUntil: evidenceValidUntil(),
+    };
+  }
+  if (!positionMatches(boat.pos, dock, dock.horizontalTolerance, dock.verticalTolerance)) {
+    return outsideTarget(boat.pos, 'boat');
+  }
+  if (!velocityAtRest(boat.velocity, dock)) {
     return {
       ...common,
       status: 'UNCONFIRMED',
@@ -1562,9 +1957,9 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
       problem: {
         kind: 'moving',
         sampleIndex: lastAcceptedIndex,
-        detail: 'velocity is absent or exceeds maxHorizontalSpeed/maxVerticalSpeed',
+        detail: 'measured boat velocity exceeds maxHorizontalSpeed/maxVerticalSpeed',
       },
-      validUntil,
+      validUntil: evidenceValidUntil(),
     };
   }
   const requiredSamples = dock.minStableSamples ?? 2;
@@ -1581,22 +1976,47 @@ export function checkWaterArrival(request: WaterArrivalRequest): WaterArrivalRes
         stableMs,
         requiredMs: dock.stableWindowMs,
       },
-      validUntil,
+      validUntil: evidenceValidUntil(),
     };
   }
   return {
     ...common,
     status: 'ARRIVED',
     reason: `measured docked boat ${dock.boatId} at ${fmt(dock.target)} after ${stableMs}ms stable`,
-    validUntil,
+    validUntil: evidenceValidUntil(),
   };
 }
 
-function stableDockSample(sample: WaterBodySample, goal: BoatDockGoal): boolean {
+type DockMeasurementBinding =
+  | { kind: 'ok'; measurement: BoatMeasurement }
+  | { kind: 'missing' }
+  | { kind: 'mismatch'; detail: string };
+
+function dockBoatMeasurement(sample: WaterBodySample, scope: WaterArrivalRequest['scope']): DockMeasurementBinding {
+  const measurement = sample.boatMeasurement;
+  if (measurement === undefined) return { kind: 'missing' };
+  if (
+    measurement.worldId !== scope.worldId ||
+    measurement.dim !== scope.dim ||
+    measurement.sessionId !== scope.sessionId
+  ) {
+    return { kind: 'mismatch', detail: 'boat measurement world/dim/session differs from the arrival scope' };
+  }
+  if (measurement.executionId !== scope.executionId) {
+    return { kind: 'mismatch', detail: 'boat measurement executionId differs from the arrival execution' };
+  }
+  if (measurement.observedAt !== sample.observedAt || measurement.sequence !== sample.sequence) {
+    return { kind: 'mismatch', detail: 'boat measurement is not bound to the same observation receipt' };
+  }
+  return { kind: 'ok', measurement };
+}
+
+function stableDockSample(sample: WaterBodySample, goal: BoatDockGoal, scope: WaterArrivalRequest['scope']): boolean {
   if (sample.boatId !== goal.boatId) return false;
-  if (!positionMatches(sample.pos, goal, goal.horizontalTolerance, goal.verticalTolerance)) return false;
-  if (sample.velocity === undefined) return false;
-  return velocityAtRest(sample.velocity, goal);
+  const bound = dockBoatMeasurement(sample, scope);
+  if (bound.kind !== 'ok' || bound.measurement.boatId !== goal.boatId) return false;
+  if (!positionMatches(bound.measurement.pos, goal, goal.horizontalTolerance, goal.verticalTolerance)) return false;
+  return velocityAtRest(bound.measurement.velocity, goal);
 }
 
 function velocityAtRest(velocity: Vec3Like, goal: BoatDockGoal): boolean {
@@ -1622,6 +2042,7 @@ function positionMatches(
 }
 
 function sampleFinite(sample: WaterBodySample): boolean {
+  const measurement = sample.boatMeasurement;
   return (
     Number.isFinite(sample.pos.x) &&
     Number.isFinite(sample.pos.y) &&
@@ -1631,8 +2052,193 @@ function sampleFinite(sample: WaterBodySample): boolean {
     (sample.velocity === undefined ||
       (Number.isFinite(sample.velocity.x) &&
         Number.isFinite(sample.velocity.y) &&
-        Number.isFinite(sample.velocity.z)))
+        Number.isFinite(sample.velocity.z))) &&
+    (measurement === undefined ||
+      (Number.isFinite(measurement.pos.x) &&
+        Number.isFinite(measurement.pos.y) &&
+        Number.isFinite(measurement.pos.z) &&
+        Number.isFinite(measurement.velocity.x) &&
+        Number.isFinite(measurement.velocity.y) &&
+        Number.isFinite(measurement.velocity.z) &&
+        Number.isFinite(measurement.observedAt) &&
+        Number.isFinite(measurement.sequence)))
   );
+}
+
+type ShoreSupportResult =
+  | { kind: 'evaluation'; evaluation: StepEvaluation }
+  | {
+      kind: 'budget';
+      problem: {
+        kind: 'budget_exceeded';
+        detail: string;
+        limit: string;
+        used: number;
+        max: number;
+      };
+    }
+  | { kind: 'unsupported_range'; detail: string };
+
+/**
+ * Bounded stationary dry-shore check. The existing grounded evaluator keeps its
+ * shape semantics, but this wrapper preflights its candidate envelope and caps
+ * provider resolutions, neighbour reads and total shape parts before the old
+ * loops can traverse unbounded data.
+ */
+function evaluateBoundedShoreSupport(
+  map: VoxelMap,
+  scope: WaterArrivalRequest['scope'],
+  feet: Vec3Like,
+  body: { width: number; height: number },
+  provider: CollisionShapeProvider,
+  now: number,
+  feetTolerance: number,
+  limits: WaterArrivalLimits,
+): ShoreSupportResult {
+  const half = body.width / 2;
+  const xMin = Math.floor(feet.x - half + EPS);
+  const xMax = Math.floor(feet.x + half - EPS);
+  const zMin = Math.floor(feet.z - half + EPS);
+  const zMax = Math.floor(feet.z + half - EPS);
+  const yMin = Math.floor(feet.y - feetTolerance - EPS);
+  const yMax = Math.max(
+    Math.floor(feet.y + body.height - EPS),
+    Math.floor(feet.y + feetTolerance - EPS),
+  );
+  if (![xMin, xMax, zMin, zMax, yMin, yMax].every(isSafeEnumeratedBound)) {
+    return {
+      kind: 'unsupported_range',
+      detail: 'stationary shore envelope bounds are outside the safely enumerable integer range',
+    };
+  }
+  const count = (xMax - xMin + 1) * (yMax - yMin + 1) * (zMax - zMin + 1);
+  if (!Number.isFinite(count) || count < 0) {
+    return {
+      kind: 'unsupported_range',
+      detail: 'stationary shore envelope cell count is not a finite non-negative number',
+    };
+  }
+  if (count > limits.maxShoreCells) {
+    return {
+      kind: 'budget',
+      problem: {
+        kind: 'budget_exceeded',
+        detail: `stationary shore envelope has ${count} candidate cells, exceeding maxShoreCells (${limits.maxShoreCells})`,
+        limit: 'maxShoreCells',
+        used: count,
+        max: limits.maxShoreCells,
+      },
+    };
+  }
+
+  let resolutions = 0;
+  let shapeParts = 0;
+  let neighborReads = 0;
+  const budgetState: {
+    value: { limit: string; used: number; max: number; detail: string } | null;
+  } = { value: null };
+  const fail = (limit: string, used: number, max: number, detail: string): void => {
+    if (budgetState.value === null) budgetState.value = { limit, used, max, detail };
+  };
+
+  const boundedProvider: CollisionShapeProvider = {
+    version: provider.version,
+    resolve(state, cell, read) {
+      if (budgetState.value !== null) throw SHORE_BUDGET_EXCEEDED;
+      resolutions += 1;
+      if (resolutions > limits.maxShoreShapeResolutions) {
+        fail(
+          'maxShoreShapeResolutions',
+          resolutions,
+          limits.maxShoreShapeResolutions,
+          `shore shape resolutions exceeded maxShoreShapeResolutions (${limits.maxShoreShapeResolutions})`,
+        );
+        throw SHORE_BUDGET_EXCEEDED;
+      }
+      const boundedRead: NeighborRead = {
+        cell(x, y, z) {
+          if (budgetState.value !== null) throw SHORE_BUDGET_EXCEEDED;
+          neighborReads += 1;
+          if (neighborReads > limits.maxShoreNeighborReads) {
+            fail(
+              'maxShoreNeighborReads',
+              neighborReads,
+              limits.maxShoreNeighborReads,
+              `shore neighbour reads exceeded maxShoreNeighborReads (${limits.maxShoreNeighborReads})`,
+            );
+            throw SHORE_BUDGET_EXCEEDED;
+          }
+          return read.cell(x, y, z);
+        },
+      };
+      const resolution = provider.resolve(state, cell, boundedRead);
+      if (resolution.kind === 'shape') {
+        const parts = resolution.shape.boxes.length + resolution.shape.supportFaces.length;
+        if (!Number.isSafeInteger(parts) || shapeParts + parts > limits.maxShoreShapeParts) {
+          fail(
+            'maxShoreShapeParts',
+            shapeParts + parts,
+            limits.maxShoreShapeParts,
+            `shore shape parts exceeded maxShoreShapeParts (${limits.maxShoreShapeParts})`,
+          );
+          throw SHORE_BUDGET_EXCEEDED;
+        }
+        shapeParts += parts;
+      }
+      return resolution;
+    },
+  };
+
+  try {
+    const evaluation = evaluateGroundedWalkSegment(
+      map,
+      {
+        worldId: scope.worldId,
+        dim: scope.dim,
+        sessionId: scope.sessionId,
+        mode: 'walk',
+        body: {
+          feet: { ...feet },
+          width: body.width,
+          height: body.height,
+          pose: 'standing',
+        },
+        direction: { axis: 'x', sign: 1 },
+      },
+      { ...feet },
+      boundedProvider,
+      now,
+      feetTolerance,
+    );
+    if (budgetState.value !== null) {
+      return {
+        kind: 'budget',
+        problem: {
+          kind: 'budget_exceeded',
+          detail: budgetState.value.detail,
+          limit: budgetState.value.limit,
+          used: budgetState.value.used,
+          max: budgetState.value.max,
+        },
+      };
+    }
+    return { kind: 'evaluation', evaluation };
+  } catch (error) {
+    if (error !== SHORE_BUDGET_EXCEEDED) throw error;
+    if (budgetState.value === null) {
+      throw new Error('shore budget sentinel escaped without a recorded budget');
+    }
+    return {
+      kind: 'budget',
+      problem: {
+        kind: 'budget_exceeded',
+        detail: budgetState.value.detail,
+        limit: budgetState.value.limit,
+        used: budgetState.value.used,
+        max: budgetState.value.max,
+      },
+    };
+  }
 }
 
 function validateGoal(goal: WaterArrivalGoal): void {
@@ -1646,6 +2252,12 @@ function validateGoal(goal: WaterArrivalGoal): void {
   }
   if (goal.verticalTolerance < 0) {
     throw new Error(`goal.verticalTolerance must not be negative: ${goal.verticalTolerance}`);
+  }
+  if (goal.kind === 'surface_target') {
+    if (goal.profile.kind !== 'surface_swim') {
+      throw new Error('surface_target requires a surface_swim profile');
+    }
+    return;
   }
   if (goal.kind === 'dry_shore') {
     assertPositive(goal.body.width, 'goal.body.width');
@@ -1661,10 +2273,14 @@ function validateGoal(goal: WaterArrivalGoal): void {
       throw new Error('goal.boatId must be a non-empty stable identity string');
     }
     assertFinite(goal.stableWindowMs, 'goal.stableWindowMs');
+    assertFinite(goal.maxSampleGapMs, 'goal.maxSampleGapMs');
     assertFinite(goal.maxHorizontalSpeed, 'goal.maxHorizontalSpeed');
     assertFinite(goal.maxVerticalSpeed, 'goal.maxVerticalSpeed');
     if (goal.stableWindowMs <= 0) {
       throw new Error(`goal.stableWindowMs must be positive: ${goal.stableWindowMs}`);
+    }
+    if (goal.maxSampleGapMs <= 0) {
+      throw new Error(`goal.maxSampleGapMs must be positive: ${goal.maxSampleGapMs}`);
     }
     if (goal.maxHorizontalSpeed < 0 || goal.maxVerticalSpeed < 0) {
       throw new Error('goal speed limits must not be negative');
@@ -1677,7 +2293,17 @@ function validateGoal(goal: WaterArrivalGoal): void {
 
 function cloneGoal(goal: WaterArrivalGoal): WaterArrivalGoal {
   if (goal.kind === 'surface_target') {
-    return { ...goal, target: { ...goal.target } };
+    return {
+      ...goal,
+      target: { ...goal.target },
+      profile: {
+        ...goal.profile,
+        orientation: { ...goal.profile.orientation },
+        body: { ...goal.profile.body },
+        breathing: { ...goal.profile.breathing },
+        surfaceBand: { ...goal.profile.surfaceBand },
+      },
+    };
   }
   if (goal.kind === 'dry_shore') {
     return {

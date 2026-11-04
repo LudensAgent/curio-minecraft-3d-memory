@@ -12,6 +12,7 @@ export { checkWaterArrival, evaluateWaterRoute } from './verify.js';
 
 export type {
   BoatDockGoal,
+  BoatMeasurement,
   Box3,
   ControlledNeighborRead,
   DryShoreGoal,
@@ -26,6 +27,8 @@ export type {
   SurfaceSwimProfile,
   SurfaceTargetGoal,
   WaterArrivalGoal,
+  WaterArrivalLimits,
+  WaterArrivalLimitsInput,
   WaterArrivalProblem,
   WaterArrivalRequest,
   WaterArrivalResult,

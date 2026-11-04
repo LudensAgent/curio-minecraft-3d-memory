@@ -69,7 +69,7 @@ export interface SurfaceSwimProfile {
   orientation: FixedOrientation;
   /** Swimmer AABB width (X and Z) and height (Y), measured from the route point. */
   body: { width: number; height: number };
-  /** Breathable clearance, measured upward from the route point. */
+  /** Breathable clearance above the route point; must stay water/lava-free and above the waterline. */
   breathing: { minY: number; width: number; height: number };
   /** Absolute world-Y band the observed water surface must lie in. */
   surfaceBand: { minY: number; maxY: number };
@@ -88,8 +88,14 @@ export interface MountedBoatProfile {
   orientation: FixedOrientation;
   /** Hull dimensions in the local frame. */
   hull: { width: number; length: number; height: number };
-  /** Passenger clearance volumes in the local frame, relative to the hull bottom center. */
+  /** Whole passenger body/headroom clearance volumes in the local frame. */
   passengerClearance: readonly Box3[];
+  /**
+   * Explicit passenger breathing volumes, separate from the whole-body
+   * clearance. A surface-only boat route requires each breathing volume to stay
+   * free of water/lava and above the adopted waterline.
+   */
+  passengerBreathing: readonly Box3[];
   /** Absolute world-Y band the observed water surface must lie in. */
   surfaceBand: { minY: number; maxY: number };
 }
@@ -150,8 +156,10 @@ export type FluidShapeResolution =
 /**
  * Controlled neighbour read. Every `cell()` call is budgeted and checked for
  * evidence freshness/completeness/session; once the budget is exhausted the
- * read reports `budgetExhausted` and returns `unobserved`, never a guessed air
- * cell. Providers may read neighbours only through this entry.
+ * read reports `budgetExhausted` and refuses the call with a private sentinel
+ * that only the owned provider boundary converts into a budget result. It never
+ * returns a guessed air cell. Providers may read neighbours only through this
+ * entry.
  */
 export interface ControlledNeighborRead extends NeighborRead {
   readonly budgetExhausted: boolean;
@@ -171,6 +179,8 @@ export interface FluidShapeProvider {
 export interface WaterValidationLimits {
   /** Maximum route points (inclusive). */
   maxPoints: number;
+  /** Maximum declared profile volumes (body/breathing/hull/passenger boxes). */
+  maxProfileVolumes: number;
   /** Maximum cells in the combined swept envelope before enumeration. */
   maxCandidateCells: number;
   /** Maximum distinct cells looked up in the evidence map. */
@@ -179,6 +189,8 @@ export interface WaterValidationLimits {
   maxNeighborReads: number;
   /** Maximum geometric box/interval checks. */
   maxShapeChecks: number;
+  /** Maximum provider risk facts collected in one evaluation. */
+  maxRiskFacts: number;
 }
 
 export type WaterLimits = Partial<WaterValidationLimits>;
@@ -209,10 +221,12 @@ export type WaterRouteProblem =
   | { kind: 'collision'; cells: Vec3Like[]; detail: string }
   | { kind: 'head_clearance'; cells: Vec3Like[]; detail: string }
   | { kind: 'missing_surface'; cells: Vec3Like[]; detail: string }
+  | { kind: 'submerged_posture'; cells: Vec3Like[]; detail: string }
   | { kind: 'unobserved'; cells: Vec3Like[]; detail: string }
   | { kind: 'stale'; cells: Vec3Like[]; detail: string }
   | { kind: 'unsupported_profile'; cells: Vec3Like[]; detail: string }
   | { kind: 'unsupported_shape'; cells: Vec3Like[]; detail: string }
+  | { kind: 'unsupported_range'; cells: Vec3Like[]; detail: string }
   | { kind: 'neighbor_gap'; cells: Vec3Like[]; detail: string }
   | {
       kind: 'budget_exceeded';
@@ -225,10 +239,12 @@ export type WaterRouteProblem =
 /** Actual work counts plus the limits that governed the evaluation. */
 export interface WaterBudgetReport {
   points: number;
+  profileVolumes: number;
   candidateCells: number;
   readCells: number;
   neighborReads: number;
   shapeChecks: number;
+  riskFacts: number;
   limits: WaterValidationLimits;
 }
 
@@ -247,7 +263,8 @@ export interface WaterRouteEvaluation {
   sessionId: string;
   /**
    * Exact original route points (deep copy). Empty only when a pre-enumeration
-   * budget rejected the request; `from`/`to` still preserve the original ends.
+   * budget or unsafe-range rejection stopped before copying; `from`/`to` still
+   * preserve the original ends.
    */
   points: Vec3Like[];
   /** First route point, never rewritten. */
@@ -270,12 +287,22 @@ export interface WaterRouteEvaluation {
 
 // --- completion verification (separate from route verification) ---
 
-/** A target whose completion only requires measured presence in water. */
+/**
+ * A surface target. Completion requires a measured in-water sample plus current
+ * surface/breathing geometry confirmation at the measured position. Being in
+ * water alone (for example fully submerged) is not arrival.
+ */
 export interface SurfaceTargetGoal {
   kind: 'surface_target';
   target: Vec3Like;
   horizontalTolerance: number;
   verticalTolerance: number;
+  /** Explicit surface-swim geometry used for the current-position check. */
+  profile: SurfaceSwimProfile;
+  solidShapeProvider: CollisionShapeProvider;
+  fluidShapeProvider: FluidShapeProvider;
+  /** Bounds for the two-point geometry confirmation; defaults apply. */
+  geometryLimits?: WaterLimits;
 }
 
 /**
@@ -310,7 +337,9 @@ export interface BoatDockGoal {
   boatId: string;
   /** Ordered stable samples must span at least this many ms. */
   stableWindowMs: number;
-  /** Speed limits in blocks per physics tick (20 Hz). */
+  /** Consecutive relied-on samples may not be farther apart than this. */
+  maxSampleGapMs: number;
+  /** Speed limits applied to the measured boat velocity, not player velocity. */
   maxHorizontalSpeed: number;
   maxVerticalSpeed: number;
   /** At least 2 by default. */
@@ -320,19 +349,58 @@ export interface BoatDockGoal {
 export type WaterArrivalGoal = SurfaceTargetGoal | DryShoreGoal | BoatDockGoal;
 
 /**
- * One measured body sample extended with mount identity.
- *
- * `boatId` is the explicit stable identity this layer trusts. `ridingLabel` is
- * carried for host logs only and is never parsed to infer identity.
+ * Boat telemetry explicitly bound to the same sample receipt. This is the
+ * authority for dock position and speed; the parent `BodySample.velocity` is
+ * player telemetry and must not be relabelled as boat motion.
+ */
+export interface BoatMeasurement {
+  /** Stable entity identity; never a display string. */
+  boatId: string;
+  /** Measured boat reference position. */
+  pos: Vec3Like;
+  /** Measured boat velocity in blocks per physics tick. */
+  velocity: Vec3Like;
+  /** Must match the parent sample's receipt identity. */
+  observedAt: number;
+  sequence: number;
+  executionId: string;
+  worldId: string;
+  dim: string;
+  sessionId: string;
+}
+
+/**
+ * One measured body sample extended with mount identity and optional boat
+ * telemetry. `boatId` is the body-side still-mounted identity; it does not by
+ * itself prove that the player velocity/position is the boat's. `ridingLabel`
+ * is carried for host logs only and is never parsed to infer identity.
  */
 export interface WaterBodySample extends BodySample {
   /** Stable boat identity the body was measured on. Absent = not provided. */
   boatId?: string;
+  /** Same-receipt boat measurement required for dock completion. */
+  boatMeasurement?: BoatMeasurement;
   /** Display text for logs only; never used for completion. */
   ridingLabel?: string;
   /** True when the host applied a server position correction around this sample. */
   positionCorrected?: boolean;
 }
+
+/** Bounds for completion verification; all fields have explicit defaults. */
+export interface WaterArrivalLimits {
+  /** Maximum samples processed (inclusive). Defaults to 512. */
+  maxSamples: number;
+  /** Maximum stationary dry-shore candidate cells. Defaults to 4096. */
+  maxShoreCells: number;
+  /** Maximum provider shape resolutions during the shore check. Defaults to 8192. */
+  maxShoreShapeResolutions: number;
+  /** Maximum provider neighbour reads during the shore check. Defaults to 16384. */
+  maxShoreNeighborReads: number;
+  /** Maximum total boxes + support faces returned by shore shape resolutions. Defaults to 4096. */
+  maxShoreShapeParts: number;
+}
+
+export type WaterArrivalLimitsInput = Partial<WaterArrivalLimits>;
 
 export interface WaterArrivalScope {
   worldId: string;
@@ -345,15 +413,15 @@ export interface WaterArrivalScope {
 export interface WaterArrivalRequest {
   goal: WaterArrivalGoal;
   scope: WaterArrivalScope;
-  /** Required for `dry_shore`; the read-only evidence map used for support geometry. */
+  /** Required for `dry_shore` and `surface_target` geometry confirmation. */
   map?: VoxelMap;
   /** Measured samples in host order; replayed/out-of-order input is rejected. */
   samples: readonly WaterBodySample[];
   now: number;
   /** Samples older than `now - maxSampleAgeMs` are stale. */
   maxSampleAgeMs: number;
-  /** Maximum samples processed (inclusive). Defaults to 512. */
-  maxSamples?: number;
+  /** Explicit completion budgets; defaults apply. */
+  limits?: WaterArrivalLimitsInput;
 }
 
 /** Completion is a separate confirmation from route verification. */
@@ -376,6 +444,12 @@ export type WaterArrivalProblem =
       detail: string;
     }
   | { kind: 'not_in_water'; sampleIndex: number; detail: string }
+  | {
+      kind: 'surface_geometry';
+      sampleIndex: number;
+      detail: string;
+      evaluation: WaterRouteEvaluation;
+    }
   | { kind: 'not_dry_grounded'; sampleIndex: number; detail: string }
   | {
       kind: 'shore_support';
@@ -391,7 +465,10 @@ export type WaterArrivalProblem =
       actual: string;
       detail: string;
     }
+  | { kind: 'boat_measurement_missing'; sampleIndex: number; detail: string }
+  | { kind: 'boat_measurement'; sampleIndex: number; detail: string }
   | { kind: 'moving'; sampleIndex: number; detail: string }
+  | { kind: 'unsupported_range'; detail: string }
   | {
       kind: 'insufficient_stable_window';
       sampleIndex: number;
@@ -424,13 +501,24 @@ export interface WaterArrivalResult {
   lastPosition?: Vec3Like;
   /** Original observation time of the last accepted sample, never the query time. */
   lastObservedAt?: number;
+  /** Surface target: the actual current-position geometry evaluation, not a boolean. */
+  surfaceGeometry?: WaterRouteEvaluation;
   /** Dry shore: the actual read-only grounded geometry evaluation, not a boolean. */
   shoreSupport?: StepEvaluation;
+  /** Section dependencies actually relied on by the geometry confirmation. */
+  dependencies?: { key: SectionKey; revision: number }[];
   /** Dock: original observation time when the current stable run started. */
   stableSince?: number;
   /** Dock: number of consecutive stable samples in the current run. */
   stableSamples?: number;
+  /** Dock: last measured boat position, kept separate from the body sample. */
+  lastBoatPosition?: Vec3Like;
+  /** Dock: original observation time of the last measured boat receipt. */
+  lastBoatObservedAt?: number;
   computedAt: number;
-  /** Freshness ceiling of the samples (and shore geometry) relied on. */
+  /**
+   * Freshness ceiling of every witness relied on: the oldest stable sample for
+   * a dock, the last sample plus any shore/surface geometry TTL otherwise.
+   */
   validUntil?: number;
 }
