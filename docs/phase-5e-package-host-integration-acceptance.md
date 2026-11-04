@@ -3,6 +3,13 @@
 > 本文件是本批次的独立验收记录。它不覆盖、不修改 `docs/spatial-memory-library-design.md` 中
 > 用户已有的未提交改动，也不迁移旧 `WorldMemory` 或容器账本。
 
+> **修订记录（L5 provenance，本次新增）**：本记录最初写于 `2e5c501`，把包版本对齐到 `0.7.4`，
+> 但其「产物摘要」把源码 commit `170debf` 与 tag `v0.7.4` 直接当作「纯 HEAD 打包」记录，忽略了
+> manifest 与运行器实际上是在 `2e5c501` 才落地的这一事实（见下方「历史局限」修正）。本次
+> （`0.7.5`）新增 L5 可追溯打包运行器，把「运行时源码基线」与「完整打包输入」分开记录，并仅在
+> 干净 HEAD 下执行打包；最终产物与断言哈希要等各阶段提交并通过审计后再由协调方统一落定，本文件
+> 现阶段不伪造任何最终 PASS。
+
 ## 结论
 
 **阶段 5E 完成。** 在既有观测地图、通行验证、受控 walk 执行、SQLite 单 Worker 持久化、Section
@@ -54,6 +61,13 @@ Curio 负责。
 产物由 `npm pack` 生成，包含 `files: ["dist"]` 下的全部 JS、类型声明、source map，以及
 `dist/storage/sqlite/worker.js`（SQLite Worker）。**产物不含未提交的运行时代码**：`dist/` 由已提交的
 `src/` 经 `npm run build`（`tsc -p tsconfig.build.json`）生成，`dist/` 本身被 `.gitignore` 排除、不入库。
+
+> **历史局限（本次修正，不移动既有 tag、不补造校验）**：上表把 `源码 commit = 170debf`、`源码 tag = v0.7.4`
+> 与产物一起记录，暗示这是一次「纯 HEAD 打包」。实际上 `v0.7.4` tag 指向 `170debf`，而
+> `package.json` 的版本对齐、`package-lock.json`、`.gitignore` 的 `*.tgz` 忽略规则，以及
+> `acceptance/run.mjs` 等运行器文件是在其后继提交 `2e5c501` 才落地的。也就是说，当时的产物并非单一
+> commit 的干净快照，而是「`170debf` 的源码 + `2e5c501` 的 manifest/运行器」的混合。这是旧记录的历史局限，
+> 本次不移动 `v0.7.4`、不重打产物，也不为旧产物补造干净 HEAD 校验；仅在此如实标注。
 
 - 根入口 `curio-minecraft-3d-memory` → `dist/index.js` + `dist/index.d.ts`，无原生依赖、不启动 Worker。
 - 子入口 `curio-minecraft-3d-memory/storage/sqlite` → `dist/storage/sqlite/index.js`，在单个 Worker 线程内
@@ -121,6 +135,58 @@ sha256        : 5b5bbfa2a4ef3ea5556c709ff80c3c0a65b3bbe8bb52ec758939af4944929970
 本参考示例采用默认 `eager` 加载（打开时全量恢复已提交 Section），只适用于世界规模落在会话预算内的情况；
 不暗示所有场景都应全量加载。需要按需驻留与路线 Pin 保护时见 `examples/working-set.ts` 与 README 的
 “手动按需 Section 驻留 / 有界工作集管理”章节。
+
+## 交付四：L5 可追溯打包 / provenance 运行器（`0.7.5`，本次新增）
+
+`acceptance/run.mjs` 被重写为带完整 provenance 的可追溯运行器，把「运行时源码基线」与「完整打包输入」
+分开记录，不再把混合工作树误报为干净 HEAD 打包。逻辑拆成两个文件，便于用纯 fixture 单测验证分类边界：
+
+| 文件 | 内容 |
+|---|---|
+| `acceptance/provenance.mjs` | 纯函数：git 查询（区分 git 失败与「无 tag」）、输入分类、SHA-256 摘要、dist 删除越界校验 |
+| `acceptance/run.mjs` | 运行器：readiness 与 `--execute` 两种模式；`process.exit` 已移除，改用拥有式 I/O 错误边界 |
+| `acceptance/provenance.test.mjs` | `node:test` 纯 fixture 测试（隔离临时 git 仓库，不触碰工作树 `dist` 或外部数据） |
+
+### 运行模式
+
+- `node acceptance/run.mjs`（readiness）：只读采集 provenance——源码 commit、精确 tag（无 tag 记 `null`）、
+  包名/版本、build 命令、Node/npm/TypeScript 实际版本、运行器与消费者内容哈希、staged/unstaged/untracked
+  输入分类与内容摘要。**git HEAD 查询失败是硬失败**，绝不回退为空哈希再报 PASS；`git describe --exact-match`
+  的「无精确 tag」与其它 git 错误区分对待（前者允许并记录 `null`）。任何 build/package/acceptance 输入脏了
+  即硬失败；无关设计文档脏了只报告、不阻断。
+- `node acceptance/run.mjs --execute`：仅在干净 HEAD 下执行——先校验 `dist` 解析后仍在仓库根内（拒绝符号链接
+  越界）再递归删除、全新 `npm run build`、`npm pack --pack-destination <唯一输出目录>`、把产物复制进独立
+  消费者目录按 `file:./<tgz>` 精确安装、跑真实 SQLite Worker 消费者与 `tsc --noEmit` 类型检查，最后把
+  evidence JSON 与不可变 `.tgz` 留在唯一输出目录（不覆盖同名、跑完仍保留），只回收临时消费者安装目录。
+
+### 输入分类
+
+| 类别 | 匹配 | 脏了是否阻断干净发布 |
+|---|---|---|
+| `build` | `src/**`、`tsconfig.json`、`tsconfig.build.json` | 是 |
+| `package` | `package.json`、`package-lock.json`、`.npmignore`、`.gitignore`、npm 必打包基线（`README.md`、`LICENSE` 等） | 是 |
+| `acceptance` | `acceptance/**`（运行器与消费者脚本） | 是 |
+| `non-input` | 其它（设计文档、examples、无关测试） | 否，仅报告 |
+
+npm 即使设置了 `files: ["dist"]` 仍会把标准 `README` / `LICENSE` / `package.json` 打包进 tgz；`README_ZH.md`
+因 basename 不匹配 npm 的必打包集合，不会自动入包，故归为 `non-input`。这一口径在
+`provenance.test.mjs` 中直接针对真实分类器断言，而不是复写一套实现。
+
+### 当前验证状态（本次准备阶段）
+
+- **已测试**：`node --test acceptance/provenance.test.mjs` 全绿（15 项），覆盖 git HEAD/精确 tag 的失败与
+  缺 tag 区分、tracked/staged/untracked 的 build/package 文件改动阻断干净发布、无关设计文档脏了放行、
+  `dist` 删除越界（符号链接逃逸 / 词法 `..`）拒绝、删除仅限 fixture 目录。
+- **待后续门禁**：`--execute` 的干净打包 + 独立安装 + 消费者/类型检查尚未运行（本阶段不得 `clean dist` /
+  build / pack / install）。最终产物 SHA-256、源码/断言哈希、安装版本、以及消费者正向 + B2a 两个负向模式
+  （release-pin-early、skip-final-checkpoint）的结果，须等各阶段提交并通过审计后由协调方统一落定；本文件
+  不伪造任何最终 PASS。
+
+### 待接入（暂以占位记录，不虚假 PASS）
+
+- `acceptance/consumer.mjs` 的正向路径由 B2a 拥有；其两个负向模式（release-pin-early、skip-final-checkpoint）
+  的 CLI 参数由 B2a 在后续提交中确定，运行器当前不猜测其 flag，只在 evidence 中记录为 `PENDING`。
+- 最终「源码 / 断言」内容哈希要在所有阶段提交后统一；当前运行器只记录运行器与消费者文件的当前内容哈希。
 
 ## 职责边界与仍需 Curio 完成
 
