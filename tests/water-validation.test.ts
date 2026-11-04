@@ -729,6 +729,230 @@ describe('water route validation', () => {
     expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
   });
 
+  it('does not claim submersion from an upper patch outside the swept footprint', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+    map.observe(observation(WATER, { x: 0, y: 1, z: 0 }));
+    const narrowUpper: FluidShapeProvider = {
+      version: 'narrow-upper-outside',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        if (cell.y === 0) {
+          return { kind: 'shape', shape: { water: waterVolume(0.875), lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: {
+            water: {
+              kind: 'water',
+              box: { minX: 0, minY: 0, minZ: 0, maxX: 0.1, maxY: 0.7, maxZ: 1 },
+              motion: 'still',
+              surface: { y: 0.7, minX: 0, minZ: 0, maxX: 0.1, maxZ: 1 },
+            },
+            lava: null,
+            risks: [],
+          },
+        };
+      },
+    };
+    const profile: SurfaceSwimProfile = {
+      ...swimProfile,
+      breathing: { minY: 1.6, width: 0.5, height: 0.2 },
+      surfaceBand: { minY: 0.875, maxY: 1.7 },
+    };
+    const point = { x: 0.5, y: 0, z: 0.5 };
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery([point, { ...point }], { profile, fluidShapeProvider: narrowUpper }),
+      1000,
+    );
+
+    expect(result.status).toBe('OPEN');
+    expect(result.hazards.some((hazard) => hazard.kind === 'water_contact')).toBe(true);
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(false);
+  });
+
+  it('does not report hull submersion from torso-only water contact', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+    map.observe(observation(WATER, { x: 0, y: 1, z: 0 }));
+    const torsoWater: FluidShapeProvider = {
+      version: 'torso-only',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        if (cell.y === 0) {
+          return { kind: 'shape', shape: { water: waterVolume(0.375), lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: {
+            water: {
+              kind: 'water',
+              box: { minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.2, maxZ: 1 },
+              motion: 'still',
+              surface: { y: 0.2, minX: 0, minZ: 0, maxX: 1, maxZ: 1 },
+            },
+            lava: null,
+            risks: [],
+          },
+        };
+      },
+    };
+    const profile: MountedBoatProfile = {
+      kind: 'mounted_boat',
+      orientation: { quarterTurns: 0 },
+      hull: { width: 0.6, length: 0.6, height: 0.6 },
+      passengerClearance: [{ minX: -0.25, minY: 0.6, minZ: -0.25, maxX: 0.25, maxY: 1.8, maxZ: 0.25 }],
+      passengerBreathing: [{ minX: -0.2, minY: 1.6, minZ: -0.2, maxX: 0.2, maxY: 1.8, maxZ: 0.2 }],
+      surfaceBand: { minY: 0.375, maxY: 0.375 },
+    };
+    const point = { x: 0.5, y: 0, z: 0.5 };
+
+    const result = evaluateWaterRoute(
+      map,
+      boatQuery([point, { ...point }], { profile, fluidShapeProvider: torsoWater }),
+      1000,
+    );
+
+    expect(result.status).toBe('OPEN');
+    expect(result.hazards.some((hazard) => hazard.kind === 'water_contact')).toBe(true);
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(false);
+  });
+
+  it('does not claim breathing submersion from a high patch that misses the breathing footprint', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+    map.observe(observation(WATER, { x: 0, y: 1, z: 0 }));
+    const shoulderOnly: FluidShapeProvider = {
+      version: 'shoulder-only',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        if (cell.y === 0) {
+          return { kind: 'shape', shape: { water: waterVolume(0.875), lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: {
+            water: {
+              kind: 'water',
+              box: { minX: 0.7, minY: 0, minZ: 0, maxX: 0.8, maxY: 0.7, maxZ: 1 },
+              motion: 'still',
+              surface: { y: 0.7, minX: 0.7, minZ: 0, maxX: 0.8, maxZ: 1 },
+            },
+            lava: null,
+            risks: [],
+          },
+        };
+      },
+    };
+    const profile: SurfaceSwimProfile = {
+      ...swimProfile,
+      breathing: { minY: 1.6, width: 0.2, height: 0.2 },
+      surfaceBand: { minY: 0.875, maxY: 1.7 },
+    };
+    const point = { x: 0.5, y: 0, z: 0.5 };
+
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery([point, { ...point }], { profile, fluidShapeProvider: shoulderOnly }),
+      1000,
+    );
+
+    expect(result.status).toBe('OPEN');
+    expect(result.hazards.some((hazard) => hazard.kind === 'water_contact')).toBe(true);
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(false);
+  });
+
+  it('still reports real hull inundation as unsupported surface posture', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+    map.observe(observation(AIR, { x: 0, y: 1, z: 0 }));
+    const inundated: FluidShapeProvider = {
+      version: 'hull-inundated',
+      resolve(state) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        return { kind: 'shape', shape: { water: waterVolume(1.0), lava: null, risks: [] } };
+      },
+    };
+    const profile: MountedBoatProfile = {
+      kind: 'mounted_boat',
+      orientation: { quarterTurns: 0 },
+      hull: { width: 0.6, length: 0.6, height: 0.6 },
+      passengerClearance: [{ minX: -0.25, minY: 0.6, minZ: -0.25, maxX: 0.25, maxY: 1.8, maxZ: 0.25 }],
+      passengerBreathing: [{ minX: -0.2, minY: 1.6, minZ: -0.2, maxX: 0.2, maxY: 1.8, maxZ: 0.2 }],
+      surfaceBand: { minY: 0.375, maxY: 1.0 },
+    };
+    const point = { x: 0.5, y: 0, z: 0.5 };
+
+    const result = evaluateWaterRoute(
+      map,
+      boatQuery([point, { ...point }], { profile, fluidShapeProvider: inundated }),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem?.kind).toBe('submerged_posture');
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
+  });
+
+  it('still reports actual breathing-volume inundation', () => {
+    const map = new VoxelMap('world');
+    map.observe(observation(WATER, { x: 0, y: 0, z: 0 }));
+    map.observe(observation(WATER, { x: 0, y: 1, z: 0 }));
+    const breathingWet: FluidShapeProvider = {
+      version: 'breathing-wet',
+      resolve(state, cell) {
+        if (state.name !== 'minecraft:water') {
+          return { kind: 'shape', shape: { water: null, lava: null, risks: [] } };
+        }
+        if (cell.y === 0) {
+          return { kind: 'shape', shape: { water: waterVolume(0.375), lava: null, risks: [] } };
+        }
+        return {
+          kind: 'shape',
+          shape: {
+            water: {
+              kind: 'water',
+              box: { minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.7, maxZ: 1 },
+              motion: 'still',
+              surface: { y: 0.7, minX: 0, minZ: 0, maxX: 1, maxZ: 1 },
+            },
+            lava: null,
+            risks: [],
+          },
+        };
+      },
+    };
+    const profile: MountedBoatProfile = {
+      kind: 'mounted_boat',
+      orientation: { quarterTurns: 0 },
+      hull: { width: 0.6, length: 0.6, height: 0.6 },
+      passengerClearance: [{ minX: -0.25, minY: 0.6, minZ: -0.25, maxX: 0.25, maxY: 1.8, maxZ: 0.25 }],
+      passengerBreathing: [{ minX: -0.2, minY: 1.6, minZ: -0.2, maxX: 0.2, maxY: 1.8, maxZ: 0.2 }],
+      surfaceBand: { minY: 0.375, maxY: 1.7 },
+    };
+    const point = { x: 0.5, y: 0, z: 0.5 };
+
+    const result = evaluateWaterRoute(
+      map,
+      boatQuery([point, { ...point }], { profile, fluidShapeProvider: breathingWet }),
+      1000,
+    );
+
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.problem?.kind).toBe('submerged_posture');
+    expect(result.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
+  });
+
   it('preflights profile volume counts before reading entries', () => {
     const evilPassengers = new Array(1000);
     Object.defineProperty(evilPassengers, 0, {

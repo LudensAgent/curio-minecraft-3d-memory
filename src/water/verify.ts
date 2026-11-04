@@ -98,8 +98,6 @@ interface RouteGeometry {
   /** Relative vertical span of the body/hull that water must actually contact. */
   contactMinY: number;
   contactMaxY: number;
-  /** Lowest relative breathing-volume bottom, if any. */
-  breathingMinY: number | null;
 }
 
 type CellRead =
@@ -660,12 +658,9 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     ) {
       continue;
     }
-    // The adopted surface may still leave the declared breathing volume wet;
-    // that is a surface-only capability gap, reported as a submersion fact.
-    if (geometry.breathingMinY !== null && absoluteSurfaceY > routeY + geometry.breathingMinY + EPS) {
-      breathingViolation = true;
-      breathingViolationCells.push({ ...record.cell });
-    }
+    // Breathing conclusions are deliberately not derived from this surface's
+    // global height: the exact water-volume sweep below binds them to the
+    // declared breathing volume's actual 3D overlap.
     for (let i = 0; i < segments.length; i++) {
       if (!chargeShape()) return budgetEvaluation();
       const interval = footprintInterval(
@@ -751,6 +746,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     if (shape === null) continue;
 
     let waterContact = false;
+    let primaryContact = false;
     let waterBreathingContact = false;
     let lavaContact = false;
     let lavaBreathingContact = false;
@@ -760,6 +756,9 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
           if (!chargeShape()) return budgetEvaluation();
           if (boxSweepOverlaps(volume, segment.from, segment.to, record.cell, shape.water.box)) {
             waterContact = true;
+            // Only the primary body/hull can substantiate "the body/hull is
+            // under this surface"; torso/clearance contact stays a contact fact.
+            if (!volume.clearance) primaryContact = true;
             if (volume.breathing) waterBreathingContact = true;
             break;
           }
@@ -775,7 +774,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       }
       const surfaceY = typeof shape.water.surface === 'object' ? shape.water.surface.y : null;
       if (
-        waterContact &&
+        primaryContact &&
         surfaceY !== null &&
         record.cell.y + surfaceY > routeY + geometry.contactMaxY + EPS
       ) {
@@ -1209,7 +1208,6 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
       surfaceBand: { ...profile.surfaceBand },
       contactMinY: body.minY,
       contactMaxY: body.maxY,
-      breathingMinY: breathing.minY,
     };
   }
 
@@ -1254,10 +1252,6 @@ function buildGeometry(profile: WaterProfile, routeY: number): RouteGeometry {
     surfaceBand: { ...profile.surfaceBand },
     contactMinY: hull.minY,
     contactMaxY: hull.maxY,
-    breathingMinY: passengerBreathing.reduce<number | null>(
-      (lowest, volume) => (lowest === null ? volume.minY : Math.min(lowest, volume.minY)),
-      null,
-    ),
   };
 }
 

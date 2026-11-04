@@ -98,8 +98,12 @@ and below its top). A surface elsewhere in a wide band, including entirely
 above the body or head, is not surface contact. For the swimmer, the declared
 `breathing` volume must stay water/lava-free; for the boat, each explicit
 `passengerBreathing` volume has the same contract (whole-body
-`passengerClearance` is not used as an air probe). If a breathing volume is
-wet or the body/hull is under an observed surface, the route is reported as
+`passengerClearance` is not used as an air probe). Wetness is bound to the
+actual 3D swept overlap: a higher patch that misses a narrow breathing volume is
+only a contact fact, not proof that the breathing volume is wet. Torso-only
+contact is likewise kept as `water_contact` and does not become hull submersion.
+If a breathable volume is actually intersected by water/lava, or the primary
+body/hull is actually under a higher observed surface, the route is reported as
 `UNSUPPORTED` with `submerged_posture` and a `submersion` hazard rather than
 silently extending this slice into underwater navigation.
 
@@ -366,6 +370,55 @@ const arrival = checkWaterArrival({
   maxSampleAgeMs: 5000,
 });
 console.log(arrival.status); // "ARRIVED" only with measured water + OPEN surface geometry
+```
+
+### Dock receipt shape
+
+Dock completion uses boat telemetry from the same receipt, never the player's
+`BodySample.velocity`:
+
+```ts
+const dockSample: WaterBodySample = {
+  worldId: 'demo-world',
+  dim: 'overworld',
+  sessionId: 's1',
+  pos: { x: 4.5, y: 0, z: 0.5 },
+  observedAt: 1000,
+  sequence: 1,
+  velocity: { x: 0, y: 0, z: 0 }, // player telemetry; not used as boat speed
+  alive: true,
+  connected: true,
+  observationReady: true,
+  onGround: false,
+  inWater: true,
+  executionId: 'exec-1',
+  boatId: 'boat-7',
+  boatMeasurement: {
+    boatId: 'boat-7',
+    pos: { x: 4.5, y: 0, z: 0.5 },
+    velocity: { x: 0, y: 0, z: 0 },
+    observedAt: 1000,
+    sequence: 1,
+    executionId: 'exec-1',
+    worldId: 'demo-world',
+    dim: 'overworld',
+    sessionId: 's1',
+  },
+};
+
+const dockGoal = {
+  kind: 'boat_dock' as const,
+  target: { x: 4.5, y: 0, z: 0.5 },
+  horizontalTolerance: 0.2,
+  verticalTolerance: 0.1,
+  boatId: 'boat-7',
+  stableWindowMs: 300,
+  maxSampleGapMs: 500, // consecutive relied-on receipts must be this close
+  maxHorizontalSpeed: 0.01,
+  maxVerticalSpeed: 0.1,
+  minStableSamples: 2,
+};
+// checkWaterArrival({ goal: dockGoal, scope, map, samples: orderedDockSamples, now, maxSampleAgeMs })
 ```
 
 ## Not implemented by this slice
