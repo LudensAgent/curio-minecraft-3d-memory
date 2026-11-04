@@ -179,12 +179,16 @@ export type {
 } from './adapter/index.js';
 
 // Navigation
-export { WalkRouteSearch } from './navigation/index.js';
+export { startKnownWalkRoute, WalkRouteSearch } from './navigation/index.js';
 export type {
   ActionRecord,
   ArrivalSpec,
   FollowKnownPathRequest,
   Frontier,
+  KnownWalkRouteRejectionReason,
+  KnownWalkRouteRequest,
+  KnownWalkRouteSnapshot,
+  KnownWalkRouteStart,
   LastObservation,
   NavigateRequest,
   NavOutcome,

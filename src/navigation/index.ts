@@ -20,6 +20,13 @@ export type {
   NavProblem,
   NavResult,
 } from './types.js';
+export { startKnownWalkRoute } from './known-walk-route.js';
+export type {
+  KnownWalkRouteRejectionReason,
+  KnownWalkRouteRequest,
+  KnownWalkRouteSnapshot,
+  KnownWalkRouteStart,
+} from './known-walk-route.js';
 export { WalkRouteSearch } from './walk-search.js';
 export type {
   WalkSearchArrival,
