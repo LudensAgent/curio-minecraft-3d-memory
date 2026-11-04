@@ -30,9 +30,9 @@ import type { MoveMode, Vec3Like } from '../types.js';
 import type { ArrivalSpec } from './types.js';
 
 /**
- * The walk executor's existing default route-point ceiling. `maxRoutePoints`
- * can only be used to apply an equal or stricter pre-check here; it cannot
- * loosen or inspect an executor constructed with a different `maxRouteLength`.
+ * Default pre-start point budget, matching the walk executor's existing default.
+ * It is a default, not a capability ceiling: callers may request any safe
+ * integer ≥ 2, while the executor's own `maxRouteLength` still applies.
  */
 const DEFAULT_MAX_ROUTE_POINTS = 1024;
 
@@ -60,7 +60,7 @@ export type KnownWalkRouteRejectionReason =
   | 'unsupported_constraint'
   /** The fixed body's feet do not equal the historical route's first point. */
   | 'wrong_start'
-  /** `maxRoutePoints` is invalid, exceeds the executor default, or the polyline is longer. */
+  /** `maxRoutePoints` is not a safe integer ≥ 2, or the polyline is longer than the requested budget. */
   | 'route_budget';
 
 /** Input to {@link startKnownWalkRoute}: the normal walk request minus `points`, plus a fragment identity. */
@@ -70,9 +70,9 @@ export type KnownWalkRouteRequest = Omit<WalkRouteRequest, 'points'> & {
   /** Host action attribution only; it never wires cancellation or any control handle. */
   parentActionId?: string;
   /**
-   * Pre-start point budget, inclusive, default 1024. Must be an integer in
-   * `[2, 1024]`; a lower value only rejects longer routes here. It does not
-   * control the executor's own `maxRouteLength` setting.
+   * Pre-start point budget, inclusive, default 1024. Must be a safe integer ≥ 2.
+   * This is only this start boundary's requested budget; it does not control
+   * the executor's own `maxRouteLength`, which may reject a stricter limit.
    */
   maxRoutePoints?: number;
 };
@@ -124,50 +124,55 @@ export function startKnownWalkRoute(
   executor: WalkRouteExecutor,
   request: KnownWalkRouteRequest,
 ): KnownWalkRouteStart {
-  if (request.worldId !== history.worldId) {
+  // Metadata-only fields do not belong on the walk request. `getFragment`
+  // already returned a deep snapshot, and `executor.start` snapshots the
+  // request it receives, so the polyline needs no intermediate copies.
+  const { fragmentId, parentActionId, maxRoutePoints: requestedMaxRoutePoints, ...walk } = request;
+
+  if (walk.worldId !== history.worldId) {
     return rejected(
       'wrong_scope',
-      `request worldId "${request.worldId}" does not match history worldId "${history.worldId}"`,
+      `request worldId "${walk.worldId}" does not match history worldId "${history.worldId}"`,
     );
   }
 
-  const fragment = history.getFragment(request.fragmentId);
+  const fragment = history.getFragment(fragmentId);
   if (fragment === null) {
     return rejected(
       'missing_history',
-      `history for world "${history.worldId}" has no fragment "${request.fragmentId}"`,
+      `history for world "${history.worldId}" has no fragment "${fragmentId}"`,
     );
   }
-  if (fragment.dim !== request.dim) {
+  if (fragment.dim !== walk.dim) {
     return rejected(
       'wrong_scope',
-      `fragment "${fragment.id}" is in dimension "${fragment.dim}", not "${request.dim}"`,
+      `fragment "${fragment.id}" is in dimension "${fragment.dim}", not "${walk.dim}"`,
     );
   }
-  if (request.mode !== 'walk') {
+  if (walk.mode !== 'walk') {
     return rejected(
       'unsupported_mode',
-      `mode "${request.mode}" is not supported; only walk can start a historical route`,
+      `mode "${walk.mode}" is not supported; only walk can start a historical route`,
     );
   }
-  if (request.arrival.kind !== 'exact') {
+  if (walk.arrival.kind !== 'exact') {
     return rejected(
       'unsupported_arrival',
-      `arrival kind "${request.arrival.kind}" is not supported; only exact foot-position arrival is executed`,
+      `arrival kind "${walk.arrival.kind}" is not supported; only exact foot-position arrival is executed`,
     );
   }
-  if ((request.constraints?.avoid?.length ?? 0) > 0) {
+  if ((walk.constraints?.avoid?.length ?? 0) > 0) {
     return rejected(
       'unsupported_constraint',
       'a non-empty avoid constraint is not consumed by the walk evaluator and cannot be silently ignored',
     );
   }
 
-  const maxRoutePoints = request.maxRoutePoints ?? DEFAULT_MAX_ROUTE_POINTS;
-  if (!Number.isInteger(maxRoutePoints) || maxRoutePoints < 2 || maxRoutePoints > DEFAULT_MAX_ROUTE_POINTS) {
+  const maxRoutePoints = requestedMaxRoutePoints ?? DEFAULT_MAX_ROUTE_POINTS;
+  if (!Number.isSafeInteger(maxRoutePoints) || maxRoutePoints < 2) {
     return rejected(
       'route_budget',
-      `maxRoutePoints must be an integer in [2, ${DEFAULT_MAX_ROUTE_POINTS}]: ${maxRoutePoints}`,
+      `maxRoutePoints must be a safe integer ≥ 2: ${maxRoutePoints}`,
     );
   }
 
@@ -190,38 +195,16 @@ export function startKnownWalkRoute(
     return rejected('unsupported_geometry', `historical route "${fragment.id}" ${geometryProblem}`);
   }
 
+  const feet = walk.body.feet;
   const start = points[0]!;
-  if (!pointsEqual(request.body.feet, start)) {
+  if (feet.x !== start.x || feet.y !== start.y || feet.z !== start.z) {
     return rejected(
       'wrong_start',
-      `body.feet ${fmt(request.body.feet)} must equal the historical route start ${fmt(start)}`,
+      `body.feet ${fmt(feet)} must equal the historical route start ${fmt(start)}`,
     );
   }
 
-  // Fresh copies: neither the executor's stored request nor the returned
-  // snapshot may alias the store record or the caller's mutable objects.
-  const routePoints = points.map((p) => ({ x: p.x, y: p.y, z: p.z }));
-  const status = executor.start({
-    worldId: request.worldId,
-    dim: request.dim,
-    sessionId: request.sessionId,
-    mode: request.mode,
-    body: {
-      feet: { x: request.body.feet.x, y: request.body.feet.y, z: request.body.feet.z },
-      width: request.body.width,
-      height: request.body.height,
-      pose: request.body.pose,
-    },
-    points: routePoints,
-    arrival: { ...request.arrival },
-    ...(request.bodyArrival === undefined ? {} : { bodyArrival: { ...request.bodyArrival } }),
-    ...(request.constraints === undefined
-      ? {}
-      : { constraints: { avoid: (request.constraints.avoid ?? []).map((p) => ({ x: p.x, y: p.y, z: p.z })) } }),
-    shapeProvider: request.shapeProvider,
-    deadlineMs: request.deadlineMs,
-    timeoutMs: request.timeoutMs,
-  });
+  const status = executor.start({ ...walk, points });
 
   return {
     kind: 'STARTED',
@@ -230,31 +213,28 @@ export function startKnownWalkRoute(
       fragmentId: fragment.id,
       geometrySource: fragment.geometrySource,
       kind: fragment.kind,
-      ...(request.parentActionId === undefined ? {} : { parentActionId: request.parentActionId }),
-      worldId: request.worldId,
-      dim: request.dim,
-      sessionId: request.sessionId,
-      mode: request.mode,
-      arrival: { ...request.arrival },
-      points: routePoints.map((p) => ({ ...p })),
-      target: { ...routePoints[routePoints.length - 1]! },
+      ...(parentActionId === undefined ? {} : { parentActionId }),
+      worldId: walk.worldId,
+      dim: walk.dim,
+      sessionId: walk.sessionId,
+      mode: walk.mode,
+      // Caller-mutable input must not alias the returned snapshot.
+      arrival: { ...walk.arrival },
+      points,
+      target: { ...points[points.length - 1]! },
     },
   };
 }
 
 /**
- * The route verifier's exact one-cell contract, checked before `executor.start`
- * so malformed stored geometry becomes a structured REJECTED instead of a
- * thrown boundary error. Returns a problem phrase, or `null` when the polyline
- * is a sequence of same-height unit X/Z steps.
+ * The route verifier's exact one-cell capability contract, checked before
+ * `executor.start` so unsupported stored geometry becomes a structured REJECTED
+ * instead of a thrown boundary error. Coordinate schema (finite numbers,
+ * non-empty ids) is already guaranteed by `FragmentStore`. Returns a problem
+ * phrase, or `null` when the polyline is a sequence of same-height unit X/Z
+ * steps.
  */
 function polylineProblem(points: readonly Vec3Like[]): string | null {
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i]!;
-    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
-      return `point ${i} has non-finite coordinates ${fmt(p)}`;
-    }
-  }
   for (let i = 0; i < points.length - 1; i++) {
     const from = points[i]!;
     const to = points[i + 1]!;
@@ -285,10 +265,6 @@ function polylineProblem(points: readonly Vec3Like[]): string | null {
 
 function rejected(reason: KnownWalkRouteRejectionReason, message: string): KnownWalkRouteStart {
   return { kind: 'REJECTED', reason, message };
-}
-
-function pointsEqual(a: Vec3Like, b: Vec3Like): boolean {
-  return a.x === b.x && a.y === b.y && a.z === b.z;
 }
 
 function fmt(p: Vec3Like): string {

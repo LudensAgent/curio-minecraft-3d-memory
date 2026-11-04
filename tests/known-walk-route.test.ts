@@ -218,6 +218,25 @@ describe('startKnownWalkRoute — starts an explicit historical polyline', () =>
     expect(history.traversals().total).toBe(0);
   });
 
+  it('accepts more than 1024 points when the caller budget and executor limit allow it', () => {
+    const points = Array.from({ length: 1025 }, (_, i) => pt(0.5 + i, 0, 0.5));
+    const history = historyWith({ polyline: points });
+    const map = new VoxelMap('world');
+    const loop = new WalkRouteExecutor(map, new FakeMoveExecutor(), { now: () => NOW, maxRouteLength: 2048 });
+
+    const started = startKnownWalkRoute(history, loop, knownRequest({ maxRoutePoints: 2048 }));
+    expect(started.kind).toBe('STARTED');
+    if (started.kind !== 'STARTED') return;
+
+    // No truncation: both the seam's snapshot and the executor's own route keep
+    // every original point in its original order.
+    expect(started.route.points).toHaveLength(1025);
+    expect(started.route.points).toEqual(points);
+    expect(started.route.target).toEqual(points[1024]);
+    expect(started.status.route.points).toHaveLength(1025);
+    expect(started.status.route.points).toEqual(points);
+  });
+
   it('isolates the returned snapshot from history and from later caller mutation', () => {
     const points = [pt(0.5, 0, 0.5), pt(1.5, 0, 0.5)];
     const history = historyWith({ polyline: points });
@@ -489,9 +508,9 @@ describe('startKnownWalkRoute — pre-start rejection leaves the active delegati
       fragmentOverrides: { polyline: tooManyByDefault },
     },
     {
-      name: 'budget above the executor default',
+      name: 'fractional route budget',
       reason: 'route_budget',
-      requestOverrides: { maxRoutePoints: 1025 },
+      requestOverrides: { maxRoutePoints: 2.5 },
     },
   ];
 

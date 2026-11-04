@@ -2,6 +2,10 @@
 
 > 本文件只记录本次新增的 `startKnownWalkRoute` 接缝。它不修改设计文档、不注册 Curio 动作、
 > 不接管执行器生命周期，也不把历史几何当成当前可通行证据。
+>
+> 本记录已包含后续修正：删除 `FragmentStore` 已保证的重复坐标 schema 校验；去掉交接给已有
+> 快照边界的重复拷贝；把 `maxRoutePoints` 从 1024 硬上限改为“默认 1024、允许任意安全整数 ≥2
+> 的请求预算”。
 
 ## 结论
 
@@ -43,7 +47,7 @@ startKnownWalkRoute(
 type KnownWalkRouteRequest = Omit<WalkRouteRequest, 'points'> & {
   fragmentId: string;
   parentActionId?: string; // 仅元数据，不连接任何宿主取消
-  maxRoutePoints?: number; // 默认 1024，只做启动前预算检查
+  maxRoutePoints?: number; // 默认 1024；任意安全整数 ≥2 的启动前预算，不是执行器能力上限
 };
 
 type KnownWalkRouteStart =
@@ -52,8 +56,9 @@ type KnownWalkRouteStart =
 ```
 
 `KnownWalkRouteSnapshot` 保留 `fragmentId`、`geometrySource`、`kind`、`parentActionId`（若提供）、
-`worldId/dim/sessionId`、`mode`、`arrival`、原始有序 `points` 与原始终点 `target`。所有快照均为新副本，
-不与存储记录或调用者可变的请求对象共享引用。
+`worldId/dim/sessionId`、`mode`、`arrival`、原始有序 `points` 与原始终点 `target`。`route.points`
+直接使用 `FragmentStore.getFragment` 已返回的深快照；`arrival`/`target` 对调用方可变输入另取副本；
+执行器状态由 `executor.start` 自行快照。因此它们不与存储记录或调用者可变的请求对象共享引用。
 
 拒绝原因码：`missing_history`、`wrong_scope`、`unsupported_geometry`、`unsupported_mode`、
 `unsupported_arrival`、`unsupported_constraint`、`wrong_start`、`route_budget`。
@@ -66,9 +71,11 @@ type KnownWalkRouteStart =
 2. 片段必须存在（`missing_history`）。
 3. 只接受 `mode: 'walk'`（`unsupported_mode`）与 `arrival: { kind: 'exact' }`（`unsupported_arrival`）。
 4. 非空 `avoid` 被拒绝（`unsupported_constraint`），因为现有 walk evaluator 不消费该约束。
-5. `maxRoutePoints` 必须是 `[2, 1024]` 内的整数，且 polyline 不得超过它（`route_budget`）。
+5. `maxRoutePoints` 必须是安全整数且 ≥ 2，且 polyline 不得超过它（`route_budget`）。默认 1024
+   只是请求预算的默认值，不是能力上限。
 6. polyline 至少两点，且每段必须同高、沿 X 或 Z 恰好一格；重复点、稀疏、对角、跨高度均拒绝
-   （`unsupported_geometry`）。不取整、不反转、不插值、不跳过重复点。
+   （`unsupported_geometry`）。不取整、不反转、不插值、不跳过重复点。坐标有限性等输入 schema
+   已由 `FragmentStore` 保证，此处不重复校验。
 7. 固定身体的 `feet` 必须严格等于历史路线首点（`wrong_start`）。
 
 ## 实际验证
@@ -78,9 +85,9 @@ type KnownWalkRouteStart =
 | 命令 | 结果 |
 |---|---|
 | `npm run typecheck`（先 `npm run build`，再 `tsc --noEmit`） | 通过，退出码 0 |
-| `npx vitest run tests/known-walk-route.test.ts --no-cache` | 25 个测试通过 |
-| `npx vitest run tests/walk-route-executor.test.ts tests/grounded-walk-route.test.ts --no-cache` | 92 个测试通过（74 + 18） |
-| `git diff --check` | 无输出，退出码 0 |
+| `npx vitest run tests/known-walk-route.test.ts --no-cache` | 26 个测试通过 |
+| `npx vitest run tests/walk-route-executor.test.ts tests/grounded-walk-route.test.ts --no-cache` | 上一轮 92 个通过（74 + 18）；本次修正未改动执行器核心文件，未重跑 |
+| `git diff --cached --check` | 无输出，退出码 0 |
 
 Vitest 首次运行时测试本身全部通过，但写入 `node_modules/.vite/vitest`（`node_modules` 为 junction）
 时报 `UNKNOWN: unknown error, mkdir`，因此后续使用 `--no-cache` 取得干净的退出码。这是本机缓存目录
@@ -91,7 +98,10 @@ Vitest 首次运行时测试本身全部通过，但写入 `node_modules/.vite/v
 - 原始分数坐标、带转向的三点路线按原顺序逐段执行，只有实测到达才产生 `ARRIVED`。
 - 当前无证据、`BLOCKED`、`STALE` 三种情况下均不调用 `move`，也不产生到达。
 - 15 个启动前拒绝分支各自验证：拒绝码正确，且既有在途委托的 `delegationId`、`nextPointIndex`、
-  `activeStepIndex` 不变，`executor.stop` 未被调用，也没有新移动请求。
+  `activeStepIndex` 不变，`executor.stop` 未被调用，也没有新移动请求。无效预算使用小数验证，
+  不再把 1024 以上的值当作非法。
+- 超过 1024 点的路线在调用者显式给出更大 `maxRoutePoints`、且执行器以足够大的 `maxRouteLength`
+  构造时可以启动：1025 点原样保留，不截断；未显式放宽时默认 1024 预算仍拒绝。
 - `deadlineMs` / `timeoutMs` 被原样传入并出现在 `WalkRouteStatus` 与每个 `ExecutableMove`；
   越过原 deadline 后由原执行器返回 `TIMEOUT`。
 - 调用者直接使用原执行器 `cancel`，保留已接受的部分位移、原执行器 `stop` 调用与中止信号。
@@ -107,9 +117,9 @@ Vitest 首次运行时测试本身全部通过，但写入 `node_modules/.vite/v
   只是快照元数据，不连接任何宿主持有/取消句柄。
 - **只支持既有执行器的一格同高直行几何。** 任意历史 polyline（跨高度、对角、稀疏、重复点）在
   启动前被拒绝；需要额外移动模式的片段不会被“转换”为可执行路线。
-- **`maxRoutePoints` 不控制执行器自身设置。** 它只提供不超过 1024 的启动前上限。若
-  `WalkRouteExecutor` 以更小的 `maxRouteLength` 构造，超长路线会按既有边界由 `executor.start`
-  抛出异常；本函数无法检查或放宽该内部设置。
+- **`maxRoutePoints` 是请求预算，不是能力上限。** 默认 1024，允许任意安全整数 ≥2。执行器自身的
+  `maxRouteLength` 可以更严格或更宽松：更严格时超长路线由 `executor.start` 按既有边界抛出异常；
+  本函数无法检查或放宽该内部设置。
 - **部分非法值仍走既有异常边界。** 非有限 body 尺寸/位置、非有限时钟、请求 `worldId` 与执行器
   地图 `worldId` 不一致等值只有执行器能判定，会按既有 `start` 异常传播；本函数不声称把它们
   全部转换为 `REJECTED`。

@@ -7,6 +7,16 @@
  * candidate, not an arrival. Full navigation primitives land in phase 3
  * (design §10) and flow through the host's arbitration, cancellation and
  * nesting chain — they are not directly invokable `api.act` entries today.
+ *
+ * The request/result *contracts* live here, plus one implemented start seam:
+ * `startKnownWalkRoute` hands an explicitly selected historical fragment's
+ * stored polyline to a caller-supplied `WalkRouteExecutor`. It only starts that
+ * delegation — segment re-validation, measured arrival, observation reports,
+ * advancement and cancellation remain with the same executor.
+ *
+ * No navigation primitive is registered as a host `api.act` action, and no
+ * host arbitration, nesting or scheduler-cancellation wiring is implemented
+ * here. `parentActionId` on the start request is metadata only.
  */
 
 export type {
