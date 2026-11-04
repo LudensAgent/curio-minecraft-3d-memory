@@ -31,6 +31,7 @@ import { strict as assert } from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
 import {
@@ -41,6 +42,9 @@ import {
 const MUTATIONS = {
   earlyReleasePin: process.argv.includes('--early-release-pin'),
   skipFinalCheckpoint: process.argv.includes('--skip-final-checkpoint'),
+  closeFaultIncomplete: process.argv.includes('--close-fault-incomplete'),
+  closeFaultThrow: process.argv.includes('--close-fault-throw'),
+  cleanupFault: process.argv.includes('--cleanup-fault'),
 };
 
 const WORLD = 'world';
@@ -210,9 +214,107 @@ function isDescendant(parent, child) {
   return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
 }
 
+/**
+ * Owning close: record each session's ACTUAL close outcome exactly once — the
+ * returned `CloseResult`, or the original thrown error (never both, never a
+ * fabricated result). A re-entrant close of an already-recorded session reuses the
+ * recorded outcome and never re-invokes `close()`. Exported so the close-fault
+ * test can exercise the real shared path.
+ */
+export async function closeSession(closeRecords, session) {
+  if (closeRecords.has(session)) {
+    const rec = closeRecords.get(session);
+    if (rec.error) throw rec.error;
+    return rec.result;
+  }
+  let result;
+  try {
+    result = await session.close();
+  } catch (err) {
+    closeRecords.set(session, { result: null, error: err });
+    throw err;
+  }
+  closeRecords.set(session, { result, error: null });
+  return result;
+}
+
+/**
+ * Final resource verdict: close every session not yet recorded through the owner,
+ * classify each recorded outcome as clean or unclean, run cleanup only when every
+ * close is clean, print the primary + secondary diagnostics, and return the process
+ * exit code. `dirty` is intentionally NOT a shutdown failure (a cleanly-closed
+ * session may legitimately still be dirty after an uncheckpointed phase); only a
+ * thrown close, a `completed !== true` result, an `unconfirmedRequest`, or a
+ * returned `error` marks a close unclean. `cleanup(dir)` is injectable so fault
+ * stubs can fail without touching the disk.
+ */
+export async function finalizeResources({ sessions, closeRecords, primaryError, dir, cleanup }) {
+  for (const session of sessions) {
+    if (closeRecords.has(session)) continue;
+    try {
+      await closeSession(closeRecords, session);
+    } catch {
+      // Recorded by closeSession; keep closing the remaining sessions.
+    }
+  }
+
+  const unclean = [];
+  for (const session of sessions) {
+    const rec = closeRecords.get(session);
+    if (!rec) {
+      unclean.push({ detail: 'session was never closed through the owning closure' });
+      continue;
+    }
+    if (rec.error) {
+      unclean.push({ detail: 'close() threw', error: rec.error });
+      continue;
+    }
+    const r = rec.result;
+    if (r.completed !== true) {
+      unclean.push({ detail: `close() returned completed=${String(r.completed)}`, error: r.error ?? null });
+    } else if (r.unconfirmedRequest === true) {
+      unclean.push({ detail: 'close() returned unconfirmedRequest=true', error: r.error ?? null });
+    } else if (r.error) {
+      unclean.push({ detail: 'close() returned a persistence error', error: r.error });
+    }
+  }
+
+  let cleanupError = null;
+  if (unclean.length === 0) {
+    try {
+      cleanup(dir);
+    } catch (err) {
+      cleanupError = err;
+    }
+  }
+
+  if (primaryError) {
+    console.error('consumer acceptance: FAIL (primary)');
+    console.error(primaryError);
+  }
+  if (unclean.length > 0) {
+    console.error(`consumer acceptance: unclean/unknown close; preserving directory ${dir}`);
+    for (const u of unclean) {
+      console.error(`  ${u.detail}`);
+      if (u.error) console.error(u.error);
+    }
+  }
+  if (cleanupError) {
+    console.error(`consumer acceptance: cleanup failure; preserving directory ${dir}`);
+    console.error(cleanupError);
+  }
+
+  const exitCode = primaryError || unclean.length > 0 || cleanupError ? 1 : 0;
+  if (exitCode === 0) {
+    console.log('consumer acceptance: PASS (all assertions held)');
+  }
+  return exitCode;
+}
+
 async function run() {
   const dir = mkdtempSync(join(tmpdir(), 'consumer-acceptance-'));
   const databasePath = join(dir, 'spatial.db');
+  const closeRecords = new Map();
   const opened = [];
 
   const open = async (options = {}) => {
@@ -220,6 +322,9 @@ async function run() {
     opened.push(s);
     return s;
   };
+
+  // The owning close closure: every real close in the scenarios goes through here.
+  const close = (s) => closeSession(closeRecords, s);
 
   let primaryError = null;
   try {
@@ -240,7 +345,7 @@ async function run() {
       assert.ok(cp.checkpointId, 'checkpoint returns a confirmation id');
       assert.equal(s.getPersistenceState().dirty, false, 'clean after checkpoint');
 
-      const closed = await s.close();
+      const closed = await close(s);
       assert.equal(closed.completed, true, 'close completes cleanly');
       assert.equal(closed.dirty, false, 'nothing dirty at close');
     }
@@ -271,7 +376,7 @@ async function run() {
       assert.equal(s.voxel.cellAt(DIM, 0, -1, 0).evidence.freshness, 'FRESH', 're-observed cell is FRESH');
       assert.equal(s.voxel.cellAt(DIM, 1, -1, 0).evidence.freshness, 'STALE', 'neighbour stays STALE');
 
-      await s.close();
+      await close(s);
     }
 
     // ===== 4. Pin protection independent of dirty (manual residency) =====
@@ -408,7 +513,7 @@ async function run() {
         }
       }
 
-      const closed = await s.close();
+      const closed = await close(s);
       assert.equal(closed.completed, true, 'manual session closes cleanly');
     }
 
@@ -437,7 +542,7 @@ async function run() {
       const flush = await s.flush();
       assert.equal(flush.pending, false, 'flush never captures new memory changes');
 
-      const closed = await s.close();
+      const closed = await close(s);
       assert.equal(closed.completed, true, 'final session closes cleanly');
       assert.equal(closed.unconfirmedRequest, false, 'no unconfirmed request at close');
       assert.equal(closed.error, null, 'no error at close');
@@ -466,49 +571,50 @@ async function run() {
       assert.equal(again.evidence.observation.observedAt, 2000, 'read never refreshes observation time');
       assert.equal(s2.getPersistenceState().dirty, false, 'read never dirties the session');
 
-      const closed2 = await s2.close();
+      const closed2 = await close(s2);
       assert.equal(closed2.completed, true, 'reopen session closes cleanly');
     }
 
-    console.log('consumer acceptance: PASS (all assertions held)');
+    // No PASS is printed here: the final verdict below reports PASS only after
+    // every close outcome and cleanup are known to be clean.
   } catch (err) {
     primaryError = err;
   }
 
-  // Close every still-open session (secondary cleanup); never mask the primary error.
-  const closeErrors = [];
-  for (const s of opened) {
-    if (s.lifecycle === 'closed') continue;
+  // Fault injection for the close-fault modes: leave a real session for the final
+  // phase, wrapped so its close() still really shuts down the SQLite worker but
+  // reports a failed shutdown or throws. This exercises the actual shared close
+  // path, not a stub.
+  if (MUTATIONS.closeFaultIncomplete || MUTATIONS.closeFaultThrow) {
     try {
-      await s.close();
+      const real = await openSpatialSession({ databasePath, worldId: WORLD });
+      opened.push({
+        async close() {
+          const r = await real.close();
+          if (MUTATIONS.closeFaultIncomplete) return { ...r, completed: false };
+          throw new Error('injected close fault (worker was really closed)');
+        },
+      });
     } catch (err) {
-      closeErrors.push(err);
+      primaryError = primaryError ?? err;
     }
   }
 
-  // Clean up only after closure; the dir is created here so it is an absolute
-  // descendant of tmpdir, but verify before recursive removal. Preserve the dir
-  // (and never print a false "saved") when a close failed.
-  if (closeErrors.length === 0 && isDescendant(tmpdir(), dir)) {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    } catch (err) {
-      closeErrors.push(err);
-    }
-  }
+  const cleanup = MUTATIONS.cleanupFault
+    ? () => {
+        throw new Error('injected cleanup fault');
+      }
+    : (d) => {
+        if (isDescendant(tmpdir(), d)) {
+          rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+        }
+      };
 
-  if (primaryError) {
-    console.error('consumer acceptance: FAIL (primary)');
-    console.error(primaryError);
-  }
-  if (closeErrors.length > 0) {
-    console.error(`consumer acceptance: secondary close/cleanup error(s); preserving directory ${dir}`);
-    for (const err of closeErrors) console.error(err);
-  }
-
-  return primaryError ? 1 : 0;
+  return finalizeResources({ sessions: opened, closeRecords, primaryError, dir, cleanup });
 }
 
-run().then((code) => {
-  process.exitCode = code;
-});
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().then((code) => {
+    process.exitCode = code;
+  });
+}

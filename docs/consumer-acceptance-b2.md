@@ -1,6 +1,7 @@
 # Consumer acceptance — B2 evidence (provisional)
 
-Scope: `acceptance/consumer.mjs` only (plus the pre-existing
+Scope: `acceptance/consumer.mjs`, `docs/consumer-acceptance-b2.md`, and the new
+`acceptance/consumer-close.test.mjs` (plus the pre-existing
 `acceptance/consumer-types.ts`, which is unchanged). No `src`, `run.mjs`, package
 manifest, existing design doc, or 5E record was changed in this stage.
 
@@ -45,13 +46,28 @@ commit.
      the `'pinned'` assertions fail (the dependency is evicted instead).
    - `--skip-final-checkpoint` skips the final checkpoint, so the reopened unique
      fact is absent and the final-fact assertions fail against the old baseline.
-5. **Resource boundary.** Every opened session (including the reopen) is closed on a
-   primary assertion/checkpoint failure; the primary error is preserved and
-   close/cleanup failures are secondary. No `process.exit`; the run returns via
-   `process.exitCode` and exits naturally. Cleanup runs only after closure, only over
-   the temp directory this consumer created (verified as an absolute descendant of
-   `tmpdir()`), and a failed close retains the directory and never prints a false
-   "saved".
+5. **Owning close + final resource verdict.** Every real `close()` goes through one
+   owning closure (`closeSession`) that records each session's *actual* outcome — the
+   returned `CloseResult` or the original thrown error (never a fabricated result,
+   never discarding the original error). The final `finalizeResources` pass closes any
+   session not yet recorded, classifies each outcome, and runs cleanup only when every
+   close is clean. A clean close is `completed === true`, `unconfirmedRequest ===
+   false`, and `error === null`; `dirty` is intentionally **not** a shutdown failure
+   (an uncheckpointed phase may legitimately close dirty). A thrown close, a
+   `completed !== true` result, an `unconfirmedRequest`, or a returned `error` is an
+   unclean/unknown close: it prevents directory removal, is diagnosed, and makes the
+   exit non-zero even without a primary error. A cleanup failure alone is non-zero; a
+   cleanup failure alongside a primary stays secondary. `PASS` is printed only after
+   every close outcome and cleanup are known clean. No `process.exit`; the run returns
+   via `process.exitCode` and exits naturally. Cleanup runs only after closure, only
+   over the temp directory this consumer created (verified as an absolute descendant
+   of `tmpdir()`).
+6. **Fault mutation modes (for targeted verification).** Three additional flags
+   exercise the close/cleanup fault paths against the real shared close path (the
+   SQLite worker is still really shut down before the fault is reported):
+   - `--close-fault-incomplete` — a session's `close()` reports `completed: false`.
+   - `--close-fault-throw` — a session's `close()` throws after really closing.
+   - `--cleanup-fault` — the directory cleanup throws.
 
 ## Validation (provisional — worktree `node`, self-resolved `dist`)
 
@@ -63,10 +79,22 @@ Commands (cwd = worktree root):
   `AssertionError: dependency (overworld, 0, 0, 0) stays pinned during the active walk`.
 - `node acceptance/consumer.mjs --skip-final-checkpoint` → exit 1, primary
   `AssertionError: reopen has the unique final fact` (`false !== true`).
+- `node acceptance/consumer.mjs --close-fault-incomplete` → exit 1, no PASS,
+  `close() returned completed=false`, directory retained.
+- `node acceptance/consumer.mjs --close-fault-throw` → exit 1, no PASS, `close()
+  threw` + the injected error, directory retained.
+- `node acceptance/consumer.mjs --cleanup-fault` → exit 1, no PASS, `cleanup
+  failure` + the injected error, directory retained.
+- `node --check acceptance/consumer.mjs` → exit 0.
+- `node --test acceptance/consumer-close.test.mjs` → 5 passed (clean-but-dirty close
+  is not a failure; returned incomplete close, thrown close, cleanup-only failure,
+  and primary-plus-secondary close failure each yield non-zero and no PASS, with the
+  primary retained).
 
-Each mutation fails at its intended assertion (pin independence and final-fact
-persistence respectively), not at startup, and the positive run exercises the full
-L3 + L4 path (pin/cancel/overlap + unique-fact save/confirm/reopen).
+Each mutation fails at its intended assertion (pin independence, final-fact
+persistence, close/cleanup resource handling respectively), not at startup, and the
+positive run exercises the full L3 + L4 path (pin/cancel/overlap + unique-fact
+save/confirm/reopen).
 
 ## Remaining limitations
 
