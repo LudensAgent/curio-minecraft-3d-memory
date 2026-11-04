@@ -124,11 +124,13 @@ test('classifyPath maps each input category and keeps non-inputs out', () => {
   assert.equal(classifyPath('package-lock.json'), 'package');
   assert.equal(classifyPath('.gitignore'), 'package');
   assert.equal(classifyPath('.npmignore'), 'package');
-  // npm always packs the standard README and LICENSE basenames even with files:[dist].
+  // Actual packed non-dist entry (from npm pack --dry-run): README.md only.
   assert.equal(classifyPath('README.md'), 'package');
-  assert.equal(classifyPath('LICENSE'), 'package');
-  // ...but NOT a non-standard README_ZH.md basename, which npm does not auto-pack.
+  // NOT packed in this repo: README_ZH.md (non-standard basename), LICENSE (absent),
+  // and any nested README/NOTICE/CHANGELOG (npm's always-include is top-level only).
   assert.equal(classifyPath('README_ZH.md'), 'non-input');
+  assert.equal(classifyPath('LICENSE'), 'non-input');
+  assert.equal(classifyPath('docs/NOTICE.md'), 'non-input');
   assert.equal(classifyPath('acceptance/run.mjs'), 'acceptance');
   assert.equal(classifyPath('docs/design.md'), 'non-input');
 });
@@ -214,6 +216,80 @@ test('only a dirty design doc is reported as non-input and does not block a clea
     const inputs = analyzeInputs(dir, dirty);
     assert.equal(inputs.releaseBlocked, false);
     assert.deepEqual(inputs.categories['non-input'].map((e) => e.path), ['docs/design.md']);
+  } finally {
+    cleanupFixture(dir);
+  }
+});
+
+test('a non-ASCII untracked source file is detected (not hidden by git quoting)', () => {
+  const dir = makeFixture();
+  try {
+    write(dir, 'src/额外.ts', 'export const extra = 1;\n');
+    const dirty = gitDirty(dir);
+    assert.deepEqual(dirty.untracked, ['src/额外.ts'], 'NUL-delimited output preserves the literal path');
+    const inputs = analyzeInputs(dir, dirty);
+    assert.equal(inputs.releaseBlocked, true);
+    assert.deepEqual(inputs.categories.build.map((e) => e.path), ['src/额外.ts']);
+  } finally {
+    cleanupFixture(dir);
+  }
+});
+
+test('a staged rename of README.md still surfaces the removed package input', () => {
+  const dir = makeFixture();
+  try {
+    git(dir, ['mv', 'README.md', 'docs/renamed-readme.md']);
+    const dirty = gitDirty(dir);
+    // --no-renames reports both the deleted old path and the added new path.
+    assert.ok(dirty.staged.includes('README.md'), 'deleted README.md is reported');
+    assert.ok(dirty.staged.includes('docs/renamed-readme.md'), 'added path is reported');
+    const inputs = analyzeInputs(dir, dirty);
+    assert.equal(inputs.releaseBlocked, true, 'removed package input blocks a clean release');
+    assert.deepEqual(inputs.categories.package.map((e) => e.path), ['README.md']);
+    assert.deepEqual(inputs.categories['non-input'].map((e) => e.path), ['docs/renamed-readme.md']);
+  } finally {
+    cleanupFixture(dir);
+  }
+});
+
+test('a deleted tracked source file blocks a clean release as a build input', () => {
+  const dir = makeFixture();
+  try {
+    git(dir, ['rm', 'src/util.ts']);
+    const dirty = gitDirty(dir);
+    assert.deepEqual(dirty.staged, ['src/util.ts']);
+    const inputs = analyzeInputs(dir, dirty);
+    assert.equal(inputs.releaseBlocked, true);
+    assert.deepEqual(inputs.categories.build.map((e) => e.path), ['src/util.ts']);
+    assert.equal(inputs.categories.build[0].kinds[0], 'staged');
+  } finally {
+    cleanupFixture(dir);
+  }
+});
+
+test('a dirty build config (tsconfig.build.json) blocks a clean release', () => {
+  const dir = makeFixture();
+  try {
+    write(dir, 'tsconfig.build.json', '{ "extends": "./tsconfig.json", "include": ["src", "extra"] }');
+    const dirty = gitDirty(dir);
+    assert.deepEqual(dirty.unstaged, ['tsconfig.build.json']);
+    const inputs = analyzeInputs(dir, dirty);
+    assert.equal(inputs.releaseBlocked, true);
+    assert.deepEqual(inputs.categories.build.map((e) => e.path), ['tsconfig.build.json']);
+  } finally {
+    cleanupFixture(dir);
+  }
+});
+
+test('a dirty pack-config (.gitignore) blocks a clean release as a package input', () => {
+  const dir = makeFixture();
+  try {
+    write(dir, '.gitignore', 'dist/\n*.tgz\nnode_modules/\n');
+    const dirty = gitDirty(dir);
+    assert.deepEqual(dirty.unstaged, ['.gitignore']);
+    const inputs = analyzeInputs(dir, dirty);
+    assert.equal(inputs.releaseBlocked, true);
+    assert.deepEqual(inputs.categories.package.map((e) => e.path), ['.gitignore']);
   } finally {
     cleanupFixture(dir);
   }

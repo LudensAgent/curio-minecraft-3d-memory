@@ -83,12 +83,20 @@ export function gitExactTag(root) {
   return { ok: false, error: `git describe --tags --exact-match failed (exit ${res.code}): ${stderr}` };
 }
 
-/** List staged, unstaged and untracked paths relative to HEAD. */
+/**
+ * List staged, unstaged and untracked paths relative to HEAD.
+ *
+ * Uses NUL-delimited (`-z`) output so non-ASCII paths (e.g. `src/额外.ts`) are never
+ * C-quoted into a leading `"` that would defeat the classifier, and disables rename
+ * folding (`--no-renames`) so a staged rename surfaces BOTH the deleted old path and
+ * the added new path (otherwise `git mv README.md docs/x.md` would report only the
+ * new path and hide the removed package input).
+ */
 export function gitDirty(root) {
   const queries = [
-    run('git', ['diff', '--name-only', '--cached'], { cwd: root }),
-    run('git', ['diff', '--name-only'], { cwd: root }),
-    run('git', ['ls-files', '--others', '--exclude-standard'], { cwd: root }),
+    run('git', ['diff', '--name-only', '-z', '--cached', '--no-renames'], { cwd: root }),
+    run('git', ['diff', '--name-only', '-z', '--no-renames'], { cwd: root }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: root }),
   ];
   for (const q of queries) {
     if (q.error) return { ok: false, error: `git status query could not run (${q.cmd}): ${q.error}` };
@@ -96,42 +104,45 @@ export function gitDirty(root) {
       return { ok: false, error: `${q.cmd} failed (exit ${q.code}): ${(q.stderr || q.stdout).trim()}` };
     }
   }
-  const lines = (s) => s.trim().split('\n').filter(Boolean);
+  const nul = (s) => s.split('\0').filter(Boolean);
   return {
     ok: true,
-    staged: lines(queries[0].stdout),
-    unstaged: lines(queries[1].stdout),
-    untracked: lines(queries[2].stdout),
+    staged: nul(queries[0].stdout),
+    unstaged: nul(queries[1].stdout),
+    untracked: nul(queries[2].stdout),
   };
 }
 
 /**
- * npm always bundles these basenames into the tarball regardless of `files`,
- * `.npmignore` or `.gitignore` (matched case-insensitively against the basename,
- * with an optional single trailing extension). `package.json` is handled
- * separately below. This is the reason a `README.md` edit is a package input even
- * though `files: ["dist"]` is set — but a `README_ZH.md` edit is not (its basename
- * does not match this set, so npm does not auto-pack it).
+ * The actual non-generated `npm pack` entries for THIS repository, established from
+ * `npm pack --dry-run --ignore-scripts --json` (no lifecycle hooks, no artifact):
+ * with `files: ["dist"]`, npm bundles `dist/` plus `package.json` and `README.md`.
+ * `README_ZH.md` is NOT packed (non-standard basename) and no `LICENSE` exists. This
+ * is recorded as the actual list, not a universal rule that arbitrary nested
+ * README/NOTICE/CHANGELOG/LICENCE files must pack — npm's always-include behaviour is
+ * top-level only, and those files are absent here. Re-verify this list if new
+ * always-include files are added.
  */
-const NPM_ALWAYS_INCLUDE = /^(readme|copying|license|licence|notice|changes|changelog|history)(\..*)?$/i;
+const PACKED_ROOT_FILES = new Set(['README.md']);
 
 /**
  * Classify a repo-relative path as a build, package, acceptance or non-input file.
  *
- * Build inputs compile into `dist/`; package inputs affect `npm pack` (the
- * manifest, lockfile, pack include/exclude files, and the README/LICENSE that npm
- * always bundles); acceptance inputs are the runner/consumer scripts that
+ * Build inputs compile into `dist/` (`src/**` plus the tsconfig pair referenced by
+ * the build command `tsc -p tsconfig.build.json`, which `extends` `tsconfig.json`).
+ * Package inputs affect `npm pack`: the manifest (which also carries the build
+ * scripts), the lockfile, the pack include/exclude config, and the actual packed
+ * non-dist entry `README.md`. Acceptance inputs are the runner/consumer scripts that
  * establish the release's own evidence. Everything else (design docs, examples,
- * unrelated tests) is non-input and may remain dirty without blocking a clean
- * release.
+ * unrelated tests, `README_ZH.md`, `LICENSE`-absent) is non-input and may remain
+ * dirty without blocking a clean release.
  */
 export function classifyPath(relPath) {
   const p = String(relPath).replace(/\\/g, '/');
   if (p === 'package.json' || p === 'package-lock.json' || p === '.npmignore' || p === '.gitignore') {
     return 'package';
   }
-  const base = p.split('/').pop();
-  if (base && NPM_ALWAYS_INCLUDE.test(base)) {
+  if (PACKED_ROOT_FILES.has(p)) {
     return 'package';
   }
   if (p === 'tsconfig.json' || p === 'tsconfig.build.json' || p === 'src' || p.startsWith('src/')) {

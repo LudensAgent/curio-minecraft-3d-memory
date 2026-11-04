@@ -156,37 +156,46 @@ sha256        : 5b5bbfa2a4ef3ea5556c709ff80c3c0a65b3bbe8bb52ec758939af4944929970
   即硬失败；无关设计文档脏了只报告、不阻断。
 - `node acceptance/run.mjs --execute`：仅在干净 HEAD 下执行——先校验 `dist` 解析后仍在仓库根内（拒绝符号链接
   越界）再递归删除、全新 `npm run build`、`npm pack --pack-destination <唯一输出目录>`、把产物复制进独立
-  消费者目录按 `file:./<tgz>` 精确安装、跑真实 SQLite Worker 消费者与 `tsc --noEmit` 类型检查，最后把
-  evidence JSON 与不可变 `.tgz` 留在唯一输出目录（不覆盖同名、跑完仍保留），只回收临时消费者安装目录。
+  消费者目录按 `file:./<tgz>` 精确安装、依次跑消费者正向 + `--early-release-pin` + `--skip-final-checkpoint`
+  三个独立进程与 `tsc --noEmit` 类型检查。evidence JSON 在成功与失败两条路径都会写进唯一输出目录（记录
+  起止时间、全部命令/退出/输出、产物、场景与主错误），不可变 `.tgz` 跑完仍保留，只回收临时消费者安装目录。
+  安装后的包名/版本须与 manifest 及实际 pack 一致；工具版本查询失败不冒称版本；发布收尾重新校验 HEAD 未变。
 
 ### 输入分类
 
 | 类别 | 匹配 | 脏了是否阻断干净发布 |
 |---|---|---|
-| `build` | `src/**`、`tsconfig.json`、`tsconfig.build.json` | 是 |
-| `package` | `package.json`、`package-lock.json`、`.npmignore`、`.gitignore`、npm 必打包基线（`README.md`、`LICENSE` 等） | 是 |
+| `build` | `src/**`、`tsconfig.json`、`tsconfig.build.json`（build 命令 `tsc -p tsconfig.build.json` 引用，`extends` 基座） | 是 |
+| `package` | `package.json`（manifest + build 脚本）、`package-lock.json`、`.npmignore`、`.gitignore`、实际入包的非 dist 项 `README.md` | 是 |
 | `acceptance` | `acceptance/**`（运行器与消费者脚本） | 是 |
-| `non-input` | 其它（设计文档、examples、无关测试） | 否，仅报告 |
+| `non-input` | 其它（设计文档、examples、无关测试、`README_ZH.md`、不存在的 `LICENSE`） | 否，仅报告 |
 
-npm 即使设置了 `files: ["dist"]` 仍会把标准 `README` / `LICENSE` / `package.json` 打包进 tgz；`README_ZH.md`
-因 basename 不匹配 npm 的必打包集合，不会自动入包，故归为 `non-input`。这一口径在
-`provenance.test.mjs` 中直接针对真实分类器断言，而不是复写一套实现。
+打包内容以 `npm pack --dry-run --ignore-scripts --json` 的实际结果为准，而不是一条「任意嵌套
+README/NOTICE/CHANGELOG/LICENSE 必打包」的通用规则。本仓库 `files: ["dist"]` 下非 dist 入包项只有
+`package.json` 与 `README.md`：`README_ZH.md` 因 basename 非标准不入包，且当前无 `LICENSE`。分类器按此
+实际清单归类，并在 `provenance.test.mjs` 中直接对真实分类器断言（包括 `README_ZH.md`/`LICENSE`/嵌套
+`NOTICE` 归为 `non-input`），而不是复写一套实现。若将来新增必打包文件，须重跑 dry-run 更新该清单。
 
-### 当前验证状态（本次准备阶段）
+### 当前验证状态（本次修订）
 
-- **已测试**：`node --test acceptance/provenance.test.mjs` 全绿（15 项），覆盖 git HEAD/精确 tag 的失败与
-  缺 tag 区分、tracked/staged/untracked 的 build/package 文件改动阻断干净发布、无关设计文档脏了放行、
+- **已测试**：`node --test acceptance/provenance.test.mjs` 全绿（20 项），覆盖 git HEAD/精确 tag 的失败与
+  缺 tag 区分、tracked/staged/untracked 的 build/package 文件改动阻断干净发布、非 ASCII 未跟踪源码、staged
+  rename 仍暴露被移除的 package 输入、删除的源码输入、build 配置与 pack 配置脏了阻断、无关设计文档放行、
   `dist` 删除越界（符号链接逃逸 / 词法 `..`）拒绝、删除仅限 fixture 目录。
+- **已接线（未执行）**：`--execute` 现按 B2a `91d14ea` 确认的接口，强制运行消费者正向 + 两个负向模式
+  `--early-release-pin`（须在断言 `stays pinned during the active walk` 处退出 1）与
+  `--skip-final-checkpoint`（须在断言 `reopen has the unique final fact` 处退出 1）。正向须退出 0；任何
+  场景 `PENDING`/`NOT_RUN` 都不会产生总 PASS。失败也会写出 evidence（含命令/退出/输出、产物、场景与主错误）。
 - **待后续门禁**：`--execute` 的干净打包 + 独立安装 + 消费者/类型检查尚未运行（本阶段不得 `clean dist` /
-  build / pack / install）。最终产物 SHA-256、源码/断言哈希、安装版本、以及消费者正向 + B2a 两个负向模式
-  （release-pin-early、skip-final-checkpoint）的结果，须等各阶段提交并通过审计后由协调方统一落定；本文件
-  不伪造任何最终 PASS。
+  build / pack / install）。最终产物 SHA-256、源码/断言哈希、安装版本须等各阶段提交并通过审计后由协调方统一
+  落定；本文件不伪造任何最终 PASS。
 
-### 待接入（暂以占位记录，不虚假 PASS）
+### 源码绑定与历史基线
 
-- `acceptance/consumer.mjs` 的正向路径由 B2a 拥有；其两个负向模式（release-pin-early、skip-final-checkpoint）
-  的 CLI 参数由 B2a 在后续提交中确定，运行器当前不猜测其 flag，只在 evidence 中记录为 `PENDING`。
-- 最终「源码 / 断言」内容哈希要在所有阶段提交后统一；当前运行器只记录运行器与消费者文件的当前内容哈希。
+最终「源码 commit」与消费者/运行器断言哈希，以门禁时刻干净输入的 HEAD 为准，而不是中间的 `76af9d3` 或其它
+并发工作树的脏文件。运行器在发布工作收尾时重新校验 HEAD 与 release 输入未在其执行期间变化，变化即拒绝。
+当前源码基线（`0.7.5` 打包输入）与旧 `170debf` tag / `2e5c501` 打包历史（见上文「历史局限」）分开记录，
+不互相替代。
 
 ## 职责边界与仍需 Curio 完成
 

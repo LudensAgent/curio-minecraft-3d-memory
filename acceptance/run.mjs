@@ -7,18 +7,19 @@
  *                                      #   inputs; fail (non-zero) on a git error
  *                                      #   or dirty build/package/acceptance input
  *   node acceptance/run.mjs --execute  # after a clean gate: clean-dist build,
- *                                      #   pack, independent install, runtime +
- *                                      #   type checks, evidence + artifact kept
+ *                                      #   pack, independent install, positive +
+ *                                      #   two negative consumer scenarios, type
+ *                                      #   check, evidence + artifact kept
  *
- * The readiness check is the whole point of "L5 provenance": it never reports a
- * clean HEAD package when the working copy differs, and it distinguishes a real
- * git failure from a merely-absent tag. The destructive clean-dist build + pack +
- * install only runs behind `--execute`, so a dry readiness run never touches the
- * worktree `dist/` or the network.
+ * The readiness check never reports a clean HEAD package when the working copy
+ * differs, and it distinguishes a real git failure from a merely-absent tag. The
+ * destructive clean-dist build + pack + install only runs behind `--execute`, so a
+ * dry readiness run never touches the worktree `dist/` or the network.
  *
  * Errors are carried by exceptions through an owning I/O boundary; there are no
- * `process.exit` shortcuts that would skip `finally`, so cleanup always runs and
- * the primary error is never masked by a cleanup failure.
+ * `process.exit` shortcuts that would skip cleanup, so the primary error is never
+ * masked by a cleanup failure. Evidence (including failure) is written to a unique
+ * per-run output directory and is never overwritten.
  */
 
 import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -33,6 +34,21 @@ const RUNNER_VERSION = '0.7.5';
 const RUNNER_FILES = ['acceptance/run.mjs', 'acceptance/provenance.mjs'];
 const CONSUMER_FILES = ['acceptance/consumer.mjs', 'acceptance/consumer-types.ts'];
 const EVIDENCE_ROOT = join(tmpdir(), 'curio-minecraft-3d-memory-acceptance');
+
+// Actual non-generated npm pack entries for this repo (see provenance.mjs). The
+// runner reconciles the packed file list against this instead of trusting any
+// universal always-include rule.
+const EXPECTED_NON_DIST_PACK = ['package.json', 'README.md'];
+
+// Mandatory consumer scenarios (B2a commit 91d14ea interface). Positive must exit
+// 0; each negative must exit 1 at its own intended AssertionError — never a
+// startup/timeout/signal/worker/cleanup failure. `expectStderr` is the assertion
+// substring the negative mode must hit.
+const SCENARIOS = [
+  { id: 'positive', flags: [], expectExit: 0, expectStdout: 'PASS (all assertions held)' },
+  { id: 'early-release-pin', flags: ['--early-release-pin'], expectExit: 1, expectStderr: 'stays pinned during the active walk' },
+  { id: 'skip-final-checkpoint', flags: ['--skip-final-checkpoint'], expectExit: 1, expectStderr: 'reopen has the unique final fact' },
+];
 
 class AcceptanceFailure extends Error {}
 
@@ -62,6 +78,71 @@ function contentHash(relPaths) {
   return P.sha256(relPaths.map((p) => readFileSync(join(ROOT, p))).join('\n'));
 }
 
+/** A tool version is only claimed when its query succeeded. */
+function toolVersion(res, label) {
+  if (res.error) return { ok: false, label, error: `could not run: ${res.error}` };
+  if (res.signal) return { ok: false, label, error: `killed by ${res.signal}` };
+  if (res.code !== 0) return { ok: false, label, error: `exited ${res.code}` };
+  return { ok: true, label, version: res.stdout.trim() };
+}
+
+function typescriptVersion(root) {
+  try {
+    return { ok: true, label: 'typescript', version: readJson(join(root, 'node_modules', 'typescript', 'package.json')).version };
+  } catch (err) {
+    return { ok: false, label: 'typescript', error: String(err && err.message ? err.message : err) };
+  }
+}
+
+function cmdRecord(res, label) {
+  return { label, cmd: res.cmd, args: res.args, cwd: res.cwd, code: res.code, signal: res.signal, error: res.error, stdout: res.stdout, stderr: res.stderr };
+}
+
+function versionLine(v) {
+  return v.ok ? v.version : `FAILED: ${v.error}`;
+}
+
+/** Evaluate a consumer scenario against its expected exit + assertion marker. */
+function evaluateScenario(scenario, res) {
+  if (res.error) return { status: 'FAIL', why: `spawn error: ${res.error}` };
+  if (res.signal) return { status: 'FAIL', why: `killed by ${res.signal}` };
+  if (scenario.expectExit === 0) {
+    if (res.code !== 0) return { status: 'FAIL', why: `expected exit 0, got ${res.code}` };
+    if (scenario.expectStdout && !res.stdout.includes(scenario.expectStdout)) {
+      return { status: 'FAIL', why: `missing expected stdout marker: ${JSON.stringify(scenario.expectStdout)}` };
+    }
+    return { status: 'PASS' };
+  }
+  if (res.code !== 1) return { status: 'FAIL', why: `expected exit 1 (assertion), got ${res.code ?? 'null'}` };
+  if (scenario.expectStderr && !res.stderr.includes(scenario.expectStderr)) {
+    return { status: 'FAIL', why: `missing intended assertion ${JSON.stringify(scenario.expectStderr)} in stderr` };
+  }
+  if (/secondary close\/cleanup error/i.test(res.stderr) || /unclean\/unknown close/i.test(res.stderr)) {
+    return { status: 'FAIL', why: 'negative failed with a secondary close/cleanup error, not the intended assertion' };
+  }
+  return { status: 'PASS' };
+}
+
+/** Re-verify that HEAD and release inputs did not change during the release work. */
+function recheckSourceBinding(root, originalHead) {
+  const head = P.gitHead(root);
+  const headChanged = !head.ok || head.hash !== originalHead;
+  let releaseBlocked = true;
+  let dirtyDetail = null;
+  if (!headChanged) {
+    const dirty = P.gitDirty(root);
+    if (!dirty.ok) dirtyDetail = dirty.error;
+    else releaseBlocked = P.analyzeInputs(root, dirty).releaseBlocked;
+  }
+  return {
+    clean: !headChanged && !releaseBlocked && !dirtyDetail,
+    headChanged,
+    releaseBlocked,
+    head: head.ok ? head.hash : head.error,
+    dirtyDetail,
+  };
+}
+
 /** Print the provenance record as stable text lines (also the human-facing summary). */
 function printRecord(record, execute) {
   const g = record.git;
@@ -73,9 +154,9 @@ function printRecord(record, execute) {
   console.log(`package name      : ${record.package.name}`);
   console.log(`package version   : ${record.package.version}`);
   console.log(`build command     : ${record.buildCommand}`);
-  console.log(`node version      : ${record.nodeVersion}`);
-  console.log(`npm version       : ${record.npmVersion}`);
-  console.log(`typescript version: ${record.typescriptVersion}`);
+  console.log(`node version      : ${versionLine(record.nodeVersion)}`);
+  console.log(`npm version       : ${versionLine(record.npmVersion)}`);
+  console.log(`typescript version: ${versionLine(record.typescriptVersion)}`);
   console.log(`runner hash       : ${record.runnerHash}`);
   console.log(`consumer hash     : ${record.consumerHash}`);
   console.log(`release blocked   : ${record.inputs.releaseBlocked}`);
@@ -89,10 +170,27 @@ function printRecord(record, execute) {
     console.log(`  dirty non-input  : ${entry.path} [${entry.kinds.join(', ')}]`);
   }
   if (execute && record.execution) {
-    console.log(`artifact          : ${record.execution.artifact.filename}`);
-    console.log(`artifact sha256   : ${record.execution.artifact.sha256}`);
-    console.log(`installed version : ${record.execution.installedVersion}`);
-    console.log(`scenarios         : ${JSON.stringify(record.execution.scenarios)}`);
+    const ex = record.execution;
+    console.log(`artifact          : ${ex.artifact ? ex.artifact.filename : '(none)'}`);
+    if (ex.artifact) console.log(`artifact sha256   : ${ex.artifact.sha256}`);
+    console.log(`installed version : ${ex.installed ? `${ex.installed.name}@${ex.installed.version}` : '(none)'}`);
+    for (const s of SCENARIOS) {
+      const r = ex.scenarios[s.id];
+      console.log(`scenario ${s.id.padEnd(22)} : ${r ? r.outcome.status : 'NOT_RUN'}`);
+    }
+    console.log(`typecheck         : ${ex.typecheck ? ex.typecheck.status : 'NOT_RUN'}`);
+    console.log(`source binding    : ${ex.sourceBinding ? (ex.sourceBinding.clean ? 'clean' : 'DIRTY') : 'NOT_RUN'}`);
+    console.log(`outcome           : ${ex.outcome}`);
+  }
+}
+
+function printScenarioFailure(ex) {
+  for (const s of SCENARIOS) {
+    const r = ex.scenarios[s.id];
+    if (!r || r.outcome.status !== 'PASS') {
+      console.error(`[scenario:${s.id}] ${r ? r.outcome.why : 'NOT_RUN'}`);
+      if (r && r.stderr) console.error(r.stderr.trim());
+    }
   }
 }
 
@@ -101,9 +199,9 @@ async function orchestrate(execute) {
     runnerVersion: RUNNER_VERSION,
     package: readJson(join(ROOT, 'package.json')),
     buildCommand: readJson(join(ROOT, 'package.json')).scripts.build,
-    nodeVersion: P.run(process.execPath, ['--version']).stdout.trim(),
-    npmVersion: runNpm(['--version']).stdout.trim(),
-    typescriptVersion: readJson(join(ROOT, 'node_modules', 'typescript', 'package.json')).version,
+    nodeVersion: toolVersion(P.run(process.execPath, ['--version']), 'node'),
+    npmVersion: toolVersion(runNpm(['--version']), 'npm'),
+    typescriptVersion: typescriptVersion(ROOT),
     runnerHash: contentHash(RUNNER_FILES),
     consumerHash: contentHash(CONSUMER_FILES),
     git: {},
@@ -150,9 +248,32 @@ async function orchestrate(execute) {
   const consumerDir = join(outputDir, 'consumer');
   mkdirSync(outputDir, { recursive: true });
   mkdirSync(consumerDir, { recursive: true });
+  const startedAt = new Date().toISOString();
+  console.log(`[acceptance] run id      : ${runId}`);
+  console.log(`[acceptance] evidence dir: ${outputDir}`);
+  console.log(`[acceptance] started     : ${startedAt}`);
 
-  const commands = [];
+  const evidence = {
+    ...record,
+    runId,
+    startedAt,
+    endedAt: null,
+    execution: {
+      outputDir,
+      commands: [],
+      artifact: null,
+      installed: null,
+      packedNonDist: null,
+      scenarios: {},
+      typecheck: null,
+      sourceBinding: null,
+      cleanupError: null,
+      outcome: 'NOT_RUN',
+      primaryError: null,
+    },
+  };
 
+  let failure = null;
   try {
     // 1. Clean the generated dist only, after confirming it stays inside the root.
     const del = P.safeDirDeletion(ROOT, 'dist');
@@ -161,12 +282,12 @@ async function orchestrate(execute) {
 
     // 2. Fresh build.
     const build = runNpm(['run', 'build'], { cwd: ROOT, timeout: 300_000 });
-    commands.push(build);
+    evidence.execution.commands.push(cmdRecord(build, 'build'));
     check('build', build);
 
     // 3. Pack into the unique output dir (immutable artifact path, no overwrite).
     const pack = runNpm(['pack', '--json', '--pack-destination', outputDir], { cwd: ROOT, timeout: 300_000 });
-    commands.push(pack);
+    evidence.execution.commands.push(cmdRecord(pack, 'pack'));
     check('pack', pack);
     let packInfo;
     try {
@@ -185,6 +306,16 @@ async function orchestrate(execute) {
       npmIntegrity: packInfo.integrity,
       files: (packInfo.files || []).map((f) => f.path),
     };
+    evidence.execution.artifact = artifact;
+
+    // Reconcile actual non-generated pack entries against the recorded list.
+    const nonDist = artifact.files.filter((f) => f !== 'dist' && !f.startsWith('dist/')).sort();
+    const unexpected = nonDist.filter((f) => !EXPECTED_NON_DIST_PACK.includes(f));
+    const missing = EXPECTED_NON_DIST_PACK.filter((f) => !nonDist.includes(f));
+    evidence.execution.packedNonDist = { actual: nonDist, expected: EXPECTED_NON_DIST_PACK, unexpected, missing };
+    if (unexpected.length > 0 || missing.length > 0) {
+      fail('pack-contents', `non-dist pack entries changed: unexpected=${JSON.stringify(unexpected)} missing=${JSON.stringify(missing)}`);
+    }
 
     // 4. Independent consumer directory: install the exact tgz by file dependency
     //    (never a source path, `../dist`, `npm link`, or a dev-machine alias).
@@ -230,61 +361,94 @@ async function orchestrate(execute) {
 
     // 5. Install the tarball + driver + TypeScript.
     const install = runNpm(['install', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: consumerDir, timeout: 600_000 });
-    commands.push(install);
+    evidence.execution.commands.push(cmdRecord(install, 'install'));
     check('install', install);
-    const installedVersion = readJson(join(consumerDir, 'node_modules', record.package.name, 'package.json')).version;
 
-    // 6. Runtime assertions (real SQLite Worker + Fake body walk lifecycle).
-    const consumer = P.run(process.execPath, ['consumer.mjs'], { cwd: consumerDir, timeout: 120_000 });
-    commands.push(consumer);
-    check('consumer.mjs', consumer);
-    process.stdout.write(consumer.stdout);
+    // Installed package identity must equal the manifest AND the actual pack.
+    const installedPkg = readJson(join(consumerDir, 'node_modules', record.package.name, 'package.json'));
+    evidence.execution.installed = { name: installedPkg.name, version: installedPkg.version };
+    if (installedPkg.name !== record.package.name || installedPkg.name !== packInfo.name) {
+      fail('installed-name', `installed ${installedPkg.name} != manifest ${record.package.name} / pack ${packInfo.name}`);
+    }
+    if (installedPkg.version !== record.package.version || installedPkg.version !== packInfo.version) {
+      fail('installed-version', `installed ${installedPkg.version} != manifest ${record.package.version} / pack ${packInfo.version}`);
+    }
+
+    // 6. Consumer scenarios: positive + two negative modes, each a fresh process.
+    for (const scenario of SCENARIOS) {
+      const res = P.run(process.execPath, ['consumer.mjs', ...scenario.flags], { cwd: consumerDir, timeout: 120_000 });
+      evidence.execution.commands.push(cmdRecord(res, `consumer:${scenario.id}`));
+      const outcome = evaluateScenario(scenario, res);
+      evidence.execution.scenarios[scenario.id] = {
+        flags: scenario.flags,
+        expectedExit: scenario.expectExit,
+        expectedMarker: scenario.expectExit === 0 ? scenario.expectStdout : scenario.expectStderr,
+        outcome,
+        code: res.code,
+        signal: res.signal,
+        error: res.error,
+        stdout: res.stdout,
+        stderr: res.stderr,
+      };
+      if (outcome.status !== 'PASS') fail(`scenario:${scenario.id}`, outcome.why);
+      process.stdout.write(res.stdout);
+    }
 
     // 7. Public type resolution through the installed package's declarations.
     const tsc = P.run(process.execPath, ['node_modules/typescript/lib/tsc.js', '-p', 'tsconfig.json'], { cwd: consumerDir, timeout: 120_000 });
-    commands.push(tsc);
+    evidence.execution.commands.push(cmdRecord(tsc, 'tsc'));
     check('tsc --noEmit', tsc);
+    evidence.execution.typecheck = { status: 'PASS' };
     console.log('type-check: PASS (public types resolve from the installed package)');
-
-    // Consumer's positive path held. B2a's two negative modes (release-pin-early,
-    // skip-final-checkpoint) are owned by the consumer stage and wired once their
-    // committed CLI options exist; record them as pending, never a fabricated PASS.
-    const scenarios = {
-      positive: { outcome: 'PASS', command: ['node', 'consumer.mjs'] },
-      'release-pin-early': { outcome: 'PENDING', note: 'consumer stage owns flags; not wired yet' },
-      'skip-final-checkpoint': { outcome: 'PENDING', note: 'consumer stage owns flags; not wired yet' },
-    };
-
-    record.execution = {
-      outputDir,
-      artifact,
-      installedVersion,
-      scenarios,
-      commands: commands.map((c) => ({ cmd: c.cmd, args: c.args, cwd: c.cwd, code: c.code, signal: c.signal, error: c.error })),
-      packedDefaultInclusions: {
-        packageJson: artifact.files.includes('package.json'),
-        readme: artifact.files.includes('README.md'),
-        license: artifact.files.includes('LICENSE'),
-      },
-    };
-
-    writeFileSync(join(outputDir, 'evidence.json'), JSON.stringify(record, null, 2));
-    printRecord(record, execute);
-
-    console.log('--- acceptance summary ---');
-    console.log(`independent consumer acceptance: PASS`);
-    console.log(`evidence         : ${join(outputDir, 'evidence.json')}`);
-    console.log(`artifact         : ${artifact.path}`);
-    return 0;
-  } finally {
-    // Keep the evidence + immutable artifact; reclaim only the transient consumer
-    // install. A cleanup failure is reported but never masks the primary result.
-    try {
-      rmSync(consumerDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    } catch (cleanupErr) {
-      console.error(`[cleanup] could not remove ${consumerDir}: ${cleanupErr.message}`);
-    }
+  } catch (err) {
+    failure = err;
   }
+
+  // Source binding: reject if HEAD/release inputs changed during the release work.
+  const sourceBinding = recheckSourceBinding(ROOT, record.git.head.hash);
+  evidence.execution.sourceBinding = sourceBinding;
+  if (!failure && !sourceBinding.clean) {
+    failure = new AcceptanceFailure(
+      'source-binding',
+      sourceBinding.headChanged ? 'HEAD changed during release work' : 'release inputs changed during release work',
+    );
+  }
+
+  evidence.endedAt = new Date().toISOString();
+
+  // Reclaim only the transient consumer install; keep evidence + artifact.
+  try {
+    rmSync(consumerDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  } catch (cleanupErr) {
+    evidence.execution.cleanupError = String(cleanupErr.message || cleanupErr);
+    console.error(`[cleanup] could not remove ${consumerDir}: ${cleanupErr.message}`);
+  }
+
+  if (failure) {
+    evidence.execution.outcome = 'FAIL';
+    evidence.execution.primaryError = String(failure.message || failure);
+  } else {
+    evidence.execution.outcome = 'PASS';
+  }
+
+  // Persist evidence (success OR failure) at the unique run output path.
+  writeFileSync(join(outputDir, 'evidence.json'), JSON.stringify(evidence, null, 2));
+  printRecord(evidence, execute);
+
+  if (failure) {
+    console.error('--- acceptance summary ---');
+    console.error(`independent consumer acceptance: FAIL`);
+    printScenarioFailure(evidence.execution);
+    console.error(`primary error   : ${failure.message}`);
+    console.error(`evidence        : ${join(outputDir, 'evidence.json')}`);
+    throw failure;
+  }
+
+  console.log('--- acceptance summary ---');
+  console.log('independent consumer acceptance: PASS (positive + both negative modes + type check)');
+  console.log(`evidence         : ${join(outputDir, 'evidence.json')}`);
+  console.log(`artifact         : ${evidence.execution.artifact.path}`);
+  return 0;
 }
 
 async function main() {
