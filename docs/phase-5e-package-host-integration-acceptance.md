@@ -56,6 +56,12 @@ spawn error；`cleanupError = null`，独立消费者安装目录已回收；安
 
 ## 消费者场景证据
 
+**宿主生命周期（L1/L2）**：见 `docs/shared-session-lifecycle-b1.md`。在真实 primary `session.voxel` 上
+验证断连/重连（`conn-1` → `conn-2`）→ 最终 checkpoint → close → reopen，`conn-2` / `observedAt=3000` 的
+证据以 STALE 恢复；旧的只读 `RouteVerifier` 漏报负对照、空 report 无后续 frame 的取消各有独立正/负对照；
+真实 `snapshotLimits` 容量错误保留原 `kind`/`message`，所有会话有界关闭并报告次级错误，CLI 自然 exit 0
+（无强行 `process.exit`）。
+
 **Pin 保护（L3，正向）**：`dirty=false`，在飞步 `activeStepIndex=0` / `result=null`，两个真实依赖
 `(overworld, 0, 0, 0)` 与 `(overworld, 0, 0, -1)` 各 `pinned`；`ARRIVED`、`cancel` 及两个重叠租约释放后
 均实际回收。早释放 mutation 下实际 `free()` 会 evict 该依赖而触发断言（预期失败），所有 close 干净。
@@ -87,7 +93,8 @@ checkpoint 的对照则 `close` 返回 `dirty=true`、重开 `observed=false`，
 
 - Fake 身体 + 真实 SQLite 是库侧验收，未运行 Minecraft；不证明 Curio 的 M2 或 D 侧接入（其他 lane 负责）。
 - close 故障是真实 Worker 关闭后的边界注入（返回 `completed:false` 或 throw），不是物理 Worker 故障。
-- 消费者用 eager 的小有界 fixture，不宣称 Curio 的 manual 按需驻留已接线。
+- `shared-session-lifecycle` 示例用预算内 eager 加载；消费者另有一路真实 manual 会话，验证 clean Section 与
+  在途 Pin。均不宣称 Curio 的 manual 按需驻留已接线。
 - 本次只跑定向测试，未跑全 suite；「561 项全绿」是旧 `0.7.4` 记录的历史数字，不是本次重跑结果。
 
 ## 验证命令
@@ -96,7 +103,9 @@ checkpoint 的对照则 `close` 返回 `dirty=true`、重开 `observed=false`，
 
 ```bash
 node --test acceptance/provenance.test.mjs acceptance/run.test.mjs   # 27/27 全绿
-node --test tests/shared-session-lifecycle.test.ts                   # B1 15/15 全绿
+node --test acceptance/consumer-close.test.mjs                       # 5/5 全绿
+npm exec vitest run tests/shared-session-lifecycle.test.ts           # B1 15/15 全绿
+node --import tsx examples/shared-session-lifecycle.ts               # 真实自然 exit 0（无强行 exit）
 node --check acceptance/run.mjs                                      # 语法校验
 node acceptance/run.mjs --execute                                    # 最终打包+安装验收（exit 0）
 ```
