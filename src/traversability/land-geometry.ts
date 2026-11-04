@@ -27,14 +27,18 @@ export interface Aabb {
   maxZ: number;
 }
 
-/** Candidate cells for one sweep, or an overflow marker when the hard cell limit is exceeded. */
-export interface BoundedCells {
-  cells: Vec3Like[];
-  /** True when the cell count exceeds the caller's limit; no array is allocated. */
-  overflow: boolean;
-  /** Exact count when known, otherwise `Infinity`. */
-  total: number;
-}
+/**
+ * Result of a bounded candidate enumeration.
+ *
+ * `capacity` is a caller-configurable limit: the work is complete in principle
+ * but the configured maximum is too small. `numeric` means the continuous
+ * coordinates or the resulting cell count cannot be represented exactly with
+ * safe integers, which is not something the caller can fix by raising a limit.
+ */
+export type BoundedCells =
+  | { kind: 'ok'; cells: Vec3Like[]; total: number }
+  | { kind: 'capacity'; total: number }
+  | { kind: 'numeric'; detail: string };
 
 export function bodyAabb(feet: Vec3Like, half: number, height: number): Aabb {
   return {
@@ -76,50 +80,113 @@ export function jumpEnvelope(
   };
 }
 
+interface CellRange {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
+  total: number;
+}
+
 /**
- * Integer cells overlapping a continuous AABB, using the same positive-overlap
- * convention as the walk evaluator: a body merely touching a cell boundary does
- * not make that cell a candidate. The count is checked before allocation.
+ * Floor a continuous AABB into integer cell bounds with the positive-overlap
+ * convention, or report that the result cannot be represented exactly.
+ *
+ * Every bound must be a safe integer: beyond `Number.MAX_SAFE_INTEGER` a loop
+ * such as `for (x = min; x <= max; x++)` may never advance because `x + 1`
+ * rounds back to `x`. The axis counts and their product must also be safe.
  */
-export function cellsInAabbBounded(aabb: Aabb, maxCells: number): BoundedCells {
-  const minBX = Math.floor(aabb.minX + LAND_EPS);
-  const maxBX = Math.floor(aabb.maxX - LAND_EPS);
-  const minBY = Math.floor(aabb.minY + LAND_EPS);
-  const maxBY = Math.floor(aabb.maxY - LAND_EPS);
-  const minBZ = Math.floor(aabb.minZ + LAND_EPS);
-  const maxBZ = Math.floor(aabb.maxZ - LAND_EPS);
+function safeCellRange(
+  minBX: number,
+  maxBX: number,
+  minBY: number,
+  maxBY: number,
+  minBZ: number,
+  maxBZ: number,
+): CellRange | { detail: string } {
   if (
-    !Number.isFinite(minBX) ||
-    !Number.isFinite(maxBX) ||
-    !Number.isFinite(minBY) ||
-    !Number.isFinite(maxBY) ||
-    !Number.isFinite(minBZ) ||
-    !Number.isFinite(maxBZ)
+    !Number.isSafeInteger(minBX) ||
+    !Number.isSafeInteger(maxBX) ||
+    !Number.isSafeInteger(minBY) ||
+    !Number.isSafeInteger(maxBY) ||
+    !Number.isSafeInteger(minBZ) ||
+    !Number.isSafeInteger(maxBZ)
   ) {
-    return { cells: [], overflow: true, total: Number.POSITIVE_INFINITY };
+    return { detail: 'continuous bounds are outside the safely representable integer cell range' };
   }
   const nx = maxBX - minBX + 1;
   const ny = maxBY - minBY + 1;
   const nz = maxBZ - minBZ + 1;
-  if (nx <= 0 || ny <= 0 || nz <= 0) return { cells: [], overflow: false, total: 0 };
-  const total = nx * ny * nz;
-  if (!Number.isSafeInteger(total) || total > maxCells) {
-    return {
-      cells: [],
-      overflow: true,
-      total: Number.isSafeInteger(total) ? total : Number.POSITIVE_INFINITY,
-    };
+  if (nx <= 0 || ny <= 0 || nz <= 0) {
+    // A positive-size body/envelope always covers at least one cell under the
+    // positive-overlap convention; an empty range would silently hide evidence.
+    return { detail: 'continuous bounds produce no positively-overlapping integer cell' };
   }
-  const cells: Vec3Like[] = new Array(total);
+  const total = nx * ny * nz;
+  if (!Number.isSafeInteger(total)) {
+    return { detail: 'candidate cell count exceeds the safely representable integer range' };
+  }
+  return { minX: minBX, maxX: maxBX, minY: minBY, maxY: maxBY, minZ: minBZ, maxZ: maxBZ, total };
+}
+
+/** Floor a continuous AABB into cells with the positive-overlap convention. */
+function continuousCellRange(
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+  minZ: number,
+  maxZ: number,
+): CellRange | { detail: string } {
+  return safeCellRange(
+    Math.floor(minX + LAND_EPS),
+    Math.floor(maxX - LAND_EPS),
+    Math.floor(minY + LAND_EPS),
+    Math.floor(maxY - LAND_EPS),
+    Math.floor(minZ + LAND_EPS),
+    Math.floor(maxZ - LAND_EPS),
+  );
+}
+
+/**
+ * Enumerate a preflighted range. `onCount` runs with the exact count before any
+ * array is allocated, so a caller can charge/reject large enumerations without
+ * doing the work first.
+ */
+function enumerateRange(range: CellRange, maxCells: number, onCount?: (total: number) => void): BoundedCells {
+  if (range.total > maxCells) return { kind: 'capacity', total: range.total };
+  onCount?.(range.total);
+  const cells: Vec3Like[] = new Array(range.total);
   let i = 0;
-  for (let x = minBX; x <= maxBX; x++) {
-    for (let y = minBY; y <= maxBY; y++) {
-      for (let z = minBZ; z <= maxBZ; z++) {
+  for (let x = range.minX; x <= range.maxX; x++) {
+    for (let y = range.minY; y <= range.maxY; y++) {
+      for (let z = range.minZ; z <= range.maxZ; z++) {
         cells[i++] = { x, y, z };
       }
     }
   }
-  return { cells, overflow: false, total };
+  return { kind: 'ok', cells, total: range.total };
+}
+
+/**
+ * Integer cells overlapping a continuous AABB, using the same positive-overlap
+ * convention as the walk evaluator: a body merely touching a cell boundary does
+ * not make that cell a candidate.
+ *
+ * `onCount` is invoked with the exact total before allocation. It may throw to
+ * reject the enumeration (for example when a work budget is exhausted), in
+ * which case no array is created.
+ */
+export function cellsInAabbBounded(
+  aabb: Aabb,
+  maxCells: number,
+  onCount?: (total: number) => void,
+): BoundedCells {
+  const range = continuousCellRange(aabb.minX, aabb.maxX, aabb.minY, aabb.maxY, aabb.minZ, aabb.maxZ);
+  if ('detail' in range) return { kind: 'numeric', detail: range.detail };
+  return enumerateRange(range, maxCells, onCount);
 }
 
 /**
@@ -127,35 +194,25 @@ export function cellsInAabbBounded(aabb: Aabb, maxCells: number): BoundedCells {
  * `top ∈ [0, 1]`, so the cell below an integer feet Y and the feet cell itself
  * both matter. Cells are keyed by the body footprint with positive-area overlap.
  */
-export function supportCandidateCells(feet: Vec3Like, half: number, maxCells: number): BoundedCells {
-  const minBX = Math.floor(feet.x - half + LAND_EPS);
-  const maxBX = Math.floor(feet.x + half - LAND_EPS);
-  const minBY = Math.floor(feet.y - LAND_EPS);
-  const maxBY = Math.floor(feet.y + LAND_EPS);
-  const minBZ = Math.floor(feet.z - half + LAND_EPS);
-  const maxBZ = Math.floor(feet.z + half - LAND_EPS);
-  const nx = maxBX - minBX + 1;
-  const ny = maxBY - minBY + 1;
-  const nz = maxBZ - minBZ + 1;
-  if (nx <= 0 || ny <= 0 || nz <= 0) return { cells: [], overflow: false, total: 0 };
-  const total = nx * ny * nz;
-  if (!Number.isSafeInteger(total) || total > maxCells) {
-    return {
-      cells: [],
-      overflow: true,
-      total: Number.isSafeInteger(total) ? total : Number.POSITIVE_INFINITY,
-    };
-  }
-  const cells: Vec3Like[] = new Array(total);
-  let i = 0;
-  for (let x = minBX; x <= maxBX; x++) {
-    for (let y = minBY; y <= maxBY; y++) {
-      for (let z = minBZ; z <= maxBZ; z++) {
-        cells[i++] = { x, y, z };
-      }
-    }
-  }
-  return { cells, overflow: false, total };
+export function supportCandidateCells(
+  feet: Vec3Like,
+  half: number,
+  maxCells: number,
+  onCount?: (total: number) => void,
+): BoundedCells {
+  // A support face can sit at `top ∈ [0, 1]`, so cells on both sides of the
+  // exact feet height matter. Unlike a continuous envelope, the lower cell is
+  // included even when the body only touches its top face.
+  const range = safeCellRange(
+    Math.floor(feet.x - half + LAND_EPS),
+    Math.floor(feet.x + half - LAND_EPS),
+    Math.floor(feet.y - LAND_EPS),
+    Math.floor(feet.y + LAND_EPS),
+    Math.floor(feet.z - half + LAND_EPS),
+    Math.floor(feet.z + half - LAND_EPS),
+  );
+  if ('detail' in range) return { kind: 'numeric', detail: range.detail };
+  return enumerateRange(range, maxCells, onCount);
 }
 
 /**

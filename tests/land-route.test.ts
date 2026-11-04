@@ -207,7 +207,14 @@ describe('LandRouteVerifier — mixed route and bounded advance', () => {
     expect(first.pendingTransitionIndexes).toEqual([0, 1, 2]);
     expect(first.budgetGap).toBeDefined();
     expect(first.budgetGap!.used).toBeLessThanOrEqual(1);
-    expect(first.budgetGap!.requiredAtLeast).toBeGreaterThan(first.budgetGap!.used);
+    expect(first.budgetGap!.requiredAtLeast).toBeGreaterThan(0);
+    expect(first.budgetGap!.transitionIndex).toBe(0);
+    expect(first.budgetGap!.limit).toBe('advance_budget');
+    expect(first.budgetGap!.limitValue).toBe(1);
+    expect(first.budgetGap!.recovery).toBe('increase_advance_budget');
+    expect(first.budgetGap!.diagnostic.kind).toBe('budget');
+    expect(first.budgetGap!.transitionWork.exhausted).toBe(true);
+    expect(first.budgetGap!.transitionWork.used).toBeLessThanOrEqual(1);
 
     const retry = verifier.advance(1);
     expect(retry.verdict).toBe('INCOMPLETE');
@@ -216,6 +223,147 @@ describe('LandRouteVerifier — mixed route and bounded advance', () => {
     const done = verifier.advance(10000);
     expect(done.verdict).toBe('OPEN');
     expect(done.budgetGap).toBeUndefined();
+  });
+
+  it('distinguishes the configured maxWork ceiling from a per-call budget shortfall', () => {
+    const map = new VoxelMap('world');
+    fillOpenStep(map);
+    const capped = new LandRouteVerifier(map, { now: () => 2000, limits: { maxWork: 2 } });
+    capped.register(request([STEP], { shapeProvider: landProvider }));
+
+    const first = capped.advance(10000);
+    expect(first.verdict).toBe('INCOMPLETE');
+    expect(first.budgetGap!.limit).toBe('maxWork');
+    expect(first.budgetGap!.limitValue).toBe(2);
+    expect(first.budgetGap!.recovery).toBe('raise_configured_limits');
+    expect(first.budgetGap!.requiredLimitAtLeast).toBeGreaterThan(2);
+    expect(first.budgetGap!.transitionIndex).toBe(0);
+
+    // A larger per-call budget cannot exceed the verifier's configured ceiling.
+    const bigger = capped.advance(1_000_000);
+    expect(bigger.verdict).toBe('INCOMPLETE');
+    expect(bigger.budgetGap!.limit).toBe('maxWork');
+    expect(bigger.budgetGap!.recovery).toBe('raise_configured_limits');
+
+    const raised = new LandRouteVerifier(map, { now: () => 2000, limits: { maxWork: 100000 } });
+    raised.register(request([STEP], { shapeProvider: landProvider }));
+    expect(raised.advance(10000).verdict).toBe('OPEN');
+  });
+
+  it('reports a candidate capacity as a configured limit and recovers with new limits', () => {
+    const map = new VoxelMap('world');
+    fillOpenStep(map);
+    const small = new LandRouteVerifier(map, { now: () => 2000, limits: { maxCandidateCells: 1 } });
+    small.register(request([STEP], { shapeProvider: landProvider }));
+
+    const first = small.advance(10000);
+    expect(first.verdict).toBe('INCOMPLETE');
+    expect(first.complete).toBe(false);
+    expect(first.verifiedTransitionIndexes).toEqual([]);
+    expect(first.pendingTransitionIndexes).toEqual([0]);
+    expect(first.budgetGap!.limit).toBe('maxCandidateCells');
+    expect(first.budgetGap!.limitValue).toBe(1);
+    expect(first.budgetGap!.requiredLimitAtLeast).toBeGreaterThan(1);
+    expect(first.budgetGap!.recovery).toBe('raise_configured_limits');
+    expect(first.budgetGap!.diagnostic.kind).toBe('capacity');
+
+    // Increasing the advance budget alone cannot pass a configured capacity.
+    const still = small.advance(1_000_000);
+    expect(still.budgetGap!.limit).toBe('maxCandidateCells');
+
+    const raised = new LandRouteVerifier(map, { now: () => 2000, limits: { maxCandidateCells: 10000 } });
+    raised.register(request([STEP], { shapeProvider: landProvider }));
+    expect(raised.advance(10000).verdict).toBe('OPEN');
+  });
+
+  it('keeps a capacity-capped segment pending while earlier segments remain verified', () => {
+    const map = new VoxelMap('world');
+    fillOpenStep(map);
+    fill(map, STONE, [[2, 1, 0]]);
+    fill(map, AIR, [
+      [1, 3, 0],
+      [2, 3, 0],
+    ]);
+    const pairState: BlockState = { name: 'minecraft:box_pair', properties: {} };
+    fill(map, pairState, [[2, 2, 0]]);
+    const pairProvider: CollisionShapeProvider = {
+      version: 'land-route-box-pair-1',
+      resolve(state, cell, read) {
+        if (state.name === pairState.name) {
+          return {
+            kind: 'shape',
+            shape: {
+              // Three boxes outside the body's Z footprint: they count against
+              // the shape-box cap without introducing a real collision.
+              boxes: [
+                { minX: 0, minY: 0, minZ: 0, maxX: 0.3, maxY: 1, maxZ: 0.01 },
+                { minX: 0.3, minY: 0, minZ: 0, maxX: 0.6, maxY: 1, maxZ: 0.01 },
+                { minX: 0.6, minY: 0, minZ: 0, maxX: 0.9, maxY: 1, maxZ: 0.01 },
+              ],
+              supportFaces: [],
+            },
+          };
+        }
+        return landProvider.resolve(state, cell, read);
+      },
+    };
+    const route: LandTransition[] = [
+      STEP,
+      { kind: 'step', from: { x: 1.5, y: 1, z: 0.5 }, to: { x: 2.5, y: 2, z: 0.5 } },
+    ];
+    const verifier = new LandRouteVerifier(map, { now: () => 2000, limits: { maxShapeBoxes: 2 } });
+    verifier.register(request(route, { shapeProvider: pairProvider }));
+
+    const capped = verifier.advance(100000);
+    expect(capped.verdict).toBe('INCOMPLETE');
+    expect(capped.complete).toBe(false);
+    expect(capped.verifiedTransitionIndexes).toEqual([0]);
+    expect(capped.pendingTransitionIndexes).toEqual([1]);
+    expect(capped.segments[0]).toMatchObject({ kind: 'verified' });
+    expect(capped.segments[1]).toMatchObject({ kind: 'pending' });
+    expect(capped.budgetGap!.transitionIndex).toBe(1);
+    expect(capped.budgetGap!.limit).toBe('maxShapeBoxes');
+    expect(capped.budgetGap!.limitValue).toBe(2);
+    expect(capped.budgetGap!.requiredLimitAtLeast).toBeGreaterThan(2);
+    expect(capped.budgetGap!.diagnostic.kind).toBe('capacity');
+
+    const raised = new LandRouteVerifier(map, { now: () => 2000, limits: { maxShapeBoxes: 10 } });
+    raised.register(request(route, { shapeProvider: pairProvider }));
+    expect(raised.advance(100000).verdict).toBe('OPEN');
+  });
+
+  it('reports a provider support-face cap as a configured limit and recovers with new limits', () => {
+    const map = new VoxelMap('world');
+    fillOpenStep(map);
+    const small = new LandRouteVerifier(map, { now: () => 2000, limits: { maxSupportFaces: 1 } });
+    small.register(request([STEP], { shapeProvider: landProvider }));
+
+    const capped = small.advance(10000);
+    expect(capped.verdict).toBe('INCOMPLETE');
+    expect(capped.budgetGap!.limit).toBe('maxSupportFaces');
+    expect(capped.budgetGap!.limitValue).toBe(1);
+    expect(capped.budgetGap!.requiredLimitAtLeast).toBeGreaterThan(1);
+    expect(capped.budgetGap!.recovery).toBe('raise_configured_limits');
+
+    const raised = new LandRouteVerifier(map, { now: () => 2000, limits: { maxSupportFaces: 100 } });
+    raised.register(request([STEP], { shapeProvider: landProvider }));
+    expect(raised.advance(10000).verdict).toBe('OPEN');
+  });
+
+  it('rejects an oversized route before visiting later transition elements', () => {
+    const map = new VoxelMap('world');
+    const verifier = new LandRouteVerifier(map, { now: () => 2000, limits: { maxTransitions: 1 } });
+    const transitions: LandTransition[] = [STEP];
+    Object.defineProperty(transitions, 1, {
+      enumerable: true,
+      get() {
+        throw new Error('later transition element was visited');
+      },
+    });
+
+    expect(() => verifier.register(request(transitions, { shapeProvider: landProvider }))).toThrow(
+      /exceeding the limit/,
+    );
   });
 
   it('snapshots registration inputs and returns isolated status copies', () => {
@@ -355,6 +503,63 @@ describe('LandRouteVerifier — local invalidation, recovery and identity change
       ],
       1150,
     );
+    expect(report.sections.every((section) => !section.invalidated)).toBe(true);
+    expect(map.sectionAt('overworld', 0, 0, 0)?.revision).toBe(revisionBefore);
+
+    const recovered = verifier.apply(report, 10000);
+    expect(recovered?.verdict).toBe('OPEN');
+    expect(recovered?.earliestProblem).toBeNull();
+  });
+
+  it('recovers an evidence-limited UNSUPPORTED conclusion on a same-content refresh', () => {
+    const map = new VoxelMap('world', { validityWindowMs: 100 });
+    const PROBE: BlockState = { name: 'minecraft:freshness_probe', properties: {} };
+    const freshnessProvider: CollisionShapeProvider = {
+      version: 'land-route-freshness-1',
+      resolve(state, cell, read) {
+        if (state.name === PROBE.name) {
+          const neighbour = read.cell(0, 1, 2);
+          if (neighbour.kind !== 'observed') {
+            return {
+              kind: 'unsupported_shape',
+              block: state.name,
+              detail: 'probe neighbour is not currently observed',
+            };
+          }
+          return { kind: 'shape', shape: EMPTY };
+        }
+        return landProvider.resolve(state, cell, read);
+      },
+    };
+    fill(map, STONE, [
+      [0, -1, 0],
+      [1, 0, 0],
+    ], 1100);
+    fill(map, AIR, [
+      [0, 0, 0],
+      [0, 2, 0],
+      [1, 1, 0],
+      [1, 2, 0],
+    ], 1100);
+    fill(map, PROBE, [[0, 1, 0]], 1100);
+    // This provider-consulted neighbour expires at 1100 while the corridor
+    // evidence stays valid until 1200.
+    fill(map, STONE, [[0, 1, 2]], 1000);
+
+    const verifier = new LandRouteVerifier(map, { now: () => 1150 });
+    verifier.register(request([STEP], { shapeProvider: freshnessProvider }));
+
+    const unsupported = verifier.advance(10000);
+    expect(unsupported.verdict).toBe('UNSUPPORTED');
+    expect(unsupported.earliestProblem?.reason?.kind).toBe('unsupported_shape');
+    expect(unsupported.pendingTransitionIndexes).toEqual([]);
+    expect(unsupported.verifiedTransitionIndexes).toEqual([0]);
+    const segment = unsupported.segments[0];
+    if (segment?.kind !== 'verified') throw new Error('expected a verified conclusion');
+    expect(segment.result.reasons.some((reason) => reason.kind === 'expired')).toBe(true);
+
+    const revisionBefore = map.sectionAt('overworld', 0, 0, 0)?.revision;
+    const report = fill(map, STONE, [[0, 1, 2]], 1150);
     expect(report.sections.every((section) => !section.invalidated)).toBe(true);
     expect(map.sectionAt('overworld', 0, 0, 0)?.revision).toBe(revisionBefore);
 

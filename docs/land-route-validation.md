@@ -35,6 +35,7 @@ import {
 import type {
   LandTransition, LandTransitionQuery, LandRules, LandLimits,
   LandTransitionEvaluation, LandMotionModel, ClimbRegionProvider,
+  LandLimitGap, LandRouteBudgetGap, LandRouteLimitField, LandRouteRecovery,
   LandRouteRequest, LandRouteStatus, LandRouteSegmentState,
 } from 'curio-minecraft-3d-memory';
 
@@ -109,6 +110,9 @@ limits 会在边界抛错；几何子集之外的范围返回 `UNSUPPORTED` / `u
   `model: { kind: 'jump', version }` 明确写出假设来源。
 - 身体整个 AABB 使用解析二次不等式与 X/Y/Z 同时时间区间求交。包围盒中身体从未占据的
   角落只用于候选格过滤，不会误报碰撞。
+- 候选包围盒中还可能包含身体**从未以正体积占据**的格（例如 X 区间已结束、身体顶部才刚
+  超过该格底面的真实角落）。这类格在要求任何证据之前，先用同一套连续整格命中判断排除：
+  已知实心不会误报碰撞，未观测也不会误报 `UNKNOWN`。这不是采样，也不替换解析碰撞。
 - 起点与落点支撑必需；空中弧段不要求、也不假设支撑。
 - **本库不附带、也不验证真实 Minecraft 运动模型。** 测试里的二次模型只标为 test model；
   几何曲线成立不代表身体真的能完成该跳跃。
@@ -142,7 +146,12 @@ limits 会在边界抛错；几何子集之外的范围返回 `UNSUPPORTED` / `u
   - 精确边界接触没有正体积，不算碰撞。
 - 已知障碍只来自接受的观测证据；不会为未看见的格编造方块名。
 - Provider 在解析形状或攀爬区间时读取的每个邻格都会记录 Section 依赖。即使 provider
-  在读到缺失/过期邻格后仍返回形状/区间，已咨询的证据缺口也会保留并使结论无法成为 `OPEN`。
+  在读到缺失/过期邻格后仍返回形状/区间，碰撞/通道所必需的证据缺口也会保留并使结论无法
+  成为 `OPEN`。
+- **仅用于支撑检查的候选**单独缓冲诊断：候选自身的读取、其 shape provider 的受控邻读
+  以及 `neighbor_gap` 先写入局部缓冲。只要任一已观测候选在精确脚高给出正面积可站立面，
+  就立即停止扫描可选候选并丢弃这些可选缺口；仅在无法证明任何支撑时，才把缓冲并回全局
+  原因。Section 依赖与 TTL 仍始终全局记录，碰撞/通道必需的 provider 缺口不受影响。
 
 ## Section 依赖、驻留与有效期
 
@@ -181,13 +190,33 @@ interface LandSectionDependency {
 | `maxJumpDistance` | 4 | jump 水平距离实现范围（格） |
 | `maxWork` | 65536 | 单次评估同步工作单位上限 |
 
-候选格数量在分配前检查。工作单位包括：格读取、受控邻读、形状解析、碰撞盒、支撑面、
-攀爬区间与运动模型调用。越界结果区分：
+候选枚举先计算精确格数，再在**分配任何数组之前**把枚举工作计入 `maxWork`；两段走廊、
+并集、支撑候选与攀爬候选都走同一条路径。因此 `maxWork = 1` 或调用方把
+`maxCandidateCells` 设得很大时，也不会先分配/遍历完整候选集。工作单位包括：候选枚举、
+格读取、受控邻读、形状解析、碰撞盒、支撑面、攀爬区间与运动模型调用。
 
-- 候选格/邻读/形状盒/攀爬区间等**配置范围**超出 → `UNSUPPORTED` / `unsupported_range`；
+越界结果严格区分：
+
+- **可配置容量**（`maxCandidateCells` / `maxNeighborReads` / `maxShapeBoxes` /
+  `maxSupportFaces` / `maxClimbRegions`）不足 → `INCOMPLETE`，并返回
+  `limitGap: { field, value, requiredAtLeast? }`。`field` 是具体配置名，`value` 是当前
+  配置值，`requiredAtLeast` 是“如已知”的更大配置值下界。它们不是
+  `UNSUPPORTED` / `unsupported_range`，也不是地形 `BLOCKED`。
 - 实际 `maxWork` 用完 → `INCOMPLETE` / `budget`，并返回
-  `work: { used, limit, requiredAtLeast, exhausted: true }`；
-- 这些都不是地形 `BLOCKED`，也不会变成健康/风险策略。
+  `work: { used, limit, requiredAtLeast, exhausted: true }`；`requiredAtLeast` 是完成
+  本次评估所需工作的下界，不是保证值。
+- 若容量/预算截断发生在**已经确认实际碰撞之后**，状态可以是已知的 `BLOCKED`，但结果仍
+  带有 `limitGap`（或 `work.exhausted`），表示其余证据未完整枚举；不得据此宣称完整评估。
+- 连续坐标/包围盒无法用安全整数精确表示（例如超出 `Number.MAX_SAFE_INTEGER`，或正体积
+  包围盒因浮点表示退化不出任何格）→ `UNSUPPORTED` / `unsupported_range`。这不是调用方
+  可以靠调大上限解决的容量问题，也绝不会静默变成 `OPEN`/空候选。
+- 真正的移动几何超出子集（step 范围、jump 距离/同高单轴、ladder 固定 XZ）或缺少
+  model/provider → `UNSUPPORTED`，分别使用 `unsupported_range` / `unsupported_model` /
+  `unsupported_provider`。
+
+`maxTransitions` 在读取/克隆任何元素之前按 `transitions.length` 先校验；超长路线不会
+遍历后续元素。所有库内循环都受上述候选与工作预算约束；provider 自身的内部执行时间仍由
+provider 负责，本库不宣称限制其硬 wall time。
 
 ## `LandRouteVerifier` 生命周期
 
@@ -219,26 +248,71 @@ verifier.clear();                   // 丢弃追踪路线，不修改地图
 
 有界推进与预算缺口：
 
-- `advance` / `apply` 的 `workBudget` 是**一次调用**的总工作单位上限，并实际下传为每段
-  `maxWork` 的剩余额度。
-- 某段预算不足时不会被存成结果，也不会算作 `OPEN`；本次调用停止，状态给出
-  `budgetGap: { used, requiredAtLeast }`。下一次调用会从该段**重新开始**评估。
-- `requiredAtLeast` 是完成下一 pending 段所需预算的**下界**，不是保证值。调用方应根据
-  实测继续增大单次预算（并确保 `limits.maxWork` 足够大），而不是让路线永久 pending。
-- 已处理段按声明顺序推进；未处理段保持 `pending`，路线判为 `INCOMPLETE`。
+- `advance` / `apply` 的 `workBudget` 是**一次调用**的总工作单位上限；每段实际下传的
+  `maxWork` 为 `min(构造时的 limits.maxWork, 本次剩余预算)`。
+- 被容量或工作预算截断、且尚未形成确定否定的段**不会**被存成结果，也不会算作 `OPEN`
+  或已验证完成；本次调用停止，这些段保持 `pending`，路线判为 `INCOMPLETE`。下一次调用
+  从该段**重新开始**评估。若截断前已经确认实际碰撞（已知否定），该段可作为 `BLOCKED`
+  保留，但仍不得宣称其余证据已被完整枚举。
+- `budgetGap` 保留具体停止原因，而不只是一个笼统数字：
+
+  ```ts
+  interface LandRouteBudgetGap {
+    used: number;                // 本次调用实际消耗
+    requiredAtLeast: number;     // 完成下一 pending 段所需预算的下界
+    transitionIndex: number;     // 停止的段
+    limit: 'advance_budget' | 'maxWork'
+         | 'maxCandidateCells' | 'maxNeighborReads' | 'maxShapeBoxes'
+         | 'maxSupportFaces' | 'maxClimbRegions';
+    limitValue: number;          // 该限制的实际值
+    requiredLimitAtLeast?: number; // 需要更大配置值时的下界（如已知）
+    recovery: 'increase_advance_budget' | 'raise_configured_limits';
+    diagnostic: { kind; detail; cells }; // 被截断评估的原始诊断
+    transitionWork: LandWorkReport;      // 该段实际工作
+  }
+  ```
+
+- `limit: 'advance_budget'` 表示本次调用的剩余预算先于构造上限耗尽；增大下一次
+  `workBudget` 可继续。
+- `limit: 'maxWork'` 表示本段预算已被构造时的 `limits.maxWork` 硬性截断；即使把
+  `workBudget` 调得更大也不会越过该上限，必须用更大的配置限制重新创建 verifier。
+- `limit: 'maxCandidateCells'` 等容量字段同理：`recovery` 为
+  `raise_configured_limits`，仅增大单次预算无效。
+- `requiredAtLeast` / `requiredLimitAtLeast` 都只是**下界**，不是保证值；调用方应按实测
+  继续调整，而不是让路线永久 pending。
+- 若在容量截断前已经确认了实际碰撞，该段仍可作为一个已知的 `BLOCKED` 否定结论保留；
+  这不表示其余证据已被完整枚举，也不能把“每段都有结论”解释为“整个评估未被截断”。
 
 局部失效与恢复：
 
 - `apply(report, budget)` 通过 Section → transition 反向索引只丢弃依赖被修改 Section 的段；
   无关 Section 的已有证明保留。
-- 刷新型报告（`invalidated: false`，内容未变但有效期延长）可以恢复 `STALE` 结论，即使
-  `Section.revision` 没有变化。
+- 刷新型报告（`invalidated: false`，内容未变但有效期延长）可以恢复依赖该 Section 的
+  `STALE` 和 `UNSUPPORTED` 结论，即使 `Section.revision` 没有变化。覆盖
+  “provider 读取过期邻格后返回 unsupported” 这类证据驱动的 `UNSUPPORTED`；有效的
+  `OPEN` 不会被无关 Section 的刷新撤销。重新评估后若仍不支持，会得到相同结论。
 - shape provider、jump model 或 climb provider 的 `version` 变化会撤销全部已验证证明并按
   新版本重新排队；结果中的 `ruleVersions` 反映当前版本。
 - 证据 TTL 到期后，旧 `OPEN` 不会仅因再次 `status()` 而继续有效；快照时会重新检查时钟。
 - Section unload/reload 通过 residency generation 撤销旧结论；未驻留使结论变为
   `nonresident`，重新载入的旧证据为 `STALE`，只有当前证据才能恢复 `OPEN`。
 - 所有快照深拷贝；调用方修改返回对象不会污染内部状态。
+
+## 本次验证
+
+在修复提交前实际执行并通过：
+
+- `npm run build`：TypeScript 构建成功。
+- `npx tsc --noEmit`：全库类型检查成功。
+- `npx vitest run tests/land-transition.test.ts tests/land-route.test.ts`：60 个陆地几何/路线
+  测试全部通过，覆盖安全整数边界与数值不可表示、容量与工作预算区分、预分配计数、路线
+  `budgetGap` 的 per-call/固定上限/容量恢复、jump 真实包围盒角落、支撑候选局部诊断、
+  刷新型 `UNSUPPORTED` 恢复。
+- `npx vitest run tests/step-evaluator.test.ts tests/traversability-cache.test.ts
+  tests/route-verifier.test.ts`：88 个既有 step/cache/route 回归测试全部通过。
+
+未运行真实 Minecraft 客户端或服务器，也未接线 mineflayer/pathfinder、动作注册或执行器；
+上文 `OPEN` 仍只是当前证据对声明几何的支持结论。
 
 ## 未实现与未验证
 

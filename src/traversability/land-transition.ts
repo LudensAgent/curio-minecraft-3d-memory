@@ -243,7 +243,30 @@ export type LandTransitionReasonKind =
   | 'unsupported_model'
   | 'unsupported_provider'
   | 'unsupported_range'
+  | 'capacity'
   | 'budget';
+
+/** Configured implementation limits that can stop otherwise-complete work. */
+export type LandLimitField =
+  | 'maxCandidateCells'
+  | 'maxNeighborReads'
+  | 'maxShapeBoxes'
+  | 'maxSupportFaces'
+  | 'maxClimbRegions';
+
+/**
+ * Structured capacity shortfall: a configured limit, not a terrain fact. The
+ * transition is INCOMPLETE; raising the named limit (or recreating the verifier
+ * with a larger one) allows a later complete evaluation.
+ */
+export interface LandLimitGap {
+  field: LandLimitField;
+  /** Configured value that stopped complete evaluation. */
+  value: number;
+  /** Lower bound on a larger configured value that would allow completion, when known. */
+  requiredAtLeast?: number;
+  detail: string;
+}
 
 /** Structured explanation for a non-OPEN conclusion. */
 export interface LandTransitionReason {
@@ -277,6 +300,8 @@ export interface LandTransitionEvaluation {
   model?: { kind: 'jump'; version: string };
   /** Assumed climb provider identity, when a provider was used. */
   provider?: { kind: 'climb'; version: string };
+  /** Configured capacity shortfall when `status` is INCOMPLETE for that reason. */
+  limitGap?: LandLimitGap;
   sessionId: string;
   computedAt: number;
   /** min validUntil over dependencies with still-valid evidence; Infinity when none. */
@@ -298,6 +323,10 @@ type ShapeResult =
 
 class LandBudgetExhausted extends Error {}
 class LandRangeLimitError extends Error {}
+class LandCapacityIncomplete extends Error {}
+
+/** Full unit cell; used to ask whether the body actually occupies a candidate cell. */
+const FULL_CELL: UnitBox = { minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 };
 
 /**
  * Evaluate one explicitly typed land transition from current map evidence.
@@ -362,6 +391,7 @@ export function evaluateLandTransition(
   let workUsed = 0;
   let minimumRequired = 1;
   let budgetExhausted = false;
+  let limitGap: LandLimitGap | undefined;
   let shapeBoxCount = 0;
   let supportFaceCount = 0;
   let climbRegionCount = 0;
@@ -378,10 +408,63 @@ export function evaluateLandTransition(
     workUsed += units;
   };
 
+  /** Record the first configured-capacity shortfall and stop this evaluation. */
+  const noteCapacity = (
+    field: LandLimitField,
+    value: number,
+    requiredAtLeast: number | undefined,
+    detail: string,
+  ): never => {
+    if (limitGap === undefined) {
+      limitGap = { field, value, ...(requiredAtLeast === undefined ? {} : { requiredAtLeast }), detail };
+    }
+    throw new LandCapacityIncomplete();
+  };
+
   const keyOf = (cell: Vec3Like): string => `${cell.x},${cell.y},${cell.z}`;
   const addCell = (map: Map<string, Vec3Like>, cell: Vec3Like): void => {
     const key = keyOf(cell);
     if (!map.get(key)) map.set(key, { x: cell.x, y: cell.y, z: cell.z });
+  };
+
+  /**
+   * Evidence-gap destination. Collision/corridor reads write to the global
+   * collections; support-only provider calls are buffered locally so an optional
+   * candidate cannot poison a transition whose required support is already
+   * proven. Section dependencies and TTLs are recorded globally either way.
+   */
+  interface GapSink {
+    unobserved: Map<string, Vec3Like>;
+    incomplete: Map<string, Vec3Like>;
+    nonresident: Map<string, { cell: Vec3Like; key: SectionKey }>;
+    stale: Map<string, Vec3Like>;
+    expired: Map<string, Vec3Like>;
+    session: Map<string, Vec3Like>;
+  }
+  const makeGapSink = (): GapSink => ({
+    unobserved: new Map(),
+    incomplete: new Map(),
+    nonresident: new Map(),
+    stale: new Map(),
+    expired: new Map(),
+    session: new Map(),
+  });
+  const globalGaps: GapSink = { unobserved, incomplete, nonresident, stale, expired, session };
+  let activeGaps: GapSink = globalGaps;
+  const gapSinkHasGaps = (sink: GapSink): boolean =>
+    sink.unobserved.size > 0 ||
+    sink.incomplete.size > 0 ||
+    sink.nonresident.size > 0 ||
+    sink.stale.size > 0 ||
+    sink.expired.size > 0 ||
+    sink.session.size > 0;
+  const mergeGapSink = (sink: GapSink): void => {
+    for (const cell of sink.unobserved.values()) addCell(unobserved, cell);
+    for (const cell of sink.incomplete.values()) addCell(incomplete, cell);
+    for (const [key, entry] of sink.nonresident) nonresident.set(key, entry);
+    for (const cell of sink.stale.values()) addCell(stale, cell);
+    for (const cell of sink.expired.values()) addCell(expired, cell);
+    for (const cell of sink.session.values()) addCell(session, cell);
   };
 
   const recordDependency = (
@@ -408,18 +491,18 @@ export function evaluateLandTransition(
   const noteRead = (read: LandCellRead, cell: Vec3Like): void => {
     switch (read.kind) {
       case 'unobserved':
-        addCell(unobserved, cell);
+        addCell(activeGaps.unobserved, cell);
         break;
       case 'incomplete':
-        addCell(incomplete, cell);
+        addCell(activeGaps.incomplete, cell);
         break;
       case 'nonresident':
-        nonresident.set(keyOf(cell), { cell: { ...cell }, key: { ...read.key } });
+        activeGaps.nonresident.set(keyOf(cell), { cell: { ...cell }, key: { ...read.key } });
         break;
       case 'stale':
-        if (read.reason === 'stale') addCell(stale, cell);
-        else if (read.reason === 'expired') addCell(expired, cell);
-        else addCell(session, cell);
+        if (read.reason === 'stale') addCell(activeGaps.stale, cell);
+        else if (read.reason === 'expired') addCell(activeGaps.expired, cell);
+        else addCell(activeGaps.session, cell);
         break;
       case 'observed':
         break;
@@ -464,15 +547,15 @@ export function evaluateLandTransition(
   const noteGap = (view: NeighborCellView): void => {
     switch (view.kind) {
       case 'unobserved':
-        addCell(unobserved, view.pos);
+        addCell(activeGaps.unobserved, view.pos);
         break;
       case 'incomplete':
-        addCell(incomplete, view.pos);
+        addCell(activeGaps.incomplete, view.pos);
         break;
       case 'stale':
-        if (view.reason === 'stale') addCell(stale, view.pos);
-        else if (view.reason === 'expired') addCell(expired, view.pos);
-        else addCell(session, view.pos);
+        if (view.reason === 'stale') addCell(activeGaps.stale, view.pos);
+        else if (view.reason === 'expired') addCell(activeGaps.expired, view.pos);
+        else addCell(activeGaps.session, view.pos);
         break;
       case 'observed':
         break;
@@ -481,11 +564,16 @@ export function evaluateLandTransition(
 
   const neighborRead: NeighborRead = {
     cell(x, y, z) {
-      if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
-        throw new Error(`neighbor read coordinates must be integers: (${x}, ${y}, ${z})`);
+      if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || !Number.isSafeInteger(z)) {
+        throw new Error(`neighbor read coordinates must be safely representable integers: (${x}, ${y}, ${z})`);
       }
       if (neighborReads >= limits.maxNeighborReads) {
-        throw new LandRangeLimitError(`controlled neighbor reads exceed maxNeighborReads (${limits.maxNeighborReads})`);
+        noteCapacity(
+          'maxNeighborReads',
+          limits.maxNeighborReads,
+          neighborReads + 1,
+          `controlled neighbor reads exceed maxNeighborReads (${limits.maxNeighborReads})`,
+        );
       }
       neighborReads += 1;
       const pos = { x, y, z };
@@ -531,27 +619,58 @@ export function evaluateLandTransition(
     shapeBoxCount += shape.boxes.length;
     supportFaceCount += shape.supportFaces.length;
     if (shapeBoxCount > limits.maxShapeBoxes) {
-      throw new LandRangeLimitError(`provider shape boxes exceed maxShapeBoxes (${limits.maxShapeBoxes})`);
+      noteCapacity(
+        'maxShapeBoxes',
+        limits.maxShapeBoxes,
+        shapeBoxCount,
+        `provider shape boxes exceed maxShapeBoxes (${limits.maxShapeBoxes})`,
+      );
     }
     if (supportFaceCount > limits.maxSupportFaces) {
-      throw new LandRangeLimitError(`provider support faces exceed maxSupportFaces (${limits.maxSupportFaces})`);
+      noteCapacity(
+        'maxSupportFaces',
+        limits.maxSupportFaces,
+        supportFaceCount,
+        `provider support faces exceed maxSupportFaces (${limits.maxSupportFaces})`,
+      );
     }
     return { kind: 'shape', shape };
   };
 
+  /** Exact count before allocation; the work budget is charged before any array exists. */
+  const countAndChargeCells = (total: number): void => {
+    minimumRequired = Math.max(minimumRequired, workUsed + total);
+    charge(total);
+  };
+
   const boundedCells = (bounded: BoundedCells, label: string): Vec3Like[] => {
-    if (bounded.overflow) {
-      throw new LandRangeLimitError(`${label} exceed maxCandidateCells (${limits.maxCandidateCells})`);
+    switch (bounded.kind) {
+      case 'numeric':
+        // Coordinates outside exact integer representation are not a configurable
+        // capacity: no budget or limit increase can make the geometry evaluable.
+        throw new LandRangeLimitError(`${label}: ${bounded.detail}`);
+      case 'capacity':
+        return noteCapacity(
+          'maxCandidateCells',
+          limits.maxCandidateCells,
+          bounded.total,
+          `${label} exceed maxCandidateCells (${limits.maxCandidateCells})`,
+        );
+      case 'ok':
+        minimumRequired = Math.max(minimumRequired, bounded.total);
+        return bounded.cells;
     }
-    minimumRequired = Math.max(minimumRequired, bounded.cells.length);
-    return bounded.cells;
   };
 
   const scanCollision = (
     cells: readonly Vec3Like[],
     hits: (cell: Vec3Like, box: UnitBox) => boolean,
+    occupied?: (cell: Vec3Like) => boolean,
   ): void => {
     for (const cell of cells) {
+      // A candidate from the bounding envelope may be a cell the body never
+      // positively occupies. Exclude it before demanding evidence.
+      if (occupied !== undefined && !occupied(cell)) continue;
       const read = readCell(cell.x, cell.y, cell.z);
       if (read.kind !== 'observed') {
         noteRead(read, cell);
@@ -580,90 +699,71 @@ export function evaluateLandTransition(
    * absence; all-observed candidates with no matching face is a known gap.
    */
   const checkSupport = (feet: Vec3Like): void => {
-    const candidate = boundedCells(supportCandidateCells(feet, half, limits.maxCandidateCells), 'support candidates');
+    const candidate = boundedCells(
+      supportCandidateCells(feet, half, limits.maxCandidateCells, countAndChargeCells),
+      'support candidates',
+    );
     let supported = false;
     const knownAbsent: Vec3Like[] = [];
-    const localStale: Vec3Like[] = [];
-    const localExpired: Vec3Like[] = [];
-    const localSession: Vec3Like[] = [];
-    const localUnknown: Vec3Like[] = [];
-    const localIncomplete: Vec3Like[] = [];
-    const localNonresident: Array<{ cell: Vec3Like; key: SectionKey }> = [];
     const localUnsupported: Array<{ cell: Vec3Like; detail: string }> = [];
-
-    for (const cell of candidate) {
-      const read = readCell(cell.x, cell.y, cell.z);
-      if (read.kind !== 'observed') {
-        // Keep these local while a support face may still be confirmed: an
-        // unobserved neighbour is not a problem once the required support is
-        // proven by another observed face.
-        if (read.kind === 'stale') {
-          if (read.reason === 'stale') localStale.push(cell);
-          else if (read.reason === 'expired') localExpired.push(cell);
-          else localSession.push(cell);
-        } else if (read.kind === 'incomplete') localIncomplete.push(cell);
-        else if (read.kind === 'nonresident') localNonresident.push({ cell, key: read.key });
-        else localUnknown.push(cell);
-        continue;
-      }
-      const shape = resolveShape(read.evidence.observation.state, cell);
-      if (shape.kind === 'unsupported') {
-        localUnsupported.push({ cell: { ...cell }, detail: shape.detail });
-        continue;
-      }
-      if (shape.kind === 'gap') {
-        if (shape.view.kind === 'stale') {
-          if (shape.view.reason === 'stale') localStale.push(shape.view.pos);
-          else if (shape.view.reason === 'expired') localExpired.push(shape.view.pos);
-          else localSession.push(shape.view.pos);
-        } else if (shape.view.kind === 'incomplete') localIncomplete.push(shape.view.pos);
-        else localUnknown.push(shape.view.pos);
-        continue;
-      }
-      let cellSupports = false;
-      for (const face of shape.shape.supportFaces) {
-        charge(1);
-        if (Math.abs(cell.y + face.top - feet.y) > LAND_EPS) continue;
-        if (
-          rectsOverlapPositive(
-            feet.x - half,
-            feet.x + half,
-            feet.z - half,
-            feet.z + half,
-            cell.x + face.minX,
-            cell.x + face.maxX,
-            cell.z + face.minZ,
-            cell.z + face.maxZ,
-          )
-        ) {
-          cellSupports = true;
+    // Buffer every evidence gap raised by an optional support candidate: its own
+    // read, a provider's controlled neighbor reads, and neighbor_gap results.
+    // These only explain a failure to prove any support; a proven support face
+    // makes other candidates irrelevant.
+    const buffer = makeGapSink();
+    const previousGaps = activeGaps;
+    activeGaps = buffer;
+    try {
+      for (const cell of candidate) {
+        const read = readCell(cell.x, cell.y, cell.z);
+        if (read.kind !== 'observed') {
+          noteRead(read, cell);
+          continue;
+        }
+        const shape = resolveShape(read.evidence.observation.state, cell);
+        if (shape.kind === 'unsupported') {
+          localUnsupported.push({ cell: { ...cell }, detail: shape.detail });
+          continue;
+        }
+        if (shape.kind === 'gap') continue; // already buffered by resolveShape
+        let cellSupports = false;
+        for (const face of shape.shape.supportFaces) {
+          charge(1);
+          if (Math.abs(cell.y + face.top - feet.y) > LAND_EPS) continue;
+          if (
+            rectsOverlapPositive(
+              feet.x - half,
+              feet.x + half,
+              feet.z - half,
+              feet.z + half,
+              cell.x + face.minX,
+              cell.x + face.maxX,
+              cell.z + face.minZ,
+              cell.z + face.maxZ,
+            )
+          ) {
+            cellSupports = true;
+            break;
+          }
+        }
+        if (cellSupports) {
+          supported = true;
+          // One complete positive-area face at the exact feet height is enough.
           break;
         }
+        knownAbsent.push(cell);
       }
-      if (cellSupports) supported = true;
-      else knownAbsent.push(cell);
+    } finally {
+      activeGaps = previousGaps;
     }
 
     if (supported) return;
 
     // No observed face covers this exact feet height. Unknown candidates could
     // still supply one, so only an all-observed set is a known absence.
-    for (const entry of localUnsupported) unsupportedShape.push(entry);
-    for (const cell of localStale) addCell(stale, cell);
-    for (const cell of localExpired) addCell(expired, cell);
-    for (const cell of localSession) addCell(session, cell);
-    for (const cell of localUnknown) addCell(unobserved, cell);
-    for (const cell of localIncomplete) addCell(incomplete, cell);
-    for (const entry of localNonresident) nonresident.set(keyOf(entry.cell), entry);
-    if (
-      localUnsupported.length > 0 ||
-      localStale.length > 0 ||
-      localExpired.length > 0 ||
-      localSession.length > 0 ||
-      localUnknown.length > 0 ||
-      localIncomplete.length > 0 ||
-      localNonresident.length > 0
-    ) {
+    if (localUnsupported.length > 0 || gapSinkHasGaps(buffer)) {
+      for (const entry of localUnsupported) unsupportedShape.push(entry);
+      mergeGapSink(buffer);
       return;
     }
     for (const cell of knownAbsent) addCell(missingSupport, cell);
@@ -676,13 +776,23 @@ export function evaluateLandTransition(
     const byKey = new Map<string, Vec3Like>();
     for (const leg of legs) {
       const envelope = unionAabb(bodyAabb(leg.from, half, height), bodyAabb(leg.to, half, height));
-      for (const cell of boundedCells(cellsInAabbBounded(envelope, limits.maxCandidateCells), 'collision candidates')) {
+      for (const cell of boundedCells(
+        cellsInAabbBounded(envelope, limits.maxCandidateCells, countAndChargeCells),
+        'collision candidates',
+      )) {
         const key = keyOf(cell);
-        if (!byKey.has(key)) byKey.set(key, cell);
+        if (!byKey.has(key)) {
+          byKey.set(key, cell);
+          if (byKey.size > limits.maxCandidateCells) {
+            noteCapacity(
+              'maxCandidateCells',
+              limits.maxCandidateCells,
+              byKey.size,
+              `collision candidates exceed maxCandidateCells (${limits.maxCandidateCells})`,
+            );
+          }
+        }
       }
-    }
-    if (byKey.size > limits.maxCandidateCells) {
-      throw new LandRangeLimitError(`collision candidates exceed maxCandidateCells (${limits.maxCandidateCells})`);
     }
     const cells = [...byKey.values()];
     minimumRequired = Math.max(minimumRequired, cells.length);
@@ -700,9 +810,14 @@ export function evaluateLandTransition(
   };
 
   const finalize = (): LandTransitionEvaluation => {
+    const capped = budgetExhausted || limitGap !== undefined;
     let status: LandTransitionStatus;
     if (collisions.length > 0 || missingSupport.size > 0 || missingClimb.size > 0) {
       status = 'BLOCKED';
+    } else if (capped) {
+      // A configured capacity or work budget stopped the evaluation. This is
+      // never a terrain conclusion, and it must not be reported as complete.
+      status = 'INCOMPLETE';
     } else if (
       unsupportedShape.length > 0 ||
       unsupportedModel.length > 0 ||
@@ -710,8 +825,6 @@ export function evaluateLandTransition(
       unsupportedRange.length > 0
     ) {
       status = 'UNSUPPORTED';
-    } else if (budgetExhausted) {
-      status = 'INCOMPLETE';
     } else if (stale.size > 0 || expired.size > 0 || session.size > 0) {
       status = 'STALE';
     } else if (unobserved.size > 0 || incomplete.size > 0 || nonresident.size > 0) {
@@ -738,6 +851,16 @@ export function evaluateLandTransition(
     if (missingClimb.size > 0) {
       addReason('missing_climb_contact', 'proven climb regions do not continuously cover the vertical travel', [...missingClimb.values()]);
     }
+    if (limitGap !== undefined) {
+      addReason('capacity', limitGap.detail, []);
+    }
+    if (budgetExhausted) {
+      addReason(
+        'budget',
+        `work budget ${limits.maxWork} exhausted before the transition was fully evaluated`,
+        [],
+      );
+    }
     if (unsupportedShape.length > 0) {
       addReason(
         'unsupported_shape',
@@ -748,13 +871,6 @@ export function evaluateLandTransition(
     for (const detail of unsupportedModel) addReason('unsupported_model', detail, []);
     for (const detail of unsupportedProvider) addReason('unsupported_provider', detail, []);
     for (const detail of unsupportedRange) addReason('unsupported_range', detail, []);
-    if (budgetExhausted) {
-      addReason(
-        'budget',
-        `work budget ${limits.maxWork} exhausted before the transition was fully evaluated`,
-        [],
-      );
-    }
     if (stale.size > 0) addReason('stale', 'required evidence is marked stale', [...stale.values()]);
     if (expired.size > 0) addReason('expired', 'required evidence passed its validity horizon', [...expired.values()]);
     if (session.size > 0) addReason('wrong_session', 'required evidence belongs to another observation session', [...session.values()]);
@@ -793,6 +909,7 @@ export function evaluateLandTransition(
       })),
       model: modelIdentity,
       provider: climbIdentity,
+      limitGap: limitGap === undefined ? undefined : { ...limitGap },
       sessionId,
       computedAt: now,
       validUntil: [...deps.values()].reduce(
@@ -874,8 +991,17 @@ export function evaluateLandTransition(
         }
         modelIdentity = { kind: 'jump', version: model.version };
         const envelope = jumpEnvelope(from, to, apexHeight, half, height);
-        const cells = boundedCells(cellsInAabbBounded(envelope, limits.maxCandidateCells), 'jump candidates');
-        scanCollision(cells, (cell, box) => jumpHitsBox(cell, box, from, to, apexHeight, half, height));
+        const cells = boundedCells(
+          cellsInAabbBounded(envelope, limits.maxCandidateCells, countAndChargeCells),
+          'jump candidates',
+        );
+        scanCollision(
+          cells,
+          (cell, box) => jumpHitsBox(cell, box, from, to, apexHeight, half, height),
+          // The jump envelope includes corners the body never occupies. Use the
+          // exact continuous full-cell predicate before requiring evidence.
+          (cell) => jumpHitsBox(cell, FULL_CELL, from, to, apexHeight, half, height),
+        );
         if (collisions.length === 0) {
           checkSupport(from);
           checkSupport(to);
@@ -897,7 +1023,7 @@ export function evaluateLandTransition(
 
         const envelope = unionAabb(bodyAabb(from, half, height), bodyAabb(to, half, height));
         const collisionCells = boundedCells(
-          cellsInAabbBounded(envelope, limits.maxCandidateCells),
+          cellsInAabbBounded(envelope, limits.maxCandidateCells, countAndChargeCells),
           'ladder collision candidates',
         );
         scanCollision(collisionCells, (cell, box) => segmentHitsBox(cell, box, from, to, half, height));
@@ -916,7 +1042,7 @@ export function evaluateLandTransition(
           maxZ: Math.max(from.z, to.z) + half,
         };
         const climbCells = boundedCells(
-          cellsInAabbBounded(climbBounds, limits.maxCandidateCells),
+          cellsInAabbBounded(climbBounds, limits.maxCandidateCells, countAndChargeCells),
           'climb candidate cells',
         );
 
@@ -942,7 +1068,12 @@ export function evaluateLandTransition(
           }
           climbRegionCount += resolution.regions.length;
           if (climbRegionCount > limits.maxClimbRegions) {
-            throw new LandRangeLimitError(`climb regions exceed maxClimbRegions (${limits.maxClimbRegions})`);
+            noteCapacity(
+              'maxClimbRegions',
+              limits.maxClimbRegions,
+              climbRegionCount,
+              `climb regions exceed maxClimbRegions (${limits.maxClimbRegions})`,
+            );
           }
           for (const region of resolution.regions) {
             charge(1);
@@ -992,6 +1123,8 @@ export function evaluateLandTransition(
   } catch (error) {
     if (error instanceof LandBudgetExhausted) {
       budgetExhausted = true;
+    } else if (error instanceof LandCapacityIncomplete) {
+      // limitGap was recorded by noteCapacity before aborting.
     } else if (error instanceof LandRangeLimitError) {
       unsupportedRange.push(error.message);
     } else {
@@ -1145,6 +1278,7 @@ export function cloneLandTransitionEvaluation(evaluation: LandTransitionEvaluati
     dependencies: evaluation.dependencies.map((dep) => ({ ...dep, key: { ...dep.key } })),
     model: evaluation.model === undefined ? undefined : { ...evaluation.model },
     provider: evaluation.provider === undefined ? undefined : { ...evaluation.provider },
+    limitGap: evaluation.limitGap === undefined ? undefined : { ...evaluation.limitGap },
     work: { ...evaluation.work },
   };
 }

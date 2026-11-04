@@ -41,6 +41,8 @@ export type {
   ClimbRegionProvider,
   ClimbRegionResolution,
   LandJumpTrajectory,
+  LandLimitField,
+  LandLimitGap,
   LandLimits,
   LandMotionInput,
   LandMotionModel,
@@ -59,7 +61,9 @@ export type {
 export { LandRouteVerifier } from './land-route.js';
 export type {
   LandRouteBudgetGap,
+  LandRouteLimitField,
   LandRoutePendingReason,
+  LandRouteRecovery,
   LandRouteRequest,
   LandRouteSegmentState,
   LandRouteStatus,

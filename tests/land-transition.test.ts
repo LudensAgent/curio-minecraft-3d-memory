@@ -16,7 +16,13 @@ import type {
   LandRules,
   LandTransition,
   LandTransitionQuery,
+  UnitBox,
 } from '../src/index.js';
+import {
+  cellsInAabbBounded,
+  jumpHitsBox,
+  supportCandidateCells,
+} from '../src/traversability/land-geometry.js';
 import { AIR, EMPTY, fakeProvider, obs, SLAB, STONE } from './fakes.js';
 
 type Cell = [number, number, number];
@@ -326,6 +332,119 @@ describe('land step geometry', () => {
   });
 });
 
+describe('land support evidence and optional candidate diagnostics', () => {
+  const PROBE: BlockState = { name: 'minecraft:support_probe', properties: {} };
+  const supportProbeProvider: CollisionShapeProvider = {
+    version: 'land-test-support-probe-2',
+    resolve(state, cell, read) {
+      if (state.name === PROBE.name) {
+        const view = read.cell(cell.x - 1, cell.y, cell.z);
+        if (view.kind !== 'observed') return { kind: 'neighbor_gap', view };
+        return { kind: 'shape', shape: EMPTY };
+      }
+      return landProvider.resolve(state, cell, read);
+    },
+  };
+
+  const PROBE_STEP: LandTransition = {
+    kind: 'step',
+    from: { x: 1, y: 0, z: 0.5 },
+    to: { x: 2, y: 1, z: 0.5 },
+  };
+
+  /** Air cells needed by both legs of PROBE_STEP's collision corridors. */
+  function fillProbeCorridor(map: VoxelMap): void {
+    fill(map, AIR, [
+      [0, 0, 0],
+      [0, 1, 0],
+      [0, 2, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+      [1, 2, 0],
+      [2, 1, 0],
+      [2, 2, 0],
+    ]);
+  }
+
+  it('OPEN: one known positive-area support face is enough while an optional candidate is unobserved', () => {
+    const transition: LandTransition = {
+      kind: 'step',
+      from: { x: 0.1, y: 0, z: 0.5 },
+      to: { x: 1.1, y: 1, z: 0.5 },
+    };
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [0, -1, 0],
+      [1, 0, 0],
+    ]);
+    fill(map, AIR, [
+      [-1, 0, 0],
+      [-1, 1, 0],
+      [-1, 2, 0],
+      [0, 0, 0],
+      [0, 1, 0],
+      [0, 2, 0],
+      [1, 1, 0],
+      [1, 2, 0],
+    ]);
+    // (-1,-1,0) is a support-only candidate and deliberately unobserved.
+    expect(evaluate(map, transition).status).toBe('OPEN');
+  });
+
+  it('OPEN: an optional support provider neighbor gap does not poison proven support', () => {
+    // Probe is visited first and buffers its neighbor_gap; the later stone face
+    // proves start support, so the optional gap must be discarded.
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [2, 0, 0],
+      [1, -1, 0],
+    ]);
+    fill(map, PROBE, [[0, -1, 0]]);
+    fillProbeCorridor(map);
+    // (-1,-1,0), consulted by the optional probe, is deliberately unobserved.
+    const result = evaluate(map, PROBE_STEP, { shapeProvider: supportProbeProvider });
+    expect(result.status).toBe('OPEN');
+  });
+
+  it('OPEN: the reported scenario with sufficient support before an optional probe', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [2, 0, 0],
+      [0, -1, 0],
+    ]);
+    fill(map, PROBE, [[1, -1, 0]]);
+    fillProbeCorridor(map);
+
+    const result = evaluate(map, PROBE_STEP, { shapeProvider: supportProbeProvider });
+    expect(result.status).toBe('OPEN');
+  });
+
+  it('UNKNOWN: an optional provider gap is preserved when no support can be proven', () => {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [[2, 0, 0]]);
+    fill(map, PROBE, [[0, -1, 0]]);
+    fillProbeCorridor(map);
+    // (1,-1,0) is observed air; (-1,-1,0) is the probe's missing neighbor.
+
+    const result = evaluate(map, PROBE_STEP, { shapeProvider: supportProbeProvider });
+    expect(result.status).toBe('UNKNOWN');
+    const gap = result.reasons.find((reason) => reason.kind === 'unobserved');
+    expect(gap?.cells).toContainEqual({ x: -1, y: -1, z: 0 });
+
+    // The same geometry with ordinary air is a known absence, not UNKNOWN.
+    const allAir = new VoxelMap('world');
+    fill(allAir, STONE, [[2, 0, 0]]);
+    fill(allAir, AIR, [
+      [0, -1, 0],
+      [1, -1, 0],
+    ]);
+    fillProbeCorridor(allAir);
+    const blocked = evaluate(allAir, PROBE_STEP);
+    expect(blocked.status).toBe('BLOCKED');
+    expect(blocked.reason?.kind).toBe('missing_support');
+  });
+});
+
 const DROP: LandTransition = {
   kind: 'drop',
   from: { x: 0.5, y: 0, z: 0.5 },
@@ -518,6 +637,35 @@ describe('land jump geometry', () => {
     expect(result.status).toBe('OPEN');
   });
 
+  it('OPEN: a true in-envelope cell the body never occupies needs neither collision nor evidence', () => {
+    const transition: LandTransition = {
+      kind: 'jump',
+      from: { x: 0.5, y: 0, z: 0.5 },
+      to: { x: 2.5, y: 0, z: 0.5 },
+    };
+
+    // [0,3,0] is inside the jump envelope, but X overlap ends at t=0.4 while the
+    // body top only rises above y=3 at t>0.4. A solid block there is not a hit.
+    const solid = new VoxelMap('world');
+    fillOpenJump(solid, 2.5);
+    fill(solid, STONE, [[0, 3, 0]], 1500);
+    expect(evaluate(solid, transition, rules(testJumpModel())).status).toBe('OPEN');
+
+    // Leaving exactly that unoccupied cell unobserved must not demand evidence.
+    const missing = new VoxelMap('world');
+    fill(missing, STONE, [
+      [0, -1, 0],
+      [2, -1, 0],
+    ]);
+    for (let x = -1; x <= 2; x++) {
+      for (let y = 0; y <= 3; y++) {
+        if (x === 0 && y === 3) continue;
+        missing.observe(obs(AIR, { x, y, z: 0 }));
+      }
+    }
+    expect(evaluate(missing, transition, rules(testJumpModel())).status).toBe('OPEN');
+  });
+
   it('UNKNOWN: any unobserved cell actually needed by the arc blocks OPEN', () => {
     const map = new VoxelMap('world');
     fill(map, STONE, [
@@ -561,6 +709,37 @@ describe('land jump geometry', () => {
     );
     expect(tooFar.status).toBe('UNSUPPORTED');
     expect(tooFar.reason?.kind).toBe('unsupported_range');
+  });
+});
+
+describe('continuous quadratic collision intervals', () => {
+  const FULL: UnitBox = { minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 };
+  const from = { x: 0.5, y: 0, z: 0.5 };
+  const to = { x: 2.5, y: 0, z: 0.5 };
+  const apex = 1.25;
+  const half = 0.3;
+  const height = 1.8;
+
+  it('keeps ascending-only, descending-only and mid-arc contacts distinct', () => {
+    // Low cell at the start is only reachable while y is still below 1 (ascending).
+    expect(jumpHitsBox({ x: 0, y: 0, z: 0 }, FULL, from, to, apex, half, height)).toBe(true);
+    // Low cell at the far end is only reachable after the descending branch.
+    expect(jumpHitsBox({ x: 2, y: 0, z: 0 }, FULL, from, to, apex, half, height)).toBe(true);
+    // Mid-arc cell is reachable near the apex.
+    expect(jumpHitsBox({ x: 1, y: 2, z: 0 }, FULL, from, to, apex, half, height)).toBe(true);
+  });
+
+  it('treats an exact apex tangency and an unoccupied envelope corner as non-collisions', () => {
+    // With apex 1.5 and body height 1.5, the body top is exactly 3.0 at the
+    // apex. A full cell at y=3 only touches it at a single instant (zero positive
+    // overlap), using exactly representable floating-point values.
+    expect(jumpHitsBox({ x: 1, y: 3, z: 0 }, FULL, from, to, 1.5, half, 1.5)).toBe(false);
+    expect(jumpHitsBox({ x: 0, y: 3, z: 0 }, FULL, from, to, apex, half, height)).toBe(false);
+  });
+
+  it('detects a thin obstacle only while the moving body overlaps it', () => {
+    const thin: UnitBox = { minX: 0.9, minY: 0, minZ: 0, maxX: 0.95, maxY: 1, maxZ: 1 };
+    expect(jumpHitsBox({ x: 1, y: 0, z: 0 }, thin, from, to, apex, half, height)).toBe(true);
   });
 });
 
@@ -723,13 +902,16 @@ describe('land evidence boundaries and hard limits', () => {
     expect(result.dependencies.some((dep) => dep.residency === 'not_resident')).toBe(true);
   });
 
-  it('UNSUPPORTED: candidate, provider-read and shape-box limits are range gaps, never terrain BLOCKED', () => {
+  it('INCOMPLETE: candidate, neighbor-read, shape-box, support-face and climb-region caps are actionable limits', () => {
     const map = new VoxelMap('world');
     fillOpenStep(map);
 
     const candidate = evaluate(map, STEP, { shapeProvider: landProvider }, { limits: { maxCandidateCells: 1 } });
-    expect(candidate.status).toBe('UNSUPPORTED');
-    expect(candidate.reason?.kind).toBe('unsupported_range');
+    expect(candidate.status).toBe('INCOMPLETE');
+    expect(candidate.reason?.kind).toBe('capacity');
+    expect(candidate.limitGap).toMatchObject({ field: 'maxCandidateCells', value: 1 });
+    expect(candidate.limitGap!.requiredAtLeast).toBeGreaterThan(1);
+    expect(candidate.work.exhausted).toBe(false);
 
     const readLimited = evaluate(
       map,
@@ -746,8 +928,9 @@ describe('land evidence boundaries and hard limits', () => {
       },
       { limits: { maxNeighborReads: 1 } },
     );
-    expect(readLimited.status).toBe('UNSUPPORTED');
-    expect(readLimited.reason?.kind).toBe('unsupported_range');
+    expect(readLimited.status).toBe('INCOMPLETE');
+    expect(readLimited.reason?.kind).toBe('capacity');
+    expect(readLimited.limitGap).toMatchObject({ field: 'maxNeighborReads', value: 1, requiredAtLeast: 2 });
 
     const twoBoxes: CollisionShape = {
       boxes: [
@@ -770,8 +953,117 @@ describe('land evidence boundaries and hard limits', () => {
       },
       { limits: { maxShapeBoxes: 1 } },
     );
-    expect(boxLimited.status).toBe('UNSUPPORTED');
-    expect(boxLimited.reason?.kind).toBe('unsupported_range');
+    expect(boxLimited.status).toBe('INCOMPLETE');
+    expect(boxLimited.reason?.kind).toBe('capacity');
+    expect(boxLimited.limitGap).toMatchObject({ field: 'maxShapeBoxes', value: 1, requiredAtLeast: 2 });
+
+    const twoFaces: CollisionShape = {
+      boxes: [],
+      supportFaces: [
+        { top: 0.5, minX: 0, minZ: 0, maxX: 0.5, maxZ: 1 },
+        { top: 0.5, minX: 0.5, minZ: 0, maxX: 1, maxZ: 1 },
+      ],
+    };
+    const faceLimited = evaluate(
+      map,
+      STEP,
+      {
+        shapeProvider: {
+          version: 'land-test-face-limit-1',
+          resolve(state, cell, read) {
+            if (state.name === AIR.name) return { kind: 'shape', shape: twoFaces };
+            return landProvider.resolve(state, cell, read);
+          },
+        },
+      },
+      { limits: { maxSupportFaces: 1 } },
+    );
+    expect(faceLimited.status).toBe('INCOMPLETE');
+    expect(faceLimited.reason?.kind).toBe('capacity');
+    expect(faceLimited.limitGap).toMatchObject({ field: 'maxSupportFaces', value: 1, requiredAtLeast: 2 });
+
+    const climbMap = new VoxelMap('world');
+    fillLadder(climbMap, 0, 3);
+    const regionLimited = evaluate(
+      climbMap,
+      LADDER_UP,
+      {
+        shapeProvider: landProvider,
+        climbProvider: {
+          version: 'test-climb-two-regions-1',
+          resolve() {
+            return {
+              kind: 'regions',
+              regions: [
+                { minFeetY: 0, maxFeetY: 2 },
+                { minFeetY: 2, maxFeetY: 3 },
+              ],
+            };
+          },
+        },
+      },
+      { limits: { maxClimbRegions: 1 } },
+    );
+    expect(regionLimited.status).toBe('INCOMPLETE');
+    expect(regionLimited.reason?.kind).toBe('capacity');
+    expect(regionLimited.limitGap).toMatchObject({ field: 'maxClimbRegions', value: 1, requiredAtLeast: 2 });
+  });
+
+  it('UNSUPPORTED: unrepresentable numeric coordinates are distinct from configurable capacity', () => {
+    const map = new VoxelMap('world');
+    fillOpenStep(map);
+
+    const result = evaluate(
+      map,
+      STEP,
+      { shapeProvider: landProvider },
+      { body: bodyAt(STEP.from, 2 ** 54) },
+    );
+    expect(result.status).toBe('UNSUPPORTED');
+    expect(result.reason?.kind).toBe('unsupported_range');
+    expect(result.reason?.detail).toMatch(/safely representable/);
+    expect(result.limitGap).toBeUndefined();
+  });
+
+  it('INCOMPLETE: a huge candidate cap still charges enumeration before allocation', () => {
+    const map = new VoxelMap('world');
+    fillOpenStep(map);
+
+    const result = evaluate(
+      map,
+      STEP,
+      { shapeProvider: landProvider },
+      {
+        body: bodyAt(STEP.from, 1024),
+        limits: { maxCandidateCells: 2 ** 40, maxWork: 1024 },
+      },
+    );
+    expect(result.status).toBe('INCOMPLETE');
+    expect(result.work.exhausted).toBe(true);
+    expect(result.work.requiredAtLeast).toBeGreaterThan(1024);
+    expect(result.limitGap).toBeUndefined();
+  });
+
+  it('direct helpers report numeric and capacity bounds and invoke the count before allocation', () => {
+    const huge = 2 ** 54;
+    const numericAabb = cellsInAabbBounded(
+      { minX: huge, maxX: huge, minY: 0, maxY: 1, minZ: 0, maxZ: 1 },
+      100,
+    );
+    expect(numericAabb.kind).toBe('numeric');
+    expect(supportCandidateCells({ x: huge, y: 0, z: 0 }, 0.3, 100).kind).toBe('numeric');
+
+    const capacity = cellsInAabbBounded({ minX: 0, maxX: 2, minY: 0, maxY: 2, minZ: 0, maxZ: 2 }, 4);
+    expect(capacity).toEqual({ kind: 'capacity', total: 8 });
+
+    let counted = -1;
+    expect(() =>
+      cellsInAabbBounded({ minX: 0, maxX: 2, minY: 0, maxY: 2, minZ: 0, maxZ: 2 }, 100, (total) => {
+        counted = total;
+        throw new Error('stop before allocation');
+      }),
+    ).toThrow(/stop before allocation/);
+    expect(counted).toBe(8);
   });
 
   it('INCOMPLETE: work budget exhaustion is explicit and never OPEN', () => {

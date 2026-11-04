@@ -8,12 +8,12 @@
  * `assurance: 'geometry_only'`, `executable: false` snapshots.
  *
  * `advance`/`apply` process pending transitions in declared order under a
- * per-call work budget. Budget-exhausted transitions stay pending and are
- * retried from scratch by a later call; the status carries an explicit
- * `budgetGap` (`used` / `requiredAtLeast`) instead of silently remaining
- * INCOMPLETE forever. Results are revoked locally by Section `ChangeReport`,
- * provider/model version changes, evidence TTL expiry and Section
- * unload/reload residency changes.
+ * per-call work budget. Budget- or capacity-capped transitions stay pending and
+ * are retried from scratch by a later call; the status carries an explicit,
+ * structured `budgetGap` (specific limit, transition index, diagnostic, work
+ * and recovery mode) instead of silently remaining INCOMPLETE forever. Results
+ * are revoked locally by Section `ChangeReport`, provider/model version changes,
+ * evidence TTL expiry and Section unload/reload residency changes.
  */
 
 import { sectionKeyString } from '../voxel/section.js';
@@ -21,12 +21,15 @@ import type { SectionKey } from '../voxel/section.js';
 import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import { cloneLandTransitionEvaluation, evaluateLandTransition, resolveLandLimits } from './land-transition.js';
 import type {
+  LandLimitField,
   LandLimits,
   LandRules,
   LandTransition,
   LandTransitionEvaluation,
   LandTransitionReason,
+  LandTransitionReasonKind,
   LandTransitionStatus,
+  LandWorkReport,
 } from './land-transition.js';
 import type { BodyContext } from './step.js';
 
@@ -45,12 +48,41 @@ export interface LandRuleVersions {
   climbProvider?: string;
 }
 
-/** Explicit per-call budget shortfall. Pass at least `requiredAtLeast` on the next call. */
+/** The configured limit or per-call budget that stopped an advance. */
+export type LandRouteLimitField = 'advance_budget' | 'maxWork' | LandLimitField;
+
+/**
+ * How to recover from a stopped advance:
+ * `increase_advance_budget` means a larger per-call budget can help;
+ * `raise_configured_limits` means the verifier was built with a hard limit that
+ * a larger per-call budget cannot exceed, so a verifier with raised configured
+ * limits is required.
+ */
+export type LandRouteRecovery = 'increase_advance_budget' | 'raise_configured_limits';
+
+/** Explicit shortfall. `requiredAtLeast` is a lower bound, never a guarantee. */
 export interface LandRouteBudgetGap {
   /** Work units actually consumed by this call. */
   used: number;
-  /** Lower bound on the budget needed to finish the next pending transition from scratch. */
+  /** Lower bound on the per-call budget needed to finish the next pending transition from scratch. */
   requiredAtLeast: number;
+  /** Index of the pending transition that stopped the call. */
+  transitionIndex: number;
+  /** Specific budget/limit that stopped the call. */
+  limit: LandRouteLimitField;
+  /** Configured (or effective) value of that limit. */
+  limitValue: number;
+  /** Lower bound on a raised configured limit value, when recovery requires one. */
+  requiredLimitAtLeast?: number;
+  recovery: LandRouteRecovery;
+  /** Original diagnostic from the stopped transition evaluation. */
+  diagnostic: {
+    kind: LandTransitionReasonKind;
+    detail: string;
+    cells: LandTransitionReason['cells'];
+  };
+  /** Work actually consumed by that transition evaluation. */
+  transitionWork: LandWorkReport;
 }
 
 /** Input describing one route plus the fixed context under which it is verified. */
@@ -190,12 +222,18 @@ export class LandRouteVerifier {
     }
     const rules = snapshotRules(request.rules);
     const versions = snapshotVersions(rules);
-    const transitions = snapshotTransitions(request.transitions);
-    if (transitions.length > this.limits.maxTransitions) {
+    // Check the declared length before touching any element: rejecting an
+    // oversized route must not clone (or invoke getters on) a huge array.
+    const rawTransitions = request.transitions;
+    if (!Array.isArray(rawTransitions) || rawTransitions.length === 0) {
+      throw new Error('a land route needs at least one transition');
+    }
+    if (rawTransitions.length > this.limits.maxTransitions) {
       throw new Error(
-        `route has ${transitions.length} transitions, exceeding the limit of ${this.limits.maxTransitions}`,
+        `route has ${rawTransitions.length} transitions, exceeding the limit of ${this.limits.maxTransitions}`,
       );
     }
+    const transitions = snapshotTransitions(rawTransitions);
     const first = transitions[0]!;
     if (!pointsEqual(body.feet, first.from)) {
       throw new Error(
@@ -246,8 +284,9 @@ export class LandRouteVerifier {
 
   /**
    * Consume a `ChangeReport`: revoke only transitions whose recorded Section
-   * dependencies were invalidated (or whose STALE conclusion can recover on a
-   * refresh-only change), then re-verify within `budget`.
+   * dependencies were invalidated, or whose evidence-limited STALE/UNSUPPORTED
+   * conclusion can recover on a refresh-only change, then re-verify within
+   * `budget`.
    */
   apply(report: ChangeReport, budget: number): LandRouteStatus | null {
     validateBudget(budget);
@@ -316,11 +355,26 @@ export class LandRouteVerifier {
     let used = 0;
     for (const i of pending) {
       if (used >= budget) {
-        this.budgetGap = { used, requiredAtLeast: used + 1 };
+        this.budgetGap = {
+          used,
+          requiredAtLeast: 1,
+          transitionIndex: i,
+          limit: 'advance_budget',
+          limitValue: budget,
+          recovery: 'increase_advance_budget',
+          diagnostic: {
+            kind: 'budget',
+            detail: 'per-call work budget was consumed before this transition could start',
+            cells: [],
+          },
+          transitionWork: { used: 0, limit: 0, requiredAtLeast: 1, exhausted: true },
+        };
         return;
       }
       const remaining = budget - used;
-      const limits: LandLimits = { ...this.limits, maxWork: Math.min(this.limits.maxWork, remaining) };
+      const configuredMaxWork = this.limits.maxWork;
+      const effectiveMaxWork = Math.min(configuredMaxWork, remaining);
+      const limits: LandLimits = { ...this.limits, maxWork: effectiveMaxWork };
       const transition = route.transitions[i]!;
       const evaluation = evaluateLandTransition(
         this.map,
@@ -343,13 +397,54 @@ export class LandRouteVerifier {
         limits,
       );
       used += evaluation.work.used;
-      if (evaluation.status === 'INCOMPLETE' && evaluation.work.exhausted) {
-        // Do not store a budget-limited attempt: the transition stays pending and
-        // is retried from scratch when the caller supplies a larger budget.
-        this.budgetGap = {
-          used,
-          requiredAtLeast: Math.max(used + 1, evaluation.work.requiredAtLeast),
-        };
+      if (evaluation.status === 'INCOMPLETE') {
+        const diagnostic = incompleteDiagnostic(evaluation);
+        if (evaluation.work.exhausted) {
+          if (remaining < configuredMaxWork) {
+            // The per-call budget, not a configured ceiling, stopped this
+            // transition. A larger advance budget is the actionable recovery.
+            this.budgetGap = {
+              used,
+              requiredAtLeast: Math.max(1, evaluation.work.requiredAtLeast),
+              transitionIndex: i,
+              limit: 'advance_budget',
+              limitValue: remaining,
+              recovery: 'increase_advance_budget',
+              diagnostic,
+              transitionWork: { ...evaluation.work },
+            };
+          } else {
+            // The effective per-transition budget is already clamped to the
+            // verifier's configured maxWork; increasing the advance budget alone
+            // cannot pass that ceiling.
+            this.budgetGap = {
+              used,
+              requiredAtLeast: Math.max(1, evaluation.work.requiredAtLeast),
+              transitionIndex: i,
+              limit: 'maxWork',
+              limitValue: configuredMaxWork,
+              requiredLimitAtLeast: evaluation.work.requiredAtLeast,
+              recovery: 'raise_configured_limits',
+              diagnostic,
+              transitionWork: { ...evaluation.work },
+            };
+          }
+        } else if (evaluation.limitGap !== undefined) {
+          const gap = evaluation.limitGap;
+          this.budgetGap = {
+            used,
+            requiredAtLeast: Math.max(1, evaluation.work.requiredAtLeast),
+            transitionIndex: i,
+            limit: gap.field,
+            limitValue: gap.value,
+            ...(gap.requiredAtLeast === undefined ? {} : { requiredLimitAtLeast: gap.requiredAtLeast }),
+            recovery: 'raise_configured_limits',
+            diagnostic,
+            transitionWork: { ...evaluation.work },
+          };
+        }
+        // A capped attempt is never stored: the transition stays pending and is
+        // retried from scratch by a later call.
         return;
       }
       this.storeResult(i, evaluation);
@@ -407,10 +502,11 @@ export class LandRouteVerifier {
         if (section.invalidated) {
           this.invalidateTransition(i);
         } else {
-          // Refresh-only: content is unchanged, but validity was extended. Only a
-          // STALE conclusion can be limited by expired evidence and recover here.
+          // Refresh-only: content is unchanged, but validity was extended. A
+          // conclusion limited by expired evidence (STALE or an evidence-driven
+          // UNSUPPORTED) can recover here. Valid OPEN results are left alone.
           const result = this.results.get(i);
-          if (result !== undefined && result.status === 'STALE') this.invalidateTransition(i);
+          if (result !== undefined && refreshRecoverable(result)) this.invalidateTransition(i);
         }
       }
     }
@@ -524,7 +620,7 @@ export class LandRouteVerifier {
       sessionId: route.sessionId,
       assurance: 'geometry_only',
       executable: false,
-      body: cloneBody(route.body),
+      body: snapshotBody(route.body),
       ruleVersions: cloneVersions(route.versions),
       transitions: route.transitions.map(cloneTransition),
       transitionCount: route.transitions.length,
@@ -584,10 +680,8 @@ function cloneVersions(versions: LandRuleVersions): LandRuleVersions {
   return out;
 }
 
+/** Snapshot already length-validated transitions without retaining caller objects. */
 function snapshotTransitions(transitions: readonly LandTransition[]): LandTransition[] {
-  if (!Array.isArray(transitions) || transitions.length === 0) {
-    throw new Error('a land route needs at least one transition');
-  }
   return transitions.map((transition, i) => {
     if (transition === null || typeof transition !== 'object') {
       throw new Error(`transition ${i} must be an object`);
@@ -667,13 +761,25 @@ function fmt(point: { x: number; y: number; z: number }): string {
   return `(${point.x}, ${point.y}, ${point.z})`;
 }
 
-function cloneBody(body: BodyContext): BodyContext {
-  return {
-    feet: { x: body.feet.x, y: body.feet.y, z: body.feet.z },
-    width: body.width,
-    height: body.height,
-    pose: body.pose,
-  };
+/**
+ * A refresh-only ChangeReport cannot restore OPEN/BLOCKED/UNKNOWN, but expired
+ * evidence can have driven either STALE or a provider UNSUPPORTED conclusion.
+ * Mirrors the existing walk `RouteVerifier` recovery rule.
+ */
+function refreshRecoverable(result: LandTransitionEvaluation): boolean {
+  return result.status === 'STALE' || result.status === 'UNSUPPORTED';
+}
+
+/** Prefer the capacity/budget diagnostic that actually stopped the evaluation. */
+function incompleteDiagnostic(evaluation: LandTransitionEvaluation): LandRouteBudgetGap['diagnostic'] {
+  const reason =
+    evaluation.reasons.find((entry) => entry.kind === 'capacity') ??
+    evaluation.reasons.find((entry) => entry.kind === 'budget') ??
+    evaluation.reason;
+  if (reason === undefined) {
+    return { kind: 'budget', detail: 'transition evaluation stopped before completion', cells: [] };
+  }
+  return cloneReason(reason);
 }
 
 function cloneTransition(transition: LandTransition): LandTransition {
