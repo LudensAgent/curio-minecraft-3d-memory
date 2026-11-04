@@ -111,7 +111,16 @@ function action(overrides: Partial<ActionRecord> = {}): ActionRecord {
   };
 }
 
-function cellChangeEvent(id: string, options: { previous?: Observation; sessionId?: string; state?: { name: string; properties: Record<string, string> } } = {}): SpatialEvent {
+function cellChangeEvent(
+  id: string,
+  options: {
+    previous?: Observation;
+    sessionId?: string;
+    state?: { name: string; properties: Record<string, string> };
+    currentSessionId?: string;
+    currentObservedAt?: number;
+  } = {},
+): SpatialEvent {
   const sessionId = options.sessionId ?? 's1';
   return {
     kind: 'observed_cell_change',
@@ -123,8 +132,8 @@ function cellChangeEvent(id: string, options: { previous?: Observation; sessionI
     pos: { x: -1, y: 64, z: 2 },
     ...(options.previous === undefined ? {} : { previous: options.previous }),
     current: obs({
-      sessionId,
-      observedAt: 2000,
+      sessionId: options.currentSessionId ?? sessionId,
+      observedAt: options.currentObservedAt ?? 2000,
       sequence: 9,
       pos: { x: -1, y: 64, z: 2 },
       state: options.state ?? dirt,
@@ -305,6 +314,58 @@ describe('pending journal acceptance', () => {
     expect((await reopened.queryEvents()).records[0]!).not.toHaveProperty('previous');
     await reopened.close();
   });
+
+  it('rejects a current observation from another session without changing pending state', async () => {
+    const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
+    try {
+      const baseline = session.journal.recordEvent(gapEvent('baseline'));
+      const before = session.journal.readPending();
+
+      // The batch holds one valid normal event before the mismatched one; the whole
+      // batch must be rejected, leaving content, bytes and revision untouched.
+      expectKind(
+        () =>
+          session.journal.recordBatch({
+            events: [
+              gapEvent('normal-before'),
+              cellChangeEvent('bad-current-session', { currentSessionId: 'stale-session' }),
+            ],
+          }),
+        'invalid_argument',
+      );
+
+      const after = session.journal.readPending();
+      expect(after).toEqual(before);
+      expect(after.bytes).toBe(before.bytes);
+      expect(after.revision).toBe(baseline.revision);
+      expect(session.getPersistenceState()).toMatchObject({ pendingJournalRecords: 1, dirty: true });
+    } finally {
+      const closed = await session.close();
+      expect(closed.completed).toBe(true);
+    }
+  });
+
+  it('rejects a current observation whose acquisition time differs from the event without changing pending state', async () => {
+    const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
+    try {
+      const baseline = session.journal.recordEvent(gapEvent('baseline'));
+      const before = session.journal.readPending();
+
+      expectKind(
+        () => session.journal.recordEvent(cellChangeEvent('bad-current-time', { currentObservedAt: 1999 })),
+        'invalid_argument',
+      );
+
+      const after = session.journal.readPending();
+      expect(after).toEqual(before);
+      expect(after.bytes).toBe(before.bytes);
+      expect(after.revision).toBe(baseline.revision);
+      expect(session.getPersistenceState()).toMatchObject({ pendingJournalRecords: 1, dirty: true });
+    } finally {
+      const closed = await session.close();
+      expect(closed.completed).toBe(true);
+    }
+  });
 });
 
 // ==============================================================================
@@ -362,7 +423,9 @@ describe('journal checkpoint roundtrip', () => {
 
   it('round-trips observed-change and gap evidence, preserving previous absence', async () => {
     const dbPath = makeDbPath();
-    const previous = obs({ observedAt: 500, state: stone, pos: { x: -1, y: 64, z: 2 } });
+    // The previous observation is a real earlier snapshot from a different session.
+    // It must survive verbatim; only the current observation belongs to this event.
+    const previous = obs({ sessionId: 's0-earlier', observedAt: 500, state: stone, pos: { x: -1, y: 64, z: 2 } });
     const withPrevious = cellChangeEvent('change-with-previous', { previous });
     const withoutPrevious = cellChangeEvent('change-without-previous');
     const gap = gapEvent('gap-1');
@@ -371,14 +434,21 @@ describe('journal checkpoint roundtrip', () => {
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     session.journal.recordBatch({ events: [withPrevious, withoutPrevious, gap] });
     await session.checkpoint();
+    expect(session.getPersistenceState()).toMatchObject({ dirty: false, pendingJournalRecords: 0 });
+    expect(session.getPersistenceState().confirmedJournalRevision).toBe(session.getPersistenceState().journalRevision);
     await session.close();
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.getPersistenceState()).toMatchObject({ dirty: false, committedJournalRecords: 3 });
     const page = await reopened.queryEvents();
     expect(page.records).toEqual(expected);
     const noPrevious = page.records.find((e) => e.id === 'change-without-previous')!;
     expect('previous' in noPrevious).toBe(false);
-    expect((page.records[0]! as Extract<SpatialEvent, { kind: 'observed_cell_change' }>).previous).toEqual(previous);
+    const changed = page.records[0]! as Extract<SpatialEvent, { kind: 'observed_cell_change' }>;
+    expect(changed.previous).toEqual(previous);
+    expect(changed.previous!.sessionId).toBe('s0-earlier');
+    expect(changed.previous!.observedAt).toBe(500);
+    expect(changed.current).toMatchObject({ sessionId: 's1', observedAt: 2000 });
 
     const gapsOnly = await reopened.queryEvents({ kind: 'observation_gap' });
     expect(gapsOnly.records.map((e) => e.id)).toEqual(['gap-1']);

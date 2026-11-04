@@ -258,6 +258,16 @@ function validateEvent(event: SpatialEvent, worldId: string): void {
   if (event.kind === 'observed_cell_change') {
     if (!isRecord(event.pos)) throw invalid('observed_cell_change.pos must be a position object');
     validateObservationScope(event.current, { worldId, dim, pos: event.pos }, 'observed_cell_change.current');
+    // The current observation establishes this change, so it must belong to the
+    // event's own session and carry the exact acquisition time of this
+    // observation. A previous observation is deliberately exempt: it may keep
+    // its real older session and time.
+    if (event.current.sessionId !== event.sessionId) {
+      throw invalid('observed_cell_change.current.sessionId does not match the event sessionId');
+    }
+    if (event.current.observedAt !== event.observedAt) {
+      throw invalid('observed_cell_change.current.observedAt does not match the event observedAt');
+    }
     if (event.previous !== undefined) {
       // The previous observation may belong to an older session; its original
       // sessionId/evidence/time are preserved. Its scope and cell must still match.
