@@ -44,9 +44,19 @@ interface CanonicalizeState {
 
 const INVALID_RECORD = 'journal record';
 
-/** Stable scope key for one record: worldId + sessionId + id (never taskId alone). */
-export function journalScopeKey(worldId: string, sessionId: string, id: string): string {
-  return JSON.stringify([worldId, sessionId, id]);
+/**
+ * Stable scoped identity for one record: `(kind, worldId, sessionId, id)`.
+ * Actions and events are separate namespaces, matching the separate pending maps
+ * and the separate SQL tables; the same id may therefore exist once as an action
+ * and once as an event in the same world/session. `taskId` is never an identity.
+ */
+export function journalScopeKey(
+  kind: 'action' | 'event',
+  worldId: string,
+  sessionId: string,
+  id: string,
+): string {
+  return JSON.stringify([kind, worldId, sessionId, id]);
 }
 
 function overLimit(name: string, value: number, limit: number): PersistenceError {
@@ -397,15 +407,58 @@ export class JournalQueue {
       throw overLimit('maxPendingRecords', total, this.limits.maxPendingRecords);
     }
 
-    const candidates: CandidateEntry[] = [];
-    const inBatch = new Map<string, CandidateEntry>();
+    // Stage one candidate at a time. Only fresh candidates are retained, and the
+    // cumulative fresh count/bytes are checked *before* retaining each one. A
+    // pending duplicate is compared against the already-retained canonical payload
+    // without keeping a second canonical copy. Nothing mutates the live queue until
+    // the whole batch has validated.
+    const inBatch = new Map<string, string>();
     let duplicates = 0;
+    let finalRecords = this.pendingRecords;
+    let finalBytes = this.bytes;
+    const fresh: CandidateEntry[] = [];
 
     const stage = (kind: 'action' | 'event', record: ActionRecord | SpatialEvent): void => {
       const sessionId = record.sessionId;
       const id = record.id;
-      const key = journalScopeKey(this.worldId, sessionId, id);
+      const key = journalScopeKey(kind, this.worldId, sessionId, id);
       const canonical = canonicalizeJournalRecord(record, this.limits);
+
+      const priorJson = inBatch.get(key);
+      if (priorJson !== undefined) {
+        if (priorJson !== canonical.json) {
+          throw new JournalConflictError(
+            `journal ${kind} conflict for session "${sessionId}" id "${id}": replay content differs`,
+          );
+        }
+        duplicates += 1;
+        return;
+      }
+
+      const map = kind === 'action' ? this.actions : this.events;
+      const existing = map.get(key);
+      if (existing !== undefined) {
+        if (existing.json !== canonical.json) {
+          throw new JournalConflictError(
+            `journal ${kind} conflict for session "${sessionId}" id "${id}": pending content differs`,
+          );
+        }
+        // Reference the pending payload, not a canonical copy of the input.
+        inBatch.set(key, existing.json);
+        duplicates += 1;
+        return;
+      }
+
+      // Enforce cumulative capacity immediately before retaining this fresh record.
+      finalRecords += 1;
+      finalBytes += canonical.bytes;
+      if (finalRecords > this.limits.maxPendingRecords) {
+        throw overLimit('maxPendingRecords', finalRecords, this.limits.maxPendingRecords);
+      }
+      if (finalBytes > this.limits.maxPendingBytes) {
+        throw overLimit('maxPendingBytes', finalBytes, this.limits.maxPendingBytes);
+      }
+
       const candidate: CandidateEntry = {
         kind,
         sessionId,
@@ -415,18 +468,8 @@ export class JournalQueue {
         bytes: canonical.bytes,
         record: canonical.record,
       };
-      const prior = inBatch.get(key);
-      if (prior !== undefined) {
-        if (prior.kind !== kind || prior.json !== candidate.json) {
-          throw new JournalConflictError(
-            `journal ${kind} conflict for session "${sessionId}" id "${id}": replay content differs`,
-          );
-        }
-        duplicates += 1;
-        return;
-      }
-      inBatch.set(key, candidate);
-      candidates.push(candidate);
+      inBatch.set(key, candidate.json);
+      fresh.push(candidate);
     };
 
     for (const action of rawActions) {
@@ -436,34 +479,6 @@ export class JournalQueue {
     for (const event of rawEvents) {
       validateEvent(event, this.worldId);
       stage('event', event);
-    }
-
-    // Check pending conflicts and compute the post-accept capacities before any
-    // mutation. Identical duplicates consume no extra quota and are idempotent.
-    let finalRecords = this.pendingRecords;
-    let finalBytes = this.bytes;
-    const fresh: CandidateEntry[] = [];
-    for (const candidate of candidates) {
-      const map = candidate.kind === 'action' ? this.actions : this.events;
-      const existing = map.get(candidate.key);
-      if (existing !== undefined) {
-        if (existing.json !== candidate.json) {
-          throw new JournalConflictError(
-            `journal ${candidate.kind} conflict for session "${candidate.sessionId}" id "${candidate.id}": pending content differs`,
-          );
-        }
-        duplicates += 1;
-        continue;
-      }
-      fresh.push(candidate);
-      finalRecords += 1;
-      finalBytes += candidate.bytes;
-    }
-    if (finalRecords > this.limits.maxPendingRecords) {
-      throw overLimit('maxPendingRecords', finalRecords, this.limits.maxPendingRecords);
-    }
-    if (finalBytes > this.limits.maxPendingBytes) {
-      throw overLimit('maxPendingBytes', finalBytes, this.limits.maxPendingBytes);
     }
 
     for (const candidate of fresh) {
@@ -537,7 +552,11 @@ export class JournalQueue {
     for (const entry of selected) {
       if (entry.kind === 'action') actions.push(entry.record as ActionRecord);
       else events.push(entry.record as SpatialEvent);
-      keys.push({ kind: entry.kind, key: journalScopeKey(this.worldId, entry.sessionId, entry.id), revision: entry.revision });
+      keys.push({
+        kind: entry.kind,
+        key: journalScopeKey(entry.kind, this.worldId, entry.sessionId, entry.id),
+        revision: entry.revision,
+      });
     }
     const last = selected[selected.length - 1]!;
     return {
@@ -579,34 +598,40 @@ export class JournalQueue {
     if (total > this.limits.maxPendingRecords) {
       throw overLimit('maxPendingRecords', total, this.limits.maxPendingRecords);
     }
-    const withdrawn: JournalWithdrawalResult['withdrawn'] = { actions: [], events: [] };
-    const missing: JournalWithdrawalResult['missing'] = [];
+    // Validate, bound and deduplicate the complete selector before mutating any
+    // pending entry, so a malformed later selector cannot strand an earlier
+    // withdrawal without a returned fact or revision advance.
     const seen = new Set<string>();
-    let removed = 0;
-
-    const take = (kind: 'action' | 'event', ref: { sessionId: string; id: string }): void => {
+    const ops: { kind: 'action' | 'event'; sessionId: string; id: string; key: string }[] = [];
+    const plan = (kind: 'action' | 'event', ref: { sessionId: string; id: string }): void => {
       if (!isRecord(ref)) throw invalid('journal withdrawal ids must be objects');
       const sessionId = requireString(ref.sessionId, 'withdrawal.sessionId');
       const id = requireString(ref.id, 'withdrawal.id');
-      const key = journalScopeKey(this.worldId, sessionId, id);
-      const token = `${kind} ${key}`;
-      if (seen.has(token)) return;
-      seen.add(token);
+      const key = journalScopeKey(kind, this.worldId, sessionId, id);
+      if (seen.has(key)) return;
+      seen.add(key);
+      ops.push({ kind, sessionId, id, key });
+    };
+
+    for (const ref of actionSelectors) plan('action', ref);
+    for (const ref of eventSelectors) plan('event', ref);
+
+    const withdrawn: JournalWithdrawalResult['withdrawn'] = { actions: [], events: [] };
+    const missing: JournalWithdrawalResult['missing'] = [];
+    let removed = 0;
+    for (const { kind, sessionId, id, key } of ops) {
       const map = kind === 'action' ? this.actions : this.events;
       const entry = map.get(key);
       if (entry === undefined) {
         missing.push({ kind, sessionId, id });
-        return;
+        continue;
       }
       map.delete(key);
       this.bytes -= entry.bytes;
       removed += 1;
       if (kind === 'action') withdrawn.actions.push(JSON.parse(entry.json) as ActionRecord);
       else withdrawn.events.push(JSON.parse(entry.json) as SpatialEvent);
-    };
-
-    for (const ref of actionSelectors) take('action', ref);
-    for (const ref of eventSelectors) take('event', ref);
+    }
     if (removed > 0) this.revisionField += 1;
     return {
       withdrawn,

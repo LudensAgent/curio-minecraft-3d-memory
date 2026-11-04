@@ -1045,6 +1045,9 @@ class SpatialSessionImpl implements SpatialSession {
         voxelRevision: entry.voxelRevision!,
         fragmentRevision: entry.fragmentRevision!,
         topologyRevision: entry.topologyRevision!,
+        // Exact captured (and now ACK-confirmed) revision, not the latest queue
+        // revision. A truncated capture reports only its confirmed prefix.
+        journalRevision: entry.journalCapture?.revision ?? this.confirmedJournalRevision,
       });
     } else {
       entry.resolve(true);

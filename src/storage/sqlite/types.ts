@@ -528,6 +528,12 @@ export interface SpatialCheckpointResult {
   voxelRevision: number;
   fragmentRevision: number;
   topologyRevision: number;
+  /**
+   * The exact journal revision captured for this checkpoint and confirmed by its
+   * ACK. A batch truncated by `maxBatchRecords`/`maxBatchBytes` reports only the
+   * captured prefix, never the latest local queue revision.
+   */
+  journalRevision: number;
 }
 
 /**

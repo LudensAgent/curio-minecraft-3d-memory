@@ -232,6 +232,40 @@ describe('pending journal acceptance', () => {
     await session.close();
   });
 
+  it('scopes identity by kind, so an action and an event may share world/session/id', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const sharedAction = action({ id: 'shared' });
+    const sharedEvent = cellChangeEvent('shared');
+
+    // One batch: the same id in the action and event namespaces is not a conflict.
+    expect(session.journal.recordBatch({ actions: [sharedAction], events: [sharedEvent] })).toMatchObject({
+      accepted: 2,
+      duplicates: 0,
+      pendingRecords: 2,
+    });
+    // Replays are idempotent per kind, still without cross-kind conflict.
+    expect(session.journal.recordAction(sharedAction)).toMatchObject({ duplicate: true, pendingRecords: 2 });
+    expect(session.journal.recordEvent(sharedEvent)).toMatchObject({ duplicate: true, pendingRecords: 2 });
+    // Same-kind different content still conflicts in both namespaces.
+    expectKind(() => session.journal.recordAction({ ...sharedAction, ts: 4242 }), 'conflict');
+    expectKind(() => session.journal.recordEvent(cellChangeEvent('shared', { state: air })), 'conflict');
+
+    // Separate calls on another pair also coexist without sharing a namespace.
+    expect(session.journal.recordAction(action({ id: 'separate' }))).toMatchObject({ duplicate: false });
+    expect(session.journal.recordEvent(gapEvent('separate'))).toMatchObject({ duplicate: false });
+
+    await session.checkpoint();
+    await session.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect((await reopened.queryActions({ actionId: 'shared' })).records.map((a) => a.id)).toEqual(['shared']);
+    expect((await reopened.queryEvents({ eventId: 'shared' })).records.map((e) => e.id)).toEqual(['shared']);
+    expect((await reopened.queryActions({ actionId: 'separate' })).records.map((a) => a.id)).toEqual(['separate']);
+    expect((await reopened.queryEvents({ eventId: 'separate' })).records.map((e) => e.id)).toEqual(['separate']);
+    await reopened.close();
+  });
+
   it('accepts or rejects a batch atomically (mixed-world input changes nothing)', async () => {
     const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
     const base = session.journal.recordAction(action({ id: 'kept' }));
@@ -488,6 +522,91 @@ describe('journal conflicts and capacity', () => {
     await session.close();
   });
 
+  it('enforces cumulative batch capacity before inspecting or retaining later records', async () => {
+    // Measure one canonical record with a 6-character id; ids of equal length have
+    // identical canonical sizes, so three records need exactly 3 × `unit` bytes.
+    const probe = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
+    const unit = probe.journal.recordAction(action({ id: 'size-a' })).pendingBytes;
+    await probe.close();
+
+    const session = await openSpatialSession({
+      databasePath: makeDbPath(),
+      worldId: WORLD,
+      journalLimits: { maxPendingBytes: unit * 3 - 1, maxRecordBytes: unit },
+    });
+    const baseline = session.journal.recordAction(action({ id: 'size-b' }));
+    expect(baseline.pendingBytes).toBe(unit);
+
+    // The third input is never inspected: reading `ts` would throw a plain Error,
+    // so a capacity rejection proves the later record was not staged or retained.
+    const later = action({ id: 'size-c' });
+    Object.defineProperty(later, 'ts', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error('a record after the capacity crossing was inspected');
+      },
+    });
+
+    expectKind(
+      () =>
+        session.journal.recordBatch({
+          actions: [action({ id: 'size-d' }), action({ id: 'size-e' }), later],
+        }),
+      'capacity',
+    );
+
+    // The whole rejected batch left the pre-existing pending state byte-for-byte
+    // and revision-for-revision unchanged (the first fresh record was not retained).
+    const pending = session.journal.readPending();
+    expect(pending.actions.map((a) => a.id)).toEqual(['size-b']);
+    expect(pending.bytes).toBe(unit);
+    expect(pending.revision).toBe(baseline.revision);
+    expect(session.getPersistenceState()).toMatchObject({ pendingJournalRecords: 1, dirty: true });
+    await session.close();
+  });
+
+  it('validates the entire withdrawal selector before mutating any pending entry', async () => {
+    const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
+    session.journal.recordBatch({
+      actions: [action({ id: 'keep-a' })],
+      events: [gapEvent('keep-e')],
+    });
+    const before = session.journal.readPending();
+
+    // The first selector is valid; the second is malformed. Nothing may be lost.
+    expectKind(
+      () =>
+        session.journal.withdraw({
+          actions: [{ sessionId: 's1', id: 'keep-a' }],
+          events: [{ sessionId: 's1', id: '' }],
+        }),
+      'invalid_argument',
+    );
+
+    const after = session.journal.readPending();
+    expect(after.actions.map((a) => a.id)).toEqual(['keep-a']);
+    expect(after.events.map((e) => e.id)).toEqual(['keep-e']);
+    expect(after.bytes).toBe(before.bytes);
+    expect(after.revision).toBe(before.revision);
+    expect(session.getPersistenceState()).toMatchObject({
+      pendingJournalRecords: 2,
+      pendingJournalBytes: before.bytes,
+    });
+
+    // A valid selector still withdraws and reports the exact returned facts.
+    const withdrawn = session.journal.withdraw({
+      actions: [{ sessionId: 's1', id: 'keep-a' }],
+      events: [{ sessionId: 's1', id: 'keep-e' }],
+    });
+    expect(withdrawn.withdrawn.actions.map((a) => a.id)).toEqual(['keep-a']);
+    expect(withdrawn.withdrawn.events.map((e) => e.id)).toEqual(['keep-e']);
+    expect(withdrawn.missing).toEqual([]);
+    expect(withdrawn.revision).toBe(before.revision + 1);
+    expect(withdrawn.pendingRecords).toBe(0);
+    await session.close();
+  });
+
   it('durable capacity keeps pending records dirty and allows duplicate replay at the cap', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({
@@ -590,6 +709,56 @@ describe('journal checkpoint capture and paging', () => {
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     expect((await reopened.queryActions()).records.map((a) => a.id)).toEqual(['a1', 'a2']);
+    await reopened.close();
+  });
+
+  it('reports the exact captured journal revision for each truncated checkpoint batch', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({
+      databasePath: dbPath,
+      worldId: WORLD,
+      journalLimits: { maxBatchRecords: 1 },
+    });
+    const r1 = session.journal.recordAction(action({ id: 'c1' })).revision;
+    const r2 = session.journal.recordAction(action({ id: 'c2' })).revision;
+    const r3 = session.journal.recordAction(action({ id: 'c3' })).revision;
+    expect(r1).toBeLessThan(r2);
+    expect(r2).toBeLessThan(r3);
+
+    // Each result reports only the prefix it actually captured and confirmed, not
+    // the latest local queue revision (r3).
+    const first = await session.checkpoint();
+    expect(first.journalRevision).toBe(r1);
+    expect(first.journalRevision).not.toBe(session.getPersistenceState().journalRevision);
+    expect(session.getPersistenceState()).toMatchObject({
+      confirmedJournalRevision: r1,
+      pendingJournalRecords: 2,
+      dirty: true,
+    });
+    expect(session.journal.readPending().actions.map((a) => a.id)).toEqual(['c2', 'c3']);
+
+    const second = await session.checkpoint();
+    expect(second.journalRevision).toBe(r2);
+    expect(session.getPersistenceState()).toMatchObject({
+      confirmedJournalRevision: r2,
+      pendingJournalRecords: 1,
+      dirty: true,
+    });
+    expect(session.journal.readPending().actions.map((a) => a.id)).toEqual(['c3']);
+
+    const final = await session.checkpoint();
+    expect(final.journalRevision).toBe(r3);
+    expect(session.getPersistenceState()).toMatchObject({
+      confirmedJournalRevision: r3,
+      pendingJournalRecords: 0,
+      dirty: false,
+    });
+    expect(session.journal.readPending().actions).toEqual([]);
+    await session.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.getPersistenceState()).toMatchObject({ journalRevision: r3, dirty: false });
+    expect((await reopened.queryActions()).records.map((a) => a.id)).toEqual(['c1', 'c2', 'c3']);
     await reopened.close();
   });
 
@@ -752,6 +921,136 @@ describe('journal lifecycle and recovery', () => {
     const verified = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     expect((await verified.queryActions()).records.map((a) => a.id)).toEqual(['recover-me']);
     await verified.close();
+  });
+
+  it('rolls back every checkpoint domain on a real SQL abort, then retries cleanly', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    session.voxel.beginSession('s1');
+    session.voxel.observe(obs({ state: stone, pos: { x: 3, y: 0, z: 0 } }));
+    session.history.saveFragment({
+      id: 'f-abort',
+      worldId: WORLD,
+      dim: DIM,
+      kind: 'walked',
+      entrances: [],
+      polyline: [{ x: 0, y: 64, z: 0 }],
+      geometrySource: 'traversal',
+      deepestY: 64,
+      createdAt: 1,
+      lastUsedAt: 1,
+      uses: 1,
+    });
+    session.journal.recordBatch({
+      actions: [action({ id: 'abort-me' })],
+      events: [gapEvent('abort-gap')],
+    });
+
+    // Real SQLite trigger on a second connection: the worker's append aborts inside
+    // the checkpoint transaction (no production fault-injection hook).
+    const admin = new Database(dbPath);
+    admin.exec(
+      "CREATE TRIGGER abort_journal BEFORE INSERT ON action_records WHEN NEW.id = 'abort-me' " +
+        "BEGIN SELECT RAISE(ABORT, 'forced journal abort'); END",
+    );
+
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'sql' });
+    expect(session.journal.readPending().actions.map((a) => a.id)).toEqual(['abort-me']);
+    expect(session.journal.readPending().events.map((e) => e.id)).toEqual(['abort-gap']);
+    expect(session.getPersistenceState()).toMatchObject({ dirty: true, pendingJournalRecords: 2 });
+
+    // Every domain rolled back together: nothing was committed on disk.
+    const count = (table: string): number =>
+      (admin.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+    expect({
+      fragments: count('path_fragments'),
+      sections: count('spatial_sections'),
+      actions: count('action_records'),
+      events: count('spatial_events'),
+      checkpoints: count('checkpoints'),
+    }).toEqual({ fragments: 0, sections: 0, actions: 0, events: 0, checkpoints: 0 });
+
+    admin.exec('DROP TRIGGER abort_journal');
+    admin.close();
+
+    // Successful retry commits the same pending batch exactly once.
+    await session.checkpoint();
+    expect(session.getPersistenceState()).toMatchObject({ dirty: false, pendingJournalRecords: 0 });
+    await session.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.history.getFragment('f-abort')).not.toBeNull();
+    expect(reopened.voxel.cellAt(DIM, 3, 0, 0)).toMatchObject({ observed: true });
+    expect((await reopened.queryActions()).records.map((a) => a.id)).toEqual(['abort-me']);
+    expect((await reopened.queryEvents()).records.map((e) => e.id)).toEqual(['abort-gap']);
+    expect(reopened.getPersistenceState()).toMatchObject({ committedJournalRecords: 2, dirty: false });
+    await reopened.close();
+  });
+
+  it('keeps recovery facts across a real worker checkpoint timeout and replays to one fact', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    // Enough journal work that the worker cannot finish before a 1 ms ACK deadline.
+    const pendingActions = Array.from({ length: 500 }, (_, i) => action({ id: `timeout-${i}` }));
+    const replayedFact = pendingActions[0]!;
+    session.journal.recordBatch({ actions: pendingActions });
+
+    // Opening needs the normal bound (worker spawn), so shorten only this test
+    // session's checkpoint ACK deadline. This is a test-local timer adjustment, not
+    // a production fault-injection hook: the worker still runs the real checkpoint.
+    (session as unknown as { timeoutMs: number }).timeoutMs = 1;
+    await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'timeout_unconfirmed' });
+
+    // Every accepted fact is still pending, and the session never reports the
+    // unconfirmed checkpoint as saved.
+    expect(session.journal.readPending().actions.map((a) => a.id)).toEqual(pendingActions.map((a) => a.id));
+    const state = session.getPersistenceState();
+    expect(state).toMatchObject({
+      dirty: true,
+      pendingJournalRecords: pendingActions.length,
+      lastConfirmedCheckpointId: null,
+      confirmedJournalRevision: 0,
+      lastError: expect.objectContaining({ kind: 'timeout_unconfirmed' }),
+      unconfirmedCheckpointId: expect.any(String),
+    });
+    expect(state.committedJournalRecords).toBe(0);
+    await session.close();
+
+    // Reopen and replay everything under the same stable ids. Whether the expired
+    // checkpoint committed before the worker was terminated or not, each id ends
+    // up committed exactly once. A bounded retry absorbs the old worker still
+    // finishing (SQLITE_BUSY is surfaced as `kind: 'sql'`).
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      let reopened: Awaited<ReturnType<typeof openSpatialSession>> | null = null;
+      try {
+        reopened = await openSpatialSession({
+          databasePath: dbPath,
+          worldId: WORLD,
+          journalLimits: { maxPageRecords: 1000, maxPageBytes: 4 * 1024 * 1024 },
+        });
+        expect(reopened.journal.recordBatch({ actions: pendingActions })).toMatchObject({
+          accepted: pendingActions.length,
+          duplicates: 0,
+        });
+        await reopened.checkpoint();
+        const records = (await reopened.queryActions()).records;
+        expect(records).toHaveLength(pendingActions.length);
+        expect(new Set(records.map((r) => r.id)).size).toBe(pendingActions.length);
+        expect((await reopened.queryActions({ actionId: replayedFact.id })).records).toEqual([replayedFact]);
+        expect(reopened.getPersistenceState()).toMatchObject({
+          committedJournalRecords: pendingActions.length,
+          pendingJournalRecords: 0,
+          dirty: false,
+        });
+        await reopened.close();
+        break;
+      } catch (err) {
+        if (reopened !== null) await reopened.close();
+        if (Date.now() > deadline || !(err instanceof PersistenceError) || err.kind !== 'sql') throw err;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
   });
 
   it('close waits for an already-accepted checkpoint and clears only its captured batch', async () => {

@@ -10,14 +10,6 @@ import { openHistorySession, openSpatialSession, PersistenceError } from '../dis
 import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from '../src/storage/sqlite/types.js';
 import * as distBytes from '../dist/bytes.js';
 
-// Mock the built helper rather than `vi.spyOn`-ing its ESM namespace: namespace
-// exports are non-configurable on this Node/Vitest combination. The assertion
-// (the escaped-byte scan is never reached) is unchanged.
-vi.mock('../dist/bytes.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../dist/bytes.js')>();
-  return { ...actual, jsonEscapedByteLength: vi.fn(actual.jsonEscapedByteLength) };
-});
-
 const WORLD = 'world';
 const DIM = 'overworld';
 
@@ -595,8 +587,7 @@ describe('SQLite combined spatial persistence', () => {
     // scan (`jsonEscapedByteLength`) is the full per-character pass; observing that
     // it never runs pins the early stop to the cheap length check rather than to the
     // later envelope check or the store measures.
-    const escapedSpy = vi.mocked(distBytes.jsonEscapedByteLength);
-    escapedSpy.mockClear();
+    const escapedSpy = vi.spyOn(distBytes, 'jsonEscapedByteLength');
     const measureSpies = [
       vi.spyOn(session.voxel, 'checkpointMeasure'),
       vi.spyOn(session.voxel, 'checkpointDirtyMeasure'),
@@ -614,6 +605,7 @@ describe('SQLite combined spatial persistence', () => {
 
     expect(escapedSpy).not.toHaveBeenCalled();
     for (const spy of [...measureSpies, ...snapshotSpies]) expect(spy).not.toHaveBeenCalled();
+    escapedSpy.mockRestore();
     await session.close();
   });
 

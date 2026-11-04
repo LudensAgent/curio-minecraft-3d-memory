@@ -1258,9 +1258,11 @@ function loadVoxelDirectory(
 }
 
 /**
- * Read only the committed journal baseline/count metadata for this world — never
- * the event/action payloads. This is what makes reopen cost independent of the
- * lifetime journal size.
+ * Read only the committed journal baseline/count metadata for this world —
+ * payloads are never decoded or loaded. This still scans committed metadata for
+ * this world (`COUNT(*)` plus `SUM(octet_length(payload))` over both tables), so
+ * reopen work grows with the number of committed rows, not with payload size or
+ * decode cost.
  */
 function loadJournalMeta(
   connection: Database.Database,
