@@ -18,7 +18,20 @@
  * further physics frame), then produce and dispatch the lifecycle reports
  * (`markStale` / `beginSession`) to the active verifier and executor. A readonly
  * verifier never refreshes itself when the map session changes — it must receive
- * the report explicitly.
+ * the report explicitly. A late old-session body frame is likewise ignored: it
+ * cannot reactivate control or rewrite the cancellation.
+ *
+ * The save/close path is owned by a small resource boundary (`runOwned`) that
+ * guarantees a bounded `close()` for every opened session (primary, reopened,
+ * capacity) before the temp directory is removed, and preserves the original
+ * (primary) error while recording close/cleanup failures as secondary
+ * diagnostics. If shutdown is not clean the temp directory is retained.
+ *
+ * It uses the default `eager` voxel loading, which restores every committed
+ * section at open and is only appropriate when the world fits the session's
+ * working-set budget. For on-demand residency and route pin protection, see
+ * `examples/working-set.ts` and the "manual on-demand section residency" README
+ * section — this example does not imply eager loading suits every world.
  *
  * Run with (the package self-resolves its own name through `exports`):
  *
@@ -26,11 +39,11 @@
  *   npx tsx examples/shared-session-lifecycle.ts
  */
 
-import { mkdtempSync, renameSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
+import { RouteVerifier, VoxelMap, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
 import type {
   BodySample,
   ChangeReport,
@@ -43,7 +56,11 @@ import type {
   WalkRouteRequest,
 } from 'curio-minecraft-3d-memory';
 import { openSpatialSession, PersistenceError } from 'curio-minecraft-3d-memory/storage/sqlite';
-import type { SpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
+import type {
+  CloseResult,
+  OpenSpatialSessionOptions,
+  SpatialSession,
+} from 'curio-minecraft-3d-memory/storage/sqlite';
 
 export const WORLD = 'world';
 export const DIM = 'overworld';
@@ -92,12 +109,7 @@ export class HangingExecutor implements MoveExecutor {
   }
 }
 
-/**
- * Host perception: write one real observation into the shared map and hand the
- * resulting `ChangeReport` back so the caller can forward it to any active route
- * (via `RouteVerifier.apply` / `WalkRouteExecutor.observe`). The library never
- * scans the world; it only diffs what the host actually saw.
- */
+/** Host perception: write one real observation and hand back its `ChangeReport`. */
 export function observe(
   map: { observe: (o: Observation) => ChangeReport },
   sessionId: string,
@@ -148,18 +160,9 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(`assertion failed: ${message}`);
 }
 
-/** Remove only the task-created temp directory (a child of the OS temp dir). */
-function removeTaskDir(dir: string): void {
-  const root = resolve(dir);
-  const tmp = resolve(tmpdir());
-  if (root !== tmp && !root.startsWith(tmp + sep)) {
-    throw new Error(`refusing to delete outside the task temp dir: ${root}`);
-  }
-  rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-}
-
 /** Seed the shared map with the grounded corridor used by every scenario. */
-function seedCorridor(map: { observe: (o: Observation) => ChangeReport }): void {
+export function seedCorridor(map: VoxelMap): void {
+  map.beginSession('conn-1');
   let seq = 0;
   for (let x = 0; x <= 3; x++) {
     observe(map, 'conn-1', STONE, { x, y: -1, z: 0 }, ++seq, NOW);
@@ -168,122 +171,303 @@ function seedCorridor(map: { observe: (o: Observation) => ChangeReport }): void 
   }
 }
 
-async function main(): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), 'shared-session-'));
-  try {
-    await runLifecycle(dir);
-    console.log('shared-session-lifecycle: all checks passed; temp dir removed.');
-  } finally {
-    removeTaskDir(dir);
+/** Register a readonly verifier for the conn-1 route and fully verify it. */
+export function registerConn1Verifier(map: VoxelMap, clock: () => number): RouteVerifier {
+  const verifier = new RouteVerifier(map, { now: clock });
+  verifier.register({
+    worldId: WORLD, dim: DIM, sessionId: 'conn-1', mode: 'walk',
+    body: BODY, shapeProvider, points: POINTS,
+  });
+  verifier.advance(10);
+  return verifier;
+}
+
+/** Start a conn-1 walk delegation and leave it in flight (hanging body). */
+export function startConn1Walk(map: VoxelMap, clock: () => number): { walk: WalkRouteExecutor; body: HangingExecutor } {
+  const body = new HangingExecutor();
+  const walk = new WalkRouteExecutor(map, body, { now: clock });
+  const started = walk.start(walkRequest('conn-1'));
+  walk.onSample(sampleAt(started.delegationId, 'conn-1', POINTS[0]!));
+  walk.advance(10);
+  return { walk, body };
+}
+
+/** Evidence collected by the real disconnect wiring, for the shared assertions. */
+export interface DisconnectResult {
+  verdict: string;
+  walkOutcome: string | null;
+  activeStepIndex: number | null;
+  lateObservationRejected: boolean;
+  reobservedCellFresh: boolean;
+  neighborCellStale: boolean;
+  stopCalls: string[];
+  lastMoveExecutionId: string | null;
+}
+
+/**
+ * The real disconnect channel: cancel the old delegation first, then dispatch the
+ * lifecycle reports, then show that old evidence (observation and body frame) can
+ * no longer refresh or reactivate anything. `main` and the positive test both call
+ * this exact wiring.
+ */
+export function runDisconnect(map: VoxelMap, clock: () => number): DisconnectResult {
+  const verifier = registerConn1Verifier(map, clock);
+  const { walk, body } = startConn1Walk(map, clock);
+
+  walk.cancel('lifecycle', 'connection lost');
+  const stale = map.markStale(DIM, 'observation_gap');
+  const switched = map.beginSession('conn-2');
+  verifier.apply(stale, 10);
+  verifier.apply(switched, 10);
+  walk.observe(stale, 10);
+  walk.observe(switched, 10);
+
+  // Late old observation: rejected.
+  const late = observe(map, 'conn-1', STONE, { x: 0, y: -1, z: 0 }, 99, clock());
+  // Late old body frame: must not reactivate control or rewrite the cancellation.
+  walk.onSample(sampleAt(walk.status()!.delegationId, 'conn-1', POINTS[1]!, 2, clock() + 1000));
+
+  // Re-observe one cell under the new connection; its neighbour stays stale.
+  observe(map, 'conn-2', AIR, { x: 0, y: 0, z: 0 }, 100, clock() + 1000);
+  const fresh = map.cellAt(DIM, 0, 0, 0);
+  const neighbor = map.cellAt(DIM, 1, 0, 0);
+  const status = walk.status()!;
+
+  return {
+    verdict: verifier.status()!.verdict,
+    walkOutcome: status.result?.outcome ?? null,
+    activeStepIndex: status.activeStepIndex,
+    lateObservationRejected: late.sections.length === 0,
+    reobservedCellFresh: fresh.observed && fresh.evidence.freshness === 'FRESH',
+    neighborCellStale: neighbor.observed && neighbor.evidence.freshness === 'STALE',
+    stopCalls: [...body.stopCalls],
+    lastMoveExecutionId: body.lastRequest?.executionId ?? null,
+  };
+}
+
+/** The shared post-disconnect invariants; fails if the cancel or dispatch is deleted. */
+export function assertDisconnected(r: DisconnectResult): void {
+  assert(r.verdict !== 'OPEN', 'old verifier must no longer be OPEN');
+  assert(r.activeStepIndex === null, 'old walk must have ended');
+  assert(r.walkOutcome === 'CANCELLED', 'old walk must be cancelled');
+  assert(r.lateObservationRejected, 'late conn-1 observation must be rejected');
+  assert(r.reobservedCellFresh, 're-observed cell must be FRESH');
+  assert(r.neighborCellStale, 'neighbour must stay STALE');
+  assert(r.stopCalls.length === 1, 'the old active move must be stopped exactly once');
+  assert(r.stopCalls[0] !== undefined && r.stopCalls[0].endsWith('-step-0'), 'body.stop must target the old move execution');
+  assert(r.lastMoveExecutionId !== null && r.lastMoveExecutionId.endsWith('-step-0'), 'no new move may start after cancel');
+}
+
+/** Run the disconnect scenario end-to-end on a fresh in-memory map. */
+export function runDisconnectScenario(clock: () => number = () => NOW): DisconnectResult {
+  const map = new VoxelMap(WORLD, { now: clock, requireSession: true });
+  seedCorridor(map);
+  return runDisconnect(map, clock);
+}
+
+// ---------------------------------------------------------------------------
+// Resource boundary: owns one temp directory and every session opened through it.
+// ---------------------------------------------------------------------------
+
+export interface OwnedRunHooks {
+  /** Override temp-dir removal (injectable for cleanup-failure tests). */
+  cleanupDir?: (dir: string) => void;
+  /** Override a session's bounded close (injectable for close-failure tests). */
+  closeSession?: (session: SpatialSession) => Promise<CloseResult>;
+}
+
+export interface OwnedRun<T> {
+  ok: boolean;
+  value: T | null;
+  /** First failure thrown by the body; its identity/kind/message are preserved. */
+  primary: unknown;
+  /** Bounded close result for every opened session, in reverse-open order. */
+  closes: CloseResult[];
+  /** Secondary: temp-dir cleanup failure (never replaces `primary`). */
+  cleanupError: unknown;
+  /** True when the temp dir was retained because a close or cleanup failed. */
+  retained: boolean;
+  dir: string;
+}
+
+/** Remove only a direct child of the OS temp root — never the temp root itself. */
+export function removeTaskDir(dir: string): void {
+  const root = resolve(dir);
+  const tmp = resolve(tmpdir());
+  if (dirname(root) !== tmp) {
+    throw new Error(`refusing to remove a directory that is not a direct child of the temp root: ${root}`);
+  }
+  rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}
+
+export class OwnedSessions {
+  readonly dir: string;
+  private readonly opened: SpatialSession[] = [];
+
+  constructor(dir: string) {
+    this.dir = dir;
+  }
+
+  databasePath(name = 'spatial.db'): string {
+    return join(this.dir, name);
+  }
+
+  async open(options: OpenSpatialSessionOptions): Promise<SpatialSession> {
+    const session = await openSpatialSession(options);
+    this.opened.push(session);
+    return session;
+  }
+
+  async closeAll(hooks: OwnedRunHooks = {}): Promise<CloseResult[]> {
+    const close = hooks.closeSession ?? ((s) => s.close());
+    const closes: CloseResult[] = [];
+    for (let i = this.opened.length - 1; i >= 0; i--) {
+      const session = this.opened[i]!;
+      try {
+        closes.push(await close(session));
+      } catch (err) {
+        closes.push({
+          completed: false,
+          lastConfirmedCheckpointId: null,
+          unconfirmedRequest: false,
+          dirty: true,
+          error: err instanceof PersistenceError ? err : new PersistenceError('worker_communication', String(err)),
+        });
+      }
+    }
+    this.opened.length = 0;
+    return closes;
   }
 }
 
-async function runLifecycle(dir: string): Promise<void> {
-  const databasePath = join(dir, 'spatial.db');
-  const capacityPath = join(dir, 'capacity.db');
-
-  // ---- 1–5. Primary session: perception, route lifecycle, disconnect, save ----
-  let now = NOW;
-  const session = await openSpatialSession({
-    databasePath,
-    worldId: WORLD,
-    voxelOptions: { now: () => now },
-  });
+export async function runOwned<T>(
+  tag: string,
+  body: (sessions: OwnedSessions) => Promise<T>,
+  hooks: OwnedRunHooks = {},
+): Promise<OwnedRun<T>> {
+  const dir = mkdtempSync(join(tmpdir(), `${tag}-`));
+  const sessions = new OwnedSessions(dir);
+  let value: T | null = null;
+  let primary: unknown = null;
   try {
-    const map = session.voxel;
-    map.beginSession('conn-1');
-    seedCorridor(map);
+    value = await body(sessions);
+  } catch (err) {
+    primary = err;
+  }
 
-    // A readonly verifier and a pending walk, both under conn-1.
-    const verifier = new RouteVerifier(map, { now: () => now });
-    verifier.register({
-      worldId: WORLD, dim: DIM, sessionId: 'conn-1', mode: 'walk',
-      body: BODY, shapeProvider, points: POINTS,
-    });
-    verifier.advance(10);
-    assert(verifier.status()!.verdict === 'OPEN', 'conn-1 route should verify OPEN');
+  const closes = await sessions.closeAll(hooks);
+  const clean = closes.every((c) => c.completed);
 
-    const body = new HangingExecutor();
-    const walk = new WalkRouteExecutor(map, body, { now: () => now });
-    const started = walk.start(walkRequest('conn-1'));
-    walk.onSample(sampleAt(started.delegationId, 'conn-1', POINTS[0]!));
-    walk.advance(10);
-    assert(walk.status()!.activeStepIndex !== null && walk.status()!.result === null, 'walk should be in flight');
+  let cleanupError: unknown = null;
+  let retained = false;
+  if (clean) {
+    try {
+      (hooks.cleanupDir ?? removeTaskDir)(dir);
+    } catch (err) {
+      cleanupError = err;
+      retained = true;
+    }
+  } else {
+    retained = true; // shutdown not clean: retain the directory and diagnostics
+  }
 
-    // ---- 3. Disconnect: cancel first (no further frame), then dispatch reports ----
-    walk.cancel('lifecycle', 'connection lost');
-    const staleReport = map.markStale(DIM, 'observation_gap');
-    const switchReport = map.beginSession('conn-2');
-    verifier.apply(staleReport, 10);
-    verifier.apply(switchReport, 10);
-    walk.observe(staleReport, 10);
-    walk.observe(switchReport, 10);
+  return {
+    ok: primary === null && cleanupError === null && clean,
+    value,
+    primary,
+    closes,
+    cleanupError,
+    retained,
+    dir,
+  };
+}
 
-    assert(verifier.status()!.verdict !== 'OPEN', 'old verifier must no longer be OPEN');
-    assert(walk.status()!.activeStepIndex === null, 'old walk must have ended');
-    assert(walk.status()!.result?.outcome === 'CANCELLED', 'old walk must be cancelled');
+// ---------------------------------------------------------------------------
+// Save/close/reopen and capacity scenarios (used by `main` and the tests).
+// ---------------------------------------------------------------------------
 
-    // Old evidence cannot refresh new facts; only a freshly re-observed cell is FRESH.
-    const late = observe(map, 'conn-1', STONE, { x: 0, y: -1, z: 0 }, 99, now);
-    assert(late.sections.length === 0, 'late conn-1 evidence must be rejected');
-    now = 3000;
-    observe(map, 'conn-2', AIR, { x: 0, y: 0, z: 0 }, 100, now);
-    const fresh = map.cellAt(DIM, 0, 0, 0);
-    const neighbor = map.cellAt(DIM, 1, 0, 0);
-    assert(fresh.observed && fresh.evidence.freshness === 'FRESH', 're-observed cell must be FRESH');
-    assert(neighbor.observed && neighbor.evidence.freshness === 'STALE', 'neighbor cell must stay STALE');
+export interface LifecycleHooks extends OwnedRunHooks {
+  /** Injected assertion failure after reopen (proves the reopened session still closes). */
+  afterReopen?: (reopened: SpatialSession) => void;
+}
 
-    // ---- 6. Normal save: checkpoint → flush → close with confirmed, clean fields ----
+/** Normal save → close → reopen → restore, with the save fields asserted. */
+export async function runPrimaryLifecycle(hooks: LifecycleHooks = {}): Promise<OwnedRun<void>> {
+  return runOwned<void>('shared-session', async (sessions) => {
+    const session = await sessions.open({ databasePath: sessions.databasePath('spatial.db'), worldId: WORLD });
+    seedCorridor(session.voxel);
+
     const cp = await session.checkpoint();
-    const flushed = await session.flush();
     const state = session.getPersistenceState();
     assert(cp.checkpointId === state.lastConfirmedCheckpointId, 'checkpoint id must equal last confirmed');
     assert(cp.voxelRevision === state.confirmedVoxelRevision, 'voxel revision must equal confirmed');
     assert(state.dirty === false, 'save must not be dirty');
-    assert(flushed.dirty === false, 'flush must report not dirty');
-  } finally {
-    const closed = await session.close();
-    assert(closed.completed, 'primary session close must complete');
-  }
 
-  // ---- 7. Restore: reopened evidence comes back STALE; close even on a later failure ----
-  const reopened = await openSpatialSession({ databasePath, worldId: WORLD });
-  try {
+    const reopened = await sessions.open({ databasePath: sessions.databasePath('spatial.db'), worldId: WORLD });
+    if (hooks.afterReopen) hooks.afterReopen(reopened);
     const cell = reopened.voxel.cellAt(DIM, 0, 0, 0);
     assert(cell.observed && cell.evidence.freshness === 'STALE', 'restored evidence must be STALE');
-  } finally {
-    await reopened.close();
-  }
+  }, hooks);
+}
 
-  // ---- L2: real capacity rejection; the PersistenceError stays primary ----
-  const capSession = await openSpatialSession({
-    databasePath: capacityPath,
-    worldId: WORLD,
-    snapshotLimits: { maxVoxelSections: 1 },
-  });
-  let primary: PersistenceError | null = null;
+/** The shared post-conditions of a clean normal save run (both sessions close clean). */
+export function assertCleanSaveRun(run: OwnedRun<unknown>): void {
+  assert(run.ok, 'normal save lifecycle must succeed');
+  assert(run.primary === null, 'no primary error expected');
+  assert(run.cleanupError === null, 'no cleanup error expected');
+  assert(!run.retained, 'temp dir must be cleaned up');
+  assert(run.closes.length === 2, 'primary and reopened sessions must both close');
+  for (const c of run.closes) {
+    assert(c.completed, 'every session close must complete');
+    assert(!c.dirty, 'close must not report dirty after a confirmed save');
+    assert(!c.unconfirmedRequest, 'close must report no unconfirmed request');
+    assert(c.error === null, 'close must report no error');
+  }
+}
+
+/** Real public snapshotLimits capacity rejection; the error propagates as primary. */
+export async function runCapacityLifecycle(hooks: OwnedRunHooks = {}): Promise<OwnedRun<void>> {
+  return runOwned<void>('shared-session-cap', async (sessions) => {
+    const session = await sessions.open({
+      databasePath: sessions.databasePath('capacity.db'),
+      worldId: WORLD,
+      snapshotLimits: { maxVoxelSections: 1 },
+    });
+    session.voxel.beginSession('cap-1');
+    observe(session.voxel, 'cap-1', STONE, { x: 0, y: -1, z: 0 }, 1, NOW); // section sy = -1
+    observe(session.voxel, 'cap-1', AIR, { x: 0, y: 0, z: 0 }, 2, NOW); // section sy = 0
+    await session.checkpoint(); // throws PersistenceError('capacity', …)
+  }, hooks);
+}
+
+async function main(): Promise<void> {
+  const failures: [string, unknown][] = [];
+
   try {
-    const map = capSession.voxel;
-    map.beginSession('cap-1');
-    observe(map, 'cap-1', STONE, { x: 0, y: -1, z: 0 }, 1, now); // section sy = -1
-    observe(map, 'cap-1', AIR, { x: 0, y: 0, z: 0 }, 2, now); // section sy = 0
-    try {
-      await capSession.checkpoint();
-      throw new Error('checkpoint unexpectedly succeeded under maxVoxelSections=1');
-    } catch (err) {
-      if (!(err instanceof PersistenceError)) throw err;
-      primary = err;
-    }
-  } finally {
-    // Close is secondary cleanup: it must never replace the primary capacity error.
-    const closed = await capSession.close();
-    assert(closed.dirty, 'capacity rejection must leave unsaved observations');
+    assertDisconnected(runDisconnectScenario());
+  } catch (err) {
+    failures.push(['L1 disconnect', err]);
   }
-  assert(primary !== null && primary.kind === 'capacity', 'capacity rejection expected');
-  assert(/maxVoxelSections/.test(primary.message), 'capacity message must name the limit');
 
-  // ---- Windows proof: no handle remains — rename succeeds only with locks released ----
-  renameSync(databasePath, join(dir, 'closed.db'));
+  try {
+    assertCleanSaveRun(await runPrimaryLifecycle());
+  } catch (err) {
+    failures.push(['L2 normal save', err]);
+  }
+
+  try {
+    const cap = await runCapacityLifecycle();
+    assert(cap.primary instanceof PersistenceError && cap.primary.kind === 'capacity', 'capacity rejection expected');
+    assert(cap.cleanupError === null && !cap.retained, 'capacity cleanup should be clean');
+  } catch (err) {
+    failures.push(['L2 capacity', err]);
+  }
+
+  if (failures.length > 0) {
+    for (const [name, err] of failures) console.error(`${name} failed:`, err);
+    throw new Error('one or more lifecycle checks failed');
+  }
+  console.log('shared-session-lifecycle: all checks passed.');
 }
 
 const isMain =
