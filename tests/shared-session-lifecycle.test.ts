@@ -7,9 +7,11 @@ import {
   HangingExecutor,
   NOW,
   WORLD,
+  assertCancelled,
   assertCleanSaveRun,
   assertDisconnected,
   registerConn1Verifier,
+  runCancelChannel,
   runCapacityLifecycle,
   runDisconnectScenario,
   runPrimaryLifecycle,
@@ -37,12 +39,17 @@ describe('shared-session lifecycle — disconnect wiring (L1)', () => {
     );
   });
 
-  it('negative B: the shared invariant fails when the cancel is omitted', () => {
-    // Omit only the cancel (reports and body frames still flow) and run the *shared*
-    // invariant — report-driven invalidation may end the walk, but its outcome is not
-    // CANCELLED, so the shared success assertion must throw.
-    expect(() => assertDisconnected(runDisconnectScenario(() => NOW, { skipCancel: true }))).toThrow(
-      'old walk must be cancelled',
+  it('cancel channel positive: the real cancel ends the in-flight step and stops only the old move', () => {
+    // The isolated channel: in-flight step + empty report + the *real* cancel. The
+    // empty report cannot end the step, so the success invariant holds only via cancel.
+    assertCancelled(runCancelChannel(freshMap(), () => NOW));
+  });
+
+  it('cancel channel negative: without the cancel an empty report cannot end the step', () => {
+    // Same isolated channel with the cancel omitted; the empty report does nothing, so
+    // the old step stays in flight and the shared success assertion must throw.
+    expect(() => assertCancelled(runCancelChannel(freshMap(), () => NOW, true))).toThrow(
+      'cancel must end the old step immediately',
     );
   });
 
@@ -90,6 +97,29 @@ describe('shared-session lifecycle — save, close, restore (L2)', () => {
     // primary close → reopen → boundary closes the reopened session.
     expect(order).toEqual(['close', 'reopen', 'close']);
     assertCleanSaveRun(run);
+  });
+
+  it('the conn-2 re-observation survives save/restore with its original time and scope', async () => {
+    let restored: { sessionId: string; observedAt: number; freshness: string } | null = null;
+    const run = await runPrimaryLifecycle({
+      afterReopen: (reopened) => {
+        const cell = reopened.voxel.cellAt(DIM, 0, 0, 0);
+        if (cell.observed) {
+          restored = {
+            sessionId: cell.evidence.observation.sessionId,
+            observedAt: cell.evidence.observation.observedAt,
+            freshness: cell.evidence.freshness,
+          };
+        }
+      },
+    });
+
+    assertCleanSaveRun(run);
+    expect(restored).toEqual({
+      sessionId: 'conn-2', // the re-observation scope is preserved
+      observedAt: NOW + 1000, // the original time is preserved
+      freshness: 'STALE', // restored, not re-freshened
+    });
   });
 
   it('a non-clean primary close prevents reopen', async () => {

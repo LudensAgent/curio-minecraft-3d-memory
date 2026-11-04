@@ -208,9 +208,8 @@ export interface DisconnectResult {
   lastMoveExecutionId: string | null;
 }
 
-/** Negative-control channel omissions; only the tests use these to prove the shared invariant depends on each channel. */
+/** Negative-control channel omission; only the tests use this to prove the shared invariant depends on the verifier report. */
 export interface DisconnectOptions {
-  skipCancel?: boolean;
   skipVerifierReport?: boolean;
 }
 
@@ -225,9 +224,7 @@ export function runDisconnect(map: VoxelMap, clock: () => number, options: Disco
   const verifier = registerConn1Verifier(map, clock);
   const { walk, body } = startConn1Walk(map, clock);
 
-  if (!options.skipCancel) {
-    walk.cancel('lifecycle', 'connection lost');
-  }
+  cancelActiveDelegation(walk);
   const stale = map.markStale(DIM, 'observation_gap');
   const switched = map.beginSession('conn-2');
   if (!options.skipVerifierReport) {
@@ -281,6 +278,56 @@ export function runDisconnectScenario(
   const map = new VoxelMap(WORLD, { now: clock, requireSession: true });
   seedCorridor(map);
   return runDisconnect(map, clock, options);
+}
+
+// ---------------------------------------------------------------------------
+// Isolated cancel channel: proves the cancel, not the report, ends the old step.
+// ---------------------------------------------------------------------------
+
+/** The real cancel wiring shared by `runDisconnect` and the cancel-channel controls. */
+export function cancelActiveDelegation(walk: WalkRouteExecutor): void {
+  walk.cancel('lifecycle', 'connection lost');
+}
+
+export interface CancelChannelResult {
+  outcome: string | null;
+  activeStepIndex: number | null;
+  stopCalls: string[];
+}
+
+/**
+ * The cancel channel in isolation: one in-flight step, then a truly empty report
+ * (an unobserved dimension) and the real cancel — no further body sample, advance,
+ * or physics tick, so only the cancel can end the old step.
+ */
+export function runCancelChannel(map: VoxelMap, clock: () => number, skipCancel = false): CancelChannelResult {
+  seedCorridor(map);
+  const { walk, body } = startConn1Walk(map, clock);
+
+  const inFlight = walk.status()!;
+  assert(inFlight.activeStepIndex !== null, 'old step must be in flight');
+  assert(inFlight.result === null, 'old step must have no result yet');
+
+  const empty = map.markStale('nether', 'observation_gap'); // unobserved dimension
+  assert(empty.sections.length === 0, 'the cancel-channel report must be empty');
+  walk.observe(empty, clock());
+
+  if (!skipCancel) cancelActiveDelegation(walk);
+
+  const after = walk.status()!;
+  return {
+    outcome: after.result?.outcome ?? null,
+    activeStepIndex: after.activeStepIndex,
+    stopCalls: [...body.stopCalls],
+  };
+}
+
+/** Shared success invariant for the isolated cancel channel. */
+export function assertCancelled(r: CancelChannelResult): void {
+  assert(r.activeStepIndex === null, 'cancel must end the old step immediately');
+  assert(r.outcome === 'CANCELLED', 'cancel must terminate the delegation as cancelled');
+  assert(r.stopCalls.length === 1, 'cancel must stop the old move exactly once');
+  assert(r.stopCalls[0] !== undefined && r.stopCalls[0].endsWith('-step-0'), 'cancel must stop the old move execution');
 }
 
 // ---------------------------------------------------------------------------
@@ -430,11 +477,20 @@ function assertCleanClose(c: CloseResult, label: string): void {
   if (c.unconfirmedRequest) throw new Error(`${label} reports an unconfirmed request`);
 }
 
-/** Normal save → close primary → reopen → restore, with the save fields asserted. */
+/** Normal disconnect → save → close primary → reopen → restore, with the save fields asserted. */
 export async function runPrimaryLifecycle(hooks: LifecycleHooks = {}): Promise<OwnedRun<void>> {
+  const clock = () => NOW;
   return runOwned<void>('shared-session', async (sessions) => {
-    const primary = await sessions.open({ databasePath: sessions.databasePath('spatial.db'), worldId: WORLD });
+    const primary = await sessions.open({
+      databasePath: sessions.databasePath('spatial.db'),
+      worldId: WORLD,
+      voxelOptions: { now: clock },
+    });
     seedCorridor(primary.voxel);
+
+    // The real disconnect wiring runs on the real primary session voxel (not a
+    // separate in-memory map), so the conn-2 re-observation is saved and restored.
+    assertDisconnected(runDisconnect(primary.voxel, clock));
 
     const cp = await primary.checkpoint();
     const state = primary.getPersistenceState();
@@ -450,6 +506,8 @@ export async function runPrimaryLifecycle(hooks: LifecycleHooks = {}): Promise<O
     if (hooks.afterReopen) hooks.afterReopen(reopened);
     const cell = reopened.voxel.cellAt(DIM, 0, 0, 0);
     assert(cell.observed && cell.evidence.freshness === 'STALE', 'restored evidence must be STALE');
+    assert(cell.observed && cell.evidence.observation.sessionId === 'conn-2', 'restored conn-2 scope must be preserved');
+    assert(cell.observed && cell.evidence.observation.observedAt === NOW + 1000, 'restored conn-2 time must be preserved');
   }, hooks);
 }
 
@@ -516,8 +574,6 @@ export function writeRunReport(write: (line: string) => void, name: string, run:
 }
 
 async function main(): Promise<void> {
-  assertDisconnected(runDisconnectScenario());
-
   const normal = await runPrimaryLifecycle();
   writeRunReport((line) => console.log(line), 'L2 normal save', normal);
   assertCleanSaveRun(normal);
