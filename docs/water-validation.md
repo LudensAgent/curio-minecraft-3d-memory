@@ -53,8 +53,9 @@ An unsupported or unresolved fluid shape never becomes air or `OPEN`.
 Both providers may inspect neighbours only through the controlled read. Every
 read is checked for session, freshness, expiry and completeness, is recorded as
 a section dependency, and consumes a real read budget. Once the budget is
-exhausted the read reports `budgetExhausted` and returns `unobserved`; it never
-guesses a missing cell.
+exhausted, a private sentinel stops the over-budget call at the owned provider
+boundary and the evaluation returns structured `budget_exceeded`; it never
+guesses a missing cell. Ordinary missing evidence still remains `UNKNOWN`.
 
 A cell can have both a solid shape and a fluid shape (for example a waterlogged
 slab). Both are evaluated: the solid shape participates in collision while the

@@ -93,7 +93,7 @@ export interface MountedBoatProfile {
   /**
    * Explicit passenger breathing volumes, separate from the whole-body
    * clearance. A surface-only boat route requires each breathing volume to stay
-   * free of water/lava and above the adopted waterline.
+   * free of actual swept water/lava overlap.
    */
   passengerBreathing: readonly Box3[];
   /** Absolute world-Y band the observed water surface must lie in. */
