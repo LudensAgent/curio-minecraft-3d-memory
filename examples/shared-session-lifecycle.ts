@@ -14,11 +14,11 @@
  *   6. save & close        — checkpoint (capture+commit) → flush (wait) → close (bounded shutdown)
  *   7. restore             — history + original times come back STALE; passability is re-established, not reused
  *
- * It uses the default `eager` voxel loading, which restores every committed
- * section at open and is only appropriate when the world fits the session's
- * working-set budget. For on-demand residency and route pin protection, see
- * `examples/working-set.ts` and the "manual on-demand section residency" README
- * section — this example does not imply eager loading suits every world.
+ * Disconnect order is fixed and matters: cancel the old delegation *first* (no
+ * further physics frame), then produce and dispatch the lifecycle reports
+ * (`markStale` / `beginSession`) to the active verifier and executor. A readonly
+ * verifier never refreshes itself when the map session changes — it must receive
+ * the report explicitly.
  *
  * Run with (the package self-resolves its own name through `exports`):
  *
@@ -26,9 +26,10 @@
  *   npx tsx examples/shared-session-lifecycle.ts
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
 import type {
   BodySample,
@@ -39,15 +40,18 @@ import type {
   MoveExecutor,
   Observation,
   Vec3Like,
+  WalkRouteRequest,
 } from 'curio-minecraft-3d-memory';
-import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
+import { openSpatialSession, PersistenceError } from 'curio-minecraft-3d-memory/storage/sqlite';
+import type { SpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
 
-const WORLD = 'world';
-const DIM = 'overworld';
-const STONE = { name: 'minecraft:stone', properties: {} };
-const AIR = { name: 'minecraft:air', properties: {} };
+export const WORLD = 'world';
+export const DIM = 'overworld';
+export const STONE = { name: 'minecraft:stone', properties: {} };
+export const AIR = { name: 'minecraft:air', properties: {} };
+export const NOW = 2000;
 
-const shapeProvider: CollisionShapeProvider = {
+export const shapeProvider: CollisionShapeProvider = {
   version: 'host-1',
   resolve(state) {
     if (state.name === 'minecraft:air') return { kind: 'shape', shape: { boxes: [], supportFaces: [] } };
@@ -61,30 +65,32 @@ const shapeProvider: CollisionShapeProvider = {
   },
 };
 
-class FakeExecutor implements MoveExecutor {
-  private seq = 1;
+/**
+ * A Fake body that never advances on its own: `move` leaves the returned promise
+ * pending until the host stops the delegation. This keeps a started step in flight
+ * (`activeStepIndex !== null`, empty `result`) so the disconnect wiring can be
+ * observed. `stop` belongs to the delegation and only releases the pending promise
+ * with a cancellation — it never fabricates a body sample.
+ */
+export class HangingExecutor implements MoveExecutor {
+  readonly stopCalls: string[] = [];
+  lastRequest: ExecutableMove | null = null;
+  private resolve: ((result: ExecutableMoveResult) => void) | null = null;
+
   move(request: ExecutableMove): Promise<ExecutableMoveResult> {
-    return Promise.resolve({
-      sample: {
-        worldId: request.worldId,
-        dim: request.dim,
-        sessionId: request.sessionId,
-        executionId: request.executionId,
-        sequence: ++this.seq,
-        pos: { ...request.to },
-        observedAt: NOW,
-        alive: true,
-        connected: true,
-        observationReady: true,
-        onGround: true,
-        inWater: false,
-      },
+    this.lastRequest = request;
+    return new Promise<ExecutableMoveResult>((resolve) => {
+      this.resolve = resolve;
     });
   }
-  stop(): void {}
-}
 
-const NOW = 2000;
+  stop(executionId: string): void {
+    this.stopCalls.push(executionId);
+    const resolve = this.resolve;
+    this.resolve = null;
+    if (resolve !== null) resolve({ failure: { kind: 'cancelled' } });
+  }
+}
 
 /**
  * Host perception: write one real observation into the shared map and hand the
@@ -92,117 +98,200 @@ const NOW = 2000;
  * (via `RouteVerifier.apply` / `WalkRouteExecutor.observe`). The library never
  * scans the world; it only diffs what the host actually saw.
  */
-function observe(
-  session: { voxel: { observe: (o: Observation) => ChangeReport } },
+export function observe(
+  map: { observe: (o: Observation) => ChangeReport },
   sessionId: string,
   state: { name: string; properties: Record<string, string> },
   pos: Vec3Like,
   sequence: number,
+  observedAt: number,
 ): ChangeReport {
-  return session.voxel.observe({
-    worldId: WORLD, dim: DIM, sessionId, observedAt: NOW, sequence,
+  return map.observe({
+    worldId: WORLD, dim: DIM, sessionId, observedAt, sequence,
     source: 'vision', evidence: 'seen', stateComplete: true, state, pos,
   });
 }
 
-function sampleAt(executionId: string, pos: Vec3Like): BodySample {
+/** A measured body sample keyed to one execution. Host pushes use the delegation id. */
+export function sampleAt(
+  executionId: string,
+  sessionId: string,
+  pos: Vec3Like,
+  sequence = 1,
+  observedAt = NOW,
+): BodySample {
   return {
-    worldId: WORLD, dim: DIM, sessionId: 'conn-1', executionId, sequence: 1,
-    pos: { ...pos }, observedAt: NOW, alive: true, connected: true,
+    worldId: WORLD, dim: DIM, sessionId, executionId, sequence,
+    pos: { ...pos }, observedAt, alive: true, connected: true,
     observationReady: true, onGround: true, inWater: false,
   };
 }
 
-const POINTS: Vec3Like[] = [
+export const POINTS: Vec3Like[] = [
   { x: 0.5, y: 0, z: 0.5 },
   { x: 1.5, y: 0, z: 0.5 },
   { x: 2.5, y: 0, z: 0.5 },
 ];
 
-const BODY = { feet: { x: 0.5, y: 0, z: 0.5 }, width: 0.6, height: 1.8, pose: 'standing' } as const;
+export const BODY = { feet: { x: 0.5, y: 0, z: 0.5 }, width: 0.6, height: 1.8, pose: 'standing' } as const;
 
-async function main(): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), 'shared-session-'));
-  const databasePath = join(dir, 'spatial.db');
+/** A walk delegation request for the shared route, bound to one connection session. */
+export function walkRequest(sessionId: string): WalkRouteRequest {
+  return {
+    worldId: WORLD, dim: DIM, sessionId, mode: 'walk', body: BODY,
+    points: POINTS, arrival: { kind: 'exact' }, shapeProvider,
+    deadlineMs: 100_000, timeoutMs: 10_000,
+  };
+}
 
-  try {
-    // ---- 1. Host startup: host owns the path + worldId, awaits the map ----
-    // `openSpatialSession` resolves only after the committed state (if any) has
-    // been restored. Use the returned `session.voxel` — do not construct a new
-    // VoxelMap per action.
-    const session = await openSpatialSession({ databasePath, worldId: WORLD });
-    const map = session.voxel; // the single shared map
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(`assertion failed: ${message}`);
+}
 
-    // ---- 2. Perception: the host writes what it actually saw ----
-    map.beginSession('conn-1');
-    let seq = 0;
-    for (let x = 0; x <= 3; x++) {
-      observe(session, 'conn-1', STONE, { x, y: -1, z: 0 }, ++seq);
-      observe(session, 'conn-1', AIR, { x, y: 0, z: 0 }, ++seq);
-      observe(session, 'conn-1', AIR, { x, y: 1, z: 0 }, ++seq);
-    }
+/** Remove only the task-created temp directory (a child of the OS temp dir). */
+function removeTaskDir(dir: string): void {
+  const root = resolve(dir);
+  const tmp = resolve(tmpdir());
+  if (root !== tmp && !root.startsWith(tmp + sep)) {
+    throw new Error(`refusing to delete outside the task temp dir: ${root}`);
+  }
+  rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}
 
-    // ---- 5. Route lifecycle: verify → execute → release (delegation 1) ----
-    // Two walk delegations share the same `map`; the library orchestrates each
-    // one independently. Cancelling/ending one never touches the other or the
-    // shared session.
-    const loopA = new WalkRouteExecutor(map, new FakeExecutor(), { now: () => NOW });
-    const started = loopA.start({
-      worldId: WORLD, dim: DIM, sessionId: 'conn-1', mode: 'walk', body: BODY,
-      points: POINTS, arrival: { kind: 'exact' }, shapeProvider,
-      deadlineMs: 100_000, timeoutMs: 10_000,
-    });
-    loopA.onSample(sampleAt(started.delegationId, POINTS[0]!));
-    loopA.advance(10);
-    await Promise.resolve();
-    loopA.advance(10);
-    await Promise.resolve();
-    console.log('delegation A outcome:', loopA.status()!.result?.outcome);
-
-    // ---- 4. Perception update mid-flight: forward the ChangeReport ----
-    // A second delegation runs on the same map. A fresh observation is written
-    // first, then its report invalidates/re-verifies the affected steps.
-    const verifier = new RouteVerifier(map, { now: () => NOW });
-    verifier.register({
-      worldId: WORLD, dim: DIM, sessionId: 'conn-1', mode: 'walk', body: BODY,
-      shapeProvider, points: POINTS,
-    });
-    verifier.advance(10);
-    console.log('route verdict after perception:', verifier.status()!.verdict);
-
-    const report = observe(session, 'conn-1', AIR, { x: 2, y: 0, z: 0 }, ++seq);
-    verifier.apply(report, 10); // only the touched steps re-verify
-    console.log('route verdict after ChangeReport:', verifier.status()!.verdict);
-
-    // ---- 3. Reconnect: a new connection session; late old evidence is dropped ----
-    map.beginSession('conn-2'); // host reconnected; same worldId stays
-    const late = observe(session, 'conn-1', STONE, { x: 0, y: -1, z: 0 }, ++seq);
-    console.log('late conn-1 evidence changed sections:', late.sections.length);
-
-    // ---- 6. Save & close: checkpoint → flush → close ----
-    // `checkpoint` captures and commits the current state (the only save
-    // trigger). `flush` only waits for an already-accepted save; it never
-    // captures new changes. `close` performs a bounded shutdown.
-    await session.checkpoint();
-    const flushed = await session.flush();
-    const closed = await session.close();
-    console.log('close completed:', closed.completed, '| dirty:', closed.dirty, '| flush dirty:', flushed.dirty);
-
-    // ---- 7. Restore: history + original times return STALE ----
-    const reopened = await openSpatialSession({ databasePath, worldId: WORLD });
-    const cell = reopened.voxel.cellAt(DIM, 0, -1, 0);
-    console.log(
-      'restored cell:',
-      cell.observed ? `${cell.evidence.observation.state.name}@${cell.evidence.observation.observedAt} (${cell.evidence.freshness})` : 'unobserved',
-    );
-    // Restored evidence is STALE: passability must be re-established with a new
-    // observation session, not read back from disk as a current OPEN.
-    await reopened.close();
-
-    console.log('note: no world scan, no real body control, no current OPEN reused above.');
-  } finally {
-    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+/** Seed the shared map with the grounded corridor used by every scenario. */
+function seedCorridor(map: { observe: (o: Observation) => ChangeReport }): void {
+  let seq = 0;
+  for (let x = 0; x <= 3; x++) {
+    observe(map, 'conn-1', STONE, { x, y: -1, z: 0 }, ++seq, NOW);
+    observe(map, 'conn-1', AIR, { x, y: 0, z: 0 }, ++seq, NOW);
+    observe(map, 'conn-1', AIR, { x, y: 1, z: 0 }, ++seq, NOW);
   }
 }
 
-void main();
+async function main(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'shared-session-'));
+  try {
+    await runLifecycle(dir);
+    console.log('shared-session-lifecycle: all checks passed; temp dir removed.');
+  } finally {
+    removeTaskDir(dir);
+  }
+}
+
+async function runLifecycle(dir: string): Promise<void> {
+  const databasePath = join(dir, 'spatial.db');
+  const capacityPath = join(dir, 'capacity.db');
+
+  // ---- 1–5. Primary session: perception, route lifecycle, disconnect, save ----
+  let now = NOW;
+  const session = await openSpatialSession({
+    databasePath,
+    worldId: WORLD,
+    voxelOptions: { now: () => now },
+  });
+  try {
+    const map = session.voxel;
+    map.beginSession('conn-1');
+    seedCorridor(map);
+
+    // A readonly verifier and a pending walk, both under conn-1.
+    const verifier = new RouteVerifier(map, { now: () => now });
+    verifier.register({
+      worldId: WORLD, dim: DIM, sessionId: 'conn-1', mode: 'walk',
+      body: BODY, shapeProvider, points: POINTS,
+    });
+    verifier.advance(10);
+    assert(verifier.status()!.verdict === 'OPEN', 'conn-1 route should verify OPEN');
+
+    const body = new HangingExecutor();
+    const walk = new WalkRouteExecutor(map, body, { now: () => now });
+    const started = walk.start(walkRequest('conn-1'));
+    walk.onSample(sampleAt(started.delegationId, 'conn-1', POINTS[0]!));
+    walk.advance(10);
+    assert(walk.status()!.activeStepIndex !== null && walk.status()!.result === null, 'walk should be in flight');
+
+    // ---- 3. Disconnect: cancel first (no further frame), then dispatch reports ----
+    walk.cancel('lifecycle', 'connection lost');
+    const staleReport = map.markStale(DIM, 'observation_gap');
+    const switchReport = map.beginSession('conn-2');
+    verifier.apply(staleReport, 10);
+    verifier.apply(switchReport, 10);
+    walk.observe(staleReport, 10);
+    walk.observe(switchReport, 10);
+
+    assert(verifier.status()!.verdict !== 'OPEN', 'old verifier must no longer be OPEN');
+    assert(walk.status()!.activeStepIndex === null, 'old walk must have ended');
+    assert(walk.status()!.result?.outcome === 'CANCELLED', 'old walk must be cancelled');
+
+    // Old evidence cannot refresh new facts; only a freshly re-observed cell is FRESH.
+    const late = observe(map, 'conn-1', STONE, { x: 0, y: -1, z: 0 }, 99, now);
+    assert(late.sections.length === 0, 'late conn-1 evidence must be rejected');
+    now = 3000;
+    observe(map, 'conn-2', AIR, { x: 0, y: 0, z: 0 }, 100, now);
+    const fresh = map.cellAt(DIM, 0, 0, 0);
+    const neighbor = map.cellAt(DIM, 1, 0, 0);
+    assert(fresh.observed && fresh.evidence.freshness === 'FRESH', 're-observed cell must be FRESH');
+    assert(neighbor.observed && neighbor.evidence.freshness === 'STALE', 'neighbor cell must stay STALE');
+
+    // ---- 6. Normal save: checkpoint → flush → close with confirmed, clean fields ----
+    const cp = await session.checkpoint();
+    const flushed = await session.flush();
+    const state = session.getPersistenceState();
+    assert(cp.checkpointId === state.lastConfirmedCheckpointId, 'checkpoint id must equal last confirmed');
+    assert(cp.voxelRevision === state.confirmedVoxelRevision, 'voxel revision must equal confirmed');
+    assert(state.dirty === false, 'save must not be dirty');
+    assert(flushed.dirty === false, 'flush must report not dirty');
+  } finally {
+    const closed = await session.close();
+    assert(closed.completed, 'primary session close must complete');
+  }
+
+  // ---- 7. Restore: reopened evidence comes back STALE; close even on a later failure ----
+  const reopened = await openSpatialSession({ databasePath, worldId: WORLD });
+  try {
+    const cell = reopened.voxel.cellAt(DIM, 0, 0, 0);
+    assert(cell.observed && cell.evidence.freshness === 'STALE', 'restored evidence must be STALE');
+  } finally {
+    await reopened.close();
+  }
+
+  // ---- L2: real capacity rejection; the PersistenceError stays primary ----
+  const capSession = await openSpatialSession({
+    databasePath: capacityPath,
+    worldId: WORLD,
+    snapshotLimits: { maxVoxelSections: 1 },
+  });
+  let primary: PersistenceError | null = null;
+  try {
+    const map = capSession.voxel;
+    map.beginSession('cap-1');
+    observe(map, 'cap-1', STONE, { x: 0, y: -1, z: 0 }, 1, now); // section sy = -1
+    observe(map, 'cap-1', AIR, { x: 0, y: 0, z: 0 }, 2, now); // section sy = 0
+    try {
+      await capSession.checkpoint();
+      throw new Error('checkpoint unexpectedly succeeded under maxVoxelSections=1');
+    } catch (err) {
+      if (!(err instanceof PersistenceError)) throw err;
+      primary = err;
+    }
+  } finally {
+    // Close is secondary cleanup: it must never replace the primary capacity error.
+    const closed = await capSession.close();
+    assert(closed.dirty, 'capacity rejection must leave unsaved observations');
+  }
+  assert(primary !== null && primary.kind === 'capacity', 'capacity rejection expected');
+  assert(/maxVoxelSections/.test(primary.message), 'capacity message must name the limit');
+
+  // ---- Windows proof: no handle remains — rename succeeds only with locks released ----
+  renameSync(databasePath, join(dir, 'closed.db'));
+}
+
+const isMain =
+  typeof process.argv[1] === 'string' && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
+  main().catch((err) => {
+    console.error('shared-session-lifecycle failed:', err);
+    process.exitCode = 1;
+  });
+}
