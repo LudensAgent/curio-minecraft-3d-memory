@@ -1,17 +1,28 @@
 # 0.7.7 journal 独立消费者接入验收记录
 
 > 本文件是本轮 `0.7.7` 的独立验收记录，不改写设计文档或既有验收报告。
-> 结论级别为 **Fake 库侧 fixture + 真实公开安装入口与 SQLite/Worker** 的消费者验收；
-> 不是 Minecraft 物理、mineflayer 控制、Curio 宿主接线或真实游戏动作的证明。
+> 结论级别为 **Fake 库侧 fixture + 真实隔离打包/安装入口与 SQLite/Worker** 的消费者验收，
+> 独立执行已 PASS；它不是 Minecraft 物理、mineflayer 控制、Curio 宿主接线或真实游戏动作的
+> 证明，也不证明宿主已经生成 journal。
 
 ## 结论与当前状态
 
-- 包版本由 `0.7.6` 升为 `0.7.7`，`package-lock.json` 顶层与根包版本同步为 `0.7.7`。
-- 本阶段只准备可审的本地 code commit。**尚未生成本版本的 `.tgz`**，也没有覆盖既有
-  `0.7.6` 产物；未执行 `pack`、`publish`、`push`、`merge`、`tag` 或 `rebase`。
-- `node acceptance/run.mjs --execute` 仍待协调员在干净 HEAD 上独立执行。该次运行才会生成
-  唯一的新包与不可变来源；固定源码 hash、真实 `.tgz` 元数据和最终 PASS 结论均在执行后
-  单独报告。本文件不预写这些结果。
+- 包版本由 `0.7.6` 升为 `0.7.7`，`package-lock.json` 顶层与根包版本同步为 `0.7.7`；
+  最终隔离安装实测包版本为 `0.7.7`。验收 runner 自身仍为 `0.7.6`，这是未改动的
+  `runnerVersion`，不是包版本。
+- 协调员已在干净 `3334e17916e4521d98bb724b4a50247dcc6357f9` 执行
+  `node acceptance/run.mjs --execute`，自然 exit 0，`outcome` 为 **PASS**。
+  `sourceBinding` 为 `clean=true`、`headChanged=false`、`releaseBlocked=false`。
+- 唯一的新包已生成：`curio-minecraft-3d-memory-0.7.7.tgz`（287202 bytes，解包
+  1289051 bytes）。SHA-256 为
+  `6e41c763150ecbde01b5234df2a0915408bfb58c53a894ccdcbe036327e7b32d`，npm integrity
+  为 `sha512-Ry3/NkWEN9nwMuMXiqLH0U6zvHraJLcVNW4x3LTnYpeCyI5fWKXz05gsvQFVBXMnRkwm03i1ns1u/7D4yD9AHQ==`，
+  npmShasum 为 `687785a2145f447a29af9584274ff433a32e53c5`。`packedNonDist` 仅
+  `README.md` 与 `package.json`，没有 unexpected 或 missing。
+- 该产物固定绑定上述 source commit。后续本 docs 收尾提交与该 commit 不同，但不会重新
+  pack，也不会改变源码绑定；本文件不把 docs commit 当作 artifact 来源。
+- 本轮未执行 `publish`、`push`、`merge`、`tag` 或 `rebase`；原有 `0.7.6` / `0.7.5`
+  产物与报告保留。
 
 ## 与 0.7.6 的关系
 
@@ -62,10 +73,39 @@
 
 - 当前 schema 版本为 **4**。v4 只是新增 journal 表与 checkpoint 元数据；`0.7.7` 不是纯版本号
   变更。
-- 已验证的 v1/v2/v3 → v4 升级会在打开时先写 `VACUUM INTO` 备份
-  （`<database>.pre-v4-<uuid>`），再在单个事务内完成 schema 升级；旧世界、history 与 voxel
+- v3 → v4 的升级在打开时先执行 `VACUUM INTO <database>.pre-v4-<uuid>` 备份，再在单个
+  事务内新增 journal 表与 checkpoint 判别列并更新 schema 版本；旧世界、history 与 voxel
   事实保持，升级后的 journal 初始为空，不会从旧数据合成 journal 历史。
-- 不支持版本降级。升级失败时事务回滚并保留备份。
+- v1/v2 按 worker 既有路径逐级迁移，而不是把整条旧版本链放进一次 v4 事务：v1 → v2
+  先写 `<database>.pre-v2-<uuid>` 备份再在单个事务内升级；v2 → v3 先写
+  `<database>.pre-v3-<uuid>` 备份再在单个事务内升级；之后才进入上述 pre-v4 备份与事务。
+  每个阶段各自备份、各自提交或回滚。
+- 不支持版本降级。任一升级阶段失败时该阶段事务回滚并保留对应备份。
+
+## 协调员独立执行结果（最终证据，2026-11-04）
+
+- runId `1793792566838-52844`；`runnerVersion` 为 `0.7.6`，runnerHash 为
+  `cfaee09a6a5bcb72b1d1c29733986f522ac47d30651d3ce4dc91f584b610dc9d`；consumerHash 为
+  `0e66fa739d5fcd429151674aa9d7109d80dbabe5d970124a7f08557cba6ae085`。运行环境为
+  node `v24.14.1`、npm `10.9.0`、typescript `5.9.3`。
+- 步骤退出码：`build` 0、`pack` 0、`install` 0、`consumer:positive` 0、
+  `consumer:early-release-pin` 1（预期）、`consumer:skip-final-checkpoint` 1（预期）、
+  安装包上的 `tsc` 0。主 `outcome` 为 PASS，`primaryError` 与 `cleanupError` 均为 `null`。
+- 负对照仍在原指定 assertion 处失败：early-release-pin 为
+  `dependency (overworld, 0, 0, 0) stays pinned during the active walk`；
+  skip-final-checkpoint 为 `reopen has the unique final fact`。
+- 三次消费者进程的最终资源收尾均为 `completed=true`、`error=null`、
+  `unconfirmedRequest=false`，`cleanupError=null`；其中故意未保存场景的 close 为
+  `dirty=true`，不称其为 saved。
+- positive journal evidence：accept revision 3、pending 3 条/2653 bytes、confirmed 0、
+  committed 0、dirty true；三次 checkpoint 的 captured/confirmed prefix 为 1 → 2 → 3，
+  前两次仍 pending/dirty，第三次后 pending 0、dirty false、committed 3，原
+  `memoryWrite` 仍为 `pending`。reopen 后 revision/confirmed 均为 3，action 分页 1 条，
+  event 分页 `hasMore=true → false`（`nextCursor="1" → null`），current/previous 保持原
+  session 与时间（2000/500），voxel cell 未写入。
+- 运行证据：`C:/Users/Administrator/AppData/Local/Temp/curio-minecraft-3d-memory-acceptance/run-1793792566838-52844/evidence.json`；
+  完整 artifact 同目录；命令日志为
+  `C:/Users/Administrator/AppData/Local/Temp/curio-memory-release-01a1a486-20261104/independent-release-execute.log`。
 
 ## 已复用的既有证据
 
@@ -79,7 +119,9 @@
   `Temp/curio-memory-release-01a1a486-20261104/independent-event.log`。
 - 未变更的导航 43/26/74/18 组合未在本轮重跑。
 
-## 本阶段实际运行结果（2026-11-04）
+## 本树先行自检结果（2026-11-04，非隔离安装）
+
+以下结果为最终独立执行之前的本树自检，保留作为过程证据，不替代上面的隔离安装结果：
 
 - `npm run typecheck`：`pretypecheck` 构建 exit 0，`tsc --noEmit` exit 0。
 - `node --test acceptance/provenance.test.mjs acceptance/run.test.mjs acceptance/consumer-close.test.mjs`：
@@ -99,9 +141,11 @@
 - `record*` 返回 accepted **不等于** saved；只有 checkpoint ACK 确认对应 prefix。`flush()` 与
   `close()` 不会隐式捕获并保存新的 dirty 状态。
 - 上一次 save ACK 丢失但事务实际已经提交的完整组合，本阶段与既有测试都没有单独证明。
-- 本轮消费者 fixture 是 Fake/library-only，不声称真实游戏动作发生，也不声称宿主已经接入
-  journal。
+- 本轮消费者 fixture 是 `fake-library-only`（evidence 中 `hostEnabled=false`），不是宿主
+  journal producer，也不声称真实游戏动作发生。host supply 本阶段尚未完成，不宣称宿主接线
+  通过。
 - 分页验证使用有限的小数据集，不是大容量压力测试。
-- self `dist` smoke 只证明本树构建产物可被自引用消费；真正的隔离安装、打包内容、类型解析与
-  负向对照需由协调员在干净 HEAD 执行 `node acceptance/run.mjs --execute`。
-- 最终 `.tgz` 的 SHA-256、npm integrity、文件清单与固定源码 hash 尚未生成，不得提前引用。
+- self `dist` smoke 只证明本树构建产物可被自引用消费；最终隔离安装、打包内容、类型解析与
+  负向对照已由上面的协调员执行覆盖。
+- 最终 hash 属于 source `3334e17916e4521d98bb724b4a50247dcc6357f9` 生成的 artifact；
+  后续 docs 收尾提交不重新 pack，也不改变该绑定。
