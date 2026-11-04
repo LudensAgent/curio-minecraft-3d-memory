@@ -151,6 +151,20 @@ function fmtKey(key) {
   return `(${key.dim}, ${key.cx}, ${key.cz}, ${key.sy})`;
 }
 
+/** Emit one small structured fact record (actual values only, never fabricated). */
+function evidence(tag, facts) {
+  console.log(JSON.stringify({ ev: tag, ...facts }));
+}
+
+/** Compact structured form of a free() result for evidence (facts, not prose). */
+function freeFacts(free) {
+  return {
+    evicted: free.evicted.map(fmtKey),
+    rejected: free.evictionRejected.map((r) => ({ key: fmtKey(r.key), reason: r.reason })),
+    capacity: free.capacity ? free.capacity.kind : null,
+  };
+}
+
 /** Observe support (y=-1) + air (y=0,1) along x = 0..3 for a flat walkable line. */
 function observeRoute(session, sessionId, observedAt) {
   session.voxel.beginSession(sessionId);
@@ -305,6 +319,26 @@ export async function finalizeResources({ sessions, closeRecords, primaryError, 
   }
 
   const exitCode = primaryError || unclean.length > 0 || cleanupError ? 1 : 0;
+
+  evidence('final.resource', {
+    primaryError: primaryError ? { name: primaryError.name, message: primaryError.message } : null,
+    closes: sessions.map((session) => {
+      const rec = closeRecords.get(session);
+      if (!rec) return { closed: false, reason: 'no-record' };
+      if (rec.error) return { closed: true, threw: true, error: rec.error.message };
+      const r = rec.result;
+      return {
+        closed: true,
+        completed: r.completed,
+        dirty: r.dirty,
+        unconfirmedRequest: r.unconfirmedRequest,
+        error: r.error ? { kind: r.error.kind, message: r.error.message } : null,
+      };
+    }),
+    cleanupError: cleanupError ? { name: cleanupError.name, message: cleanupError.message } : null,
+    exitCode,
+  });
+
   if (exitCode === 0) {
     console.log('consumer acceptance: PASS (all assertions held)');
   }
@@ -399,14 +433,23 @@ async function run() {
 
         observeRoute(s, 'live', t);
         const cp = await s.checkpoint();
+        const ps = s.getPersistenceState();
+        evidence('l3.checkpoint', {
+          t,
+          checkpointId: cp.checkpointId,
+          voxelRevision: cp.voxelRevision,
+          confirmedVoxelRevision: ps.confirmedVoxelRevision,
+          dirty: ps.dirty,
+        });
         assert.ok(cp.checkpointId, 'route facts checkpointed');
-        assert.equal(s.getPersistenceState().dirty, false, 'clean after route checkpoint');
+        assert.equal(ps.dirty, false, 'clean after route checkpoint');
 
         const verifier = new RouteVerifier(s.voxel, { now: () => t });
         verifier.register(routeRequest('live'));
         const status = verifier.advance(10);
         assert.equal(status.verdict, 'OPEN', 'route OPEN with fresh evidence');
         const deps = collectDeps(status);
+        evidence('l3.deps', { t, deps: deps.map(fmtKey) });
         assert.ok(deps.length > 0, 'route reports concrete section dependencies');
 
         // Every dependency section is clean: global dirty is false and each section
@@ -438,6 +481,13 @@ async function run() {
         loop.advance(10);
         await Promise.resolve();
         const active = loop.status();
+        evidence('l3.inflight', {
+          completion,
+          delegationId: active.delegationId,
+          activeStepIndex: active.activeStepIndex,
+          result: active.result ? active.result.outcome : null,
+          nextPointIndex: active.nextPointIndex,
+        });
         assert.notEqual(active.activeStepIndex, null, 'a step is in flight');
         assert.equal(active.result, null, 'no terminal result while in flight');
 
@@ -448,6 +498,7 @@ async function run() {
         }
 
         const freeActive = manager.free();
+        evidence('l3.freeActive', { completion, ...freeFacts(freeActive) });
         for (const key of deps) {
           const rejected = freeActive.evictionRejected.find((r) => sameKey(r.key, key));
           assert.ok(rejected, `dependency ${fmtKey(key)} stays pinned during the active walk`);
@@ -464,9 +515,11 @@ async function run() {
           await Promise.resolve();
           loop.advance(10);
           await Promise.resolve();
+          evidence('l3.finish', { outcome: loop.status().result?.outcome ?? null });
           assert.equal(loop.status().result?.outcome, 'ARRIVED', 'walk finishes ARRIVED');
         } else {
           const cancelled = loop.cancel('user', 'acceptance cancellation');
+          evidence('l3.cancel', { outcome: cancelled.outcome });
           assert.equal(cancelled.outcome, 'CANCELLED', 'walk cancels cleanly');
         }
 
@@ -474,6 +527,7 @@ async function run() {
         // pin and no new dirty (they were committed before pinning).
         s.releasePins([lease.lease.token]);
         const freeAfter = manager.free();
+        evidence('l3.reclaim', { completion, ...freeFacts(freeAfter) });
         for (const key of deps) {
           const rejected = freeAfter.evictionRejected.find((r) => sameKey(r.key, key));
           assert.equal(rejected, undefined, `dependency ${fmtKey(key)} recycled after release`);
@@ -498,6 +552,7 @@ async function run() {
 
         s.releasePins([lease1.lease.token]);
         const freeOverlap1 = manager.free();
+        evidence('l3.overlapOldReleased', freeFacts(freeOverlap1));
         for (const key of deps) {
           const rejected = freeOverlap1.evictionRejected.find((r) => sameKey(r.key, key));
           assert.ok(rejected, `old token released but ${fmtKey(key)} still protected by new lease`);
@@ -506,6 +561,7 @@ async function run() {
 
         s.releasePins([lease2.lease.token]);
         const freeOverlap2 = manager.free();
+        evidence('l3.overlapNewReleased', freeFacts(freeOverlap2));
         for (const key of deps) {
           const rejected = freeOverlap2.evictionRejected.find((r) => sameKey(r.key, key));
           assert.equal(rejected, undefined, `new token released so ${fmtKey(key)} reclaimed`);
@@ -531,8 +587,15 @@ async function run() {
 
       if (!MUTATIONS.skipFinalCheckpoint) {
         const cp = await s.checkpoint();
-        assert.ok(cp.checkpointId, 'final checkpoint returns a confirmation id');
         const ps = s.getPersistenceState();
+        evidence('l4.checkpoint', {
+          checkpointId: cp.checkpointId,
+          voxelRevision: cp.voxelRevision,
+          confirmedVoxelRevision: ps.confirmedVoxelRevision,
+          lastConfirmedCheckpointId: ps.lastConfirmedCheckpointId,
+          dirty: ps.dirty,
+        });
+        assert.ok(cp.checkpointId, 'final checkpoint returns a confirmation id');
         assert.equal(ps.lastConfirmedCheckpointId, cp.checkpointId, 'final checkpointId confirmed');
         assert.equal(ps.confirmedVoxelRevision, cp.voxelRevision, 'voxel revision confirmed');
         assert.equal(ps.dirty, false, 'clean after final checkpoint (no later writes)');
@@ -543,6 +606,13 @@ async function run() {
       assert.equal(flush.pending, false, 'flush never captures new memory changes');
 
       const closed = await close(s);
+      evidence('l4.close', {
+        completed: closed.completed,
+        dirty: closed.dirty,
+        unconfirmedRequest: closed.unconfirmedRequest,
+        error: closed.error ? { kind: closed.error.kind, message: closed.error.message } : null,
+        lastConfirmedCheckpointId: closed.lastConfirmedCheckpointId,
+      });
       assert.equal(closed.completed, true, 'final session closes cleanly');
       assert.equal(closed.unconfirmedRequest, false, 'no unconfirmed request at close');
       assert.equal(closed.error, null, 'no error at close');
@@ -557,6 +627,15 @@ async function run() {
       // baseline where this cell was never observed (so the next assertion fails).
       const s2 = await open();
       const cell = s2.voxel.cellAt(DIM, 4, 0, 0);
+      evidence('l4.reopenFact', {
+        observed: cell.observed,
+        freshness: cell.observed ? cell.evidence.freshness : null,
+        stateName: cell.observed ? cell.evidence.observation.state.name : null,
+        properties: cell.observed ? cell.evidence.observation.state.properties : null,
+        observedAt: cell.observed ? cell.evidence.observation.observedAt : null,
+        sessionId: cell.observed ? cell.evidence.observation.sessionId : null,
+        stateComplete: cell.observed ? cell.evidence.observation.stateComplete : null,
+      });
       assert.equal(cell.observed, true, 'reopen has the unique final fact');
       assert.equal(cell.evidence.freshness, 'STALE', 'restored unique fact is STALE');
       assert.equal(cell.evidence.observation.state.name, 'minecraft:oak_log', 'unique state name preserved');

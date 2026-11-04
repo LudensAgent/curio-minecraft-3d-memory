@@ -68,6 +68,17 @@ commit.
    - `--close-fault-incomplete` — a session's `close()` reports `completed: false`.
    - `--close-fault-throw` — a session's `close()` throws after really closing.
    - `--cleanup-fault` — the directory cleanup throws.
+7. **Structured stdout evidence.** The consumer emits small, single-line JSON
+   records (`{"ev":…}`) of actual values, recorded *before* the matching assertion
+   where possible so an intended mutation failure still leaves the real values:
+   L3 checkpoint id/revision/dirty and dependency keys, the in-flight
+   delegation/result, the actual `free()` rejection `'pinned'` reasons, the
+   ARRIVED/cancel reclamation keys, and the two-lease handoff `free()` results; L4
+   checkpoint id/confirmed revisions/dirty, the real `CloseResult`, and the reopened
+   unique fact (observed flag, freshness, state name, properties, original
+   `observedAt`/`sessionId`/`stateComplete`); and a final `final.resource` record of
+   every real close result plus the primary/secondary errors and exit code. Records
+   are facts only — no fabricated `completed`, no full-library or unrelated snapshot.
 
 ## Validation (provisional — worktree `node`, self-resolved `dist`)
 
