@@ -31,6 +31,20 @@ export type {
   NavResult,
 } from './types.js';
 export { startKnownWalkRoute } from './known-walk-route.js';
+export { NAVIGATION_CAPABILITIES, NAVIGATION_CAPABILITY_STATUSES } from './capabilities.js';
+export type {
+  NavigationCapability,
+  NavigationCapabilityEffects,
+  NavigationCapabilityName,
+  NavigationCapabilityStatus,
+} from './capabilities.js';
+export { frontierCandidates, inspectRoute } from './route-inspection.js';
+export type {
+  FrontierCandidateView,
+  FrontierCandidatesResult,
+  RouteBoundaryFact,
+  RouteInspection,
+} from './route-inspection.js';
 export type {
   KnownWalkRouteRejectionReason,
   KnownWalkRouteRequest,
