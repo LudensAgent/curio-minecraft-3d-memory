@@ -32,7 +32,7 @@ const search = new WalkRouteSearch(map, {
 
 search.start({
   worldId, dim, sessionId, mode: 'walk', body,          // body.feet 是固定连续脚位
-  target, arrival: { kind: 'exact' } | { kind: 'near', radius },
+  target, arrival: { kind: 'near', radius: 2 },
   shapeProvider,                                         // 注入的形状规则；无宿主全局导入
 });
 
@@ -44,6 +44,9 @@ search.invalidateSections(keys);// 消费驻留变化（unload/load/load_failed�
 search.clear();                 // 丢弃本次搜索
 ```
 
+`arrival` 取两种形态之一：`exact` 表示要求精确脚格（不带半径）；`near` 需显式给出有限、非负的
+`radius`，按完整三维欧氏距离判定。示例选用 `near` 且 `radius: 2`。
+
 `WalkSearchState`：`PENDING` / `FOUND` / `NO_VERIFIED_PATH` / `INSUFFICIENT_EVIDENCE` /
 `UNSUPPORTED` / `BUDGET_EXHAUSTED` / `CANCELLED` / `INVALIDATED`。
 
@@ -53,7 +56,7 @@ search.clear();                 // 丢弃本次搜索
   exact 目标若高度不同或 X/Z 偏移不是整数，返回 `UNSUPPORTED`（`problem.kind === 'unsupported_target'`），
   不取整、不改写目标、不报 `NO_VERIFIED_PATH`。浮点近整数判定使用 `1e-9` 容差（与既有路线分解一致），
   返回的目标仍是调用方原值。
-- **near 为完整 XYZ 距离**：在每个实际到达的 stance 上用三维欧氏距离判断，不投影到 XZ；
+- **near 为完整 XYZ 距离**：在每个经 OPEN 边发现的候选 stance 上用三维欧氏距离判断，不投影到 XZ；
   半径必须显式给出且有限、非负。固定高度差已超过半径时直接返回 `NO_VERIFIED_PATH`（0 条边评估）。
 - **零边候选**：起点已满足 exact/近目标时返回 0 边候选，不声称 `ARRIVED`、不虚构移动。
 - **只走 OPEN**：每个方向调用 `evaluateWalkStep`；`BLOCKED` / `UNKNOWN` / `STALE` / `UNSUPPORTED`
@@ -62,7 +65,7 @@ search.clear();                 // 丢弃本次搜索
   `BUDGET_EXHAUSTED` 并给出 `problem.kind === 'budget_exhausted'` 的布尔与计数事实，不静默截断。
   `advance(n)` 的剩余工作在后续调用继续。
 - **取消**：`cancel` 前后均不产生 `FOUND` 假象；开始前取消时 `edgesEvaluated === 0`；中途取消保留
-  已到达节点数、边计数和取消前候选。
+  搜索已发现节点数、边计数和取消前候选。
 - **失效/过期契约**：所有已读依赖 Section 记录 revision 无关的驻留 generation；`advance`/`status`
   会检测规则版本变化、证据 `validUntil` 过期和驻留 generation 变化。所有已评估边（不仅是 OPEN 路径，
   也包括支撑 `NO_VERIFIED_PATH` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` 的 BLOCKED / UNKNOWN /
@@ -164,7 +167,7 @@ npx vitest run --no-cache
   过期而保守失效；这是有意的“不得混用旧证据”取舍，且不会自动重试。
 - refresh-only 失效按 Section 判定：仅当刷新触及曾产生 STALE/UNSUPPORTED 结论的 Section 时发生；
   同一 Section 内未参与该结论的格也会导致整个 search 失效（不做逐格派生追踪）。
-- near 完成条件只在实际到达的格点 stance 上判定，不判定边中间位置。
+- near 完成条件只在经 OPEN 边发现的候选 stance 上判定，不判定边中间位置。
 - 零边候选只有一个点，不能直接传给需要至少两个点的 `RouteVerifier`；调用方必须分支，并从实测身体
   位置确认完成条件后才能报告到达。
 - 失效由调用方显式转发 `ChangeReport`/驻留变化；未提供通用自动重试或后台重扫框架。
