@@ -1103,7 +1103,7 @@ function spatialColumns(dbPath: string): string[] {
   return cols.map((c) => c.name);
 }
 
-describe('v2 → v3 migration (real SQLite)', () => {
+describe('v2 → latest migration (real SQLite)', () => {
   it('backfills across the 100-row metadata window', async () => {
     const dbPath = makeDbPath();
     // 130 sections span two 100-row windows, exercising the rowid cursor rollover.
@@ -1111,7 +1111,7 @@ describe('v2 → v3 migration (real SQLite)', () => {
     makeV2Db(dbPath, payloads);
 
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    expect(schemaVersion(dbPath)).toBe('3');
+    expect(schemaVersion(dbPath)).toBe('4');
     expect(spatialColumns(dbPath)).toEqual(expect.arrayContaining(['observed_cells', 'palette_entries', 'revision']));
 
     const db = new Database(dbPath, { readonly: true });

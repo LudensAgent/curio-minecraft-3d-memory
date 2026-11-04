@@ -14,7 +14,13 @@ import { randomUUID } from 'node:crypto';
 import { FragmentStore } from '../../topology/fragment-store.js';
 import { TopologyStore } from '../../topology/topology-store.js';
 import { jsonEscapedByteLength } from '../../topology/path-fragment.js';
-import { PersistenceError, resolveSnapshotLimits, resolveTimeoutMs, SNAPSHOT_FRAME_BYTES } from './types.js';
+import {
+  PersistenceError,
+  resolveJournalLimits,
+  resolveSnapshotLimits,
+  resolveTimeoutMs,
+  SNAPSHOT_FRAME_BYTES,
+} from './types.js';
 import type {
   CheckpointResult,
   CloseResult,
@@ -23,29 +29,52 @@ import type {
   HistorySnapshot,
   OpenHistorySessionOptions,
   PersistenceState,
+  ResolvedJournalLimits,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
 
-export { DEFAULT_SNAPSHOT_LIMITS, DEFAULT_TIMEOUT_MS, PersistenceError } from './types.js';
+export {
+  DEFAULT_JOURNAL_LIMITS,
+  DEFAULT_SNAPSHOT_LIMITS,
+  DEFAULT_TIMEOUT_MS,
+  PersistenceError,
+  resolveJournalLimits,
+} from './types.js';
 export type {
+  ActionJournalQuery,
   CheckpointResult,
   CloseResult,
+  EventJournalQuery,
   FlushResult,
   HistorySession,
   HistorySnapshot,
+  JournalAcceptResult,
+  JournalBatchAcceptResult,
+  JournalBatchInput,
+  JournalController,
+  JournalLimits,
+  JournalPage,
+  JournalQueryBase,
+  JournalSaveMode,
+  JournalWithdrawalResult,
+  JournalWithdrawalSelector,
   LoadSectionsResult,
   MeasureSectionsResult,
   OpenHistorySessionOptions,
   OpenSpatialSessionOptions,
+  PendingJournalSnapshot,
   PersistenceErrorKind,
   PersistenceState,
+  ResolvedJournalLimits,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   SnapshotLimits,
   SpatialCheckpointResult,
+  SpatialEvent,
+  SpatialEventKind,
   SpatialPersistenceState,
   SpatialSession,
   VoxelLoading,
@@ -108,6 +137,7 @@ class HistorySessionImpl implements HistorySession {
   private readonly databasePath: string;
   private readonly timeoutMs: number;
   private readonly limits: ResolvedSnapshotLimits;
+  private readonly journalLimits: ResolvedJournalLimits;
 
   private worker: Worker | null = null;
   private lifecycle: SessionLifecycle = 'open';
@@ -138,6 +168,7 @@ class HistorySessionImpl implements HistorySession {
     this.databasePath = options.databasePath;
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
+    this.journalLimits = resolveJournalLimits(options.journalLimits);
 
     this.history = new FragmentStore(options.worldId, options.fragmentOptions);
     this.topology = new TopologyStore(this.history, options.topologyOptions);
@@ -250,6 +281,10 @@ class HistorySessionImpl implements HistorySession {
         voxelMode: 'none',
         voxelRevision: 0,
         voxelSnapshot: { worldId: this.worldId, sections: [] },
+        // A history-only checkpoint never appends or re-baselines journal facts.
+        journalMode: 'none',
+        journalRevision: 0,
+        journalBatch: { actions: [], events: [] },
       } satisfies WorkerRequest);
     });
     this.inFlight = { checkpointId, promise };
@@ -373,6 +408,7 @@ class HistorySessionImpl implements HistorySession {
         databasePath: this.databasePath,
         worldId: this.worldId,
         limits: this.limits,
+        journalLimits: this.journalLimits,
         kind: 'history',
         voxelLoading: 'eager',
       } satisfies WorkerRequest);

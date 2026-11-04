@@ -13,9 +13,13 @@ import { parentPort } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from './types.js';
+import type { ActionRecord } from '../../navigation/types.js';
+import { JournalConflictError, canonicalizeJournalRecord } from './journal.js';
 import type {
   HistorySnapshot,
+  ResolvedJournalLimits,
   ResolvedSnapshotLimits,
+  SpatialEvent,
   VoxelSaveMode,
   WorkerRequest,
   WorkerResponse,
@@ -30,7 +34,7 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -44,6 +48,8 @@ const KNOWN_TABLES_V1 = new Set([
 const KNOWN_TABLES_V2 = new Set([...KNOWN_TABLES_V1, 'spatial_sections']);
 
 const KNOWN_TABLES_V3 = new Set(KNOWN_TABLES_V2);
+
+const KNOWN_TABLES_V4 = new Set([...KNOWN_TABLES_V3, 'action_records', 'spatial_events']);
 
 /** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
 const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
@@ -90,6 +96,41 @@ const REQUIRED_COLUMNS_V3: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
   },
 };
 
+/** Required columns for the v4 schema (append-only action/event journal). */
+const REQUIRED_COLUMNS_V4: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V3,
+  checkpoints: {
+    checkpoint_id: 'TEXT',
+    world_id: 'TEXT',
+    fragment_revision: 'INTEGER',
+    topology_revision: 'INTEGER',
+    voxel_revision: 'INTEGER',
+    has_voxel: 'INTEGER',
+    journal_revision: 'INTEGER',
+    has_journal: 'INTEGER',
+    seq: 'INTEGER',
+  },
+  action_records: {
+    world_id: 'TEXT',
+    seq: 'INTEGER',
+    id: 'TEXT',
+    session_id: 'TEXT',
+    dim: 'TEXT',
+    ts: 'INTEGER',
+    payload: 'TEXT',
+  },
+  spatial_events: {
+    world_id: 'TEXT',
+    seq: 'INTEGER',
+    id: 'TEXT',
+    session_id: 'TEXT',
+    dim: 'TEXT',
+    kind: 'TEXT',
+    observed_at: 'INTEGER',
+    payload: 'TEXT',
+  },
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -103,6 +144,8 @@ CREATE TABLE checkpoints (
   topology_revision INTEGER NOT NULL,
   voxel_revision INTEGER NOT NULL DEFAULT 0,
   has_voxel INTEGER NOT NULL DEFAULT 0,
+  journal_revision INTEGER NOT NULL DEFAULT 0,
+  has_journal INTEGER NOT NULL DEFAULT 0,
   seq INTEGER NOT NULL
 );
 CREATE INDEX checkpoints_world_seq ON checkpoints (world_id, seq);
@@ -149,6 +192,33 @@ CREATE TABLE spatial_sections (
   revision INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (world_id, id)
 );
+
+CREATE TABLE action_records (
+  world_id TEXT NOT NULL,
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  dim TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  UNIQUE (world_id, session_id, id)
+);
+CREATE INDEX action_records_world_seq ON action_records (world_id, seq);
+CREATE INDEX action_records_scope_seq ON action_records (world_id, session_id, seq);
+
+CREATE TABLE spatial_events (
+  world_id TEXT NOT NULL,
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  dim TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  UNIQUE (world_id, session_id, id)
+);
+CREATE INDEX spatial_events_world_seq ON spatial_events (world_id, seq);
+CREATE INDEX spatial_events_scope_seq ON spatial_events (world_id, session_id, seq);
 `;
 
 interface PreparedSnapshot {
@@ -168,9 +238,33 @@ interface PreparedVoxelSnapshot {
   bytes: number;
 }
 
+interface PreparedAction {
+  id: string;
+  sessionId: string;
+  dim: string;
+  ts: number;
+  payload: string;
+}
+
+interface PreparedEvent {
+  id: string;
+  sessionId: string;
+  dim: string;
+  kind: string;
+  observedAt: number;
+  payload: string;
+}
+
+interface PreparedJournal {
+  actions: PreparedAction[];
+  events: PreparedEvent[];
+  bytes: number;
+}
+
 let db: Database.Database | null = null;
 let worldId: string | null = null;
 let limits: ResolvedSnapshotLimits | null = null;
+let journalLimits: ResolvedJournalLimits | null = null;
 
 function respond(msg: WorkerResponse): void {
   parentPort!.postMessage(msg);
@@ -215,6 +309,7 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV1ToV2(connection, databasePath);
     upgradeV2ToV3(connection, databasePath);
+    upgradeV3ToV4(connection, databasePath);
     return connection;
   }
 
@@ -224,12 +319,22 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV2ToV3(connection, databasePath);
+    upgradeV3ToV4(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (3)
-  validateKnownTables(connection, names, KNOWN_TABLES_V3);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V3)) {
+  if (version === 3) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V3);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V3)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV3ToV4(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (4)
+  validateKnownTables(connection, names, KNOWN_TABLES_V4);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V4)) {
     assertRequiredColumns(connection, table, columns);
   }
   return connection;
@@ -330,6 +435,53 @@ function upgradeV2ToV3(connection: Database.Database, databasePath: string): voi
     }
 
     connection.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
+/**
+ * Upgrade a validated v3 database in place: write a consistent backup first,
+ * then add the append-only journal tables and the independent journal checkpoint
+ * discriminator columns inside one transaction. No existing history/voxel rows
+ * are read, rewritten or deleted; an upgraded database starts with an empty
+ * journal rather than synthesized events.
+ */
+function upgradeV3ToV4(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v4-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.exec('ALTER TABLE checkpoints ADD COLUMN journal_revision INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE checkpoints ADD COLUMN has_journal INTEGER NOT NULL DEFAULT 0');
+    connection.exec(`
+      CREATE TABLE action_records (
+        world_id TEXT NOT NULL,
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        UNIQUE (world_id, session_id, id)
+      )
+    `);
+    connection.exec('CREATE INDEX action_records_world_seq ON action_records (world_id, seq)');
+    connection.exec('CREATE INDEX action_records_scope_seq ON action_records (world_id, session_id, seq)');
+    connection.exec(`
+      CREATE TABLE spatial_events (
+        world_id TEXT NOT NULL,
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        UNIQUE (world_id, session_id, id)
+      )
+    `);
+    connection.exec('CREATE INDEX spatial_events_world_seq ON spatial_events (world_id, seq)');
+    connection.exec('CREATE INDEX spatial_events_scope_seq ON spatial_events (world_id, session_id, seq)');
+    connection.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
   });
   tx();
 }
@@ -454,6 +606,68 @@ function prepareVoxelSnapshot(snapshot: VoxelCheckpointSnapshot): PreparedVoxelS
   return { sections, bytes };
 }
 
+/**
+ * Encode and bound one captured journal batch. The caller already validated and
+ * canonicalized the records on the main thread; the worker re-canonicalizes at
+ * this process/DB boundary so durable idempotency never depends on object-key
+ * insertion order and every column value is re-derived from the record itself.
+ */
+function prepareJournalBatch(
+  batch: { actions: ActionRecord[]; events: SpatialEvent[] },
+  wId: string,
+  resolved: ResolvedJournalLimits,
+): PreparedJournal {
+  const total = batch.actions.length + batch.events.length;
+  if (total > resolved.maxBatchRecords) {
+    throw new Error(`journal batch exceeds maxBatchRecords (${total})`);
+  }
+  const prepared: PreparedJournal = { actions: [], events: [], bytes: 0 };
+  const addBytes = (bytes: number): void => {
+    prepared.bytes += bytes;
+    if (prepared.bytes > resolved.maxBatchBytes) {
+      throw new Error(`journal batch exceeds maxBatchBytes (${prepared.bytes})`);
+    }
+  };
+  const requireString = (value: unknown, what: string): string => {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`journal ${what} must be a non-empty string`);
+    }
+    return value;
+  };
+  for (const action of batch.actions) {
+    if (action.worldId !== wId) throw new Error('journal action worldId does not match session worldId');
+    if (typeof action.ts !== 'number' || !Number.isFinite(action.ts)) {
+      throw new Error('journal action ts must be a finite number');
+    }
+    const canonical = canonicalizeJournalRecord(action, resolved);
+    addBytes(canonical.bytes);
+    prepared.actions.push({
+      id: requireString(action.id, 'action id'),
+      sessionId: requireString(action.sessionId, 'action sessionId'),
+      dim: requireString(action.dim, 'action dim'),
+      ts: action.ts,
+      payload: canonical.json,
+    });
+  }
+  for (const event of batch.events) {
+    if (event.worldId !== wId) throw new Error('journal event worldId does not match session worldId');
+    if (typeof event.observedAt !== 'number' || !Number.isFinite(event.observedAt)) {
+      throw new Error('journal event observedAt must be a finite number');
+    }
+    const canonical = canonicalizeJournalRecord(event, resolved);
+    addBytes(canonical.bytes);
+    prepared.events.push({
+      id: requireString(event.id, 'event id'),
+      sessionId: requireString(event.sessionId, 'event sessionId'),
+      dim: requireString(event.dim, 'event dim'),
+      kind: requireString(event.kind, 'event kind'),
+      observedAt: event.observedAt,
+      payload: canonical.json,
+    });
+  }
+  return prepared;
+}
+
 /** Exact outer-envelope bytes: fixed frame + inter-record commas + JSON-escaped worldId. */
 function snapshotEnvelopeBytes(snapshot: HistorySnapshot): number {
   return (
@@ -537,7 +751,9 @@ function writeCheckpoint(
   topologyRevision: number,
   prepared: PreparedSnapshot,
   voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
+  journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
   resolved: ResolvedSnapshotLimits,
+  resolvedJournal: ResolvedJournalLimits,
 ): void {
   const tx = connection.transaction(() => {
     const nextSeqRow = connection
@@ -599,9 +815,16 @@ function writeCheckpoint(
       assertVoxelFullSetWithinLimits(connection, wId, prepared.bytes, resolved);
     }
 
+    // The journal is append-only. `none` never touches rows or the journal
+    // baseline; `append` inserts the captured batch (possibly empty) and records
+    // the captured local revision. An empty append never deletes committed rows.
+    if (journal.mode === 'append') {
+      appendJournal(connection, wId, journal.prepared, resolvedJournal);
+    }
+
     connection
       .prepare(
-        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, seq) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         checkpointId,
@@ -610,10 +833,100 @@ function writeCheckpoint(
         topologyRevision,
         voxel.mode === 'none' ? 0 : voxel.voxelRevision,
         voxel.mode === 'none' ? 0 : 1,
+        journal.mode === 'none' ? 0 : journal.revision,
+        journal.mode === 'none' ? 0 : 1,
         nextSeq,
       );
   });
   tx();
+}
+
+/**
+ * Append one captured journal batch, detecting conflicts inside the transaction.
+ * A replay of an identical scoped id is a no-op (no quota growth, no overwrite);
+ * different content throws and rolls back every domain in the checkpoint.
+ */
+function appendJournal(
+  connection: Database.Database,
+  wId: string,
+  prepared: PreparedJournal,
+  resolved: ResolvedJournalLimits,
+): void {
+  const existingAction = connection.prepare(
+    'SELECT payload FROM action_records WHERE world_id = ? AND session_id = ? AND id = ?',
+  );
+  const existingEvent = connection.prepare(
+    'SELECT payload FROM spatial_events WHERE world_id = ? AND session_id = ? AND id = ?',
+  );
+  const insertAction = connection.prepare(
+    'INSERT INTO action_records (world_id, id, session_id, dim, ts, payload) VALUES (?, ?, ?, ?, ?, ?)',
+  );
+  const insertEvent = connection.prepare(
+    'INSERT INTO spatial_events (world_id, id, session_id, dim, kind, observed_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+
+  const batchSeen = new Map<string, string>();
+  for (const action of prepared.actions) {
+    const key = JSON.stringify([action.sessionId, action.id]);
+    const prior = batchSeen.get(key);
+    if (prior !== undefined) {
+      if (prior !== action.payload) {
+        throw new JournalConflictError(
+          `journal action conflict for session "${action.sessionId}" id "${action.id}": batch content differs`,
+        );
+      }
+      continue;
+    }
+    batchSeen.set(key, action.payload);
+    const existing = existingAction.get(wId, action.sessionId, action.id) as { payload: string } | undefined;
+    if (existing !== undefined) {
+      if (existing.payload !== action.payload) {
+        throw new JournalConflictError(
+          `journal action conflict for session "${action.sessionId}" id "${action.id}": committed content differs`,
+        );
+      }
+      continue;
+    }
+    insertAction.run(wId, action.id, action.sessionId, action.dim, action.ts, action.payload);
+  }
+
+  const batchSeenEvents = new Map<string, string>();
+  for (const event of prepared.events) {
+    const key = JSON.stringify([event.sessionId, event.id]);
+    const prior = batchSeenEvents.get(key);
+    if (prior !== undefined) {
+      if (prior !== event.payload) {
+        throw new JournalConflictError(
+          `journal event conflict for session "${event.sessionId}" id "${event.id}": batch content differs`,
+        );
+      }
+      continue;
+    }
+    batchSeenEvents.set(key, event.payload);
+    const existing = existingEvent.get(wId, event.sessionId, event.id) as { payload: string } | undefined;
+    if (existing !== undefined) {
+      if (existing.payload !== event.payload) {
+        throw new JournalConflictError(
+          `journal event conflict for session "${event.sessionId}" id "${event.id}": committed content differs`,
+        );
+      }
+      continue;
+    }
+    insertEvent.run(wId, event.id, event.sessionId, event.dim, event.kind, event.observedAt, event.payload);
+  }
+
+  // Duplicate replays do not grow these counts, so a full-capacity replay still
+  // succeeds. A genuinely new row is rejected (and the whole checkpoint rolls
+  // back) rather than evicting old facts.
+  const records = countRows(connection, 'action_records', wId) + countRows(connection, 'spatial_events', wId);
+  if (records > resolved.maxCommittedRecords) {
+    throw new Error(`journal exceeds maxCommittedRecords (${records})`);
+  }
+  const bytes =
+    sumPayloadBytes(connection, 'action_records', wId) + sumPayloadBytes(connection, 'spatial_events', wId);
+  if (bytes > resolved.maxCommittedBytes) {
+    throw new Error(`journal exceeds maxCommittedBytes (${bytes})`);
+  }
 }
 
 /**
@@ -710,7 +1023,9 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
               OR typeof(checkpoint_id) != 'text'
               OR checkpoint_id = ''
               OR typeof(has_voxel) != 'integer' OR (has_voxel != 0 AND has_voxel != 1)
-              OR typeof(voxel_revision) != 'integer' OR voxel_revision < 0)`,
+              OR typeof(voxel_revision) != 'integer' OR voxel_revision < 0
+              OR typeof(has_journal) != 'integer' OR (has_journal != 0 AND has_journal != 1)
+              OR typeof(journal_revision) != 'integer' OR journal_revision < 0)`,
     )
     .get(wId) as { n: number };
   if (bad.n > 0) {
@@ -942,6 +1257,44 @@ function loadVoxelDirectory(
   return { voxelBaselineCheckpointId: cp.checkpoint_id, voxelDirectory: directory, bytes };
 }
 
+/**
+ * Read only the committed journal baseline/count metadata for this world — never
+ * the event/action payloads. This is what makes reopen cost independent of the
+ * lifetime journal size.
+ */
+function loadJournalMeta(
+  connection: Database.Database,
+  wId: string,
+  resolved: ResolvedJournalLimits,
+): {
+  baselineCheckpointId: string | null;
+  revision: number;
+  recordCount: number;
+  recordBytes: number;
+} {
+  const cp = connection
+    .prepare(
+      'SELECT checkpoint_id, journal_revision FROM checkpoints WHERE world_id = ? AND has_journal = 1 ORDER BY seq DESC LIMIT 1',
+    )
+    .get(wId) as { checkpoint_id: string; journal_revision: number } | undefined;
+  const recordCount = countRows(connection, 'action_records', wId) + countRows(connection, 'spatial_events', wId);
+  const recordBytes =
+    sumPayloadBytes(connection, 'action_records', wId) + sumPayloadBytes(connection, 'spatial_events', wId);
+  if (cp === undefined) {
+    // Corruption guard: rows must not read as an empty journal when their
+    // checkpoint baseline is missing.
+    if (recordCount > 0) throw new Error('world has journal rows but no journal checkpoint metadata');
+    return { baselineCheckpointId: null, revision: 0, recordCount, recordBytes };
+  }
+  if (recordCount > resolved.maxCommittedRecords) {
+    throw new Error(`journal exceeds maxCommittedRecords (${recordCount})`);
+  }
+  if (recordBytes > resolved.maxCommittedBytes) {
+    throw new Error(`journal exceeds maxCommittedBytes (${recordBytes})`);
+  }
+  return { baselineCheckpointId: cp.checkpoint_id, revision: cp.journal_revision, recordCount, recordBytes };
+}
+
 /** Parse a stable section id (`JSON.stringify([dim, cx, cz, sy])`) back into its parts. */
 function parseSectionId(id: string): [string, number, number, number] {
   const arr = JSON.parse(id) as unknown;
@@ -963,8 +1316,10 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   db = connection;
   worldId = msg.worldId;
   limits = msg.limits;
+  journalLimits = msg.journalLimits;
   try {
     const world = loadWorld(connection, msg.worldId, msg.limits);
+    const journal = loadJournalMeta(connection, msg.worldId, msg.journalLimits);
     let voxelBaselineCheckpointId: string | null = null;
     let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
     let voxelDirectory: VoxelDirectoryEntry[] | null = null;
@@ -990,11 +1345,16 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       voxelBaselineCheckpointId,
       voxelSnapshot,
       voxelDirectory,
+      journalBaselineCheckpointId: journal.baselineCheckpointId,
+      journalRevision: journal.revision,
+      journalRecordCount: journal.recordCount,
+      journalRecordBytes: journal.recordBytes,
     });
   } catch (err) {
     db = null;
     worldId = null;
     limits = null;
+    journalLimits = null;
     connection.close();
     const message = (err as Error).message;
     const kind = /exceeds/.test(message) ? 'capacity' : 'data';
@@ -1003,7 +1363,7 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
 }
 
 function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
-  if (db === null || worldId === null || limits === null) {
+  if (db === null || worldId === null || limits === null || journalLimits === null) {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'worker is not open' });
     return;
   }
@@ -1015,8 +1375,21 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'data', message: 'snapshot worldId does not match session worldId' });
     return;
   }
+  if (msg.journalMode !== 'none' && msg.journalMode !== 'append') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid journal save mode' });
+    return;
+  }
+  if (!Number.isSafeInteger(msg.journalRevision) || msg.journalRevision < 0) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'journal revision must be a non-negative safe integer' });
+    return;
+  }
+  if (msg.journalMode === 'none' && (msg.journalBatch.actions.length > 0 || msg.journalBatch.events.length > 0)) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'journal mode none must not carry records' });
+    return;
+  }
   let prepared: PreparedSnapshot;
   let preparedVoxel: PreparedVoxelSnapshot | null = null;
+  let preparedJournal: PreparedJournal;
   try {
     prepared = prepareSnapshot(msg.snapshot);
     assertWithinLimits(prepared, limits);
@@ -1033,6 +1406,10 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
         throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
       }
     }
+    preparedJournal =
+      msg.journalMode === 'none'
+        ? { actions: [], events: [], bytes: 0 }
+        : prepareJournalBatch(msg.journalBatch, worldId, journalLimits);
   } catch (err) {
     respond({
       type: 'error',
@@ -1047,19 +1424,32 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       mode: msg.voxelMode,
       voxelRevision: msg.voxelRevision,
       sections: preparedVoxel?.sections ?? [],
-    }, limits);
+    }, {
+      mode: msg.journalMode,
+      revision: msg.journalRevision,
+      prepared: preparedJournal,
+    }, limits, journalLimits);
   } catch (err) {
-    // Capacity rejections raised inside the transaction (the post-increment full-set
-    // check) roll the whole batch back and must read as `capacity`, not a SQL fault.
+    // Capacity/conflict rejections raised inside the transaction roll the whole
+    // batch back; a conflict is never reported as a generic SQL fault.
     const message = (err as Error).message;
-    respond({ type: 'error', requestId: msg.requestId, kind: /exceeds/.test(message) ? 'capacity' : 'sql', message });
+    const kind =
+      err instanceof JournalConflictError ? 'conflict' : /exceeds/.test(message) ? 'capacity' : 'sql';
+    respond({ type: 'error', requestId: msg.requestId, kind, message });
     return;
   }
   const voxelBytes = (preparedVoxel?.sections ?? []).map((s) => {
     const [dim, cx, cz, sy] = parseSectionId(s.id);
     return { dim, cx, cz, sy, bytes: Buffer.byteLength(s.payload, 'utf8') };
   });
-  respond({ type: 'checkpoint_ok', requestId: msg.requestId, checkpointId: msg.checkpointId, voxelBytes });
+  respond({
+    type: 'checkpoint_ok',
+    requestId: msg.requestId,
+    checkpointId: msg.checkpointId,
+    voxelBytes,
+    journalRecordCount: countRows(db, 'action_records', worldId) + countRows(db, 'spatial_events', worldId),
+    journalRecordBytes: sumPayloadBytes(db, 'action_records', worldId) + sumPayloadBytes(db, 'spatial_events', worldId),
+  });
 }
 
 function handleLoadSections(msg: WorkerRequest & { type: 'load_sections' }): void {
@@ -1098,6 +1488,143 @@ function handleLoadSections(msg: WorkerRequest & { type: 'load_sections' }): voi
   }
 }
 
+interface JournalMetaRow {
+  seq: number;
+  bytes: number;
+}
+
+/**
+ * Shared committed-journal paging. Metadata (including `octet_length`) is read
+ * before any payload, the page budget is enforced before decode, and a record
+ * whose own payload exceeds the page budget is rejected explicitly instead of
+ * being silently skipped. Ordering is storage insertion sequence.
+ */
+function readJournalPage<T>(
+  connection: Database.Database,
+  table: 'action_records' | 'spatial_events',
+  wId: string,
+  afterSeq: number,
+  maxRecords: number,
+  maxBytes: number,
+  filters: { dim?: string; sessionId?: string; id?: string; kind?: string },
+): { records: T[]; nextCursor: string | null; hasMore: boolean } {
+  const conditions = ['world_id = ?', 'seq > ?'];
+  const params: (string | number)[] = [wId, afterSeq];
+  if (filters.dim !== undefined) {
+    conditions.push('dim = ?');
+    params.push(filters.dim);
+  }
+  if (filters.sessionId !== undefined) {
+    conditions.push('session_id = ?');
+    params.push(filters.sessionId);
+  }
+  if (filters.id !== undefined) {
+    conditions.push('id = ?');
+    params.push(filters.id);
+  }
+  if (filters.kind !== undefined) {
+    conditions.push('kind = ?');
+    params.push(filters.kind);
+  }
+  const rows = connection
+    .prepare(
+      `SELECT seq, octet_length(payload) AS bytes FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY seq ASC LIMIT ?`,
+    )
+    .all(...params, maxRecords + 1) as JournalMetaRow[];
+
+  const selected: JournalMetaRow[] = [];
+  let bytes = 0;
+  for (const row of rows) {
+    if (selected.length >= maxRecords) break;
+    if (row.bytes > maxBytes) {
+      if (selected.length === 0) {
+        throw new Error(`journal record exceeds maxPageBytes (${row.bytes})`);
+      }
+      break;
+    }
+    if (bytes + row.bytes > maxBytes) {
+      if (selected.length === 0) {
+        throw new Error(`journal page exceeds maxPageBytes (${row.bytes})`);
+      }
+      break;
+    }
+    selected.push(row);
+    bytes += row.bytes;
+  }
+  const hasMore = selected.length < rows.length;
+  if (selected.length === 0) {
+    return { records: [], nextCursor: null, hasMore: false };
+  }
+
+  const load = connection.prepare(`SELECT payload FROM ${table} WHERE seq = ?`);
+  const records = selected.map((row) => {
+    const payload = load.get(row.seq) as { payload: string } | undefined;
+    if (payload === undefined) throw new Error(`journal row ${row.seq} disappeared while paging`);
+    return JSON.parse(payload.payload) as T;
+  });
+  const last = selected[selected.length - 1]!;
+  return { records, nextCursor: hasMore ? String(last.seq) : null, hasMore };
+}
+
+function assertQueryBounds(
+  msg: WorkerRequest & { type: 'query_actions' | 'query_events' },
+  resolved: ResolvedJournalLimits,
+): void {
+  if (msg.worldId !== worldId) {
+    throw new Error('journal query worldId does not match session worldId');
+  }
+  if (!Number.isSafeInteger(msg.afterSeq) || msg.afterSeq < 0) {
+    throw new Error('journal query cursor must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(msg.maxRecords) || msg.maxRecords < 1 || msg.maxRecords > resolved.maxPageRecords) {
+    throw new Error(`journal query maxRecords must be within 1..${resolved.maxPageRecords}`);
+  }
+  if (!Number.isSafeInteger(msg.maxBytes) || msg.maxBytes < 1 || msg.maxBytes > resolved.maxPageBytes) {
+    throw new Error(`journal query maxBytes must be within 1..${resolved.maxPageBytes}`);
+  }
+}
+
+function handleQueryActions(msg: WorkerRequest & { type: 'query_actions' }): void {
+  if (db === null || worldId === null || journalLimits === null) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'worker is not open' });
+    return;
+  }
+  try {
+    assertQueryBounds(msg, journalLimits);
+    const page = readJournalPage<ActionRecord>(db, 'action_records', worldId, msg.afterSeq, msg.maxRecords, msg.maxBytes, {
+      dim: msg.dim,
+      sessionId: msg.sessionId,
+      id: msg.actionId,
+    });
+    respond({ type: 'query_actions_ok', requestId: msg.requestId, ...page });
+  } catch (err) {
+    const message = (err as Error).message;
+    const kind = /exceeds/.test(message) ? 'capacity' : /worldId|cursor|maxRecords|maxBytes/.test(message) ? 'invalid_argument' : 'data';
+    respond({ type: 'error', requestId: msg.requestId, kind, message });
+  }
+}
+
+function handleQueryEvents(msg: WorkerRequest & { type: 'query_events' }): void {
+  if (db === null || worldId === null || journalLimits === null) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'worker is not open' });
+    return;
+  }
+  try {
+    assertQueryBounds(msg, journalLimits);
+    const page = readJournalPage<SpatialEvent>(db, 'spatial_events', worldId, msg.afterSeq, msg.maxRecords, msg.maxBytes, {
+      dim: msg.dim,
+      sessionId: msg.sessionId,
+      id: msg.eventId,
+      kind: msg.kind,
+    });
+    respond({ type: 'query_events_ok', requestId: msg.requestId, ...page });
+  } catch (err) {
+    const message = (err as Error).message;
+    const kind = /exceeds/.test(message) ? 'capacity' : /worldId|cursor|maxRecords|maxBytes/.test(message) ? 'invalid_argument' : 'data';
+    respond({ type: 'error', requestId: msg.requestId, kind, message });
+  }
+}
+
 function handleClose(msg: WorkerRequest & { type: 'close' }): void {
   if (db !== null) {
     db.close();
@@ -1126,6 +1653,12 @@ parentPort!.on('message', (msg: WorkerRequest) => {
       break;
     case 'load_sections':
       handleLoadSections(msg);
+      break;
+    case 'query_actions':
+      handleQueryActions(msg);
+      break;
+    case 'query_events':
+      handleQueryEvents(msg);
       break;
     case 'close':
       handleClose(msg);

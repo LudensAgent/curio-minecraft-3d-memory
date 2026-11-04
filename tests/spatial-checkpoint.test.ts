@@ -10,6 +10,14 @@ import { openHistorySession, openSpatialSession, PersistenceError } from '../dis
 import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from '../src/storage/sqlite/types.js';
 import * as distBytes from '../dist/bytes.js';
 
+// Mock the built helper rather than `vi.spyOn`-ing its ESM namespace: namespace
+// exports are non-configurable on this Node/Vitest combination. The assertion
+// (the escaped-byte scan is never reached) is unchanged.
+vi.mock('../dist/bytes.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../dist/bytes.js')>();
+  return { ...actual, jsonEscapedByteLength: vi.fn(actual.jsonEscapedByteLength) };
+});
+
 const WORLD = 'world';
 const DIM = 'overworld';
 
@@ -114,6 +122,23 @@ function writeV1Schema(dbPath: string, options: { extraCheckpointColumn?: string
     CREATE TABLE spatial_edges (world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (world_id, id));
   `);
   db.close();
+}
+
+/**
+ * Simulate a real v2 database from the current (v4) fixture: remove the v3
+ * section-metadata columns plus the v4 journal tables/checkpoint columns, then
+ * set the version back to 2. This keeps the migration test honest — it does not
+ * leave later-schema objects behind for the v2 validation to accidentally accept.
+ */
+function downgradeToV2(db: Database.Database): void {
+  db.exec('DROP TABLE IF EXISTS action_records');
+  db.exec('DROP TABLE IF EXISTS spatial_events');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN journal_revision');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN has_journal');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN observed_cells');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN palette_entries');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN revision');
+  db.prepare("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'").run();
 }
 
 afterEach(() => {
@@ -570,7 +595,8 @@ describe('SQLite combined spatial persistence', () => {
     // scan (`jsonEscapedByteLength`) is the full per-character pass; observing that
     // it never runs pins the early stop to the cheap length check rather than to the
     // later envelope check or the store measures.
-    const escapedSpy = vi.spyOn(distBytes, 'jsonEscapedByteLength');
+    const escapedSpy = vi.mocked(distBytes.jsonEscapedByteLength);
+    escapedSpy.mockClear();
     const measureSpies = [
       vi.spyOn(session.voxel, 'checkpointMeasure'),
       vi.spyOn(session.voxel, 'checkpointDirtyMeasure'),
@@ -588,7 +614,6 @@ describe('SQLite combined spatial persistence', () => {
 
     expect(escapedSpy).not.toHaveBeenCalled();
     for (const spy of [...measureSpies, ...snapshotSpies]) expect(spy).not.toHaveBeenCalled();
-    escapedSpy.mockRestore();
     await session.close();
   });
 
@@ -683,7 +708,7 @@ describe('v1 → latest schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('3');
+    expect(version).toBe('4');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();
@@ -796,10 +821,7 @@ describe('v2 → v3 migration scope', () => {
     // Downgrade to v2 (drop the per-section metadata columns) so a reopen must
     // migrate again.
     const db = new Database(dbPath);
-    db.exec('ALTER TABLE spatial_sections DROP COLUMN observed_cells');
-    db.exec('ALTER TABLE spatial_sections DROP COLUMN palette_entries');
-    db.exec('ALTER TABLE spatial_sections DROP COLUMN revision');
-    db.exec("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'");
+    downgradeToV2(db);
     db.close();
 
     // The whole database holds two sections; worldA alone holds one. A per-world
@@ -827,10 +849,7 @@ describe('v2 → v3 migration scope', () => {
     await b.close();
 
     const db = new Database(dbPath);
-    db.exec('ALTER TABLE spatial_sections DROP COLUMN observed_cells');
-    db.exec('ALTER TABLE spatial_sections DROP COLUMN palette_entries');
-    db.exec('ALTER TABLE spatial_sections DROP COLUMN revision');
-    db.exec("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'");
+    downgradeToV2(db);
     db.close();
 
     const probe = new Database(dbPath, { readonly: true });

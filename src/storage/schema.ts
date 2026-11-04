@@ -21,9 +21,9 @@ export const TABLE_NAMES = {
   /** Place anchors and route connections. */
   spatialNodes: 'spatial_nodes',
   spatialEdges: 'spatial_edges',
-  /** Important spatial changes (block / clear / re-verify). */
+  /** Append-only spatial evidence events (observed cell change / observation gap). */
   spatialEvents: 'spatial_events',
-  /** Delegation, execution, result, consumption. */
+  /** Append-only delegated action records, including the original NavResult when supplied. */
   actionRecords: 'action_records',
   /** Existing placement ledger (name / LRU order / delete semantics). */
   placedBlocks: 'placed_blocks',

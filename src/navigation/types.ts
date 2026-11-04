@@ -173,4 +173,11 @@ export interface ActionRecord {
   failureAt?: Vec3Like;
   failureReason?: string;
   confirmed: boolean;
+  /**
+   * Full original navigation/execution result, when the caller has one. This is
+   * optional so older callers remain valid; when present it is retained verbatim
+   * (outcome, problem, last observation, trace, partial effects and the original
+   * `memoryWrite` marker) rather than reconstructed from legacy `ok/confirmed`.
+   */
+  result?: NavResult;
 }

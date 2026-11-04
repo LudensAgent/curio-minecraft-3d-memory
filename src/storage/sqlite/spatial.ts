@@ -31,20 +31,34 @@ import type {
 import { jsonEscapedByteLength } from '../../bytes.js';
 import {
   PersistenceError,
+  resolveJournalLimits,
   resolveSnapshotLimits,
   resolveTimeoutMs,
   SNAPSHOT_FRAME_BYTES,
   VOXEL_FRAME_BYTES,
 } from './types.js';
 import type {
+  ActionJournalQuery,
   CloseResult,
+  EventJournalQuery,
   FlushResult,
+  JournalAcceptResult,
+  JournalBatchAcceptResult,
+  JournalBatchInput,
+  JournalController,
+  JournalPage,
+  JournalQueryBase,
+  JournalWithdrawalResult,
+  JournalWithdrawalSelector,
   LoadSectionsResult,
   MeasureSectionsResult,
   OpenSpatialSessionOptions,
+  PendingJournalSnapshot,
+  ResolvedJournalLimits,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   SpatialCheckpointResult,
+  SpatialEvent,
   SpatialPersistenceState,
   SpatialSession,
   VoxelLoading,
@@ -52,12 +66,15 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
+import type { ActionRecord } from '../../navigation/types.js';
+import { JournalQueue } from './journal.js';
+import type { JournalCapture } from './journal.js';
 import type { HistorySnapshot } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import { estimateVoxelSectionResidentBytesFromSnapshot } from '../../voxel/snapshot.js';
 
 interface PendingRequest {
-  kind: 'open' | 'checkpoint' | 'load' | 'close';
+  kind: 'open' | 'checkpoint' | 'load' | 'query' | 'close';
   resolve: (value: unknown) => void;
   reject: (e: PersistenceError) => void;
   timer?: NodeJS.Timeout;
@@ -69,11 +86,34 @@ interface PendingRequest {
   voxelMode?: VoxelSaveMode;
   /** The captured (committed) voxel sections, for the directory update on ACK. */
   voxelSections?: VoxelSectionSnapshot[];
+  /** The captured journal batch, for the ACK-time pending clear. */
+  journalCapture?: JournalCapture;
 }
 
 interface InFlightCheckpoint {
   checkpointId: string;
   promise: Promise<SpatialCheckpointResult>;
+}
+
+interface JournalQueryMessage {
+  type: 'query_actions' | 'query_events';
+  worldId: string;
+  afterSeq: number;
+  maxRecords: number;
+  maxBytes: number;
+  dim?: string;
+  sessionId?: string;
+  actionId?: string;
+  eventId?: string;
+  kind?: 'observed_cell_change' | 'observation_gap';
+}
+
+function optionalQueryString(value: string | undefined, what: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new PersistenceError('invalid_argument', `${what} must be a non-empty string when present`);
+  }
+  return value;
 }
 
 /**
@@ -115,13 +155,17 @@ class SpatialSessionImpl implements SpatialSession {
   }
 
   get busy(): boolean {
-    return this.inFlight !== null || this.loadInFlight || this.workingSetLock;
+    return this.inFlight !== null || this.loadInFlight || this.workingSetLock || this.queryInFlight;
   }
+
+  readonly journal: JournalController;
 
   private readonly worldId: string;
   private readonly databasePath: string;
   private readonly timeoutMs: number;
   private readonly limits: ResolvedSnapshotLimits;
+  private readonly journalLimitsField: ResolvedJournalLimits;
+  private readonly journalQueue: JournalQueue;
 
   private worker: Worker | null = null;
   private lifecycleField: SessionLifecycle = 'open';
@@ -130,6 +174,8 @@ class SpatialSessionImpl implements SpatialSession {
   private pending = new Map<number, PendingRequest>();
   private inFlight: InFlightCheckpoint | null = null;
   private loadInFlight = false;
+  private queryInFlight = false;
+  private activeQuery: Promise<unknown> | null = null;
   /** Session-wide operation gate shared by working-set managers and direct load/save. */
   private workingSetLock = false;
   private readonly voxelLoadingField: VoxelLoading;
@@ -138,8 +184,12 @@ class SpatialSessionImpl implements SpatialSession {
   private confirmedVoxelRevision = 0;
   private confirmedFragmentRevision = 0;
   private confirmedTopologyRevision = 0;
+  private confirmedJournalRevision = 0;
   private baselineCheckpointId: string | null = null;
   private voxelBaselineCheckpointId: string | null = null;
+  private journalBaselineCheckpointId: string | null = null;
+  private committedJournalRecords = 0;
+  private committedJournalBytes = 0;
   /** Whether a voxel save baseline exists (restored, or established this session). */
   private voxelBaselineEstablished = false;
   private lastConfirmedCheckpointId: string | null = null;
@@ -160,6 +210,24 @@ class SpatialSessionImpl implements SpatialSession {
     this.databasePath = options.databasePath;
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
+    this.journalLimitsField = resolveJournalLimits(options.journalLimits);
+    this.journalQueue = new JournalQueue(this.worldId, this.journalLimitsField);
+    this.journal = {
+      recordAction: (record: ActionRecord): JournalAcceptResult => {
+        this.assertJournalAccepting();
+        return this.journalQueue.recordAction(record);
+      },
+      recordEvent: (event: SpatialEvent): JournalAcceptResult => {
+        this.assertJournalAccepting();
+        return this.journalQueue.recordEvent(event);
+      },
+      recordBatch: (batch: JournalBatchInput): JournalBatchAcceptResult => {
+        this.assertJournalAccepting();
+        return this.journalQueue.acceptBatch(batch);
+      },
+      readPending: (): PendingJournalSnapshot => this.journalQueue.readPending(),
+      withdraw: (selector: JournalWithdrawalSelector): JournalWithdrawalResult => this.withdrawPending(selector),
+    };
     this.voxelLoadingField = options.voxelLoading ?? 'eager';
     this.residencyLimitsField = resolveResidencyLimits(options.residencyLimits);
 
@@ -190,6 +258,10 @@ class SpatialSessionImpl implements SpatialSession {
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
       voxelDirectory: VoxelDirectoryEntry[] | null;
+      journalBaselineCheckpointId: string | null;
+      journalRevision: number;
+      journalRecordCount: number;
+      journalRecordBytes: number;
     };
     try {
       result = await this.requestOpen();
@@ -218,6 +290,11 @@ class SpatialSessionImpl implements SpatialSession {
     this.baselineCheckpointId = result.baselineCheckpointId;
     this.voxelBaselineCheckpointId = result.voxelBaselineCheckpointId;
     this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
+    this.journalBaselineCheckpointId = result.journalBaselineCheckpointId;
+    this.committedJournalRecords = result.journalRecordCount;
+    this.committedJournalBytes = result.journalRecordBytes;
+    this.journalQueue.resetRevisionForRestore(result.journalRevision);
+    this.confirmedJournalRevision = result.journalRevision;
     this.confirmedFragmentRevision = this.history.revision;
     this.confirmedTopologyRevision = this.topology.revision;
     this.confirmedVoxelRevision = this.voxel.saveRevision;
@@ -233,7 +310,7 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.lifecycleField === 'closed') {
       throw new PersistenceError('closed', 'session is closed; new checkpoints are not accepted');
     }
-    if (this.inFlight !== null || this.loadInFlight || this.workingSetLock) {
+    if (this.inFlight !== null || this.loadInFlight || this.workingSetLock || this.queryInFlight) {
       throw new PersistenceError('busy', 'a persistence request is already in flight');
     }
 
@@ -344,6 +421,13 @@ class SpatialSessionImpl implements SpatialSession {
         ? this.voxel.checkpointSnapshot()
         : { worldId: this.worldId, sections: this.voxel.captureDirtySections() };
 
+    // Capture the exact pending batch/revision now. Records accepted after this
+    // line keep a higher local revision and survive this ACK.
+    const journalCapture = this.journalQueue.capture(
+      this.journalLimitsField.maxBatchRecords,
+      this.journalLimitsField.maxBatchBytes,
+    );
+
     const checkpointId = randomUUID();
     const promise = new Promise<SpatialCheckpointResult>((resolve, reject) => {
       const requestId = this.nextRequestId++;
@@ -356,6 +440,7 @@ class SpatialSessionImpl implements SpatialSession {
         topologyRevision,
         voxelMode,
         voxelSections: voxelSnapshot.sections,
+        journalCapture,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -371,6 +456,9 @@ class SpatialSessionImpl implements SpatialSession {
         voxelMode,
         voxelRevision,
         voxelSnapshot,
+        journalMode: 'append',
+        journalRevision: journalCapture.revision,
+        journalBatch: { actions: journalCapture.actions, events: journalCapture.events },
       } satisfies WorkerRequest);
     });
     this.inFlight = { checkpointId, promise };
@@ -424,7 +512,7 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.lifecycleField === 'closed') {
       throw new PersistenceError('closed', 'session is closed; new loads are not accepted');
     }
-    if (this.inFlight !== null || this.loadInFlight) {
+    if (this.inFlight !== null || this.loadInFlight || this.queryInFlight) {
       throw new PersistenceError('busy', 'a persistence request is already in flight');
     }
 
@@ -507,7 +595,7 @@ class SpatialSessionImpl implements SpatialSession {
     if (this.workingSetLock) {
       throw new PersistenceError('busy', 'another working-set operation is in flight');
     }
-    if (this.inFlight !== null || this.loadInFlight) {
+    if (this.inFlight !== null || this.loadInFlight || this.queryInFlight) {
       throw new PersistenceError('busy', 'a persistence request is in flight');
     }
     this.workingSetLock = true;
@@ -530,11 +618,47 @@ class SpatialSessionImpl implements SpatialSession {
       dirty: this.isDirty(),
       baselineCheckpointId: this.baselineCheckpointId,
       voxelBaselineCheckpointId: this.voxelBaselineCheckpointId,
+      journalRevision: this.journalQueue.revision,
+      confirmedJournalRevision: this.confirmedJournalRevision,
+      journalBaselineCheckpointId: this.journalBaselineCheckpointId,
+      pendingJournalRecords: this.journalQueue.pendingRecords,
+      pendingJournalBytes: this.journalQueue.pendingBytes,
+      committedJournalRecords: this.committedJournalRecords,
+      committedJournalBytes: this.committedJournalBytes,
       lastConfirmedCheckpointId: this.lastConfirmedCheckpointId,
       inFlightCheckpointId: this.inFlight?.checkpointId ?? null,
       unconfirmedCheckpointId: this.unconfirmedCheckpointId,
       lastError: this.lastError,
     };
+  }
+
+  /** Bounded read of committed action records through the same worker gate. */
+  async queryActions(query: ActionJournalQuery = {}): Promise<JournalPage<ActionRecord>> {
+    const page = this.resolveJournalQuery(query);
+    const actionId = optionalQueryString(query.actionId, 'actionId');
+    return this.sendJournalQuery<ActionRecord>({
+      type: 'query_actions',
+      worldId: this.worldId,
+      ...page,
+      actionId,
+    });
+  }
+
+  /** Bounded read of committed spatial events through the same worker gate. */
+  async queryEvents(query: EventJournalQuery = {}): Promise<JournalPage<SpatialEvent>> {
+    const page = this.resolveJournalQuery(query);
+    const eventId = optionalQueryString(query.eventId, 'eventId');
+    const kind = query.kind;
+    if (kind !== undefined && kind !== 'observed_cell_change' && kind !== 'observation_gap') {
+      throw new PersistenceError('invalid_argument', `unsupported spatial event kind filter: ${String(kind)}`);
+    }
+    return this.sendJournalQuery<SpatialEvent>({
+      type: 'query_events',
+      worldId: this.worldId,
+      ...page,
+      eventId,
+      kind,
+    });
   }
 
   async flush(): Promise<FlushResult> {
@@ -584,6 +708,17 @@ class SpatialSessionImpl implements SpatialSession {
         unconfirmed = true;
         closeError =
           err instanceof PersistenceError ? err : new PersistenceError('worker_communication', String(err));
+      }
+    }
+
+    // An already-accepted read is awaited (inside the same deadline) so close
+    // does not terminate its worker mid-query. Query failures are reported to
+    // that caller; they are not unsaved writes.
+    if (this.activeQuery !== null) {
+      try {
+        await this.activeQuery;
+      } catch {
+        // already surfaced through lastError / the query promise
       }
     }
 
@@ -655,11 +790,106 @@ class SpatialSessionImpl implements SpatialSession {
     });
   }
 
+  private assertJournalAccepting(): void {
+    if (this.lifecycleField === 'closing') {
+      throw new PersistenceError('closing', 'session is closing; journal records are not accepted');
+    }
+    if (this.lifecycleField === 'closed') {
+      throw new PersistenceError('closed', 'session is closed; journal records are not accepted');
+    }
+  }
+
+  private withdrawPending(selector: JournalWithdrawalSelector): JournalWithdrawalResult {
+    // The simplest safe rule: no withdrawal while any checkpoint may be covering
+    // these entries. Withdrawal is local and never touches committed rows.
+    if (this.inFlight !== null) {
+      throw new PersistenceError('busy', 'a checkpoint is in flight; pending journal withdrawal is not accepted');
+    }
+    return this.journalQueue.withdraw(selector);
+  }
+
+  private resolveJournalQuery(query: JournalQueryBase | undefined): {
+    dim?: string;
+    sessionId?: string;
+    afterSeq: number;
+    maxRecords: number;
+    maxBytes: number;
+  } {
+    const q: JournalQueryBase = query ?? {};
+    if (q === null || typeof q !== 'object' || Array.isArray(q)) {
+      throw new PersistenceError('invalid_argument', 'journal query must be an object');
+    }
+    const dim = optionalQueryString(q.dim, 'dim');
+    const sessionId = optionalQueryString(q.sessionId, 'sessionId');
+    const maxRecords = q.maxRecords ?? this.journalLimitsField.maxPageRecords;
+    if (
+      !Number.isSafeInteger(maxRecords) ||
+      maxRecords < 1 ||
+      maxRecords > this.journalLimitsField.maxPageRecords
+    ) {
+      throw new PersistenceError(
+        'invalid_argument',
+        `maxRecords must be within 1..${this.journalLimitsField.maxPageRecords}`,
+      );
+    }
+    const maxBytes = q.maxBytes ?? this.journalLimitsField.maxPageBytes;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > this.journalLimitsField.maxPageBytes) {
+      throw new PersistenceError(
+        'invalid_argument',
+        `maxBytes must be within 1..${this.journalLimitsField.maxPageBytes}`,
+      );
+    }
+    let afterSeq = 0;
+    if (q.cursor !== undefined) {
+      if (typeof q.cursor !== 'string' || !/^(0|[1-9][0-9]*)$/.test(q.cursor)) {
+        throw new PersistenceError('invalid_argument', 'cursor must be an opaque string from a previous journal page');
+      }
+      const parsed = Number(q.cursor);
+      if (!Number.isSafeInteger(parsed)) {
+        throw new PersistenceError('invalid_argument', 'cursor is out of range');
+      }
+      afterSeq = parsed;
+    }
+    return { dim, sessionId, afterSeq, maxRecords, maxBytes };
+  }
+
+  private async sendJournalQuery<T>(msg: JournalQueryMessage): Promise<JournalPage<T>> {
+    if (this.lifecycleField === 'closing') {
+      throw new PersistenceError('closing', 'session is closing; journal queries are not accepted');
+    }
+    if (this.lifecycleField === 'closed') {
+      throw new PersistenceError('closed', 'session is closed; journal queries are not accepted');
+    }
+    if (this.inFlight !== null || this.loadInFlight || this.workingSetLock || this.queryInFlight) {
+      throw new PersistenceError('busy', 'a persistence request is already in flight');
+    }
+    this.queryInFlight = true;
+    const promise = new Promise<JournalPage<T>>((resolve, reject) => {
+      const requestId = this.nextRequestId++;
+      const timer = setTimeout(() => this.onTimeout(requestId), this.timeoutMs);
+      this.pending.set(requestId, {
+        kind: 'query',
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timer,
+      });
+      this.worker!.postMessage({ ...msg, requestId });
+    });
+    this.activeQuery = promise;
+    try {
+      return await promise;
+    } finally {
+      this.queryInFlight = false;
+      if (this.activeQuery === promise) this.activeQuery = null;
+    }
+  }
+
   private isDirty(): boolean {
     return (
       this.voxel.saveRevision !== this.confirmedVoxelRevision ||
       this.history.revision !== this.confirmedFragmentRevision ||
-      this.topology.revision !== this.confirmedTopologyRevision
+      this.topology.revision !== this.confirmedTopologyRevision ||
+      this.journalQueue.revision !== this.confirmedJournalRevision
     );
   }
 
@@ -669,6 +899,10 @@ class SpatialSessionImpl implements SpatialSession {
     voxelBaselineCheckpointId: string | null;
     voxelSnapshot: VoxelCheckpointSnapshot | null;
     voxelDirectory: VoxelDirectoryEntry[] | null;
+    journalBaselineCheckpointId: string | null;
+    journalRevision: number;
+    journalRecordCount: number;
+    journalRecordBytes: number;
   }> {
     const requestId = this.nextRequestId++;
     return new Promise((resolve, reject) => {
@@ -680,6 +914,7 @@ class SpatialSessionImpl implements SpatialSession {
         databasePath: this.databasePath,
         worldId: this.worldId,
         limits: this.limits,
+        journalLimits: this.journalLimitsField,
         kind: 'spatial',
         voxelLoading: this.voxelLoadingField,
       } satisfies WorkerRequest);
@@ -761,10 +996,24 @@ class SpatialSessionImpl implements SpatialSession {
         voxelBaselineCheckpointId: openMsg.voxelBaselineCheckpointId,
         voxelSnapshot: openMsg.voxelSnapshot,
         voxelDirectory: openMsg.voxelDirectory,
+        journalBaselineCheckpointId: openMsg.journalBaselineCheckpointId,
+        journalRevision: openMsg.journalRevision,
+        journalRecordCount: openMsg.journalRecordCount,
+        journalRecordBytes: openMsg.journalRecordBytes,
       });
     } else if (entry.kind === 'load') {
       const loadMsg = msg as WorkerResponse & { type: 'load_ok' };
       entry.resolve({ sections: loadMsg.sections, missing: loadMsg.missing });
+    } else if (entry.kind === 'query') {
+      if (msg.type !== 'query_actions_ok' && msg.type !== 'query_events_ok') {
+        entry.reject(new PersistenceError('data', 'unexpected worker response to journal query'));
+        return;
+      }
+      entry.resolve({
+        records: msg.records,
+        nextCursor: msg.nextCursor,
+        hasMore: msg.hasMore,
+      });
     } else if (entry.kind === 'checkpoint') {
       const okMsg = msg as WorkerResponse & { type: 'checkpoint_ok' };
       this.inFlight = null;
@@ -781,6 +1030,14 @@ class SpatialSessionImpl implements SpatialSession {
       this.confirmedVoxelRevision = entry.voxelRevision!;
       this.confirmedFragmentRevision = entry.fragmentRevision!;
       this.confirmedTopologyRevision = entry.topologyRevision!;
+      // Clear only the captured journal entries; newer acceptances stay pending.
+      if (entry.journalCapture !== undefined) {
+        this.journalQueue.confirm(entry.journalCapture.keys, entry.journalCapture.revision);
+        this.confirmedJournalRevision = entry.journalCapture.revision;
+        this.journalBaselineCheckpointId = okMsg.checkpointId;
+      }
+      this.committedJournalRecords = okMsg.journalRecordCount;
+      this.committedJournalBytes = okMsg.journalRecordBytes;
       this.lastConfirmedCheckpointId = okMsg.checkpointId;
       entry.resolve({
         checkpointId: okMsg.checkpointId,
@@ -822,12 +1079,15 @@ class SpatialSessionImpl implements SpatialSession {
       void this.terminateWorker();
       return;
     }
-    if (entry.kind === 'load') {
+    if (entry.kind === 'load' || entry.kind === 'query') {
       // A read timeout is distinct from an unconfirmed save (no checkpoint id is
       // fabricated), but the worker may still be running the slow read — so the
       // session must not accept new requests that would queue behind it. Poison and
       // terminate, exactly like a checkpoint timeout, to avoid an unbounded queue.
-      const error = new PersistenceError('timeout', 'section load did not complete within timeout');
+      const error = new PersistenceError(
+        'timeout',
+        entry.kind === 'load' ? 'section load did not complete within timeout' : 'journal query did not complete within timeout',
+      );
       this.lastError = error;
       this.lifecycleField = 'closed';
       this.failAllPending(error);

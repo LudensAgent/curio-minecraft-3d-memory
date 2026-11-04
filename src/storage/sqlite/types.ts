@@ -9,6 +9,8 @@
  * which this phase neither implements nor supersedes.
  */
 
+import type { ActionRecord } from '../../navigation/types.js';
+import type { Observation, ObservationGap } from '../../observation/types.js';
 import type { FragmentStore, FragmentStoreOptions } from '../../topology/fragment-store.js';
 import type { TopologyStore, TopologyStoreOptions } from '../../topology/topology-store.js';
 import type {
@@ -17,6 +19,7 @@ import type {
   TopologyEdgeSnapshot,
   TraversalEvidence,
 } from '../../topology/index.js';
+import type { Vec3Like } from '../../types.js';
 import type { SectionKey } from '../../voxel/section.js';
 import type {
   ResidencyLimits,
@@ -44,7 +47,9 @@ export type PersistenceErrorKind =
   | 'timeout_unconfirmed'
   | 'timeout'
   | 'schema'
-  | 'data';
+  | 'data'
+  /** A replay used an already-recorded scoped id with a different canonical payload. */
+  | 'conflict';
 
 /** A typed persistence failure. `kind` is machine-readable; `message` is for humans. */
 export class PersistenceError extends Error {
@@ -116,6 +121,253 @@ export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
   maxBytes: 64 * 1024 * 1024,
 };
 
+/**
+ * Bounded capacities for the append-only event/action journal. These are storage
+ * capacities, not game rules. Journal bytes count canonical UTF-8 JSON payload
+ * bytes (SQL framing/index overhead is excluded).
+ */
+export interface JournalLimits {
+  /** Maximum accepted-but-not-checkpointed records across actions + events. Default 10000. */
+  maxPendingRecords?: number;
+  /** Maximum accepted-but-not-checkpointed canonical payload bytes. Default 16 MiB. */
+  maxPendingBytes?: number;
+  /** Maximum canonical payload bytes of one record. Default 1 MiB. */
+  maxRecordBytes?: number;
+  /** Maximum element count of any array nested in one record. Default 100000. */
+  maxRecordArrayLength?: number;
+  /** Maximum nesting depth of one record. Default 32. */
+  maxRecordDepth?: number;
+  /** Maximum records sent in one checkpoint. Default 1000. */
+  maxBatchRecords?: number;
+  /** Maximum canonical payload bytes sent in one checkpoint. Default 8 MiB. */
+  maxBatchBytes?: number;
+  /** Maximum committed action + event rows per world. Default 1_000_000. */
+  maxCommittedRecords?: number;
+  /** Maximum committed canonical payload bytes per world. Default 512 MiB. */
+  maxCommittedBytes?: number;
+  /** Maximum rows returned by one journal query page. Default 200. */
+  maxPageRecords?: number;
+  /** Maximum decoded payload bytes returned by one journal query page. Default 1 MiB. */
+  maxPageBytes?: number;
+}
+
+/** `JournalLimits` with every default resolved. */
+export interface ResolvedJournalLimits {
+  maxPendingRecords: number;
+  maxPendingBytes: number;
+  maxRecordBytes: number;
+  maxRecordArrayLength: number;
+  maxRecordDepth: number;
+  maxBatchRecords: number;
+  maxBatchBytes: number;
+  maxCommittedRecords: number;
+  maxCommittedBytes: number;
+  maxPageRecords: number;
+  maxPageBytes: number;
+}
+
+export const DEFAULT_JOURNAL_LIMITS: ResolvedJournalLimits = {
+  maxPendingRecords: 10_000,
+  maxPendingBytes: 16 * 1024 * 1024,
+  maxRecordBytes: 1024 * 1024,
+  maxRecordArrayLength: 100_000,
+  maxRecordDepth: 32,
+  maxBatchRecords: 1_000,
+  maxBatchBytes: 8 * 1024 * 1024,
+  maxCommittedRecords: 1_000_000,
+  maxCommittedBytes: 512 * 1024 * 1024,
+  maxPageRecords: 200,
+  maxPageBytes: 1024 * 1024,
+};
+
+/** Resolve optional journal limits with every default filled and relationally validated. */
+export function resolveJournalLimits(options: JournalLimits | undefined): ResolvedJournalLimits {
+  const limits: ResolvedJournalLimits = { ...DEFAULT_JOURNAL_LIMITS };
+  if (options === undefined) return limits;
+  const keys = [
+    'maxPendingRecords',
+    'maxPendingBytes',
+    'maxRecordBytes',
+    'maxRecordArrayLength',
+    'maxRecordDepth',
+    'maxBatchRecords',
+    'maxBatchBytes',
+    'maxCommittedRecords',
+    'maxCommittedBytes',
+    'maxPageRecords',
+    'maxPageBytes',
+  ] as const;
+  for (const key of keys) {
+    const value = options[key];
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new PersistenceError('invalid_argument', `${key} must be a positive safe integer: ${String(value)}`);
+    }
+    limits[key] = value;
+  }
+  if (limits.maxRecordBytes > limits.maxPendingBytes) {
+    throw new PersistenceError(
+      'invalid_argument',
+      `maxRecordBytes (${limits.maxRecordBytes}) must not exceed maxPendingBytes (${limits.maxPendingBytes})`,
+    );
+  }
+  if (limits.maxRecordBytes > limits.maxBatchBytes) {
+    throw new PersistenceError(
+      'invalid_argument',
+      `maxRecordBytes (${limits.maxRecordBytes}) must not exceed maxBatchBytes (${limits.maxBatchBytes})`,
+    );
+  }
+  return limits;
+}
+
+/**
+ * The explicit event vocabulary accepted by the journal. This is deliberately a
+ * closed union rather than an arbitrary JSON blob: every variant names the
+ * original evidence and scope it rests on.
+ */
+export type SpatialEvent =
+  | {
+      kind: 'observed_cell_change';
+      /** Caller-supplied stable id, unique within (worldId, sessionId). */
+      id: string;
+      /** Real time the change observation was acquired, preserved verbatim. */
+      observedAt: number;
+      worldId: string;
+      dim: string;
+      sessionId: string;
+      pos: Vec3Like;
+      /**
+       * The actual previous observation, when one was retained. Absence means the
+       * prior cell state is unknown — never that it was air.
+       */
+      previous?: Observation;
+      /** The actual new observation that established this change. Required. */
+      current: Observation;
+      /** Only a confirmed own-action attribution; never inferred from time proximity. */
+      actionId?: string;
+    }
+  | {
+      kind: 'observation_gap';
+      id: string;
+      /** Real time the gap started or was observed, preserved verbatim. */
+      observedAt: number;
+      worldId: string;
+      dim: string;
+      sessionId: string;
+      reason: ObservationGap['reason'] | 'disconnected' | 'paused' | 'scope_changed' | 'not_ready';
+      /** Present only when the gap concerns one specific cell. */
+      pos?: Vec3Like;
+    };
+
+export type SpatialEventKind = SpatialEvent['kind'];
+
+/** Result of a synchronous, unsaved journal acceptance. */
+export interface JournalAcceptResult {
+  accepted: true;
+  /** True when an identical scoped record was already pending (no quota consumed). */
+  duplicate: boolean;
+  /** Local journal revision after this call (not a save confirmation). */
+  revision: number;
+  pendingRecords: number;
+  pendingBytes: number;
+}
+
+/** Atomic batch input for `journal.recordBatch`. */
+export interface JournalBatchInput {
+  actions?: readonly ActionRecord[];
+  events?: readonly SpatialEvent[];
+}
+
+/** Result of an atomic batch acceptance. */
+export interface JournalBatchAcceptResult {
+  /** Newly accepted records (duplicates are excluded). */
+  accepted: number;
+  /** Identical duplicates already pending or repeated within the batch. */
+  duplicates: number;
+  revision: number;
+  pendingRecords: number;
+  pendingBytes: number;
+}
+
+/**
+ * Bounded snapshot of caller-accepted but not yet checkpointed records, for
+ * explicit recovery. Entries are isolated copies; mutating them cannot change
+ * the session's pending queue.
+ */
+export interface PendingJournalSnapshot {
+  revision: number;
+  actions: ActionRecord[];
+  events: SpatialEvent[];
+  bytes: number;
+}
+
+/** Exact scoped ids to withdraw from the pending queue. */
+export interface JournalWithdrawalSelector {
+  actions?: readonly { sessionId: string; id: string }[];
+  events?: readonly { sessionId: string; id: string }[];
+}
+
+/** Result of an explicit pending withdrawal. Committed rows are never touched. */
+export interface JournalWithdrawalResult {
+  withdrawn: {
+    actions: ActionRecord[];
+    events: SpatialEvent[];
+  };
+  missing: { kind: 'action' | 'event'; sessionId: string; id: string }[];
+  revision: number;
+  pendingRecords: number;
+  pendingBytes: number;
+}
+
+/** Common filters/bounds for committed journal pages. */
+export interface JournalQueryBase {
+  /** Exact dimension filter. */
+  dim?: string;
+  /** Exact original sessionId filter. */
+  sessionId?: string;
+  /** Page row bound; capped by the resolved maxPageRecords. */
+  maxRecords?: number;
+  /** Page decoded-payload byte bound; capped by the resolved maxPageBytes. */
+  maxBytes?: number;
+  /** Opaque continuation from a previous page. */
+  cursor?: string;
+}
+
+export interface ActionJournalQuery extends JournalQueryBase {
+  /** Exact action record id filter. */
+  actionId?: string;
+}
+
+export interface EventJournalQuery extends JournalQueryBase {
+  /** Exact spatial event id filter. */
+  eventId?: string;
+  /** Exact event variant filter. */
+  kind?: SpatialEventKind;
+}
+
+/** One stable-insertion-order page of committed journal records. */
+export interface JournalPage<T> {
+  records: T[];
+  /** Continuation, or null when this is the last page. */
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+/** Synchronous pending-journal API exposed as `session.journal`. */
+export interface JournalController {
+  recordAction(record: ActionRecord): JournalAcceptResult;
+  recordEvent(event: SpatialEvent): JournalAcceptResult;
+  recordBatch(batch: JournalBatchInput): JournalBatchAcceptResult;
+  readPending(): PendingJournalSnapshot;
+  /**
+   * Deliberately drop exact pending records (e.g. a rejected/conflicting replay).
+   * Rejects with `busy` while any checkpoint is in flight. Never deletes committed
+   * rows. An actual withdrawal advances the local journal revision so an empty
+   * checkpoint can confirm the new state.
+   */
+  withdraw(selector: JournalWithdrawalSelector): JournalWithdrawalResult;
+}
+
 /** Default bound for every worker operation timeout. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -159,6 +411,8 @@ export interface OpenHistorySessionOptions {
   fragmentOptions?: FragmentStoreOptions;
   topologyOptions?: TopologyStoreOptions;
   snapshotLimits?: SnapshotLimits;
+  /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
+  journalLimits?: JournalLimits;
   /** Bound for worker open/checkpoint/close/flush waits. Default 30000 ms. */
   timeoutMs?: number;
 }
@@ -245,6 +499,8 @@ export interface OpenSpatialSessionOptions {
   fragmentOptions?: FragmentStoreOptions;
   topologyOptions?: TopologyStoreOptions;
   snapshotLimits?: SnapshotLimits;
+  /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
+  journalLimits?: JournalLimits;
   /**
    * Voxel loading mode. `eager` (default) restores every committed section into
    * memory at open, preserving the phase 5B/5C behavior. `manual` reads only the
@@ -293,6 +549,20 @@ export interface SpatialPersistenceState {
   baselineCheckpointId: string | null;
   /** Voxel restore baseline checkpoint id (null when voxel has never been saved). */
   voxelBaselineCheckpointId: string | null;
+  /** Local journal revision (acceptances/withdrawals); not a save confirmation. */
+  journalRevision: number;
+  /** Journal revision confirmed by the last committed journal checkpoint. */
+  confirmedJournalRevision: number;
+  /** Journal restore baseline checkpoint id (null when no journal baseline exists). */
+  journalBaselineCheckpointId: string | null;
+  /** Accepted-but-not-checkpointed journal records. */
+  pendingJournalRecords: number;
+  /** Accepted-but-not-checkpointed canonical payload bytes. */
+  pendingJournalBytes: number;
+  /** Committed journal rows for this world (metadata known without loading payloads). */
+  committedJournalRecords: number;
+  /** Committed canonical payload bytes for this world. */
+  committedJournalBytes: number;
   /** Last checkpoint id confirmed this session (null until the first one). */
   lastConfirmedCheckpointId: string | null;
   /** Checkpoint id currently in flight (null when none). */
@@ -313,11 +583,21 @@ export interface SpatialSession {
   readonly residencyLimits: ResolvedResidencyLimits;
   /** The session lifecycle (`open` / `closing` / `closed`). */
   readonly lifecycle: SessionLifecycle;
-  /** True while a checkpoint or section load is in flight (single in-flight I/O). */
+  /** True while a checkpoint, section load, working-set operation or journal query is in flight. */
   readonly busy: boolean;
-  /** Capture and commit history + topology + voxel in one transaction. */
+  /** Synchronous acceptance into the bounded pending journal; acceptance is not a save. */
+  readonly journal: JournalController;
+  /**
+   * Capture and commit history + topology + voxel + the pending journal batch in
+   * one transaction. Journal rows are append-only; an empty batch never clears
+   * previously committed journal facts.
+   */
   checkpoint(): Promise<SpatialCheckpointResult>;
   getPersistenceState(): SpatialPersistenceState;
+  /** Bounded, read-only page of committed action records (insertion order). */
+  queryActions(query?: ActionJournalQuery): Promise<JournalPage<ActionRecord>>;
+  /** Bounded, read-only page of committed spatial events (insertion order). */
+  queryEvents(query?: EventJournalQuery): Promise<JournalPage<SpatialEvent>>;
   /** Wait only for an already-accepted checkpoint; never captures new memory changes. */
   flush(): Promise<FlushResult>;
   /** Stop accepting writes and shut the persistence channel down within a bounded time. */
@@ -375,6 +655,16 @@ export type WorkerSessionKind = 'history' | 'spatial';
  */
 export type VoxelSaveMode = 'none' | 'full' | 'incremental';
 
+/**
+ * How a checkpoint persists the journal.
+ *
+ * - `none`: never touches journal rows or the journal baseline (history-only sessions).
+ * - `append`: appends the captured batch and records a new journal baseline revision.
+ *   An empty batch is valid and never deletes committed rows; it is how an
+ *   acceptance/withdrawal revision is confirmed without new records.
+ */
+export type JournalSaveMode = 'none' | 'append';
+
 /** Wire request messages sent from the session to the worker. */
 export type WorkerRequest =
   | {
@@ -383,6 +673,7 @@ export type WorkerRequest =
       databasePath: string;
       worldId: string;
       limits: ResolvedSnapshotLimits;
+      journalLimits: ResolvedJournalLimits;
       kind: WorkerSessionKind;
       /** How a combined spatial session loads voxel sections at open. */
       voxelLoading: VoxelLoading;
@@ -400,6 +691,12 @@ export type WorkerRequest =
       voxelRevision: number;
       /** The full set for `full`, the changed set for `incremental`; ignored for `none`. */
       voxelSnapshot: VoxelCheckpointSnapshot;
+      /** How this checkpoint persists the journal (`none` never alters journal facts/baseline). */
+      journalMode: JournalSaveMode;
+      /** Local journal revision captured with this batch. */
+      journalRevision: number;
+      /** Captured pending records, in acceptance order (may be empty). */
+      journalBatch: { actions: ActionRecord[]; events: SpatialEvent[] };
     }
   | {
       type: 'load_sections';
@@ -407,6 +704,30 @@ export type WorkerRequest =
       worldId: string;
       /** Distinct section coordinates to load. */
       keys: { dim: string; cx: number; cz: number; sy: number }[];
+    }
+  | {
+      type: 'query_actions';
+      requestId: number;
+      worldId: string;
+      /** Exclusive insertion-sequence cursor; 0 starts at the beginning. */
+      afterSeq: number;
+      maxRecords: number;
+      maxBytes: number;
+      dim?: string;
+      sessionId?: string;
+      actionId?: string;
+    }
+  | {
+      type: 'query_events';
+      requestId: number;
+      worldId: string;
+      afterSeq: number;
+      maxRecords: number;
+      maxBytes: number;
+      dim?: string;
+      sessionId?: string;
+      eventId?: string;
+      kind?: SpatialEventKind;
     }
   | { type: 'close'; requestId: number };
 
@@ -422,6 +743,11 @@ export type WorkerResponse =
       voxelSnapshot: VoxelCheckpointSnapshot | null;
       /** Committed section directory (manual loading); null when loaded eagerly. */
       voxelDirectory: VoxelDirectoryEntry[] | null;
+      /** Journal metadata only — payloads are never decoded at open. */
+      journalBaselineCheckpointId: string | null;
+      journalRevision: number;
+      journalRecordCount: number;
+      journalRecordBytes: number;
     }
   | {
       type: 'load_ok';
@@ -432,11 +758,28 @@ export type WorkerResponse =
       missing: { dim: string; cx: number; cz: number; sy: number }[];
     }
   | {
+      type: 'query_actions_ok';
+      requestId: number;
+      records: ActionRecord[];
+      nextCursor: string | null;
+      hasMore: boolean;
+    }
+  | {
+      type: 'query_events_ok';
+      requestId: number;
+      records: SpatialEvent[];
+      nextCursor: string | null;
+      hasMore: boolean;
+    }
+  | {
       type: 'checkpoint_ok';
       requestId: number;
       checkpointId: string;
       /** Actual committed payload octet_length per section, for the directory's exact byte count. */
       voxelBytes: { dim: string; cx: number; cz: number; sy: number; bytes: number }[];
+      /** Committed journal row count/bytes for this world after the transaction. */
+      journalRecordCount: number;
+      journalRecordBytes: number;
     }
   | { type: 'closed'; requestId: number }
   | { type: 'error'; requestId: number; kind: PersistenceErrorKind; message: string };
