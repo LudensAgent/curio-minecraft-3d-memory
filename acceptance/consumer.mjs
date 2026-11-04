@@ -324,11 +324,11 @@ export async function finalizeResources({ sessions, closeRecords, primaryError, 
     primaryError: primaryError ? { name: primaryError.name, message: primaryError.message } : null,
     closes: sessions.map((session) => {
       const rec = closeRecords.get(session);
-      if (!rec) return { closed: false, reason: 'no-record' };
-      if (rec.error) return { closed: true, threw: true, error: rec.error.message };
+      if (!rec) return { closeAttempted: false, reason: 'no-record' };
+      if (rec.error) return { closeAttempted: true, threw: true, error: rec.error.message };
       const r = rec.result;
       return {
-        closed: true,
+        closeAttempted: true,
         completed: r.completed,
         dirty: r.dirty,
         unconfirmedRequest: r.unconfirmedRequest,
