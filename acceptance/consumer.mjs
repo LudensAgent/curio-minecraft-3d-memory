@@ -33,7 +33,14 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
+import {
+  FragmentStore,
+  RouteVerifier,
+  VoxelMap,
+  WalkRouteExecutor,
+  WalkRouteSearch,
+  startKnownWalkRoute,
+} from 'curio-minecraft-3d-memory';
 import {
   openSpatialSession,
   WorkingSetManager,
@@ -367,6 +374,153 @@ async function run() {
     assert.equal(typeof WalkRouteExecutor, 'function', 'root entry exports WalkRouteExecutor');
     assert.equal(typeof openSpatialSession, 'function', 'storage/sqlite exports openSpatialSession');
     assert.equal(typeof WorkingSetManager, 'function', 'storage/sqlite exports WorkingSetManager');
+    assert.equal(typeof VoxelMap, 'function', 'root entry exports VoxelMap');
+    assert.equal(typeof FragmentStore, 'function', 'root entry exports FragmentStore');
+    assert.equal(typeof WalkRouteSearch, 'function', 'root entry exports WalkRouteSearch');
+    assert.equal(typeof startKnownWalkRoute, 'function', 'root entry exports startKnownWalkRoute');
+
+    // ===== 1b. Root-entry followups: bounded search + explicit historical route =====
+    {
+      // Fresh standalone map with the same typed fixture facts the route scenarios
+      // observe. No worker or database is involved in either API below.
+      const map = new VoxelMap(WORLD);
+      observeRoute({ voxel: map }, 'live', 2000);
+      const mapBefore = {
+        revision: map.saveRevision,
+        support: map.cellAt(DIM, 1, -1, 0),
+        feet: map.cellAt(DIM, 1, 0, 0),
+      };
+
+      const searchRequest = {
+        worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk',
+        body: routeRequest('live').body, target: POINTS[1],
+        arrival: { kind: 'exact' }, shapeProvider,
+      };
+      const search = new WalkRouteSearch(map, { now: () => 2000 });
+      let searchResult = search.start(searchRequest);
+      for (let round = 0; round < 8 && searchResult.state === 'PENDING'; round++) {
+        searchResult = search.advance(16);
+      }
+
+      assert.equal(searchResult.state, 'FOUND', 'bounded search finds the observed one-edge route');
+      assert.ok(searchResult.candidate, 'FOUND carries a candidate stance sequence');
+      assert.deepEqual(searchResult.candidate.points, [POINTS[0], POINTS[1]], 'candidate keeps the exact ordered polyline');
+      assert.deepEqual(searchResult.candidate.target, POINTS[1], 'candidate target is the exact requested point');
+      assert.equal(searchResult.candidate.edgeCount, 1, 'candidate is one walked edge');
+      // FOUND is a candidate, never a NavResult ARRIVED or a physical success claim.
+      assert.equal('outcome' in searchResult, false, 'search snapshot has no navigation outcome');
+      assert.equal('outcome' in searchResult.candidate, false, 'search candidate has no navigation outcome');
+      assert.notEqual(searchResult.state, 'ARRIVED', 'search state is not an arrival outcome');
+
+      // Read-only search: no save revision, observation time or cell fact moved.
+      assert.equal(map.saveRevision, mapBefore.revision, 'read-only search did not advance saveRevision');
+      assert.deepEqual(map.cellAt(DIM, 1, -1, 0), mapBefore.support, 'read-only search left support evidence unchanged');
+      assert.deepEqual(map.cellAt(DIM, 1, 0, 0), mapBefore.feet, 'read-only search left feet evidence unchanged');
+
+      // Public negative: an empty map is unknown evidence, not a frontier or path.
+      const emptySearch = new WalkRouteSearch(new VoxelMap(WORLD), { now: () => 2000 });
+      emptySearch.start(searchRequest);
+      const emptyResult = emptySearch.advance(8);
+      assert.equal(emptyResult.state, 'INSUFFICIENT_EVIDENCE', 'empty map yields INSUFFICIENT_EVIDENCE');
+      assert.equal(emptyResult.frontiers.length, 0, 'empty map yields no OPEN frontier');
+      assert.equal(emptyResult.candidate, null, 'empty map yields no candidate');
+
+      // Actual historical geometry: one chosen two-point legacy/built polyline.
+      const history = new FragmentStore(WORLD);
+      const historyPoints = [POINTS[0], POINTS[1]];
+      history.saveFragment({
+        id: 'consumer-built-route', worldId: WORLD, dim: DIM,
+        kind: 'built', geometrySource: 'legacy',
+        entrances: [POINTS[0]], polyline: historyPoints, deepestY: 0,
+        createdAt: 1000, lastUsedAt: 1000, uses: 1,
+      });
+      const historyBefore = history.checkpointSnapshot();
+      const historyRevisionBefore = history.revision;
+
+      const body = new HangingExecutor(2000);
+      const loop = new WalkRouteExecutor(map, body, { now: () => 2000 });
+      let knownStart;
+      let finalStatus = null;
+      try {
+        const { points: _routePoints, ...routeBase } = routeRequest('live');
+        knownStart = startKnownWalkRoute(history, loop, {
+          ...routeBase, arrival: { kind: 'exact' }, deadlineMs: 100_000, timeoutMs: 10_000,
+          fragmentId: 'consumer-built-route', parentActionId: 'consumer-parent-action',
+        });
+        assert.equal(knownStart.kind, 'STARTED', 'selected historical fragment starts');
+        const started = knownStart.status;
+        assert.equal(started.result, null, 'STARTED is an accepted delegation, not a result');
+        assert.deepEqual(knownStart.route.points, historyPoints, 'started route keeps the original ordered points');
+        assert.deepEqual(knownStart.route.target, POINTS[1], 'started route keeps the original target');
+        assert.equal(knownStart.route.parentActionId, 'consumer-parent-action', 'parentActionId metadata preserved');
+        assert.equal(knownStart.route.kind, 'built', 'historical kind is retained as metadata');
+        assert.equal(knownStart.route.geometrySource, 'legacy', 'geometry source is retained as metadata');
+
+        // Pre-start rejections through the actual API leave the running delegation
+        // fully intact (same identity, still no terminal result).
+        const delegationId = started.delegationId;
+        const missing = startKnownWalkRoute(history, loop, {
+          ...routeBase, arrival: { kind: 'exact' }, deadlineMs: 100_000, timeoutMs: 10_000,
+          fragmentId: 'consumer-missing-fragment',
+        });
+        assert.equal(missing.kind, 'REJECTED', 'missing fragment is rejected');
+        assert.equal(missing.reason, 'missing_history', 'missing fragment reason is missing_history');
+        const wrongScope = startKnownWalkRoute(history, loop, {
+          ...routeBase, worldId: 'another-world', arrival: { kind: 'exact' },
+          deadlineMs: 100_000, timeoutMs: 10_000, fragmentId: 'consumer-built-route',
+        });
+        assert.equal(wrongScope.kind, 'REJECTED', 'wrong world scope is rejected');
+        assert.equal(wrongScope.reason, 'wrong_scope', 'wrong scope reason is wrong_scope');
+        const untouched = loop.status();
+        assert.equal(untouched.delegationId, delegationId, 'rejections did not replace the delegation');
+        assert.equal(untouched.result, null, 'rejections did not terminate the delegation');
+
+        loop.onSample(sampleAt(delegationId, POINTS[0], 2000));
+        loop.advance(10);
+        await Promise.resolve();
+        const inFlight = loop.status();
+        assert.notEqual(inFlight.activeStepIndex, null, 'a step is in flight');
+        assert.equal(inFlight.result, null, 'no terminal result while in flight');
+        assert.equal(body.pending.length, 1, 'the hanging executor owns the in-flight move');
+
+        body.complete(POINTS[1]);
+        await Promise.resolve();
+        loop.advance(10);
+        await Promise.resolve();
+        finalStatus = loop.status();
+        assert.equal(finalStatus.result?.outcome, 'ARRIVED', 'historical walk finishes ARRIVED');
+        assert.equal(finalStatus.result?.confirmed, true, 'ARRIVED is confirmed');
+        assert.deepEqual(finalStatus.result?.lastPosition, POINTS[1], 'ARRIVED lastPosition is the measured point');
+      } finally {
+        const current = loop.status();
+        if (current !== null && current.result === null) {
+          loop.cancel('user', 'acceptance followups cleanup');
+        }
+      }
+
+      // Reading and executing history is not a traversal write and does not move it.
+      assert.deepEqual(history.checkpointSnapshot(), historyBefore, 'history snapshot unchanged');
+      assert.equal(history.revision, historyRevisionBefore, 'history revision unchanged');
+      assert.equal(history.traversals().total, 0, 'no traversal facts invented');
+
+      evidence('navigation.followups', {
+        body: 'fake',
+        api: 'library-only',
+        hostEnabled: false,
+        search: {
+          state: searchResult.state,
+          points: searchResult.candidate?.points ?? null,
+          edgeCount: searchResult.candidate?.edgeCount ?? null,
+        },
+        emptySearch: { state: emptyResult.state, frontiers: emptyResult.frontiers.length },
+        known: {
+          startKind: knownStart.kind,
+          result: finalStatus?.result?.outcome ?? null,
+          historyRevision: history.revision,
+          traversals: history.checkpointSnapshot().traversals.length,
+        },
+      });
+    }
 
     // ===== 2. Save & restore (baseline at observedAt=1000) =====
     {

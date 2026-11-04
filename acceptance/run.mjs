@@ -30,7 +30,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as P from './provenance.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const RUNNER_VERSION = '0.7.5';
+const RUNNER_VERSION = '0.7.6';
 const RUNNER_FILES = ['acceptance/run.mjs', 'acceptance/provenance.mjs'];
 const CONSUMER_FILES = ['acceptance/consumer.mjs', 'acceptance/consumer-types.ts'];
 const EVIDENCE_ROOT = join(tmpdir(), 'curio-minecraft-3d-memory-acceptance');
