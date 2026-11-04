@@ -372,8 +372,51 @@ examples/
 ├── spatial-checkpoint.ts           # 可运行的组合空间 checkpoint 生命周期示例
 ├── spatial-checkpoint-incremental.ts # 可运行的体素增量 checkpoint 示例
 ├── spatial-residency.ts            # 可运行的手动按需 Section 驻留示例
-└── working-set.ts                  # 可运行的有界工作集管理 + Fake 路线示例
+├── working-set.ts                  # 可运行的有界工作集管理 + Fake 路线示例
+└── shared-session-lifecycle.ts     # 可运行的宿主共享会话生命周期参考示例
 ```
+
+## 安装与消费
+
+```bash
+npm install --no-audit --no-fund          # 开发依赖
+npm run build                             # 产出 dist/（NodeNext ESM + 类型声明）
+npm pack                                  # 产出 curio-minecraft-3d-memory-<version>.tgz
+```
+
+消费者在独立项目中安装实际 `.tgz`，用包名与公开子路径引入（不用源码路径、`../dist`、`npm link` 或开发机目录别名）：
+
+```json
+{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.7.4.tgz", "better-sqlite3": "^12.0.0" } }
+```
+
+```ts
+import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
+import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
+```
+
+运行时要求 Node `>= 18`。核心入口（`curio-minecraft-3d-memory`）无原生依赖、不启动 Worker；SQLite 子入口
+（`curio-minecraft-3d-memory/storage/sqlite`）在单个 Worker 线程内使用 `better-sqlite3`（可选 peer dependency），
+使用 SQLite 的消费者须显式安装 `better-sqlite3@^12`。独立安装验收一键命令：`node acceptance/run.mjs`
+（打包 → 临时安装 → 运行时断言 + 类型检查，任一失败非零退出）。
+
+## 宿主共享会话生命周期
+
+库只提供事实与执行辅助；宿主（Curio）负责连接、真实感知与身体控制。接线顺序见
+`examples/shared-session-lifecycle.ts`（默认 eager 加载，适用于世界规模落在会话预算内的情况）：
+
+1. **宿主启动**：宿主提供数据库绝对路径与 `worldId`，`await openSpatialSession({ databasePath, worldId })`
+   完成后再使用返回的 `session.voxel`，不每个动作新建地图。
+2. **共享地图**：持续感知与多个 walk 委托共用 `session.voxel`；共享地图不代表共享各委托的执行所有权。
+3. **连接与重连**：观测 `sessionId` 来自实际连接生命周期；正常重连同一世界不更换 `worldId`。用
+   `map.beginSession(sessionId)` 切换，旧会话的迟到观测被拒绝，不能重新标 FRESH。
+4. **感知更新**：宿主先 `map.observe(...)` 写入合法观测，再把返回的 `ChangeReport` 交给活跃路线
+   （`RouteVerifier.apply` / `WalkRouteExecutor.observe`）；库不主动扫描世界。
+5. **路线生命周期**：加载、准备并保护实际路线依赖（`WorkingSetManager.prepare` + 租约），结束
+   `releasePins`；取消某动作不关闭共享会话。需按需驻留见“手动按需 Section 驻留 / 有界工作集管理”。
+6. **保存与关闭**：`checkpoint()` 捕获并提交当前变化（唯一保存触发）；`flush()` 只等待已接受的保存；
+   `close()` 做有界关闭。顺序：停止接收写入 → 最终 `checkpoint` → 检查确认 → `close`。
+7. **恢复**：恢复的是历史记录与原证据时间，当前通行性必须重新建立，不能把读回数据库当作重新观察。
 
 ## 开发
 
@@ -392,6 +435,8 @@ npx tsx examples/spatial-checkpoint.ts        # 运行组合空间 checkpoint �
 npx tsx examples/spatial-checkpoint-incremental.ts # 运行体素增量 checkpoint 示例
 npx tsx examples/spatial-residency.ts         # 运行手动按需 Section 驻留示例
 npx tsx examples/working-set.ts               # 运行有界工作集管理 + Fake 路线示例
+npx tsx examples/shared-session-lifecycle.ts  # 运行宿主共享会话生命周期参考示例
+node acceptance/run.mjs                       # 运行独立消费者安装验收（打包 + 临时安装 + 断言 + 类型检查）
 ```
 
 > `examples/fragment-store-history.ts`、`examples/topology-facts.ts`、`examples/historical-topology-query.ts`、`examples/historical-anchor-query.ts` 与 `examples/history-checkpoint.ts` 以公开包名（`curio-minecraft-3d-memory`，其中 `history-checkpoint.ts` 使用 `curio-minecraft-3d-memory/storage/sqlite` 子路径）而非源码路径导入，用于验证包的 `exports` 入口 —— 请先 `npm run build` 再运行。

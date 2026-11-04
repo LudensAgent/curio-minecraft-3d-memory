@@ -297,6 +297,56 @@ Behavior:
 
 The route-pin closed loop is demonstrated in `examples/working-set.ts`: prepare a route's actual dependency sections → restore current evidence → verify → protect the dependencies → execute a Fake walk route → release → free. This phase adds bounded working-set management only — no predictive prefetch, background eviction, automatic checkpoint, observation overlay, new pathfinding, or real mineflayer/Curio wiring.
 
+## Install & consume
+
+```bash
+npm install --no-audit --no-fund          # dev dependencies
+npm run build                             # emits dist/ (NodeNext ESM + type declarations)
+npm pack                                  # emits curio-minecraft-3d-memory-<version>.tgz
+```
+
+Consumers install the real `.tgz` into their own project and import by package name and public subpath
+(never a source path, `../dist`, `npm link`, or a dev-machine directory alias):
+
+```json
+{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.7.4.tgz", "better-sqlite3": "^12.0.0" } }
+```
+
+```ts
+import { RouteVerifier, WalkRouteExecutor } from 'curio-minecraft-3d-memory';
+import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
+```
+
+Requires Node `>= 18`. The core entry (`curio-minecraft-3d-memory`) has no native dependency and never starts a
+worker; the SQLite entry (`curio-minecraft-3d-memory/storage/sqlite`) uses `better-sqlite3` (an optional peer
+dependency) inside a single worker thread, so SQLite consumers must install `better-sqlite3@^12` explicitly. The
+one-shot independent-install acceptance is `node acceptance/run.mjs` (pack → throwaway install → runtime
+assertions + type-check; any failure exits non-zero).
+
+## Host shared session lifecycle
+
+The library provides facts and execution assistance; the host (Curio) owns the connection, real perception, and
+body control. See `examples/shared-session-lifecycle.ts` for the wiring order (default `eager` loading, for worlds
+that fit the session budget):
+
+1. **Startup** — the host supplies the database path and `worldId`; `await openSpatialSession({ databasePath, worldId })`
+   resolves before you use the returned `session.voxel`; do not recreate the map per action.
+2. **Shared map** — continuous perception and multiple walk delegations reuse `session.voxel`; sharing the map
+   does not share each delegation's execution ownership.
+3. **Connect / reconnect** — the observation `sessionId` comes from the real connection lifecycle; reconnecting the
+   same world does not change `worldId`. Switch with `map.beginSession(sessionId)`; late old-session evidence is
+   rejected and cannot re-mark cells FRESH.
+4. **Perception update** — the host writes `map.observe(...)` first, then forwards the returned `ChangeReport` to
+   the active route (`RouteVerifier.apply` / `WalkRouteExecutor.observe`); the library never scans the world.
+5. **Route lifecycle** — load, prepare, and protect the real route dependencies (`WorkingSetManager.prepare` + the
+   lease), then `releasePins`; cancelling one action does not close the shared session. For on-demand residency see
+   "Manual on-demand section residency" / "Bounded working-set management".
+6. **Save & close** — `checkpoint()` captures and commits current changes (the only save trigger); `flush()` only
+   waits for an already-accepted save; `close()` does a bounded shutdown. Order: stop accepting writes → final
+   `checkpoint` → check confirmation → `close`.
+7. **Restore** — restore brings back history and original evidence times; current passability must be re-established,
+   never read back from disk as a fresh observation.
+
 ## Project structure
 
 ```
@@ -325,7 +375,8 @@ examples/
 ├── spatial-checkpoint.ts           # runnable demo of the combined spatial checkpoint lifecycle
 ├── spatial-checkpoint-incremental.ts # runnable demo of the incremental voxel checkpoint
 ├── spatial-residency.ts            # runnable demo of manual on-demand section residency
-└── working-set.ts                  # runnable demo of bounded working-set management + Fake route
+├── working-set.ts                  # runnable demo of bounded working-set management + Fake route
+└── shared-session-lifecycle.ts     # runnable reference for the host shared-session lifecycle
 ```
 
 ## Development
@@ -344,6 +395,9 @@ npx tsx examples/history-checkpoint.ts        # run the SQLite checkpoint-lifecy
 npx tsx examples/spatial-checkpoint.ts        # run the combined spatial checkpoint-lifecycle demo
 npx tsx examples/spatial-checkpoint-incremental.ts # run the incremental voxel checkpoint demo
 npx tsx examples/spatial-residency.ts         # run the manual on-demand section residency demo
+npx tsx examples/working-set.ts               # run the bounded working-set + Fake route demo
+npx tsx examples/shared-session-lifecycle.ts  # run the host shared-session lifecycle reference
+node acceptance/run.mjs                       # run the independent consumer acceptance (pack + install + assertions + type-check)
 ```
 
 > `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, `examples/historical-anchor-query.ts`, and `examples/history-checkpoint.ts` import the built package by its public name (`curio-minecraft-3d-memory`, with `history-checkpoint.ts` using the `curio-minecraft-3d-memory/storage/sqlite` subpath) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
