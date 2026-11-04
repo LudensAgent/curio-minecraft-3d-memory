@@ -316,7 +316,10 @@ describe('pending journal acceptance', () => {
   });
 
   it('rejects a current observation from another session without changing pending state', async () => {
-    const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
+    // Deliberately outside tempDirs: this directory may only be removed after
+    // the opened session has confirmed a clean close.
+    const dir = mkdtempSync(join(tmpdir(), 'spatial-memory-journal-'));
+    const session = await openSpatialSession({ databasePath: join(dir, 'journal.db'), worldId: WORLD });
     try {
       const baseline = session.journal.recordEvent(gapEvent('baseline'));
       const before = session.journal.readPending();
@@ -341,12 +344,21 @@ describe('pending journal acceptance', () => {
       expect(session.getPersistenceState()).toMatchObject({ pendingJournalRecords: 1, dirty: true });
     } finally {
       const closed = await session.close();
-      expect(closed.completed).toBe(true);
+      expect(closed).toMatchObject({
+        completed: true,
+        error: null,
+        unconfirmedRequest: false,
+        dirty: true,
+      });
     }
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   it('rejects a current observation whose acquisition time differs from the event without changing pending state', async () => {
-    const session = await openSpatialSession({ databasePath: makeDbPath(), worldId: WORLD });
+    // Deliberately outside tempDirs: this directory may only be removed after
+    // the opened session has confirmed a clean close.
+    const dir = mkdtempSync(join(tmpdir(), 'spatial-memory-journal-'));
+    const session = await openSpatialSession({ databasePath: join(dir, 'journal.db'), worldId: WORLD });
     try {
       const baseline = session.journal.recordEvent(gapEvent('baseline'));
       const before = session.journal.readPending();
@@ -363,8 +375,14 @@ describe('pending journal acceptance', () => {
       expect(session.getPersistenceState()).toMatchObject({ pendingJournalRecords: 1, dirty: true });
     } finally {
       const closed = await session.close();
-      expect(closed.completed).toBe(true);
+      expect(closed).toMatchObject({
+        completed: true,
+        error: null,
+        unconfirmedRequest: false,
+        dirty: true,
+      });
     }
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 });
 
@@ -374,51 +392,75 @@ describe('pending journal acceptance', () => {
 
 describe('journal checkpoint roundtrip', () => {
   it('round-trips a cancelled/partial action with its original result, timestamps and evidence', async () => {
-    const dbPath = makeDbPath();
-    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    // Deliberately outside tempDirs: this directory is removed only after both
+    // sequentially opened sessions have confirmed a clean close.
+    const dir = mkdtempSync(join(tmpdir(), 'spatial-memory-journal-'));
+    const dbPath = join(dir, 'journal.db');
     const original = action({ id: 'a-cancelled' });
     const expected = structuredClone(original);
-    session.journal.recordAction(original);
+    let checkpointId: string | undefined;
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    try {
+      session.journal.recordAction(original);
 
-    // Acceptance is an immutable snapshot: later caller mutation must not leak.
-    original.trace.push({ pos: { x: 99, y: 99, z: 99 }, ts: 9999 });
-    original.result!.message = 'mutated after acceptance';
-    original.consumption.durabilityLost = 999;
+      // Acceptance is an immutable snapshot: later caller mutation must not leak.
+      original.trace.push({ pos: { x: 99, y: 99, z: 99 }, ts: 9999 });
+      original.result!.message = 'mutated after acceptance';
+      original.consumption.durabilityLost = 999;
 
-    const stateBefore = session.getPersistenceState();
-    expect(stateBefore.dirty).toBe(true);
-    expect(stateBefore.pendingJournalRecords).toBe(1);
+      const stateBefore = session.getPersistenceState();
+      expect(stateBefore.dirty).toBe(true);
+      expect(stateBefore.pendingJournalRecords).toBe(1);
 
-    const checkpoint = await session.checkpoint();
-    const stateAfter = session.getPersistenceState();
-    expect(stateAfter.pendingJournalRecords).toBe(0);
-    expect(stateAfter.dirty).toBe(false);
-    expect(stateAfter.journalBaselineCheckpointId).toBe(checkpoint.checkpointId);
-    expect(stateAfter.confirmedJournalRevision).toBe(stateAfter.journalRevision);
-    expect(stateAfter.committedJournalRecords).toBe(1);
-    await session.close();
+      const checkpoint = await session.checkpoint();
+      checkpointId = checkpoint.checkpointId;
+      const stateAfter = session.getPersistenceState();
+      expect(stateAfter.pendingJournalRecords).toBe(0);
+      expect(stateAfter.dirty).toBe(false);
+      expect(stateAfter.journalBaselineCheckpointId).toBe(checkpoint.checkpointId);
+      expect(stateAfter.confirmedJournalRevision).toBe(stateAfter.journalRevision);
+      expect(stateAfter.committedJournalRecords).toBe(1);
+    } finally {
+      const closed = await session.close();
+      expect(closed).toMatchObject({
+        completed: true,
+        error: null,
+        unconfirmedRequest: false,
+        dirty: false,
+      });
+    }
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.getPersistenceState()).toMatchObject({
-      journalBaselineCheckpointId: checkpoint.checkpointId,
-      committedJournalRecords: 1,
-      pendingJournalRecords: 0,
-      dirty: false,
-    });
-    const page = await reopened.queryActions();
-    expect(page.hasMore).toBe(false);
-    expect(page.nextCursor).toBeNull();
-    expect(page.records).toEqual([expected]);
-    expect(page.records[0]!.result).toMatchObject({
-      outcome: 'CANCELLED',
-      confirmed: false,
-      memoryWrite: 'pending',
-      problem: { kind: 'cancelled', by: 'agent' },
-    });
-    expect(page.records[0]!.result!.consumption).toEqual(expected.result!.consumption);
-    expect(page.records[0]!.subActions[0]!.origin).toBe('execution_helper');
-    expect(page.records[0]!.subActions[0]!.effects![0]!.verified).toBe(true);
-    await reopened.close();
+    try {
+      expect(reopened.getPersistenceState()).toMatchObject({
+        journalBaselineCheckpointId: checkpointId,
+        committedJournalRecords: 1,
+        pendingJournalRecords: 0,
+        dirty: false,
+      });
+      const page = await reopened.queryActions();
+      expect(page.hasMore).toBe(false);
+      expect(page.nextCursor).toBeNull();
+      expect(page.records).toEqual([expected]);
+      expect(page.records[0]!.result).toMatchObject({
+        outcome: 'CANCELLED',
+        confirmed: false,
+        memoryWrite: 'pending',
+        problem: { kind: 'cancelled', by: 'agent' },
+      });
+      expect(page.records[0]!.result!.consumption).toEqual(expected.result!.consumption);
+      expect(page.records[0]!.subActions[0]!.origin).toBe('execution_helper');
+      expect(page.records[0]!.subActions[0]!.effects![0]!.verified).toBe(true);
+    } finally {
+      const closed = await reopened.close();
+      expect(closed).toMatchObject({
+        completed: true,
+        error: null,
+        unconfirmedRequest: false,
+        dirty: false,
+      });
+    }
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   it('round-trips observed-change and gap evidence, preserving previous absence', async () => {
