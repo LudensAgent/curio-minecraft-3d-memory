@@ -20,6 +20,7 @@ import type { Vec3Like } from '../types.js';
 import { blockToSection, cellIndex } from '../voxel/coordinates.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { Section, SectionKey } from '../voxel/section.js';
+import type { SectionResidency } from '../voxel/residency.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
 import type {
   CollisionShape,
@@ -36,9 +37,11 @@ import type {
   BoatMeasurement,
   Box3,
   ControlledNeighborRead,
+  FluidRiskFact,
   FluidShape,
   FluidShapeResolution,
   FluidSurfacePatch,
+  FluidVolume,
   WaterArrivalGoal,
   WaterArrivalLimits,
   WaterArrivalLimitsInput,
@@ -108,6 +111,7 @@ type CellRead =
       evidence: CellEvidence;
     }
   | { kind: 'unobserved'; sectionKey: SectionKey; sectionRevision: number }
+  | { kind: 'not_resident'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'incomplete'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'stale'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'expired'; sectionKey: SectionKey; sectionRevision: number }
@@ -133,7 +137,7 @@ interface CellRecord {
   fluid: FluidResolved | null;
 }
 
-type UnresolvedCategory = 'unknown' | 'stale' | 'unsupported';
+type UnresolvedCategory = 'unknown' | 'not_resident' | 'motion_unknown' | 'stale' | 'unsupported';
 
 interface Unresolved {
   category: UnresolvedCategory;
@@ -198,6 +202,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
 
   const preBudget = (problem: BudgetProblem): WaterRouteEvaluation => ({
     status: 'UNSUPPORTED',
+    assurance: 'geometry_only',
+    executable: false,
     profileKind,
     ruleVersions,
     worldId: query.worldId,
@@ -257,6 +263,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   if (query.points.some((point) => point.y !== routeY)) {
     return {
       status: 'UNSUPPORTED',
+      assurance: 'geometry_only',
+      executable: false,
       profileKind,
       ruleVersions,
       worldId: query.worldId,
@@ -290,6 +298,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   if (!envelope.safe) {
     return {
       status: 'UNSUPPORTED',
+      assurance: 'geometry_only',
+      executable: false,
       profileKind,
       ruleVersions,
       worldId: query.worldId,
@@ -323,10 +333,22 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
 
   const points = query.points.map((point) => ({ x: point.x, y: point.y, z: point.z }));
 
-  const deps = new Map<string, { key: SectionKey; revision: number }>();
-  const recordDep = (key: SectionKey, revision: number): void => {
+  const deps = new Map<string, {
+    key: SectionKey;
+    revision: number;
+    residency: SectionResidency;
+    residencyGeneration: number;
+  }>();
+  const recordDep = (key: SectionKey, revision: number, residency: SectionResidency): void => {
     const ks = sectionKeyString(key);
-    if (!deps.has(ks)) deps.set(ks, { key: { ...key }, revision });
+    if (!deps.has(ks)) {
+      deps.set(ks, {
+        key: { ...key },
+        revision,
+        residency,
+        residencyGeneration: map.residencyGeneration(key.dim, key.cx, key.cz, key.sy),
+      });
+    }
   };
 
   const sectionCache = new Map<string, Section | null>();
@@ -356,6 +378,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     const problem = budgetProblem!;
     return {
       status: 'UNSUPPORTED',
+      assurance: 'geometry_only',
+      executable: false,
       profileKind,
       ruleVersions,
       worldId: query.worldId,
@@ -374,7 +398,12 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       },
       hazards: [],
       obstacles: [],
-      dependencies: [...deps.values()].map((dep) => ({ key: { ...dep.key }, revision: dep.revision })),
+      dependencies: [...deps.values()].map((dep) => ({
+        key: { ...dep.key },
+        revision: dep.revision,
+        residency: dep.residency,
+        residencyGeneration: dep.residencyGeneration,
+      })),
       budget,
       computedAt: now,
       validUntil: minValidUntil,
@@ -405,13 +434,18 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       section = map.sectionAt(query.dim, x, y, z);
       sectionCache.set(sk, section);
     }
+    const residency = map.sectionResidency(sectionKey).residency;
     if (section === null) {
-      recordDep(sectionKey, 0);
-      const result: CellRead = { kind: 'unobserved', sectionKey, sectionRevision: 0 };
+      recordDep(sectionKey, 0, residency);
+      // A saved-but-not-resident section is unavailable history, not air and not
+      // "never observed". Only a true no_record section is unobserved.
+      const result: CellRead = residency === 'no_record'
+        ? { kind: 'unobserved', sectionKey, sectionRevision: 0 }
+        : { kind: 'not_resident', sectionKey, sectionRevision: 0 };
       cellReadCache.set(cacheKey, result);
       return result;
     }
-    recordDep(sectionKey, section.revision);
+    recordDep(sectionKey, section.revision, residency);
     const evidence = section.evidence.get(cellIndex(lx, ly, lz));
     const sectionRevision = section.revision;
 
@@ -469,6 +503,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
         case 'session':
           return { pos, kind: 'stale', reason: 'session' };
         case 'unobserved':
+          return { pos, kind: 'unobserved' };
+        case 'not_resident':
           return { pos, kind: 'unobserved' };
       }
     },
@@ -534,13 +570,18 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   const obstacles: ObstacleEvidence[] = [];
   let blocked: { problem: WaterRouteProblem } | null = null;
 
+  const unresolvedCategory = (read: CellRead): UnresolvedCategory =>
+    read.kind === 'stale' || read.kind === 'expired' || read.kind === 'session'
+      ? 'stale'
+      : read.kind === 'not_resident'
+        ? 'not_resident'
+        : 'unknown';
+
   for (const record of records) {
     if (!record.collisionRelevant) continue;
     if (record.read.kind !== 'observed') {
       solidUnresolved.push({
-        category: record.read.kind === 'stale' || record.read.kind === 'expired' || record.read.kind === 'session'
-          ? 'stale'
-          : 'unknown',
+        category: unresolvedCategory(record.read),
         cell: record.cell,
         viaNeighborGap: false,
       });
@@ -609,9 +650,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     if (record.read.kind !== 'observed') {
       if (record.surfaceRelevant) {
         fluidUnresolved.push({
-          category: record.read.kind === 'stale' || record.read.kind === 'expired' || record.read.kind === 'session'
-            ? 'stale'
-            : 'unknown',
+          category: unresolvedCategory(record.read),
           cell: record.cell,
           viaNeighborGap: false,
         });
@@ -632,6 +671,14 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
         cell: record.cell,
         viaNeighborGap: true,
       });
+    }
+    if (record.fluid.kind === 'shape') {
+      const waterMotion = record.fluid.shape.water?.motion;
+      const lavaMotion = record.fluid.shape.lava?.motion;
+      if (waterMotion === 'unknown' || lavaMotion === 'unknown') {
+        // motion 是 provider 的真实声明；unknown 不能被当作 still 或 OPEN。
+        fluidUnresolved.push({ category: 'motion_unknown', cell: record.cell, viaNeighborGap: false });
+      }
     }
   }
 
@@ -682,6 +729,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   let missingSurface: { problem: WaterRouteProblem } | null = null;
   let surfaceUnsupported: Unresolved[] = [];
   let surfaceStale: Unresolved[] = [];
+  let surfaceNotResident: Unresolved[] = [];
   let surfaceUnknown: Unresolved[] = [];
 
   const observedGaps = uncoveredGaps(observedSurfaceIntervals, 0, segmentSpan);
@@ -722,9 +770,11 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       const relevant = potentials.filter((potential) => overlapsAnyGap(potential.intervals, observedGaps));
       const unsupported = relevant.filter((potential) => potential.category === 'unsupported');
       const stale = relevant.filter((potential) => potential.category === 'stale');
+      const notResident = relevant.filter((potential) => potential.category === 'not_resident');
       const unknown = relevant.filter((potential) => potential.category === 'unknown');
       if (unsupported.length > 0) surfaceUnsupported = unsupported;
       else if (stale.length > 0) surfaceStale = stale;
+      else if (notResident.length > 0) surfaceNotResident = notResident;
       else surfaceUnknown = unknown;
     }
     // `potentialIntervals` is only used for the conservative cover check above.
@@ -827,19 +877,36 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     if (waterContact || lavaContact || surfaceContributors.has(cellKey(record.cell))) {
       const risks = shape.risks;
       if (!Array.isArray(risks)) throw new Error('fluid provider returned a non-array risks value');
+      // Provider-declared motion is authoritative: flowing/falling must not be
+      // silently treated as still just because risks[] omitted it. `unknown`
+      // already makes the route UNKNOWN via fluidUnresolved.
+      const motionRisks: FluidRiskFact[] = [];
+      const addMotionRisk = (volume: FluidVolume | null): void => {
+        if (volume === null) return;
+        const kind = volume.motion === 'flowing' ? 'current' : volume.motion === 'falling' ? 'falling' : null;
+        if (kind === null || risks.some((risk) => risk.kind === kind)) return;
+        motionRisks.push({
+          kind,
+          basis: 'observed',
+          detail: `provider reports ${volume.kind} ${volume.motion}`,
+        });
+      };
+      addMotionRisk(shape.water);
+      addMotionRisk(shape.lava);
+      const riskCount = risks.length + motionRisks.length;
       // Charge provider facts before enumerating them; an over-long list is
       // rejected without touching its elements.
-      if (!Number.isSafeInteger(risks.length) || budget.riskFacts + risks.length > limits.maxRiskFacts) {
+      if (!Number.isSafeInteger(riskCount) || budget.riskFacts + riskCount > limits.maxRiskFacts) {
         failBudget(
           'maxRiskFacts',
-          budget.riskFacts + risks.length,
+          budget.riskFacts + riskCount,
           limits.maxRiskFacts,
           `fluid risk facts exceeded maxRiskFacts (${limits.maxRiskFacts})`,
         );
         return budgetEvaluation();
       }
-      budget.riskFacts += risks.length;
-      for (const risk of risks) {
+      budget.riskFacts += riskCount;
+      for (const risk of [...risks, ...motionRisks]) {
         addHazard({
           kind: risk.kind === 'falling' ? 'fall' : risk.kind,
           pos: { ...record.cell },
@@ -854,7 +921,14 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
 
   // --- verdict precedence: budget, confirmed physical failure, capability, evidence ---
 
-  const allUnresolved = [...solidUnresolved, ...fluidUnresolved, ...surfaceUnsupported, ...surfaceStale, ...surfaceUnknown];
+  const allUnresolved = [
+    ...solidUnresolved,
+    ...fluidUnresolved,
+    ...surfaceUnsupported,
+    ...surfaceStale,
+    ...surfaceNotResident,
+    ...surfaceUnknown,
+  ];
   const dedupeCells = (entries: Unresolved[]): Vec3Like[] => {
     const seen = new Set<string>();
     return entries.flatMap((entry) => {
@@ -866,6 +940,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   };
 
   const base = {
+    assurance: 'geometry_only' as const,
+    executable: false as const,
     profileKind,
     ruleVersions,
     worldId: query.worldId,
@@ -876,7 +952,12 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
     to: { ...points[points.length - 1]! },
     hazards,
     obstacles,
-    dependencies: [...deps.values()].map((dep) => ({ key: { ...dep.key }, revision: dep.revision })),
+    dependencies: [...deps.values()].map((dep) => ({
+      key: { ...dep.key },
+      revision: dep.revision,
+      residency: dep.residency,
+      residencyGeneration: dep.residencyGeneration,
+    })),
     budget,
     computedAt: now,
     validUntil: minValidUntil,
@@ -933,6 +1014,28 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       status: 'STALE',
       reason: detail,
       problem: { kind: 'stale', cells: dedupeCells(stale), detail },
+    };
+  }
+
+  const notResident = allUnresolved.filter((entry) => entry.category === 'not_resident');
+  if (notResident.length > 0) {
+    const detail = `${notResident.length} required cell(s) belong to saved but not resident sections; they are unavailable history, not unobserved air`;
+    return {
+      ...base,
+      status: 'UNKNOWN',
+      reason: detail,
+      problem: { kind: 'not_resident', cells: dedupeCells(notResident), detail },
+    };
+  }
+
+  const motionUnknown = allUnresolved.filter((entry) => entry.category === 'motion_unknown');
+  if (motionUnknown.length > 0) {
+    const detail = `${motionUnknown.length} required cell(s) have provider-declared unknown fluid motion`;
+    return {
+      ...base,
+      status: 'UNKNOWN',
+      reason: detail,
+      problem: { kind: 'motion_unknown', cells: dedupeCells(motionUnknown), detail },
     };
   }
 
@@ -996,9 +1099,7 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
   function surfacePotential(record: CellRecord): Unresolved | null {
     if (record.read.kind !== 'observed') {
       return {
-        category: record.read.kind === 'stale' || record.read.kind === 'expired' || record.read.kind === 'session'
-          ? 'stale'
-          : 'unknown',
+        category: unresolvedCategory(record.read),
         cell: record.cell,
         viaNeighborGap: false,
       };

@@ -73,11 +73,15 @@ const solidProvider: CollisionShapeProvider = {
   },
 };
 
-function waterVolume(surfaceY: number, patch?: Partial<FluidSurfacePatch>): FluidVolume {
+function waterVolume(
+  surfaceY: number,
+  patch?: Partial<FluidSurfacePatch>,
+  motion: FluidVolume['motion'] = 'still',
+): FluidVolume {
   return {
     kind: 'water',
     box: { minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: surfaceY, maxZ: 1 },
-    motion: 'still',
+    motion,
     surface: { y: surfaceY, minX: 0, minZ: 0, maxX: 1, maxZ: 1, ...patch },
   };
 }
@@ -86,6 +90,7 @@ function fluidProvider(options: {
   surfaceY?: number;
   patch?: Partial<FluidSurfacePatch>;
   risks?: FluidShape['risks'];
+  motion?: FluidVolume['motion'];
 } = {}): FluidShapeProvider {
   const surfaceY = options.surfaceY ?? 0.875;
   return {
@@ -100,7 +105,7 @@ function fluidProvider(options: {
           return {
             kind: 'shape',
             shape: {
-              water: waterVolume(surfaceY, options.patch),
+              water: waterVolume(surfaceY, options.patch, options.motion ?? 'still'),
               lava: null,
               risks: options.risks ?? [],
             },
@@ -1834,6 +1839,59 @@ describe('water arrival completion', () => {
 });
 
 // --- packaging / import boundaries ---
+
+describe('fluid motion and residency semantics', () => {
+  it('treats provider-declared unknown motion as UNKNOWN, never OPEN', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery(swimRoute, { fluidShapeProvider: fluidProvider({ motion: 'unknown' }) }),
+      1000,
+    );
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.problem?.kind).toBe('motion_unknown');
+  });
+
+  it('records flowing motion as a current hazard even when risks[] omits it', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+    const result = evaluateWaterRoute(
+      map,
+      swimQuery(swimRoute, { fluidShapeProvider: fluidProvider({ motion: 'flowing' }) }),
+      1000,
+    );
+    expect(result.status).toBe('OPEN');
+    expect(result.hazards.some((hazard) => hazard.kind === 'current')).toBe(true);
+  });
+
+  it('reports a saved but non-resident section as not_resident, not unobserved air', () => {
+    const map = new VoxelMap('world', { manualResidency: true });
+    map.installDirectory([{
+      key: { worldId: 'world', dim: 'overworld', cx: 0, cz: 0, sy: 0 },
+      seq: 1, bytes: 1, observedCells: 1, paletteEntries: 1, revision: 9,
+    }]);
+    const result = evaluateWaterRoute(map, swimQuery(swimRoute), 1000);
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.problem?.kind).toBe('not_resident');
+    const dep = result.dependencies.find(
+      (entry) => entry.key.cx === 0 && entry.key.cz === 0 && entry.key.sy === 0,
+    );
+    expect(dep).toMatchObject({
+      revision: 0,
+      residency: 'not_resident',
+      residencyGeneration: 0,
+    });
+  });
+
+  it('marks route results as geometry-only and non-executable', () => {
+    const map = new VoxelMap('world');
+    fillSwimWater(map, 0, 2);
+    const result = evaluateWaterRoute(map, swimQuery(swimRoute), 1000);
+    expect(result.assurance).toBe('geometry_only');
+    expect(result.executable).toBe(false);
+  });
+});
 
 describe('water module packaging', () => {
   it('declares the public ./water export', () => {

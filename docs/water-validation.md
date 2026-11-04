@@ -49,6 +49,10 @@ The library does **not** implement Minecraft water-level formulae and does not
 read block names itself. The injected provider is the versioned authority for
 source/flowing/falling state, partial waterlogged volumes, and surface height.
 An unsupported or unresolved fluid shape never becomes air or `OPEN`.
+`motion` is consumed independently of `risks`: `unknown` makes the route
+`UNKNOWN` (`motion_unknown`), `flowing` contributes a `current` hazard, and
+`falling` contributes a `fall` hazard even when the provider omitted those
+facts from `risks`. `unknown` is never treated as `still`.
 
 Both providers may inspect neighbours only through the controlled read. Every
 read is checked for session, freshness, expiry and completeness, is recorded as
@@ -146,7 +150,9 @@ safety, or no risk.
 
 - `BLOCKED` — confirmed physical collision, passenger-headroom collision, or
   uncovered water surface.
-- `UNKNOWN` — required cells are unobserved/state-incomplete/neighbour-gapped.
+- `UNKNOWN` — required cells are unobserved/state-incomplete/neighbour-gapped,
+  belong to a saved-but-not-resident section (`not_resident`), or have
+  provider-declared unknown fluid motion (`motion_unknown`).
 - `STALE` — required evidence is stale, expired, or from another session.
 - `UNSUPPORTED` — the profile/shape/fluid interpretation is outside the slice,
   or a work budget was exceeded.
@@ -184,11 +190,15 @@ promptly; duplicate reads still count and cannot bypass the budget. Other
 provider errors propagate. The library bounds its own work, not arbitrary
 third-party provider CPU that catches and ignores the sentinel.
 
-Each actual cell/provider read contributes its section revision and validity
-ceiling to `dependencies` / `validUntil`. Reads never mutate the map, evidence
-timestamps, section revisions, sessions or persistence state. There is no
-persistent cache; every call re-evaluates current evidence. Callers can use the
-exposed dependencies and `validUntil` for their own local invalidation.
+Each actual cell/provider read contributes its section `revision`, `residency`
+and `residencyGeneration` plus its validity ceiling to `dependencies` /
+`validUntil`. Residency generation is included because unload/reload changes
+residency without advancing the section revision. A saved but non-resident
+section is reported as `not_resident` (status `UNKNOWN`), never as unobserved
+air. Reads never mutate the map, evidence timestamps, section revisions,
+sessions or persistence state. There is no persistent cache; every call
+re-evaluates current evidence. Callers can use the exposed dependencies and
+`validUntil` for their own local invalidation.
 
 ### Completion verification
 

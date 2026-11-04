@@ -16,10 +16,13 @@ contains only commands and results that were actually executed on
 
 | Order | Merge commit | Merged branch |
 | --- | --- | --- |
-| 1 | `940a079` | `codex/land-route-validation-20261104` |
-| 2 | `470625b` | `codex/water-boat-validation-20261104` |
+| 1 | `0dd2d33` | `codex/land-route-validation-20261104` |
+| 2 | `b86c4af` | `codex/water-boat-validation-20261104` |
 
-The merge used `--no-ff`; no feature commit was rewritten. Land adds
+The integration worktree originally used `940a079` / `470625b`; those commits
+are not reachable from `main` and are not present in any branch. Their trees
+are identical to `0dd2d33` / `b86c4af`, which are the actual reachable merges in
+`main`. No feature commit was rewritten. Land adds
 `src/traversability/land-geometry.ts`, `land-route.ts`, `land-transition.ts`,
 root exports, and two test files. Water adds `src/water/`, the
 `./water` package export, and `tests/water-validation.test.ts`.
@@ -38,12 +41,11 @@ development constraints:
   timer, or rescue strategy is implemented.
 - Land transition and route results carry `assurance: 'geometry_only'` and
   `executable: false`.
-- Water results do not carry an `assurance` literal. Their bounded, read-only
-  semantics are stated in the public type comments: `OPEN` covers only the
-  declared geometry/evidence contract and never arrival, authorization,
-  executor support, or absence of risk. `checkWaterArrival` returns only
-  `ARRIVED` or `UNCONFIRMED`. This is a documentation-level difference, not a
-  behavior change made during integration.
+- Water route evaluations carry the same `assurance: 'geometry_only'` and
+  `executable: false` markers. Their bounded, read-only semantics remain stated
+  in the public type comments: `OPEN` covers only the declared geometry/evidence
+  contract and never arrival, authorization, executor support, or absence of
+  risk. `checkWaterArrival` returns only `ARRIVED` or `UNCONFIRMED`.
 
 ## Version
 

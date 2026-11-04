@@ -26,6 +26,7 @@ import type {
 } from '../traversability/collision-shape.js';
 import type { StepEvaluation } from '../traversability/step.js';
 import type { HazardFact, ObstacleEvidence, Traversability } from '../traversability/types.js';
+import type { SectionResidency } from '../voxel/residency.js';
 import type { SectionKey } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
 
@@ -223,6 +224,8 @@ export type WaterRouteProblem =
   | { kind: 'missing_surface'; cells: Vec3Like[]; detail: string }
   | { kind: 'submerged_posture'; cells: Vec3Like[]; detail: string }
   | { kind: 'unobserved'; cells: Vec3Like[]; detail: string }
+  | { kind: 'not_resident'; cells: Vec3Like[]; detail: string }
+  | { kind: 'motion_unknown'; cells: Vec3Like[]; detail: string }
   | { kind: 'stale'; cells: Vec3Like[]; detail: string }
   | { kind: 'unsupported_profile'; cells: Vec3Like[]; detail: string }
   | { kind: 'unsupported_shape'; cells: Vec3Like[]; detail: string }
@@ -256,6 +259,9 @@ export interface WaterBudgetReport {
  */
 export interface WaterRouteEvaluation {
   status: WaterRouteStatus;
+  /** This is a bounded geometry/evidence verdict, never an execution contract. */
+  assurance: 'geometry_only';
+  executable: false;
   profileKind: WaterProfileKind;
   ruleVersions: { solid: string; fluid: string };
   worldId: string;
@@ -277,8 +283,18 @@ export interface WaterRouteEvaluation {
   hazards: HazardFact[];
   /** Confirmed solid obstacles for a collision/head-clearance verdict. */
   obstacles: ObstacleEvidence[];
-  /** Actual section reads (deduped), for local cache invalidation. */
-  dependencies: { key: SectionKey; revision: number }[];
+  /**
+   * Actual section reads (deduped), for local cache invalidation. `revision` is
+   * the resident section revision; `residency` and `residencyGeneration` must be
+   * compared as well because unload/reload changes residency without advancing
+   * `revision`. A saved-but-not-resident section is not "never observed".
+   */
+  dependencies: {
+    key: SectionKey;
+    revision: number;
+    residency: SectionResidency;
+    residencyGeneration: number;
+  }[];
   budget: WaterBudgetReport;
   computedAt: number;
   /** No later than the validity of the still-valid evidence actually read. */
