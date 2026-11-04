@@ -26,6 +26,9 @@
  *   support are required; no support is required or assumed in the air.
  * - `ladder`: fixed-XZ vertical travel covered continuously by an explicit,
  *   versioned `ClimbRegionProvider` plus continuous body collision clearance.
+ *   Source cells are every cell touched by the continuously swept body, not only
+ *   cells in the feet-travel interval; the provider asserts the permitted world
+ *   feet regions under current evidence.
  *
  * Evidence is read only through `VoxelMap` snapshots and the controlled
  * `NeighborRead` passed to providers. Every read records its Section revision,
@@ -130,7 +133,7 @@ export interface ClimbCellInput {
   body: BodyContext;
 }
 
-/** A continuous world-Y feet interval proven climbable for this body at this cell. */
+/** A provider-asserted continuous world-Y feet interval for this body at this source cell. */
 export interface ClimbRegion {
   minFeetY: number;
   maxFeetY: number;
@@ -429,9 +432,10 @@ export function evaluateLandTransition(
 
   /**
    * Evidence-gap destination. Collision/corridor reads write to the global
-   * collections; support-only provider calls are buffered locally so an optional
-   * candidate cannot poison a transition whose required support is already
-   * proven. Section dependencies and TTLs are recorded globally either way.
+   * collections; support-only provider calls are buffered per candidate so an
+   * optional candidate cannot poison a transition whose required support is
+   * already proven, and a candidate cannot prove support while hiding its own
+   * consulted gap. Section dependencies and TTLs are recorded globally either way.
    */
   interface GapSink {
     unobserved: Map<string, Vec3Like>;
@@ -458,14 +462,15 @@ export function evaluateLandTransition(
     sink.stale.size > 0 ||
     sink.expired.size > 0 ||
     sink.session.size > 0;
-  const mergeGapSink = (sink: GapSink): void => {
-    for (const cell of sink.unobserved.values()) addCell(unobserved, cell);
-    for (const cell of sink.incomplete.values()) addCell(incomplete, cell);
-    for (const [key, entry] of sink.nonresident) nonresident.set(key, entry);
-    for (const cell of sink.stale.values()) addCell(stale, cell);
-    for (const cell of sink.expired.values()) addCell(expired, cell);
-    for (const cell of sink.session.values()) addCell(session, cell);
+  const mergeGapSinkInto = (target: GapSink, source: GapSink): void => {
+    for (const cell of source.unobserved.values()) addCell(target.unobserved, cell);
+    for (const cell of source.incomplete.values()) addCell(target.incomplete, cell);
+    for (const [key, entry] of source.nonresident) target.nonresident.set(key, entry);
+    for (const cell of source.stale.values()) addCell(target.stale, cell);
+    for (const cell of source.expired.values()) addCell(target.expired, cell);
+    for (const cell of source.session.values()) addCell(target.session, cell);
   };
+  const mergeGapSink = (sink: GapSink): void => mergeGapSinkInto(globalGaps, sink);
 
   const recordDependency = (
     key: SectionKey,
@@ -706,61 +711,73 @@ export function evaluateLandTransition(
     let supported = false;
     const knownAbsent: Vec3Like[] = [];
     const localUnsupported: Array<{ cell: Vec3Like; detail: string }> = [];
-    // Buffer every evidence gap raised by an optional support candidate: its own
-    // read, a provider's controlled neighbor reads, and neighbor_gap results.
-    // These only explain a failure to prove any support; a proven support face
-    // makes other candidates irrelevant.
+    // Buffer evidence gaps from support candidates that do not themselves form a
+    // complete witness: the read, provider controlled neighbor reads and
+    // neighbor_gap results. Each candidate is isolated so a provider's own gap
+    // cannot be discarded by a face it still returns, while a different
+    // candidate's optional gap cannot poison a separate complete witness.
     const buffer = makeGapSink();
     const previousGaps = activeGaps;
-    activeGaps = buffer;
-    try {
-      for (const cell of candidate) {
+
+    for (const cell of candidate) {
+      const candidateGaps = makeGapSink();
+      activeGaps = candidateGaps;
+      let observedShape = false;
+      let cellSupports = false;
+      try {
         const read = readCell(cell.x, cell.y, cell.z);
-        if (read.kind !== 'observed') {
-          noteRead(read, cell);
-          continue;
-        }
-        const shape = resolveShape(read.evidence.observation.state, cell);
-        if (shape.kind === 'unsupported') {
-          localUnsupported.push({ cell: { ...cell }, detail: shape.detail });
-          continue;
-        }
-        if (shape.kind === 'gap') continue; // already buffered by resolveShape
-        let cellSupports = false;
-        for (const face of shape.shape.supportFaces) {
-          charge(1);
-          if (Math.abs(cell.y + face.top - feet.y) > LAND_EPS) continue;
-          if (
-            rectsOverlapPositive(
-              feet.x - half,
-              feet.x + half,
-              feet.z - half,
-              feet.z + half,
-              cell.x + face.minX,
-              cell.x + face.maxX,
-              cell.z + face.minZ,
-              cell.z + face.maxZ,
-            )
-          ) {
-            cellSupports = true;
-            break;
+        if (read.kind === 'observed') {
+          const shape = resolveShape(read.evidence.observation.state, cell);
+          if (shape.kind === 'unsupported') {
+            localUnsupported.push({ cell: { ...cell }, detail: shape.detail });
+          } else if (shape.kind === 'shape') {
+            observedShape = true;
+            for (const face of shape.shape.supportFaces) {
+              charge(1);
+              if (Math.abs(cell.y + face.top - feet.y) > LAND_EPS) continue;
+              if (
+                rectsOverlapPositive(
+                  feet.x - half,
+                  feet.x + half,
+                  feet.z - half,
+                  feet.z + half,
+                  cell.x + face.minX,
+                  cell.x + face.maxX,
+                  cell.z + face.minZ,
+                  cell.z + face.maxZ,
+                )
+              ) {
+                cellSupports = true;
+                break;
+              }
+            }
           }
+          // A `gap` result was already buffered by resolveShape.
+        } else {
+          noteRead(read, cell);
         }
-        if (cellSupports) {
-          supported = true;
-          // One complete positive-area face at the exact feet height is enough.
-          break;
-        }
-        knownAbsent.push(cell);
+      } finally {
+        activeGaps = previousGaps;
       }
-    } finally {
-      activeGaps = previousGaps;
+
+      // One complete positive-area face at the exact feet height is enough. A
+      // candidate whose own read or provider consultation left an evidence gap
+      // is not complete: the returned face depends on the missing evidence.
+      if (cellSupports && !gapSinkHasGaps(candidateGaps)) {
+        supported = true;
+        break;
+      }
+      mergeGapSinkInto(buffer, candidateGaps);
+      // Only a fully observed, gap-free candidate without a matching face is a
+      // known absence. A candidate that supports only with its own gap remains
+      // inconclusive, not absent.
+      if (observedShape && !cellSupports && !gapSinkHasGaps(candidateGaps)) knownAbsent.push(cell);
     }
 
     if (supported) return;
 
-    // No observed face covers this exact feet height. Unknown candidates could
-    // still supply one, so only an all-observed set is a known absence.
+    // No complete witness. Unknown candidates could still supply one, so only
+    // an all-observed, gap-free set is a known absence.
     if (localUnsupported.length > 0 || gapSinkHasGaps(buffer)) {
       for (const entry of localUnsupported) unsupportedShape.push(entry);
       mergeGapSink(buffer);
@@ -1021,33 +1038,27 @@ export function evaluateLandTransition(
         }
         climbIdentity = { kind: 'climb', version: provider.version };
 
-        const envelope = unionAabb(bodyAabb(from, half, height), bodyAabb(to, half, height));
-        const collisionCells = boundedCells(
-          cellsInAabbBounded(envelope, limits.maxCandidateCells, countAndChargeCells),
-          'ladder collision candidates',
+        // Enumerate the whole continuously swept body envelope once. The same
+        // bounded candidates serve required collision clearance and climb-source
+        // contact: a tall body can overlap a climb cell above its feet, so the
+        // source set is not limited to the feet-travel interval [lo, hi]. No
+        // second enumeration is charged for the provider scan.
+        const bodyCells = boundedCells(
+          cellsInAabbBounded(
+            unionAabb(bodyAabb(from, half, height), bodyAabb(to, half, height)),
+            limits.maxCandidateCells,
+            countAndChargeCells,
+          ),
+          'ladder body candidates',
         );
-        scanCollision(collisionCells, (cell, box) => segmentHitsBox(cell, box, from, to, half, height));
+        scanCollision(bodyCells, (cell, box) => segmentHitsBox(cell, box, from, to, half, height));
         if (collisions.length > 0) break;
 
         const lo = Math.min(from.y, to.y);
         const hi = Math.max(from.y, to.y);
-        // Only cells covering a positive-length part of [lo, hi] can contribute a
-        // proven feet region. A cell above an integer endpoint merely touches it.
-        const climbBounds = {
-          minX: Math.min(from.x, to.x) - half,
-          maxX: Math.max(from.x, to.x) + half,
-          minY: lo,
-          maxY: hi,
-          minZ: Math.min(from.z, to.z) - half,
-          maxZ: Math.max(from.z, to.z) + half,
-        };
-        const climbCells = boundedCells(
-          cellsInAabbBounded(climbBounds, limits.maxCandidateCells, countAndChargeCells),
-          'climb candidate cells',
-        );
 
         const regions: Array<[number, number]> = [];
-        for (const cell of climbCells) {
+        for (const cell of bodyCells) {
           const read = readCell(cell.x, cell.y, cell.z);
           if (read.kind !== 'observed') {
             noteRead(read, cell);
@@ -1111,8 +1122,8 @@ export function evaluateLandTransition(
           if (!alreadyExplained) {
             for (const [gapLo, gapHi] of gaps) {
               const midY = Math.floor((gapLo + gapHi) / 2);
-              const gapCells = climbCells.filter((cell) => cell.y === midY);
-              const chosen = gapCells.length > 0 ? gapCells : climbCells.slice(0, 1);
+              const gapCells = bodyCells.filter((cell) => cell.y === midY);
+              const chosen = gapCells.length > 0 ? gapCells : bodyCells.slice(0, 1);
               for (const cell of chosen) addCell(missingClimb, cell);
             }
           }

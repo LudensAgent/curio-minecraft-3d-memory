@@ -23,7 +23,7 @@ import {
   jumpHitsBox,
   supportCandidateCells,
 } from '../src/traversability/land-geometry.js';
-import { AIR, EMPTY, fakeProvider, obs, SLAB, STONE } from './fakes.js';
+import { AIR, EMPTY, fakeProvider, FULL_CUBE, obs, SLAB, STONE } from './fakes.js';
 
 type Cell = [number, number, number];
 
@@ -419,6 +419,44 @@ describe('land support evidence and optional candidate diagnostics', () => {
     expect(result.status).toBe('OPEN');
   });
 
+  it('UNKNOWN: a supporting provider cannot hide its own consulted neighbor gap by returning a face', () => {
+    // Opposite direction to the optional-gap case above: here the start support
+    // can only come from the provider that consults unobserved (-1,-1,0). A face
+    // returned while its own consulted evidence is missing cannot prove support.
+    const hiddenGapProvider: CollisionShapeProvider = {
+      version: 'land-test-support-hidden-gap-1',
+      resolve(state, cell, read) {
+        if (state.name === STONE.name) {
+          read.cell(cell.x - 1, cell.y, cell.z);
+          return { kind: 'shape', shape: FULL_CUBE };
+        }
+        return landProvider.resolve(state, cell, read);
+      },
+    };
+    const transition: LandTransition = {
+      kind: 'step',
+      from: { x: 0.5, y: 0, z: 0.5 },
+      to: { x: 1.5, y: 1, z: 0.5 },
+    };
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [0, -1, 0],
+      [1, 0, 0],
+    ]);
+    fill(map, AIR, [
+      [0, 0, 0],
+      [0, 1, 0],
+      [0, 2, 0],
+      [1, 1, 0],
+      [1, 2, 0],
+    ]);
+
+    const result = evaluate(map, transition, { shapeProvider: hiddenGapProvider });
+    expect(result.status).toBe('UNKNOWN');
+    const gap = result.reasons.find((reason) => reason.kind === 'unobserved');
+    expect(gap?.cells).toContainEqual({ x: -1, y: -1, z: 0 });
+  });
+
   it('UNKNOWN: an optional provider gap is preserved when no support can be proven', () => {
     const map = new VoxelMap('world');
     fill(map, STONE, [[2, 0, 0]]);
@@ -766,6 +804,65 @@ describe('land ladder geometry', () => {
     });
     expect(result.status).toBe('OPEN');
     expect(result.provider).toEqual({ kind: 'climb', version: 'test-climb-v1' });
+  });
+
+  it('OPEN: a provider region from upper-body contact above the feet interval counts', () => {
+    // The only ladder is at cell Y = 1 while the feet travel is [0, 0.5]. The
+    // 1.8-tall body overlaps that cell throughout the travel, so it is a source
+    // candidate even though no feet position enters [1, 2]. The provider region
+    // [-0.7, 1.9] is asserted as-is and must not be clipped to [cellY, cellY + 1].
+    const transition: LandTransition = {
+      kind: 'ladder',
+      from: { x: 0.5, y: 0, z: 0.5 },
+      to: { x: 0.5, y: 0.5, z: 0.5 },
+    };
+    const map = new VoxelMap('world');
+    fill(map, AIR, [[0, 0, 0]]);
+    fill(map, LADDER, [[0, 1, 0]]);
+    fill(map, AIR, [[0, 2, 0]]);
+    const consulted: Cell[] = [];
+    const upperBodyProvider: ClimbRegionProvider = {
+      version: 'test-upper-body-climb-1',
+      resolve(input) {
+        consulted.push([input.cell.x, input.cell.y, input.cell.z]);
+        if (input.cell.y === 1) {
+          return { kind: 'regions', regions: [{ minFeetY: -0.7, maxFeetY: 1.9 }] };
+        }
+        return { kind: 'regions', regions: [] };
+      },
+    };
+
+    const result = evaluate(map, transition, {
+      shapeProvider: landProvider,
+      climbProvider: upperBodyProvider,
+    });
+    expect(result.status).toBe('OPEN');
+    expect(consulted).toContainEqual([0, 1, 0]);
+  });
+
+  it('BLOCKED: no provider region covering the travel is a known absence', () => {
+    const transition: LandTransition = {
+      kind: 'ladder',
+      from: { x: 0.5, y: 0, z: 0.5 },
+      to: { x: 0.5, y: 0.5, z: 0.5 },
+    };
+    const map = new VoxelMap('world');
+    fill(map, AIR, [[0, 0, 0]]);
+    fill(map, LADDER, [[0, 1, 0]]);
+    fill(map, AIR, [[0, 2, 0]]);
+    const noContact: ClimbRegionProvider = {
+      version: 'test-no-contact-1',
+      resolve() {
+        return { kind: 'regions', regions: [] };
+      },
+    };
+
+    const result = evaluate(map, transition, {
+      shapeProvider: landProvider,
+      climbProvider: noContact,
+    });
+    expect(result.status).toBe('BLOCKED');
+    expect(result.reason?.kind).toBe('missing_climb_contact');
   });
 
   it('BLOCKED: a known continuous gap in climb contact is not skipped', () => {

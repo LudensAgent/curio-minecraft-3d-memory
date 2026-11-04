@@ -122,11 +122,18 @@ limits 会在边界抛错；几何子集之外的范围返回 `UNSUPPORTED` / `u
 - XZ 必须固定，只允许竖直向上或向下移动。
 - **必须**显式提供版本化 `ClimbRegionProvider`。缺失即 `UNSUPPORTED`；不根据方块名称、
   空碰撞或距离推断梯子。
-- Provider 会收到：`cell`、该格完整观测状态、固定 `body`（width/height/pose），并通过
-  受控 `NeighborRead` 读取必要邻格。它返回世界脚高区间 `[minFeetY, maxFeetY]`，或显式
-  unsupported。返回区间必须是有限且 `minFeetY <= maxFeetY`。
+- 攀爬来源候选是**整个连续扫掠身体**实际重叠的格，而不只是脚高行程 `[lo, hi]` 内的格：
+  高身体可以在脚位低于某格时仍与其上身接触。来源候选与碰撞净空复用同一次有界枚举，
+  不额外分配或重复计入候选枚举工作。
+- Provider 会收到每个来源格的 `cell`、该格完整观测状态、固定 `body`（width/height/pose），
+  并通过受控 `NeighborRead` 读取必要邻格。它返回世界脚高区间 `[minFeetY, maxFeetY]`，
+  或显式 unsupported。这些区间是 provider 在当前证据下对允许脚高范围的断言；本库不会
+  把它裁剪到 `[cellY, cellY + 1]`（脚位可以低于所接触的格），也不会据方块名称或接近程度
+  推断梯子。返回区间必须是有限且 `minFeetY <= maxFeetY`。
 - 竖直行程必须被已证明的脚高区间**连续覆盖**；窄到 `1e-9` 以上的缺口也不能跳过。
-  同一竖直行程还需要身体碰撞净空连续无碰撞。
+  同一竖直行程还需要身体碰撞净空连续无碰撞。只有在所有来源格都已观测且 provider 没有
+  返回不支持结果时，未覆盖区间才记为 `BLOCKED` / `missing_climb_contact`；来源证据缺失
+  仍优先表达为 `UNKNOWN` / `STALE`。
 - 只读验证不自动挂载、下梯或斜向攀爬；这些转换返回显式的范围不支持结果。
 - 高行程会逐格读取所需 Section；`maxCandidateCells`、`maxNeighborReads`、`maxClimbRegions`
   与 `maxWork` 共同限制实际工作。
@@ -148,10 +155,14 @@ limits 会在边界抛错；几何子集之外的范围返回 `UNSUPPORTED` / `u
 - Provider 在解析形状或攀爬区间时读取的每个邻格都会记录 Section 依赖。即使 provider
   在读到缺失/过期邻格后仍返回形状/区间，碰撞/通道所必需的证据缺口也会保留并使结论无法
   成为 `OPEN`。
-- **仅用于支撑检查的候选**单独缓冲诊断：候选自身的读取、其 shape provider 的受控邻读
-  以及 `neighbor_gap` 先写入局部缓冲。只要任一已观测候选在精确脚高给出正面积可站立面，
-  就立即停止扫描可选候选并丢弃这些可选缺口；仅在无法证明任何支撑时，才把缓冲并回全局
-  原因。Section 依赖与 TTL 仍始终全局记录，碰撞/通道必需的 provider 缺口不受影响。
+- **仅用于支撑检查的候选**逐个候选隔离诊断：每个候选自身的读取、其 shape provider 的
+  受控邻读以及 `neighbor_gap` 先写入该候选自己的局部缓冲。只有该候选自身证据完整
+  （自身读取与 provider 邻读都没有缺口）且在精确脚高给出正面积可站立面，才算一个完整
+  支撑见证；找到后立即停止扫描并丢弃其他候选的可选缺口。provider 即使仍返回形状，也不能
+  用返回面掩盖它已经读取到的缺失邻格：这类候选只是不完整的断言，不能证明支撑。反过来，
+  其他候选的可选缺口也不会污染一个独立的完整见证。仅在无法得到任何完整见证时，才把所有
+  候选缓冲并回全局原因；只有全观测且无缺口的候选都没有匹配面才是 `missing_support`。
+  Section 依赖与 TTL 仍始终全局记录，碰撞/通道必需的 provider 缺口不受影响。
 
 ## Section 依赖、驻留与有效期
 
@@ -304,10 +315,11 @@ verifier.clear();                   // 丢弃追踪路线，不修改地图
 
 - `npm run build`：TypeScript 构建成功。
 - `npx tsc --noEmit`：全库类型检查成功。
-- `npx vitest run tests/land-transition.test.ts tests/land-route.test.ts`：60 个陆地几何/路线
+- `npx vitest run tests/land-transition.test.ts tests/land-route.test.ts`：63 个陆地几何/路线
   测试全部通过，覆盖安全整数边界与数值不可表示、容量与工作预算区分、预分配计数、路线
-  `budgetGap` 的 per-call/固定上限/容量恢复、jump 真实包围盒角落、支撑候选局部诊断、
-  刷新型 `UNSUPPORTED` 恢复。
+  `budgetGap` 的 per-call/固定上限/容量恢复、jump 真实包围盒角落、支撑候选逐候选局部
+  诊断（可选缺口不污染独立完整见证，且 provider 不能用返回面掩盖自身邻读缺口）、
+  上身接触的高于脚高行程的攀爬来源、刷新型 `UNSUPPORTED` 恢复。
 - `npx vitest run tests/step-evaluator.test.ts tests/traversability-cache.test.ts
   tests/route-verifier.test.ts`：88 个既有 step/cache/route 回归测试全部通过。
 
