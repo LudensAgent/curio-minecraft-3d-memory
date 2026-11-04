@@ -1,12 +1,13 @@
 /**
- * Provenance helpers shared by the acceptance runner (`run.mjs`) and its pure
+ * Provenance metadata helpers shared by the acceptance runner (`run.mjs`) and its
  * fixture tests (`provenance.test.mjs`).
  *
- * Everything exported here is a pure function of the filesystem / git state it
- * is handed: no build, no pack, no install, no `dist` deletion. It records which
- * working-tree files constitute build/package/acceptance inputs, distinguishes a
- * genuine git failure from a merely-absent tag, and computes SHA-256 content
- * digests so the runner never claims a clean HEAD when the working copy differs.
+ * These are read-only metadata tools, not side-effect-free pure functions: they
+ * query git, read the filesystem and hash content, but perform no build, pack,
+ * install or `dist` deletion. They record which working-tree files constitute
+ * build/package/acceptance inputs, distinguish a genuine git failure from a
+ * merely-absent tag, and compute SHA-256 content digests so the runner never
+ * claims a clean HEAD when the working copy differs.
  */
 
 import { spawnSync } from 'node:child_process';

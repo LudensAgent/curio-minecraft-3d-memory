@@ -25,7 +25,7 @@
 import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import * as P from './provenance.mjs';
 
@@ -102,24 +102,38 @@ function versionLine(v) {
   return v.ok ? v.version : `FAILED: ${v.error}`;
 }
 
+/**
+ * Resource-closing/cleanup failure markers the consumer prints when a session close
+ * or the final cleanup is unclean. A scenario that hits one of these did NOT fail at
+ * its intended assertion alone (or, for the positive path, did not close cleanly), so
+ * it must not be judged PASS. These three cover the consumer's real closing errors:
+ * `unclean/unknown close`, `cleanup failure`, and the older `secondary close/cleanup
+ * error` wording.
+ */
+const RESOURCE_FAILURE_MARKERS = ['unclean/unknown close', 'cleanup failure', 'secondary close/cleanup error'];
+
+export function hasResourceFailure(text) {
+  return RESOURCE_FAILURE_MARKERS.some((m) => text.includes(m));
+}
+
 /** Evaluate a consumer scenario against its expected exit + assertion marker. */
-function evaluateScenario(scenario, res) {
+export function evaluateScenario(scenario, res) {
   if (res.error) return { status: 'FAIL', why: `spawn error: ${res.error}` };
   if (res.signal) return { status: 'FAIL', why: `killed by ${res.signal}` };
+  const resourceFailure = hasResourceFailure(res.stderr);
   if (scenario.expectExit === 0) {
     if (res.code !== 0) return { status: 'FAIL', why: `expected exit 0, got ${res.code}` };
     if (scenario.expectStdout && !res.stdout.includes(scenario.expectStdout)) {
       return { status: 'FAIL', why: `missing expected stdout marker: ${JSON.stringify(scenario.expectStdout)}` };
     }
+    if (resourceFailure) return { status: 'FAIL', why: 'positive run had a resource/cleanup failure' };
     return { status: 'PASS' };
   }
   if (res.code !== 1) return { status: 'FAIL', why: `expected exit 1 (assertion), got ${res.code ?? 'null'}` };
   if (scenario.expectStderr && !res.stderr.includes(scenario.expectStderr)) {
     return { status: 'FAIL', why: `missing intended assertion ${JSON.stringify(scenario.expectStderr)} in stderr` };
   }
-  if (/secondary close\/cleanup error/i.test(res.stderr) || /unclean\/unknown close/i.test(res.stderr)) {
-    return { status: 'FAIL', why: 'negative failed with a secondary close/cleanup error, not the intended assertion' };
-  }
+  if (resourceFailure) return { status: 'FAIL', why: 'negative run had a resource/cleanup failure alongside the assertion' };
   return { status: 'PASS' };
 }
 
@@ -409,24 +423,36 @@ async function orchestrate(execute) {
   evidence.execution.sourceBinding = sourceBinding;
   if (!failure && !sourceBinding.clean) {
     failure = new AcceptanceFailure(
-      'source-binding',
-      sourceBinding.headChanged ? 'HEAD changed during release work' : 'release inputs changed during release work',
+      `[source-binding] ${sourceBinding.headChanged ? 'HEAD changed during release work' : 'release inputs changed during release work'}`,
     );
   }
 
-  evidence.endedAt = new Date().toISOString();
-
-  // Reclaim only the transient consumer install; keep evidence + artifact.
-  try {
-    rmSync(consumerDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-  } catch (cleanupErr) {
-    evidence.execution.cleanupError = String(cleanupErr.message || cleanupErr);
-    console.error(`[cleanup] could not remove ${consumerDir}: ${cleanupErr.message}`);
+  // Reclaim only the transient consumer install; keep evidence + artifact. Reuse the
+  // same confined-path validation as `dist` so a re-pointed/symlinked consumer dir
+  // cannot escape the run output dir, and delete the returned resolved path.
+  const consumerDel = P.safeDirDeletion(outputDir, 'consumer');
+  if (consumerDel.ok) {
+    try {
+      rmSync(consumerDel.path, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch (cleanupErr) {
+      evidence.execution.cleanupError = String(cleanupErr.message || cleanupErr);
+      console.error(`[cleanup] could not remove ${consumerDel.path}: ${cleanupErr.message}`);
+    }
+  } else {
+    evidence.execution.cleanupError = consumerDel.error;
+    console.error(`[cleanup] ${consumerDel.error}`);
   }
 
-  if (failure) {
+  // Reflect the true end of the run (after cleanup), never before it.
+  evidence.endedAt = new Date().toISOString();
+
+  const cleanupFailure = evidence.execution.cleanupError
+    ? new AcceptanceFailure(`[cleanup] ${evidence.execution.cleanupError}`)
+    : null;
+  const failed = failure !== null || cleanupFailure !== null;
+  if (failed) {
     evidence.execution.outcome = 'FAIL';
-    evidence.execution.primaryError = String(failure.message || failure);
+    evidence.execution.primaryError = failure ? String(failure.message || failure) : null;
   } else {
     evidence.execution.outcome = 'PASS';
   }
@@ -435,13 +461,14 @@ async function orchestrate(execute) {
   writeFileSync(join(outputDir, 'evidence.json'), JSON.stringify(evidence, null, 2));
   printRecord(evidence, execute);
 
-  if (failure) {
+  if (failed) {
     console.error('--- acceptance summary ---');
-    console.error(`independent consumer acceptance: FAIL`);
+    console.error('independent consumer acceptance: FAIL');
     printScenarioFailure(evidence.execution);
-    console.error(`primary error   : ${failure.message}`);
+    if (failure) console.error(`primary error   : ${failure.message}`);
+    if (evidence.execution.cleanupError) console.error(`cleanup error   : ${evidence.execution.cleanupError}`);
     console.error(`evidence        : ${join(outputDir, 'evidence.json')}`);
-    throw failure;
+    throw failure ?? cleanupFailure;
   }
 
   console.log('--- acceptance summary ---');
@@ -457,8 +484,12 @@ async function main() {
   process.exitCode = code;
 }
 
-main().catch((err) => {
-  console.error('[acceptance] hard failure:');
-  console.error(err && err.stack ? err.stack : String(err));
-  process.exitCode = 1;
-});
+// Direct-entry guard: only run the orchestrator when this file is the CLI entry,
+// so `run.test.mjs` can import the exported helpers without triggering a run.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error('[acceptance] hard failure:');
+    console.error(err && err.stack ? err.stack : String(err));
+    process.exitCode = 1;
+  });
+}

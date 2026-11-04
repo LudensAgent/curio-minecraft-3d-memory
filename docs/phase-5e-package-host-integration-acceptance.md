@@ -213,10 +213,21 @@ Curio 源码，不把制动系数、按键时序或服务器连接逻辑放进�
 
 ## 验证命令
 
+本次修订实际可跑（不触碰 `dist`、不 build/pack/install）：
+
 ```bash
-npm run typecheck              # tsc --noEmit（含 src 与 tests）
-npm test                       # vitest run（561 项，全绿）
-npm run build                  # 产出 dist/
-node acceptance/run.mjs        # 独立消费者安装验收（非零退出即失败）
-npx tsx examples/shared-session-lifecycle.ts   # 宿主生命周期参考示例
+node --test acceptance/provenance.test.mjs   # 分类器/越界校验 fixture（当前 20 项全绿）
+node --test acceptance/run.test.mjs          # 场景判定回归（断言 + 收尾失败仍 FAIL）
+node --check acceptance/run.mjs              # 运行器语法校验
+node acceptance/run.mjs                      # readiness（只读采集 + 输入分类；脏输入非零退出）
 ```
+
+最终独立安装验收（须在干净 HEAD、所有阶段提交+审计后由协调方放行，本文件不预先宣称完成）：
+
+```bash
+node acceptance/run.mjs --execute            # 干净 dist → build → pack → 安装 → 正向 + 两负向 + 类型检查
+```
+
+下方 `npm test` 的「561 项」与旧 `node acceptance/run.mjs` 是上一版 `0.7.4` 记录的历史数字，不是本次修订
+重跑的结果；本次未执行 `npm run typecheck` / `npm test` / `npm run build`。最终产物 SHA-256、源码/断言哈希、
+安装版本仍待门禁实际执行后落定。
