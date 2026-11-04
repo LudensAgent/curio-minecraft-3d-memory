@@ -310,7 +310,7 @@ export function runCancelChannel(map: VoxelMap, clock: () => number, skipCancel 
 
   const empty = map.markStale('nether', 'observation_gap'); // unobserved dimension
   assert(empty.sections.length === 0, 'the cancel-channel report must be empty');
-  walk.observe(empty, clock());
+  walk.observe(empty, 10);
 
   if (!skipCancel) cancelActiveDelegation(walk);
 
