@@ -217,21 +217,36 @@ export type {
 } from './adapter/index.js';
 
 // Navigation
-export { startKnownWalkRoute, WalkRouteSearch } from './navigation/index.js';
+export {
+  frontierCandidates,
+  inspectRoute,
+  NAVIGATION_CAPABILITIES,
+  NAVIGATION_CAPABILITY_STATUSES,
+  startKnownWalkRoute,
+  WalkRouteSearch,
+} from './navigation/index.js';
 export type {
   ActionRecord,
   ArrivalSpec,
   FollowKnownPathRequest,
   Frontier,
+  FrontierCandidateView,
+  FrontierCandidatesResult,
   KnownWalkRouteRejectionReason,
   KnownWalkRouteRequest,
   KnownWalkRouteSnapshot,
   KnownWalkRouteStart,
   LastObservation,
   NavigateRequest,
+  NavigationCapability,
+  NavigationCapabilityEffects,
+  NavigationCapabilityName,
+  NavigationCapabilityStatus,
   NavOutcome,
   NavProblem,
   NavResult,
+  RouteBoundaryFact,
+  RouteInspection,
   WalkSearchArrival,
   WalkSearchCandidate,
   WalkSearchCounters,
