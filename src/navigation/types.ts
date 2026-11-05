@@ -8,6 +8,7 @@
 
 import type { EffectEvidence, MaterialAllowance } from '../adapter/types.js';
 import type { Observation, ObservationGap } from '../observation/types.js';
+import type { StepConstraints } from '../traversability/step.js';
 import type { HazardFact, ObstacleEvidence, Traversability } from '../traversability/types.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 
@@ -48,7 +49,11 @@ export type NavProblem =
   | { kind: 'route_invalidated'; detail: string }
   | { kind: 'scope_changed'; detail: string }
   | { kind: 'unavailable'; detail: string }
-  | { kind: 'execution_failed'; detail: string };
+  | { kind: 'execution_failed'; detail: string }
+  // Request-boundary rejection: malformed fields or fields outside the
+  // declared contract. This is not a world fact and must not be read as any
+  // obstacle or path conclusion.
+  | { kind: 'invalid_request'; detail: string };
 
 export type ArrivalSpec =
   | { kind: 'exact' }
@@ -65,11 +70,25 @@ export interface NavigateRequest {
   allowTower: boolean;
   materials: MaterialAllowance[];
   exploration: 'known_only' | 'allow_frontier';
+  /**
+   * Optional delegation constraints. Only an empty `avoid` is executable today;
+   * a non-empty one is rejected instead of being silently ignored.
+   */
+  constraints?: StepConstraints;
 }
 
 /** Input to `follow_known_path`. */
 export interface FollowKnownPathRequest {
-  pathId: string;
+  /** Stable historical fragment id to follow. At least one of pathId/fragmentId is required. */
+  pathId?: string;
+  /** Older alias for `pathId`; both may be supplied only when they are equal. */
+  fragmentId?: string;
+  /** Only `walk` is executed; other modes are rejected before the executor starts. */
+  mode: MoveMode;
+  /** Only `{ kind: 'exact' }` is executed; other completion conditions are rejected. */
+  arrival: ArrivalSpec;
+  /** Only an empty `avoid` is executable today. */
+  constraints?: StepConstraints;
 }
 
 /** Body/world evidence snapshot that must accompany an ARRIVED position (§7). */
@@ -154,6 +173,8 @@ export interface ActionRecord {
     allowTower: boolean;
     materials: MaterialAllowance[];
     exploration: 'known_only' | 'allow_frontier';
+    /** Delegation constraints, when supplied; absent means none were requested. */
+    constraints?: StepConstraints;
   };
   subActions: {
     kind: string;

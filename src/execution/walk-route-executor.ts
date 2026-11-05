@@ -1213,6 +1213,7 @@ function cloneProblem(problem: NavProblem): NavProblem {
     case 'scope_changed':
     case 'unavailable':
     case 'execution_failed':
+    case 'invalid_request':
       return { kind: problem.kind, detail: problem.detail };
     case 'no_path':
     case 'timeout':

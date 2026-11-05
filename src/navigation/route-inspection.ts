@@ -39,12 +39,35 @@ export interface RouteBoundaryFact {
 }
 
 /**
+ * Caller-supplied historical lookup for {@link frontierCandidates}.
+ *
+ * The callback is the caller's query over its own history store. This module
+ * does not import topology, so it cannot fabricate `true`/`false`: `undefined`
+ * (or any non-boolean) is projected as `'unknown'`.
+ */
+export type HistoricalConnectionLookup = (candidate: {
+  pos: Vec3Like;
+  stance: Vec3Like;
+  gap: Vec3Like[];
+}) => boolean | undefined;
+
+/** Options for {@link frontierCandidates}. */
+export interface FrontierCandidatesOptions {
+  /**
+   * Optional history lookup. Only a real `true`/`false` returned by the caller's
+   * own lookup is reported; the library never queries topology here.
+   */
+  historicalConnection?: HistoricalConnectionLookup;
+}
+
+/**
  * A never-observed boundary projected from `WalkSearchFrontier`.
  *
  * `pos` is the adjacent boundary point (`to`), which was not entered and is not
  * claimed reachable. `stance` is the OPEN-verified stance the boundary is next
- * to. `historicalConnection` is always `'unknown'`: this projection does not
- * query topology or history, so it neither proves nor disproves a connection.
+ * to. `historicalConnection` is `'unknown'` unless the caller supplied a history
+ * lookup that returned a boolean for this candidate; this projection itself
+ * never queries history.
  */
 export interface FrontierCandidateView {
   pos: Vec3Like;
@@ -53,7 +76,7 @@ export interface FrontierCandidateView {
   /** Reachability of `stance` only, never of `pos` or `gap`. */
   reachability: 'OPEN';
   basis: Observation[];
-  historicalConnection: 'unknown';
+  historicalConnection: boolean | 'unknown';
   reason: string;
   computedAt: number;
   validUntil: number;
@@ -108,14 +131,30 @@ export interface RouteInspection {
 }
 
 /** Project the bounded frontier candidates already in `snapshot`. */
-export function frontierCandidates(snapshot: WalkSearchSnapshot): FrontierCandidatesResult {
+export function frontierCandidates(
+  snapshot: WalkSearchSnapshot,
+  options: FrontierCandidatesOptions = {},
+): FrontierCandidatesResult {
+  const lookup = options.historicalConnection;
   return {
     source: 'walk_search_snapshot',
     worldId: snapshot.worldId,
     dim: snapshot.dim,
     sessionId: snapshot.sessionId,
     state: snapshot.state,
-    candidates: snapshot.frontiers.map(cloneFrontierCandidate),
+    candidates: snapshot.frontiers.map((frontier) => {
+      const connection = lookup === undefined
+        ? undefined
+        : lookup({
+            pos: { ...frontier.to },
+            stance: { ...frontier.stance },
+            gap: frontier.gap.map((cell) => ({ ...cell })),
+          });
+      return cloneFrontierCandidate(
+        frontier,
+        connection === true || connection === false ? connection : 'unknown',
+      );
+    }),
     selected: false,
     explorationStarted: false,
     truncated: snapshot.counters.frontierLimitReached,
@@ -152,7 +191,7 @@ export function inspectRoute(snapshot: WalkSearchSnapshot): RouteInspection {
       computedAt: diagnostic.computedAt,
       problem: diagnostic.problem === undefined ? undefined : cloneStepProblem(diagnostic.problem),
     })),
-    frontiers: snapshot.frontiers.map(cloneFrontierCandidate),
+    frontiers: snapshot.frontiers.map((frontier) => cloneFrontierCandidate(frontier, 'unknown')),
     unavailableHistorical: snapshot.unavailableHistorical.map(cloneUnavailable),
     counters: { ...snapshot.counters },
     limits: { ...snapshot.limits },
@@ -161,14 +200,17 @@ export function inspectRoute(snapshot: WalkSearchSnapshot): RouteInspection {
   };
 }
 
-function cloneFrontierCandidate(frontier: WalkSearchFrontier): FrontierCandidateView {
+function cloneFrontierCandidate(
+  frontier: WalkSearchFrontier,
+  historicalConnection: boolean | 'unknown',
+): FrontierCandidateView {
   return {
     pos: { ...frontier.to },
     stance: { ...frontier.stance },
     gap: frontier.gap.map((cell) => ({ ...cell })),
     reachability: frontier.reachability,
     basis: frontier.basis.map(cloneObservation),
-    historicalConnection: 'unknown',
+    historicalConnection,
     reason: frontier.reason,
     computedAt: frontier.computedAt,
     validUntil: frontier.validUntil,
