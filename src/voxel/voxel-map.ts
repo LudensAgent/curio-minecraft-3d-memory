@@ -16,11 +16,14 @@
  * methods appear here as fake-success stubs.
  */
 
-import type { CellEvidence, Observation, ObservationBatch } from '../observation/types.js';
+import { VOXEL_SNAPSHOT_SCHEMA_VERSION } from '../constants.js';
+import { cloneObservationGap } from '../observation/clone.js';
+import type { CellEvidence, Observation, ObservationBatch, ObservationGap } from '../observation/types.js';
+import { assertIntegerCoords, validateObservation, validateObservationGap } from '../observation/validate.js';
 import type { Vec3Like } from '../types.js';
 import { serializeBlockState } from './blockstate.js';
 import { blockToSection, cellIndex } from './coordinates.js';
-import { bitsRequired, createSection, repack, setBit, writeCell } from './palette.js';
+import { bitsRequired, createSection, getBit, repack, setBit, writeCell } from './palette.js';
 import { sectionKeyString } from './section.js';
 import type { Section, SectionKey } from './section.js';
 import {
@@ -52,8 +55,18 @@ import type {
   VoxelSectionSnapshot,
 } from './snapshot.js';
 
-/** What one accepted update did to its cell. */
-export type CellChangeKind = 'inserted' | 'changed' | 'refreshed' | 'staled' | 'restored';
+/**
+ * What one accepted update did to its cell. `traversed` / `modified` are history
+ * marks: they never advance the block-content revision.
+ */
+export type CellChangeKind =
+  | 'inserted'
+  | 'changed'
+  | 'refreshed'
+  | 'staled'
+  | 'restored'
+  | 'traversed'
+  | 'modified';
 
 export interface CellChange {
   pos: Vec3Like;
@@ -72,6 +85,29 @@ export interface SectionChange {
 export interface ChangeReport {
   /** Affected sections, in first-touch order. Empty when nothing changed. */
   sections: SectionChange[];
+}
+
+/**
+ * Result of a batch observation: the localized change report plus the gaps this
+ * batch was asked about but could not observe. Gaps are diagnostics only — they
+ * never become cells, air, or evidence.
+ */
+export interface BatchChangeReport extends ChangeReport {
+  gaps: ObservationGap[];
+}
+
+/** Read-only history/validity flags for one cell. Never mutates or refreshes. */
+export interface CellHistoryView {
+  /** A precise observation (including confirmed air) exists. */
+  explored: boolean;
+  /** The agent walked/stood on this cell at some point. */
+  traversed: boolean;
+  /** The agent dug/placed this cell through a confirmed action. */
+  modified: boolean;
+  /** Derived risk-candidate index; read together with evidence. */
+  risk: boolean;
+  /** Previously observed but now needing re-verification. */
+  stale: boolean;
 }
 
 export interface VoxelMapOptions {
@@ -105,6 +141,14 @@ export interface VoxelMapOptions {
   manualResidency?: boolean;
   /** Working-set bounds used when `manualResidency` is true. */
   residencyLimits?: ResidencyLimits;
+  /**
+   * Synchronous change-report hook, invoked once per accepted update/batch that
+   * changed at least one section. Hosts use it to invalidate derived caches (e.g.
+   * a `TraversabilityCache`) before the next read. The callback must return
+   * synchronously and must not be used to perform hidden world reads; errors
+   * propagate to the caller. Restore (the initialization path) never fires it.
+   */
+  onChange?: (report: ChangeReport) => void;
 }
 
 /** Read-only view of one cell. `observed: false` means never observed (UNKNOWN). */
@@ -127,6 +171,7 @@ export class VoxelMap {
   private readonly requireSession: boolean;
   private readonly manualResidency: boolean;
   private readonly residentLimits: ResolvedResidencyLimits;
+  private readonly onChange: ((report: ChangeReport) => void) | undefined;
   /**
    * Committed section directory (manual mode only), keyed by a dim|coords key.
    * Read once at open from the worker without decoding any payload.
@@ -192,6 +237,7 @@ export class VoxelMap {
     this.requireSession = options.requireSession ?? false;
     this.manualResidency = options.manualResidency ?? false;
     this.residentLimits = resolveResidencyLimits(options.residencyLimits);
+    this.onChange = options.onChange;
   }
 
   /** Current persistence revision (see `saveRevisionCount`). */
@@ -205,6 +251,7 @@ export class VoxelMap {
    * and are reported. Idempotent for the already-active session.
    */
   beginSession(sessionId: string): ChangeReport {
+    assertNonEmptyString(sessionId, 'sessionId');
     if (sessionId === this.currentSessionId) return { sections: [] };
     const previous = this.currentSessionId;
     this.currentSessionId = sessionId;
@@ -221,7 +268,7 @@ export class VoxelMap {
         );
       }
     }
-    return { sections: [...bySection.values()] };
+    return this.emit({ sections: [...bySection.values()] });
   }
 
   /**
@@ -245,28 +292,120 @@ export class VoxelMap {
     for (const section of dimMap.values()) {
       this.markSectionCellsStale(section, () => true, reason, bySection);
     }
-    return { sections: [...bySection.values()] };
+    return this.emit({ sections: [...bySection.values()] });
   }
 
   /** Accept one confirmed observation and return its localized change (or empty). */
   observe(observation: Observation): ChangeReport {
     validateObservation(this.worldId, observation);
     this.assertWritable([observation]);
-    return this.applyObservations([observation]);
+    return this.emit(this.applyObservations([observation]));
   }
 
   /**
-   * Accept a batch; only the confirmed observations are written, gaps are not
-   * cells. The whole batch is validated up front — both for malformed input and
-   * for the manual-residency write guard — so an invalid observation or a
-   * not-resident section does not leave behind a half-applied batch.
+   * Accept a batch; only the confirmed observations are written. Gaps are kept as
+   * diagnostics and returned (never written as cells or air). The whole batch is
+   * validated up front — both for malformed input and for the manual-residency
+   * write guard — so an invalid observation or a not-resident section does not
+   * leave behind a half-applied batch.
    */
-  observeBatch(batch: ObservationBatch): ChangeReport {
+  observeBatch(batch: ObservationBatch): BatchChangeReport {
+    if (batch === null || typeof batch !== 'object' || !Array.isArray(batch.observations) || !Array.isArray(batch.unobserved)) {
+      throw new Error('observation batch must have observations and unobserved arrays');
+    }
     for (const observation of batch.observations) {
       validateObservation(this.worldId, observation);
     }
+    for (const gap of batch.unobserved) {
+      validateObservationGap(gap);
+    }
     this.assertWritable(batch.observations);
-    return this.applyObservations(batch.observations);
+    const report = this.applyObservations(batch.observations);
+    return this.emit({ sections: report.sections, gaps: batch.unobserved.map(cloneObservationGap) });
+  }
+
+  /**
+   * Record that the agent actually stood on this cell (history, design §3.1 /
+   * §4). The caller must pass a measured stance; this method never infers a
+   * traversal from a coordinate, a route, or a placed block. It sets only the
+   * `traversed` bitmap — never `explored`, evidence, freshness, or the
+   * block-content revision. Idempotent for an already-marked cell.
+   */
+  markTraversed(dim: string, pos: Vec3Like): ChangeReport {
+    return this.markHistory(dim, pos, 'traversed');
+  }
+
+  /**
+   * Record that one of the agent's own confirmed actions changed this cell
+   * (history, design §3.1 / §4). `actionId` is required and must be the verified
+   * effect's id; this is not an implicit "I probably broke this" marker and it
+   * never writes an expected new state or advances the block-content revision.
+   */
+  markModified(dim: string, pos: Vec3Like, actionId: string): ChangeReport {
+    assertNonEmptyString(actionId, 'actionId');
+    return this.markHistory(dim, pos, 'modified');
+  }
+
+  /**
+   * Read the per-cell history/validity flags. Read-only: never allocates,
+   * scans, refreshes evidence time, or changes a revision.
+   */
+  historyAt(dim: string, x: number, y: number, z: number): CellHistoryView {
+    assertIntegerCoords(x, y, z);
+    const section = this.lookupSection(dim, x, y, z);
+    if (section === undefined) {
+      return { explored: false, traversed: false, modified: false, risk: false, stale: false };
+    }
+    const { lx, ly, lz } = blockToSection(x, y, z);
+    const index = cellIndex(lx, ly, lz);
+    return {
+      explored: getBit(section.explored, index),
+      traversed: getBit(section.traversed, index),
+      modified: getBit(section.modified, index),
+      risk: getBit(section.risk, index),
+      stale: getBit(section.stale, index),
+    };
+  }
+
+  /**
+   * Mark existing evidence as pending an effect the agent requested: an action
+   * request is not an observed result, so the old conclusion becomes STALE with
+   * reason `pending_effect` and its revision advances. No expected new state is
+   * written. Unknown cells stay unknown. When `actionId` is supplied and the
+   * cell's evidence was already confirmed by that same action, this is a no-op.
+   */
+  invalidatePendingEffect(dim: string, pos: Vec3Like, actionId?: string): ChangeReport {
+    assertNonEmptyString(dim, 'dim');
+    assertIntegerCoords(pos.x, pos.y, pos.z);
+    if (actionId !== undefined) assertNonEmptyString(actionId, 'actionId');
+    const section = this.lookupSection(dim, pos.x, pos.y, pos.z);
+    if (section === undefined) return { sections: [] };
+    const { lx, ly, lz } = blockToSection(pos.x, pos.y, pos.z);
+    const index = cellIndex(lx, ly, lz);
+    const existing = section.evidence.get(index);
+    if (existing === undefined) return { sections: [] };
+    if (existing.freshness === 'STALE' && existing.staleReason === 'pending_effect') return { sections: [] };
+    if (actionId !== undefined && existing.observation.actionId === actionId) return { sections: [] };
+
+    section.evidence.set(index, {
+      ...existing,
+      freshness: 'STALE',
+      staleReason: 'pending_effect',
+      revision: existing.revision + 1,
+    });
+    section.revision += 1;
+    setBit(section.stale, index, true);
+    this.recordSaveChange(section);
+    return this.emit({
+      sections: [
+        {
+          key: { ...section.key },
+          revision: section.revision,
+          invalidated: true,
+          cells: [{ pos: { ...pos }, kind: 'staled' }],
+        },
+      ],
+    });
   }
 
   /** Read the current cell state; never mutates, scans, or refreshes evidence time/version. */
@@ -344,7 +483,7 @@ export class VoxelMap {
         out.push(snapshotVoxelSection(section));
       }
     }
-    return { worldId: this.worldId, sections: out };
+    return { worldId: this.worldId, schemaVersion: VOXEL_SNAPSHOT_SCHEMA_VERSION, sections: out };
   }
 
   /** Cheap full-map counts (no serialization), for the full-set capacity check. */
@@ -458,6 +597,16 @@ export class VoxelMap {
     }
     if (snapshot.worldId !== this.worldId) {
       throw new Error(`snapshot worldId "${snapshot.worldId}" does not match map worldId "${this.worldId}"`);
+    }
+    if (
+      snapshot.schemaVersion !== undefined &&
+      (!Number.isSafeInteger(snapshot.schemaVersion) ||
+        snapshot.schemaVersion < 1 ||
+        snapshot.schemaVersion > VOXEL_SNAPSHOT_SCHEMA_VERSION)
+    ) {
+      throw new Error(
+        `unsupported voxel snapshot schemaVersion ${String(snapshot.schemaVersion)} (supported: 1..${VOXEL_SNAPSHOT_SCHEMA_VERSION})`,
+      );
     }
     // Restore is the initialization path only: reject a map that has already been
     // delivered (even if still empty), activated (a session started), or that
@@ -822,6 +971,73 @@ export class VoxelMap {
 
   // --- internals ---
 
+  /**
+   * Shared history-mark path for `traversed` / `modified`. Allocates a sparse
+   * section when needed (a stance or a confirmed action can be real history even
+   * when the cell itself is not currently observed), but never writes evidence,
+   * explored, freshness, or the block-content revision.
+   */
+  private markHistory(dim: string, pos: Vec3Like, kind: 'traversed' | 'modified'): ChangeReport {
+    assertNonEmptyString(dim, 'dim');
+    assertIntegerCoords(pos.x, pos.y, pos.z);
+    const { cx, cz, sy, lx, ly, lz } = blockToSection(pos.x, pos.y, pos.z);
+    let section = this.lookupSection(dim, pos.x, pos.y, pos.z);
+    if (section === undefined) {
+      this.assertHistoryAllocatable(dim, cx, cz, sy);
+      section = this.getOrCreateSection(dim, cx, cz, sy);
+      if (this.manualResidency) {
+        this.residentSectionCount += 1;
+        this.residentBytes += estimateVoxelSectionResidentBytes(section);
+      }
+    }
+    const bitmap = kind === 'traversed' ? section.traversed : section.modified;
+    const index = cellIndex(lx, ly, lz);
+    if (getBit(bitmap, index)) return { sections: [] };
+    setBit(bitmap, index, true);
+    // History is persisted (save revision) but is not a block-content change.
+    this.recordSaveChange(section);
+    return this.emit({
+      sections: [
+        {
+          key: { ...section.key },
+          revision: section.revision,
+          invalidated: false,
+          cells: [{ pos: { ...pos }, kind }],
+        },
+      ],
+    });
+  }
+
+  /**
+   * Manual-residency guard for history writes: a committed-but-not-resident
+   * section must be loaded first (allocating an empty shadow would hide its
+   * facts), and a brand-new section must fit the working-set bounds.
+   */
+  private assertHistoryAllocatable(dim: string, cx: number, cz: number, sy: number): void {
+    if (!this.manualResidency) return;
+    const key = dirKey(dim, cx, cz, sy);
+    if (this.directory.has(key) || this.extraResidency.has(key)) {
+      throw new VoxelResidencyError([{ worldId: this.worldId, dim, cx, cz, sy }]);
+    }
+    if (this.residentSectionCount + 1 > this.residentLimits.maxResidentSections) {
+      throw new Error(
+        `resident sections would exceed maxResidentSections (${this.residentSectionCount + 1} > ${this.residentLimits.maxResidentSections})`,
+      );
+    }
+    const estimate = estimateVoxelSectionResidentBytes(createSection({ worldId: this.worldId, dim, cx, cz, sy }));
+    if (this.residentBytes + estimate > this.residentLimits.maxResidentBytes) {
+      throw new Error(
+        `resident working set would exceed maxResidentBytes (${this.residentBytes + estimate} > ${this.residentLimits.maxResidentBytes})`,
+      );
+    }
+  }
+
+  /** Fire the synchronous change hook once per non-empty report. */
+  private emit<T extends ChangeReport>(report: T): T {
+    if (this.onChange !== undefined && report.sections.length > 0) this.onChange(report);
+    return report;
+  }
+
   private lookupSection(dim: string, x: number, y: number, z: number): Section | undefined {
     const { cx, cz, sy } = blockToSection(x, y, z);
     return this.sections.get(dim)?.get(innerKey(cx, cz, sy));
@@ -1178,21 +1394,9 @@ function snapshotSection(section: Section): Section {
   };
 }
 
-function validateObservation(worldId: string, observation: Observation): void {
-  if (observation.worldId !== worldId) {
-    throw new Error(
-      `observation worldId "${observation.worldId}" does not match map worldId "${worldId}"`,
-    );
-  }
-  assertIntegerCoords(observation.pos.x, observation.pos.y, observation.pos.z);
-  if (!Number.isFinite(observation.observedAt)) {
-    throw new Error(`observation observedAt must be a finite number: ${observation.observedAt}`);
-  }
-}
-
-function assertIntegerCoords(x: number, y: number, z: number): void {
-  if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
-    throw new Error(`coordinates must be integer grid coordinates: (${x}, ${y}, ${z})`);
+function assertNonEmptyString(value: string, what: string): void {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${what} must be a non-empty string`);
   }
 }
 

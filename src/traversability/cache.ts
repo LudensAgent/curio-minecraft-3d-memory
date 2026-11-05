@@ -216,6 +216,7 @@ function cloneEvaluation(e: StepEvaluation): StepEvaluation {
         ? { kind: 'block', observation: cloneObservation(o.observation) }
         : { kind: 'contact', pos: { ...o.pos }, observedAt: o.observedAt, sessionId: o.sessionId },
     ),
+    hazards: e.hazards?.map((h) => ({ ...h, pos: { ...h.pos } })),
     dependencies: e.dependencies.map((d) => ({ key: { ...d.key }, revision: d.revision })),
   };
 }

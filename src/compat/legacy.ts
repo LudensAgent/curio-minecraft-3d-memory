@@ -13,7 +13,11 @@
  * and such records are never resurrected from the still-present JSON snapshot.
  */
 
+import { PASSAGE_LINK } from '../constants.js';
 import type { Vec3Like } from '../types.js';
+
+/** Re-exported for legacy callers; the value is single-sourced in `constants.ts`. */
+export { PASSAGE_LINK };
 
 export interface LegacyLink {
   a: Vec3Like;
@@ -301,8 +305,6 @@ export function createLegacyReadBackend(
     },
   };
 }
-
-export const PASSAGE_LINK = 3.5;
 
 const d3 = (a: Vec3Like, b: Vec3Like) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 
