@@ -2,16 +2,19 @@
  * Compatibility layer for Curio's legacy `WorldMemory` / `TravelStore` entry
  * points (design §8, §9.1).
  *
- * Responsibilities once implemented:
- * - `JsonWorldMemoryBackend` so old queries (`{"kind":"passages"}` pagination,
- *   `findLandmark`, `recallChests`, `hazardAt`, …) keep byte-identical output.
- * - Keep legacy pure functions in `src/memory/passages.ts`
- *   (`passageRoute` / `passageSurfaceAnchor` / `passageDeepestAnchor` /
- *   `passageFragmentation`) as shims over the new store.
- * - Preserve stable IDs (passage `psg_…`, landmark id, chest key
- *   `worldId:dim:x,y,z`, portal endpoint id) and coordinate/scope semantics.
- * - Route new `NavResult` through the legacy `SkillResult` shell
- *   (`data.nav`), without redefining existing action completion conditions.
+ * Implemented here:
+ * - `legacy.ts`: read-only projection of a caller-validated JSON-shaped
+ *   snapshot (`{"kind":"passages"}` pagination, legacy `passageRoute`, landmark
+ *   and container/farm/placed/travel fields) with explicit deletion tombstones.
+ * - `migration-dry-run.ts`: offline A–D rehearsal that imports the passage
+ *   geometry batch into a caller-provided temporary SQLite database and checks
+ *   IDs, fields, order, coordinates, original times and deletion semantics.
  *
- * No implementation is present yet; this module is the documented seam.
+ * Still not implemented: the live `JsonWorldMemoryBackend`, real migration
+ * execution, persistence-authority switching, removal of the legacy write path,
+ * and wiring new `NavResult` through the legacy `SkillResult` shell. The dry run
+ * reports those as not performed and never claims real data was migrated.
  */
+
+export * from './legacy.js';
+export * from './migration-dry-run.js';
