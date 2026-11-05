@@ -126,6 +126,13 @@ export interface LegacyPlacedRecord {
   name: string;
   /** Legacy LRU serial, not a placement or observation time. */
   at: number;
+  /**
+   * Only present when an external source proves the placement's scope. The legacy
+   * `world-memory.json.placed` map is keyed by `x,y,z` alone; records without both
+   * fields stay unattributed history and are never projected into a live world.
+   */
+  worldId?: string;
+  dim?: string;
 }
 
 export interface LegacyTravelEndpoint {
@@ -158,6 +165,8 @@ export interface LegacySpatialSnapshot {
   farms?: readonly LegacyFarmRecord[];
   /** Keyed by the original `x,y,z` key. */
   placed?: Readonly<Record<string, LegacyPlacedRecord>>;
+  /** Keyed by the original `worldId:dim:cx:cz` key; values are exact visit counts. */
+  visitedChunks?: Readonly<Record<string, number>>;
   travel?: {
     endpoints?: readonly LegacyTravelEndpoint[];
     traversals?: readonly LegacyTravelCrossing[];
@@ -177,6 +186,10 @@ export interface LegacyDeletionSet {
   farmIds?: readonly string[];
   placedKeys?: readonly string[];
   endpointIds?: readonly string[];
+  /** Original `worldId:dim:cx:cz` visit keys. */
+  chunkVisitKeys?: readonly string[];
+  /** Canonical crossing ids (see `portalTraversalIdentity`). */
+  traversalKeys?: readonly string[];
 }
 
 export interface LegacyLedgerView {
@@ -184,6 +197,8 @@ export interface LegacyLedgerView {
   furnaces: LegacyFurnaceRecord[];
   farms: LegacyFarmRecord[];
   placed: Record<string, LegacyPlacedRecord>;
+  /** Exact counts keyed by the original `worldId:dim:cx:cz` key. */
+  visitedChunks: Record<string, number>;
   travel: {
     endpoints: LegacyTravelEndpoint[];
     traversals: LegacyTravelCrossing[];
@@ -205,6 +220,7 @@ interface DeletionSets {
   farms: Set<string>;
   placed: Set<string>;
   endpoints: Set<string>;
+  chunkVisits: Set<string>;
 }
 
 const clone = <T>(value: T): T => structuredClone(value);
@@ -219,6 +235,89 @@ export function legacyBlockKey(record: { worldId?: string; dim: string; pos: Vec
   return `${legacyRecordWorldId(record)}:${record.dim}:${record.pos.x},${record.pos.y},${record.pos.z}`;
 }
 
+/** Canonical chunk-visit identity, identical to the storage ledger's key format. */
+export function legacyChunkVisitKey(worldId: string, dim: string, cx: number, cz: number): string {
+  return `${worldId}:${dim}:${cx}:${cz}`;
+}
+
+/**
+ * Parse a legacy `x,y,z` placement key. The legacy writer floors positions, so a
+ * non-integer or malformed key is reported rather than rounded into a plausible
+ * cell.
+ */
+export function parseLegacyPlacedKey(key: string): Vec3Like | null {
+  const parts = key.split(',');
+  if (parts.length !== 3) return null;
+  const [x, y, z] = parts.map(Number);
+  if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || !Number.isSafeInteger(z)) return null;
+  return { x: x!, y: y!, z: z! };
+}
+
+/** One legacy placement normalized for migration, preserving its raw key and LRU. */
+export interface LegacyPlacedEntry {
+  /** Original `x,y,z` map key. */
+  sourceKey: string;
+  /** Canonical `worldId:dim:x,y,z` key, or null when the scope is not proven. */
+  key: string | null;
+  worldId: string | null;
+  dim: string | null;
+  pos: Vec3Like;
+  name: string;
+  lruAt: number;
+  attributed: boolean;
+}
+
+/**
+ * Normalize one legacy placement. `at` is preserved as `lruAt` verbatim and is
+ * never treated as a time. A record without both `worldId` and `dim` (or whose
+ * position key is malformed) stays unattributed/invalid, never guessed into the
+ * caller's world.
+ */
+export function normalizeLegacyPlaced(
+  sourceKey: string,
+  record: LegacyPlacedRecord,
+): LegacyPlacedEntry | null {
+  const pos = parseLegacyPlacedKey(sourceKey);
+  if (pos === null) return null;
+  if (typeof record?.name !== 'string' || record.name.length === 0) return null;
+  if (!Number.isSafeInteger(record.at) || record.at < 0) return null;
+  const worldId = typeof record.worldId === 'string' && record.worldId.length > 0 ? record.worldId : null;
+  const dim = typeof record.dim === 'string' && record.dim.length > 0 ? record.dim : null;
+  const attributed = worldId !== null && dim !== null;
+  return {
+    sourceKey,
+    key: attributed ? legacyBlockKey({ worldId: worldId!, dim: dim!, pos }) : null,
+    worldId,
+    dim,
+    pos,
+    name: record.name,
+    lruAt: record.at,
+    attributed,
+  };
+}
+
+/**
+ * Parse a `worldId:dim:cx:cz` visit key for a known world. Only keys that carry
+ * exactly this world's prefix are accepted; the dimension is everything between
+ * that prefix and the final two integer segments (so `minecraft:overworld`
+ * survives intact).
+ */
+export function parseLegacyChunkVisitKey(
+  key: string,
+  worldId: string,
+): { dim: string; cx: number; cz: number } | null {
+  const prefix = `${worldId}:`;
+  if (!key.startsWith(prefix)) return null;
+  const parts = key.slice(prefix.length).split(':');
+  if (parts.length < 3) return null;
+  const cz = Number(parts[parts.length - 1]);
+  const cx = Number(parts[parts.length - 2]);
+  if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cz)) return null;
+  const dim = parts.slice(0, -2).join(':');
+  if (dim.length === 0) return null;
+  return { dim, cx, cz };
+}
+
 function deletionSets(deletions: LegacyDeletionSet | undefined): DeletionSets {
   return {
     passages: new Set(deletions?.passageIds ?? []),
@@ -228,6 +327,7 @@ function deletionSets(deletions: LegacyDeletionSet | undefined): DeletionSets {
     farms: new Set(deletions?.farmIds ?? []),
     placed: new Set(deletions?.placedKeys ?? []),
     endpoints: new Set(deletions?.endpointIds ?? []),
+    chunkVisits: new Set(deletions?.chunkVisitKeys ?? []),
   };
 }
 
@@ -293,6 +393,11 @@ export function createLegacyReadBackend(
           Object.entries(snapshot.placed ?? {})
             .filter(([key]) => !deleted.placed.has(key))
             .map(([key, value]) => [key, clone(value)]),
+        ),
+        visitedChunks: Object.fromEntries(
+          Object.entries(snapshot.visitedChunks ?? {})
+            .filter(([key]) => key.startsWith(`${worldId}:`))
+            .filter(([key]) => !deleted.chunkVisits.has(key)),
         ),
         travel: {
           endpoints: (snapshot.travel?.endpoints ?? [])

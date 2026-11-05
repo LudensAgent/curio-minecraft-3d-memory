@@ -32,6 +32,7 @@ import { jsonEscapedByteLength } from '../../bytes.js';
 import {
   PersistenceError,
   resolveJournalLimits,
+  resolveLedgerLimits,
   resolveSnapshotLimits,
   resolveTimeoutMs,
   SNAPSHOT_FRAME_BYTES,
@@ -50,15 +51,18 @@ import type {
   JournalQueryBase,
   JournalWithdrawalResult,
   JournalWithdrawalSelector,
+  LedgerSnapshot,
   LoadSectionsResult,
   MeasureSectionsResult,
   OpenSpatialSessionOptions,
   PendingJournalSnapshot,
   ResolvedJournalLimits,
+  ResolvedLedgerLimits,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   SpatialCheckpointResult,
   SpatialEvent,
+  SpatialEventKind,
   SpatialPersistenceState,
   SpatialSession,
   VoxelLoading,
@@ -66,6 +70,7 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from './types.js';
+import { LedgerStore } from './ledger.js';
 import type { ActionRecord } from '../../navigation/types.js';
 import { JournalQueue } from './journal.js';
 import type { JournalCapture } from './journal.js';
@@ -88,6 +93,8 @@ interface PendingRequest {
   voxelSections?: VoxelSectionSnapshot[];
   /** The captured journal batch, for the ACK-time pending clear. */
   journalCapture?: JournalCapture;
+  /** Ledger revision captured by this checkpoint. */
+  ledgerRevision?: number;
 }
 
 interface InFlightCheckpoint {
@@ -105,7 +112,7 @@ interface JournalQueryMessage {
   sessionId?: string;
   actionId?: string;
   eventId?: string;
-  kind?: 'observed_cell_change' | 'observation_gap';
+  kind?: SpatialEventKind;
 }
 
 function optionalQueryString(value: string | undefined, what: string): string | undefined {
@@ -141,6 +148,7 @@ class SpatialSessionImpl implements SpatialSession {
   readonly voxel: VoxelMap;
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
+  readonly ledger: LedgerStore;
 
   get voxelLoading(): VoxelLoading {
     return this.voxelLoadingField;
@@ -166,6 +174,7 @@ class SpatialSessionImpl implements SpatialSession {
   private readonly limits: ResolvedSnapshotLimits;
   private readonly journalLimitsField: ResolvedJournalLimits;
   private readonly journalQueue: JournalQueue;
+  private readonly ledgerLimitsField: ResolvedLedgerLimits;
 
   private worker: Worker | null = null;
   private lifecycleField: SessionLifecycle = 'open';
@@ -185,9 +194,11 @@ class SpatialSessionImpl implements SpatialSession {
   private confirmedFragmentRevision = 0;
   private confirmedTopologyRevision = 0;
   private confirmedJournalRevision = 0;
+  private confirmedLedgerRevision = 0;
   private baselineCheckpointId: string | null = null;
   private voxelBaselineCheckpointId: string | null = null;
   private journalBaselineCheckpointId: string | null = null;
+  private ledgerBaselineCheckpointId: string | null = null;
   private committedJournalRecords = 0;
   private committedJournalBytes = 0;
   /** Whether a voxel save baseline exists (restored, or established this session). */
@@ -212,6 +223,8 @@ class SpatialSessionImpl implements SpatialSession {
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
     this.journalLimitsField = resolveJournalLimits(options.journalLimits);
     this.journalQueue = new JournalQueue(this.worldId, this.journalLimitsField);
+    this.ledgerLimitsField = resolveLedgerLimits(options.ledgerLimits);
+    this.ledger = new LedgerStore(this.worldId, this.ledgerLimitsField);
     this.journal = {
       recordAction: (record: ActionRecord): JournalAcceptResult => {
         this.assertJournalAccepting();
@@ -262,6 +275,8 @@ class SpatialSessionImpl implements SpatialSession {
       journalRevision: number;
       journalRecordCount: number;
       journalRecordBytes: number;
+      ledgerBaselineCheckpointId: string | null;
+      ledgerSnapshot: LedgerSnapshot | null;
     };
     try {
       result = await this.requestOpen();
@@ -282,6 +297,9 @@ class SpatialSessionImpl implements SpatialSession {
       } else if (result.voxelSnapshot !== null) {
         this.voxel.restoreSnapshot(result.voxelSnapshot);
       }
+      if (result.ledgerSnapshot !== null) {
+        this.ledger.restoreSnapshot(result.ledgerSnapshot);
+      }
     } catch (err) {
       this.lifecycleField = 'closed';
       await this.terminateWorker();
@@ -291,10 +309,12 @@ class SpatialSessionImpl implements SpatialSession {
     this.voxelBaselineCheckpointId = result.voxelBaselineCheckpointId;
     this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
     this.journalBaselineCheckpointId = result.journalBaselineCheckpointId;
+    this.ledgerBaselineCheckpointId = result.ledgerBaselineCheckpointId;
     this.committedJournalRecords = result.journalRecordCount;
     this.committedJournalBytes = result.journalRecordBytes;
     this.journalQueue.resetRevisionForRestore(result.journalRevision);
     this.confirmedJournalRevision = result.journalRevision;
+    this.confirmedLedgerRevision = this.ledger.revision;
     this.confirmedFragmentRevision = this.history.revision;
     this.confirmedTopologyRevision = this.topology.revision;
     this.confirmedVoxelRevision = this.voxel.saveRevision;
@@ -428,6 +448,28 @@ class SpatialSessionImpl implements SpatialSession {
       this.journalLimitsField.maxBatchBytes,
     );
 
+    // Capture the complete ledger for this world. The ledger is bounded separately
+    // from the history/voxel envelope; its exact serialized size is checked before
+    // any copy or message pass.
+    const ledgerRevision = this.ledger.revision;
+    const ledgerSnapshot = this.ledger.snapshot();
+    if (ledgerSnapshot.placed.length > this.ledgerLimitsField.maxPlacedBlocks) {
+      throw new PersistenceError('capacity', `ledger exceeds maxPlacedBlocks (${ledgerSnapshot.placed.length})`);
+    }
+    if (ledgerSnapshot.visits.length > this.ledgerLimitsField.maxChunkVisits) {
+      throw new PersistenceError('capacity', `ledger exceeds maxChunkVisits (${ledgerSnapshot.visits.length})`);
+    }
+    if (ledgerSnapshot.traversals.length > this.ledgerLimitsField.maxPortalTraversals) {
+      throw new PersistenceError(
+        'capacity',
+        `ledger exceeds maxPortalTraversals (${ledgerSnapshot.traversals.length})`,
+      );
+    }
+    const ledgerBytes = Buffer.byteLength(JSON.stringify(ledgerSnapshot), 'utf8');
+    if (ledgerBytes > this.ledgerLimitsField.maxBytes) {
+      throw new PersistenceError('capacity', `ledger exceeds maxBytes (${ledgerBytes})`);
+    }
+
     const checkpointId = randomUUID();
     const promise = new Promise<SpatialCheckpointResult>((resolve, reject) => {
       const requestId = this.nextRequestId++;
@@ -441,6 +483,7 @@ class SpatialSessionImpl implements SpatialSession {
         voxelMode,
         voxelSections: voxelSnapshot.sections,
         journalCapture,
+        ledgerRevision,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -459,6 +502,9 @@ class SpatialSessionImpl implements SpatialSession {
         journalMode: 'append',
         journalRevision: journalCapture.revision,
         journalBatch: { actions: journalCapture.actions, events: journalCapture.events },
+        ledgerMode: 'full',
+        ledgerRevision,
+        ledgerSnapshot,
       } satisfies WorkerRequest);
     });
     this.inFlight = { checkpointId, promise };
@@ -621,6 +667,9 @@ class SpatialSessionImpl implements SpatialSession {
       journalRevision: this.journalQueue.revision,
       confirmedJournalRevision: this.confirmedJournalRevision,
       journalBaselineCheckpointId: this.journalBaselineCheckpointId,
+      ledgerRevision: this.ledger.revision,
+      confirmedLedgerRevision: this.confirmedLedgerRevision,
+      ledgerBaselineCheckpointId: this.ledgerBaselineCheckpointId,
       pendingJournalRecords: this.journalQueue.pendingRecords,
       pendingJournalBytes: this.journalQueue.pendingBytes,
       committedJournalRecords: this.committedJournalRecords,
@@ -649,7 +698,14 @@ class SpatialSessionImpl implements SpatialSession {
     const page = this.resolveJournalQuery(query);
     const eventId = optionalQueryString(query.eventId, 'eventId');
     const kind = query.kind;
-    if (kind !== undefined && kind !== 'observed_cell_change' && kind !== 'observation_gap') {
+    if (
+      kind !== undefined &&
+      kind !== 'observed_cell_change' &&
+      kind !== 'cell_blocked' &&
+      kind !== 'cell_cleared' &&
+      kind !== 'cell_revalidated' &&
+      kind !== 'observation_gap'
+    ) {
       throw new PersistenceError('invalid_argument', `unsupported spatial event kind filter: ${String(kind)}`);
     }
     return this.sendJournalQuery<SpatialEvent>({
@@ -889,7 +945,8 @@ class SpatialSessionImpl implements SpatialSession {
       this.voxel.saveRevision !== this.confirmedVoxelRevision ||
       this.history.revision !== this.confirmedFragmentRevision ||
       this.topology.revision !== this.confirmedTopologyRevision ||
-      this.journalQueue.revision !== this.confirmedJournalRevision
+      this.journalQueue.revision !== this.confirmedJournalRevision ||
+      this.ledger.revision !== this.confirmedLedgerRevision
     );
   }
 
@@ -903,6 +960,8 @@ class SpatialSessionImpl implements SpatialSession {
     journalRevision: number;
     journalRecordCount: number;
     journalRecordBytes: number;
+    ledgerBaselineCheckpointId: string | null;
+    ledgerSnapshot: LedgerSnapshot | null;
   }> {
     const requestId = this.nextRequestId++;
     return new Promise((resolve, reject) => {
@@ -915,6 +974,7 @@ class SpatialSessionImpl implements SpatialSession {
         worldId: this.worldId,
         limits: this.limits,
         journalLimits: this.journalLimitsField,
+        ledgerLimits: this.ledgerLimitsField,
         kind: 'spatial',
         voxelLoading: this.voxelLoadingField,
       } satisfies WorkerRequest);
@@ -1000,6 +1060,8 @@ class SpatialSessionImpl implements SpatialSession {
         journalRevision: openMsg.journalRevision,
         journalRecordCount: openMsg.journalRecordCount,
         journalRecordBytes: openMsg.journalRecordBytes,
+        ledgerBaselineCheckpointId: openMsg.ledgerBaselineCheckpointId,
+        ledgerSnapshot: openMsg.ledgerSnapshot,
       });
     } else if (entry.kind === 'load') {
       const loadMsg = msg as WorkerResponse & { type: 'load_ok' };
@@ -1030,6 +1092,10 @@ class SpatialSessionImpl implements SpatialSession {
       this.confirmedVoxelRevision = entry.voxelRevision!;
       this.confirmedFragmentRevision = entry.fragmentRevision!;
       this.confirmedTopologyRevision = entry.topologyRevision!;
+      if (entry.ledgerRevision !== undefined) {
+        this.confirmedLedgerRevision = entry.ledgerRevision;
+        this.ledgerBaselineCheckpointId = okMsg.checkpointId;
+      }
       // Clear only the captured journal entries; newer acceptances stay pending.
       if (entry.journalCapture !== undefined) {
         this.journalQueue.confirm(entry.journalCapture.keys, entry.journalCapture.revision);
@@ -1048,6 +1114,7 @@ class SpatialSessionImpl implements SpatialSession {
         // Exact captured (and now ACK-confirmed) revision, not the latest queue
         // revision. A truncated capture reports only its confirmed prefix.
         journalRevision: entry.journalCapture?.revision ?? this.confirmedJournalRevision,
+        ledgerRevision: entry.ledgerRevision ?? this.confirmedLedgerRevision,
       });
     } else {
       entry.resolve(true);

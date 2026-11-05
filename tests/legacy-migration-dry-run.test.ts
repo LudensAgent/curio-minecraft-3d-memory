@@ -22,6 +22,7 @@ import type {
   LegacySpatialSnapshot,
 } from '../src/compat/index.js';
 import { openSpatialSession } from '../dist/storage/sqlite/index.js';
+import { portalTraversalIdentity } from '../src/storage/sqlite/ledger.js';
 
 const WORLD = 'world-1';
 const DIM = 'overworld';
@@ -250,9 +251,19 @@ function makeSnapshot(): LegacySpatialSnapshot {
       },
     ],
     placed: {
+      // Unattributed legacy history: the old file has no world/dimension scope.
       '1,64,2': { name: 'minecraft:torch', at: 11 },
       '-5,63,-6': { name: 'minecraft:cobblestone', at: 12 },
       '9,64,9': { name: 'minecraft:torch', at: 13 },
+      // Attributed by an external source, and a record from another world.
+      '4,64,4': { name: 'minecraft:glass', at: 14, worldId: WORLD, dim: DIM },
+      '5,64,5': { name: 'minecraft:stone', at: 15, worldId: 'other-world', dim: DIM },
+    },
+    visitedChunks: {
+      'world-1:overworld:0:0': 3,
+      'world-1:overworld:-1:-2': 1,
+      'world-1:the_nether:0:0': 2,
+      'other-world:overworld:5:5': 9,
     },
     travel: {
       endpoints: [
@@ -309,6 +320,7 @@ function makeDeletions(): LegacyDeletionSet {
     farmIds: ['farm_deleted'],
     placedKeys: ['9,64,9'],
     endpointIds: ['ep_deleted'],
+    chunkVisitKeys: ['world-1:overworld:-1:-2'],
   };
 }
 
@@ -425,6 +437,11 @@ describe('legacy compatibility layer (stage A)', () => {
     expect(ledger.farms[0]!.cells[0]).toEqual({ x: -20, y: 64, z: 40 });
     expect(ledger.placed['-5,63,-6']).toEqual({ name: 'minecraft:cobblestone', at: 12 });
     expect(ledger.placed['9,64,9']).toBeUndefined();
+    // Exact visit counts survive; only this world's keys are projected.
+    expect(ledger.visitedChunks).toEqual({
+      'world-1:overworld:0:0': 3,
+      'world-1:the_nether:0:0': 2,
+    });
     expect(ledger.travel.endpoints.map((endpoint) => endpoint.id)).toEqual([
       'ep_overworld',
       'ep_nether',
@@ -515,6 +532,110 @@ describe('passage snapshot import, verification and temporary switch rehearsal',
     expect(report.stages.d.sessionsClosed).toBe(true);
     expect(report.stages.d.sourceSnapshotUnchanged).toBe(true);
     expect(report.stages.d.realCleanupPerformed).toBe(false);
+  });
+
+  it('rehearses placed, chunk-visit and portal batches with per-batch verification counts', async () => {
+    const report = await runLegacyMigrationDryRun({
+      databasePath: makeDbPath(),
+      snapshot: makeSnapshot(),
+      query: makeQuery(),
+      openSession: openSpatialSession,
+      deletions: makeDeletions(),
+    });
+    expect(report.stages.b.status).toBe('passed');
+    expect(report.stages.c.status).toBe('passed');
+    expect(report.realMigrationPerformed).toBe(false);
+    expect(report.realAuthoritySwitch).toBe(false);
+    expect(report.legacyWritePathRemoved).toBe(false);
+
+    const plans = Object.fromEntries(report.batchPlans.map((plan) => [plan.batch, plan]));
+    const landmarkPlan = plans.landmarks!;
+    expect(landmarkPlan).toMatchObject({
+      status: 'planned',
+      destination: 'planned:spatial_nodes',
+      expectedIds: ['lm_base', 'lm_resource'],
+      deletedRecords: 1,
+      idsMatch: true,
+      timesMatch: true,
+    });
+    expect(landmarkPlan.expectedValues['lm_base']).toBe(1_700_001_000_000);
+
+    const placedPlan = plans.placed!;
+    expect(placedPlan).toMatchObject({
+      status: 'imported',
+      destination: 'placed_blocks',
+      importedIds: ['world-1:overworld:4,64,4'],
+      unattributedIds: ['1,64,2', '-5,63,-6'],
+      crossWorldIds: ['5,64,5'],
+      deletedRecords: 1,
+      timesMatch: true,
+    });
+    // The LRU serial is preserved verbatim; it is not a timestamp.
+    expect(placedPlan.expectedValues['world-1:overworld:4,64,4']).toBe(14);
+
+    const visitPlan = plans.chunkVisits!;
+    expect(visitPlan).toMatchObject({
+      status: 'imported',
+      destination: 'chunk_visits',
+      deletedRecords: 1,
+      crossWorldRecords: 1,
+      crossWorldIds: ['other-world:overworld:5:5'],
+      timesMatch: true,
+    });
+    expect(visitPlan.expectedValues).toEqual({
+      'world-1:overworld:0:0': 3,
+      'world-1:the_nether:0:0': 2,
+    });
+
+    const endpointPlan = plans.travelEndpoints!;
+    expect(endpointPlan).toMatchObject({
+      status: 'planned',
+      expectedIds: ['ep_overworld', 'ep_nether'],
+      deletedRecords: 1,
+      timesMatch: true,
+    });
+    expect(endpointPlan.expectedValues).toEqual({
+      ep_overworld: 1_700_005_000_000,
+      ep_nether: 1_700_005_100_000,
+    });
+
+    const crossingId = portalTraversalIdentity({
+      kind: 'traversal',
+      fromId: 'ep_overworld',
+      toId: 'ep_nether',
+      ts: 1_700_005_300_000,
+      fromSession: 's1',
+      toSession: 's2',
+      fromObservation: 7,
+      toObservation: 8,
+    });
+    const traversalPlan = plans.travelTraversals!;
+    expect(traversalPlan).toMatchObject({
+      status: 'imported',
+      destination: 'portal_traversals',
+      importedIds: [crossingId],
+      timesMatch: true,
+      evidenceIntact: true,
+    });
+    expect(traversalPlan.expectedValues).toEqual({ [crossingId]: 1_700_005_300_000 });
+    expect(plans.travelGateways).toMatchObject({ status: 'imported', importedRecords: 0 });
+
+    expect(report.stages.c.status).not.toBe('not_run');
+    if (report.stages.c.status === 'passed' || report.stages.c.status === 'failed') {
+      expect(report.stages.c.ledgerOk).toBe(true);
+      expect(report.stages.c.ledgerVerification.every((plan) => plan.ok)).toBe(true);
+    }
+    expect(report.verificationCounts).toMatchObject({
+      unattributedRecords: 2,
+      crossWorldRecords: 2,
+      deletedRecords: 5,
+      allVerified: true,
+    });
+    expect(report.rehearsedBatches).toEqual(
+      expect.arrayContaining(['passages', 'placed', 'chunkVisits', 'travelTraversals', 'travelGateways']),
+    );
+    expect(report.plannedBatches).toEqual(expect.arrayContaining(['landmarks', 'travelEndpoints']));
+    expect(report.unmigratedCollections).toEqual(['chests', 'furnaces', 'farms']);
   });
 
   it('does not resurrect a tombstoned passage from the still-present JSON after the switch', () => {
