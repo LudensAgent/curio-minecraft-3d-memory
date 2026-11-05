@@ -4,7 +4,8 @@ import { evaluateWalkStep, VoxelMap } from '../src/index.js';
 import type { Section } from '../src/index.js';
 import type { CollisionShapeProvider } from '../src/traversability/collision-shape.js';
 import { evaluateGroundedWalkSegment } from '../src/traversability/step.js';
-import { AIR, bodyAt, fakeProvider, obs, SLAB, STONE, stepQuery, THIN } from './fakes.js';
+import type { BlockState } from '../src/types.js';
+import { AIR, bodyAt, EMPTY, fakeProvider, obs, SLAB, STONE, stepQuery, THIN } from './fakes.js';
 
 type Cell = [number, number, number];
 
@@ -628,5 +629,127 @@ describe('evaluateGroundedWalkSegment — swept vertical collision', () => {
     const q = { worldId: 'world', dim: 'overworld', sessionId: 's1', mode: 'walk' as const, body: bodyAt(0.5, 0.04, 0.5), direction: { axis: 'x' as const, sign: 1 as const } };
     const r = evaluateGroundedWalkSegment(map, q, { x: 1.5, y: 0, z: 0.5 }, lateSliverProvider, 2000, 0.05);
     expect(r.status).toBe('OPEN');
+  });
+});
+
+describe('evaluateWalkStep — hazards and context', () => {
+  const WATER: BlockState = { name: 'minecraft:water', properties: { level: '0' } };
+  const LAVA: BlockState = { name: 'minecraft:lava', properties: {} };
+  const BUBBLE: BlockState = { name: 'minecraft:bubble_column', properties: {} };
+
+  const liquidProvider: CollisionShapeProvider = {
+    version: 'liquid-1',
+    resolve(state, cell, read) {
+      if (
+        state.name === 'minecraft:water' ||
+        state.name === 'minecraft:lava' ||
+        state.name === 'minecraft:bubble_column'
+      ) {
+        return { kind: 'shape', shape: EMPTY };
+      }
+      return fakeProvider.resolve(state, cell, read);
+    },
+  };
+
+  function wetMap(destinationTop: BlockState): VoxelMap {
+    const map = new VoxelMap('world');
+    fill(map, STONE, [
+      [0, -1, 0],
+      [1, -1, 0],
+    ]);
+    fill(map, AIR, [
+      [0, 0, 0],
+      [0, 1, 0],
+    ]);
+    fill(map, WATER, [[1, 0, 0]]);
+    fill(map, destinationTop, [[1, 1, 0]]);
+    return map;
+  }
+
+  it('reports water contact and submersion without changing OPEN status', () => {
+    const map = wetMap(WATER);
+    const result = evaluateWalkStep(map, stepQuery(), liquidProvider, 2000);
+
+    expect(result.status).toBe('OPEN');
+    expect(result.hazards).toContainEqual({
+      kind: 'water_contact',
+      pos: { x: 1, y: 0, z: 0 },
+      basis: 'observed',
+      detail: 'observed minecraft:water',
+    });
+    expect(result.hazards).toContainEqual({
+      kind: 'submersion',
+      pos: { x: 1.5, y: 0, z: 0.5 },
+      basis: 'observed',
+      detail: 'the destination body volume is observed water',
+    });
+  });
+
+  it('reports lava and bubble columns as observed hazards', () => {
+    const lava = evaluateWalkStep(wetMap(LAVA), stepQuery(), liquidProvider, 2000);
+    expect(lava.status).toBe('OPEN');
+    expect(lava.hazards?.some((h) => h.kind === 'lava_contact' && h.pos.x === 1 && h.pos.y === 1)).toBe(true);
+    expect(lava.hazards?.some((h) => h.kind === 'submersion')).toBe(false);
+
+    const bubble = evaluateWalkStep(wetMap(BUBBLE), stepQuery(), liquidProvider, 2000);
+    expect(bubble.hazards?.some((h) => h.kind === 'bubble_column' && h.pos.y === 1)).toBe(true);
+  });
+
+  it('never invents a hazard for a cell outside the body path or for unknown cells', () => {
+    const map = wetMap(WATER);
+    fill(map, WATER, [[0, 2, 0]]); // above the 1.8-high body
+
+    const result = evaluateWalkStep(map, stepQuery(), liquidProvider, 2000);
+    expect(result.hazards?.some((h) => h.pos.y === 2)).toBe(false);
+
+    const dry = new VoxelMap('world');
+    fill(dry, STONE, [
+      [0, -1, 0],
+      [1, -1, 0],
+    ]);
+    fill(dry, AIR, SWEPT_AIR);
+    expect(evaluateWalkStep(dry, stepQuery(), fakeProvider, 2000).hazards).toEqual([]);
+  });
+
+  it('derives a fall hazard from a measured descent only', () => {
+    const map = wetMap(WATER);
+    const horizontal = evaluateWalkStep(map, stepQuery(), liquidProvider, 2000);
+    expect(horizontal.hazards?.some((h) => h.kind === 'fall')).toBe(false);
+
+    const descent = evaluateGroundedWalkSegment(
+      map,
+      stepQuery(),
+      { x: 1.5, y: -1, z: 0.5 },
+      liquidProvider,
+      2000,
+      0.5,
+    );
+    expect(descent.hazards).toContainEqual({
+      kind: 'fall',
+      pos: { x: 1.5, y: -1, z: 0.5 },
+      basis: 'derived',
+      detail: 'measured drop of 1 block(s)',
+    });
+  });
+
+  it('publishes a deterministic contextKey that includes body, mode and constraints', () => {
+    const map = wetMap(WATER);
+    const base = evaluateWalkStep(map, stepQuery(), liquidProvider, 2000);
+    expect(base.contextKey).toBeTypeOf('string');
+
+    expect(evaluateWalkStep(map, stepQuery(), liquidProvider, 3000).contextKey).toBe(base.contextKey);
+    expect(
+      evaluateWalkStep(map, stepQuery({ constraints: { avoid: [{ x: 2, y: 0, z: 1 }, { x: 1, y: 0, z: 0 }] } }), liquidProvider, 2000)
+        .contextKey,
+    ).toBe(
+      evaluateWalkStep(map, stepQuery({ constraints: { avoid: [{ x: 1, y: 0, z: 0 }, { x: 2, y: 0, z: 1 }] } }), liquidProvider, 2000)
+        .contextKey,
+    );
+    expect(
+      evaluateWalkStep(map, stepQuery({ mode: 'jump' }), liquidProvider, 2000).contextKey,
+    ).not.toBe(base.contextKey);
+    expect(
+      evaluateWalkStep(map, stepQuery({ body: bodyAt(0.5, 0, 0.5, 1.2, 1.8) }), liquidProvider, 2000).contextKey,
+    ).not.toBe(base.contextKey);
   });
 });

@@ -19,5 +19,24 @@ export const AIR_PALETTE_INDEX = 0;
  * Distance threshold (in blocks) used to associate nearby geometry as the *same*
  * path fragment. It is a candidate-matching hint only — it never fabricates a
  * traversed `links` edge between positions that were not actually walked.
+ *
+ * Single source: the compatibility layer re-exports this value instead of
+ * declaring its own copy.
  */
 export const PASSAGE_LINK = 3.5;
+
+/**
+ * Version of the persisted voxel-section payload (design §4 / §9).
+ *
+ * - v1 (previous): per-cell evidence embedded a full blockstate, no history bitmaps.
+ * - v2: palette + packed cells + history/risk bitmaps + compact per-cell metadata;
+ *   the blockstate is reconstructed from the palette on restore.
+ */
+export const VOXEL_SECTION_PAYLOAD_VERSION = 2;
+
+/**
+ * Version of the in-memory checkpoint snapshot emitted by `VoxelMap`. v1 snapshots
+ * (and payloads decoded from them) are still accepted by the restore path; fields
+ * introduced in v2 (`traversed` / `modified` / `risk` bitmaps) default to empty.
+ */
+export const VOXEL_SNAPSHOT_SCHEMA_VERSION = 2;

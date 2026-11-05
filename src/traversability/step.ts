@@ -21,13 +21,13 @@
  */
 
 import type { CellEvidence } from '../observation/types.js';
-import type { MoveMode, Vec3Like } from '../types.js';
+import type { BlockState, MoveMode, Vec3Like } from '../types.js';
 import { blockToSection, cellIndex } from '../voxel/coordinates.js';
 import type { Section, SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
 import type { CollisionShape, CollisionShapeProvider, NeighborCellView, NeighborRead, UnitBox } from './collision-shape.js';
-import type { ObstacleEvidence, Traversability } from './types.js';
+import type { HazardFact, ObstacleEvidence, Traversability } from './types.js';
 
 /** The four passage states plus the capability gap they cannot express. */
 export type StepStatus = Traversability | 'UNSUPPORTED';
@@ -83,6 +83,14 @@ export interface StepEvaluation {
   problem?: StepProblem;
   /** Confirmed obstacle for a BLOCKED collision. */
   obstacles: ObstacleEvidence[];
+  /**
+   * Objective risk facts observed along the body path (water/lava contact,
+   * submersion, bubble column) or derived from a measured drop. Independent of
+   * the passage status: an OPEN step may still carry hazards.
+   */
+  hazards?: HazardFact[];
+  /** Normalized body/pose/mode/delegation key this judgement was computed under. */
+  contextKey?: string;
   /** Actual section reads (deduped), for local cache invalidation. */
   dependencies: { key: SectionKey; revision: number }[];
   sessionId: string;
@@ -335,6 +343,8 @@ function evaluateWalkGeometry(
     to: { ...body.feet },
     mode: 'walk',
     obstacles: [],
+    hazards: [],
+    contextKey: stepContextKey(query),
     dependencies: [],
     sessionId,
     computedAt: now,
@@ -458,6 +468,9 @@ function evaluateWalkGeometry(
     return { kind: 'shape', shape: resolution.shape };
   };
 
+  // Observed states along the body path, used only to report objective hazards.
+  const observedStates = new Map<string, { pos: Vec3Like; state: BlockState }>();
+
   // Collision: the body sweep must not intersect any solid shape.
   for (const cell of cellsInAabb(sweep)) {
     const read = readCell(cell.x, cell.y, cell.z);
@@ -473,6 +486,10 @@ function evaluateWalkGeometry(
       acc.unknownCells.push(cell);
       continue;
     }
+    observedStates.set(`${cell.x},${cell.y},${cell.z}`, {
+      pos: cell,
+      state: read.evidence.observation.state,
+    });
     const shape = resolveShape(read.evidence, cell);
     if (shape.kind === 'unsupported') {
       if (acc.unsupported === null) {
@@ -533,6 +550,7 @@ function evaluateWalkGeometry(
     status,
     reason,
     problem,
+    hazards: collectHazards(observedStates, body.feet, to, half, body.height),
     dependencies: [...deps.values()],
     validUntil: minValidUntil,
   };
@@ -637,4 +655,110 @@ function evaluateWalkGeometry(
       };
     }
   }
+}
+
+/**
+ * Normalized context key over body size/pose, mode and delegation constraints
+ * (design §3.3). The step geometry itself is keyed separately by the cache.
+ */
+function stepContextKey(query: StepQuery): string {
+  const avoid = (query.constraints?.avoid ?? [])
+    .map((point) => `${point.x},${point.y},${point.z}`)
+    .sort()
+    .join(';');
+  return JSON.stringify({
+    mode: query.mode,
+    pose: query.body.pose,
+    width: query.body.width,
+    height: query.body.height,
+    avoid,
+  });
+}
+
+function isWaterState(state: BlockState): boolean {
+  return (
+    state.name === 'water' ||
+    state.name === 'minecraft:water' ||
+    state.properties['waterlogged'] === 'true'
+  );
+}
+
+function isLavaState(state: BlockState): boolean {
+  return state.name === 'lava' || state.name === 'minecraft:lava';
+}
+
+function isBubbleColumnState(state: BlockState): boolean {
+  return state.name === 'minecraft:bubble_column' || state.name === 'bubble_column';
+}
+
+/**
+ * Objective hazards from observed states along the body path, plus a derived fall
+ * for a measured descent. It never invents a hazard for an unknown cell, never
+ * guesses flow direction/current from a single state, and never changes the
+ * OPEN/BLOCKED/UNKNOWN/STALE conclusion.
+ */
+function collectHazards(
+  observed: ReadonlyMap<string, { pos: Vec3Like; state: BlockState }>,
+  from: Vec3Like,
+  to: Vec3Like,
+  half: number,
+  height: number,
+): HazardFact[] {
+  const hazards: HazardFact[] = [];
+  const seen = new Set<string>();
+  const add = (hazard: HazardFact): void => {
+    const key = `${hazard.kind}|${hazard.pos.x},${hazard.pos.y},${hazard.pos.z}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    hazards.push(hazard);
+  };
+
+  for (const { pos, state } of observed.values()) {
+    if (isWaterState(state)) {
+      add({
+        kind: 'water_contact',
+        pos: { ...pos },
+        basis: 'observed',
+        detail: state.properties['waterlogged'] === 'true'
+          ? `observed waterlogged ${state.name}`
+          : `observed ${state.name}`,
+      });
+    }
+    if (isLavaState(state)) {
+      add({ kind: 'lava_contact', pos: { ...pos }, basis: 'observed', detail: `observed ${state.name}` });
+    }
+    if (isBubbleColumnState(state)) {
+      add({ kind: 'bubble_column', pos: { ...pos }, basis: 'observed', detail: `observed ${state.name}` });
+    }
+  }
+
+  // Submersion is only reported when the entire destination body volume is
+  // positively observed as water; a partial or unknown volume is not enough.
+  const destinationCells = cellsInAabb(bodyAabb(to, half, height));
+  if (
+    destinationCells.length > 0 &&
+    destinationCells.every((cell) => {
+      const view = observed.get(`${cell.x},${cell.y},${cell.z}`);
+      return view !== undefined && isWaterState(view.state);
+    })
+  ) {
+    add({
+      kind: 'submersion',
+      pos: { ...to },
+      basis: 'observed',
+      detail: 'the destination body volume is observed water',
+    });
+  }
+
+  // A measured descent is an objective fall fact; it is not inferred for an
+  // ordinary horizontal query.
+  if (to.y < from.y - EPS) {
+    add({
+      kind: 'fall',
+      pos: { ...to },
+      basis: 'derived',
+      detail: `measured drop of ${from.y - to.y} block(s)`,
+    });
+  }
+  return hazards;
 }
