@@ -3,13 +3,16 @@ import { describe, expect, it } from 'vitest';
 import * as navigation from '../src/navigation/index.js';
 import {
   frontierCandidates,
+  followKnownPath,
+  inspectKnownRoute,
   inspectRoute,
+  navigateTo,
   NAVIGATION_CAPABILITIES,
   NAVIGATION_CAPABILITY_STATUSES,
   startKnownWalkRoute,
-  VoxelMap,
   WalkRouteSearch,
-} from '../src/index.js';
+} from '../src/navigation/index.js';
+import { NAVIGATION_CAPABILITIES as ROOT_CAPABILITIES, VoxelMap } from '../src/index.js';
 import type {
   NavigationCapabilityName,
   NavigationCapabilityStatus,
@@ -100,14 +103,17 @@ describe('navigation capability table', () => {
   });
 
   it('reports the real entry for each name', () => {
-    expect(capability('navigate_to')).toMatchObject({ status: 'not_implemented', entry: null });
+    expect(capability('navigate_to')).toMatchObject({
+      status: 'implemented',
+      entry: ['navigateTo'],
+    });
     expect(capability('follow_known_path')).toMatchObject({
       status: 'implemented',
-      entry: ['startKnownWalkRoute'],
+      entry: ['startKnownWalkRoute', 'followKnownPath'],
     });
     expect(capability('inspect_route')).toMatchObject({
       status: 'read_only',
-      entry: ['inspectRoute'],
+      entry: ['inspectRoute', 'inspectKnownRoute'],
     });
     expect(capability('frontier_candidates')).toMatchObject({
       status: 'read_only',
@@ -115,9 +121,13 @@ describe('navigation capability table', () => {
     });
     expect(capability('recall_route')).toMatchObject({ status: 'not_implemented', entry: null });
 
+    expect(typeof navigateTo).toBe('function');
+    expect(typeof followKnownPath).toBe('function');
     expect(typeof startKnownWalkRoute).toBe('function');
     expect(typeof inspectRoute).toBe('function');
+    expect(typeof inspectKnownRoute).toBe('function');
     expect(typeof frontierCandidates).toBe('function');
+    expect(ROOT_CAPABILITIES).toBe(NAVIGATION_CAPABILITIES);
   });
 
   it('does not expose the §7 names as runtime entries', () => {
@@ -136,15 +146,36 @@ describe('navigation capability table', () => {
     }
   });
 
-  it('declares the follow_known_path start seam as action-starting but not body-moving', () => {
+  it('declares navigate_to as body-moving and action-starting through the caller executor', () => {
+    expect(capability('navigate_to').effects).toEqual({
+      movesBody: true,
+      turnsHead: false,
+      writesLibrary: false, // persistence stays a host callback, never a library write
+      pinsSections: false,
+      triggersObservation: false,
+      startsAction: true,
+    });
+  });
+
+  it('declares follow_known_path as able to drive the caller executor when explicitly requested', () => {
     expect(capability('follow_known_path').effects).toEqual({
-      movesBody: false,
+      movesBody: true,
       turnsHead: false,
       writesLibrary: false,
       pinsSections: false,
       triggersObservation: false,
       startsAction: true,
     });
+    expect(capability('follow_known_path').notes).toContain('drive');
+  });
+
+  it('never claims navigate_to supports digging, placing, towering or materials', () => {
+    const unsupported = capability('navigate_to').unsupported.join(' ');
+    expect(unsupported).toContain('digging');
+    expect(unsupported).toContain('placing');
+    expect(unsupported).toContain('towering');
+    expect(unsupported).toContain('material');
+    expect(capability('navigate_to').supported.join(' ')).toContain('measured');
   });
 
   it('keeps statuses within the declared union', () => {

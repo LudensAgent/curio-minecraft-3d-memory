@@ -46,6 +46,10 @@ const UNIT_EPS = 1e-9;
  * the selected fragment cannot be combined — neither claims a block is blocked.
  */
 export type KnownWalkRouteRejectionReason =
+  /** Neither `pathId` nor the `fragmentId` alias was supplied. */
+  | 'missing_path_id'
+  /** `pathId` and `fragmentId` were both supplied with different values. */
+  | 'ambiguous_path'
   /** No fragment with the requested id exists in this history store. */
   | 'missing_history'
   /** Request worldId differs from the history worldId, or the fragment's dimension differs from the request. */
@@ -66,7 +70,9 @@ export type KnownWalkRouteRejectionReason =
 /** Input to {@link startKnownWalkRoute}: the normal walk request minus `points`, plus a fragment identity. */
 export type KnownWalkRouteRequest = Omit<WalkRouteRequest, 'points'> & {
   /** Historical fragment whose stored polyline becomes the ordered route. */
-  fragmentId: string;
+  pathId?: string;
+  /** Older alias for `pathId`; both may be supplied only when they are equal. */
+  fragmentId?: string;
   /** Host action attribution only; it never wires cancellation or any control handle. */
   parentActionId?: string;
   /**
@@ -127,7 +133,24 @@ export function startKnownWalkRoute(
   // Metadata-only fields do not belong on the walk request. `getFragment`
   // already returned a deep snapshot, and `executor.start` snapshots the
   // request it receives, so the polyline needs no intermediate copies.
-  const { fragmentId, parentActionId, maxRoutePoints: requestedMaxRoutePoints, ...walk } = request;
+  const {
+    pathId: explicitPathId,
+    fragmentId: fragmentAlias,
+    parentActionId,
+    maxRoutePoints: requestedMaxRoutePoints,
+    ...walk
+  } = request;
+
+  if (explicitPathId !== undefined && fragmentAlias !== undefined && explicitPathId !== fragmentAlias) {
+    return rejected(
+      'ambiguous_path',
+      `pathId "${explicitPathId}" and fragmentId "${fragmentAlias}" name different fragments`,
+    );
+  }
+  const fragmentId = explicitPathId ?? fragmentAlias;
+  if (fragmentId === undefined) {
+    return rejected('missing_path_id', 'either pathId or fragmentId must name one historical fragment');
+  }
 
   if (walk.worldId !== history.worldId) {
     return rejected(
