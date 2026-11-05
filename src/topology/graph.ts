@@ -6,6 +6,7 @@
  * there and what does it connect to", not "can we walk it right now".
  */
 
+import type { JsonObject } from '../json-value.js';
 import type { HazardFact, ObstacleEvidence } from '../traversability/types.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 import type { SectionKey } from '../voxel/section.js';
@@ -76,6 +77,13 @@ export interface SpatialNode {
   observedAt?: number;
   /** Host identity for the same object (e.g. landmark id, chest key), opaque to the library. */
   externalRef?: string;
+  /**
+   * Host-requested durability. Durable program nodes are never evicted by the
+   * program-node quota; if the store is full, insertion fails instead.
+   */
+  durable?: boolean;
+  /** Opaque host metadata; never interpreted by the library. */
+  metadata?: JsonObject;
   /**
    * The object at this anchor was observed to be gone. The node record and its
    * history are kept; `markGone` requires real observation evidence.

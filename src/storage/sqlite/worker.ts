@@ -48,7 +48,7 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -345,7 +345,7 @@ CREATE TABLE placed_blocks (
   name TEXT NOT NULL,
   lru_at INTEGER NOT NULL,
   source TEXT NOT NULL,
-  CHECK ((world_id IS NULL AND dim IS NULL) OR (world_id IS NOT NULL AND dim IS NOT NULL))
+  CHECK (world_id IS NOT NULL OR dim IS NULL)
 );
 CREATE INDEX placed_blocks_world_lru ON placed_blocks (world_id, dim, lru_at);
 
@@ -487,6 +487,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV3ToV4(connection, databasePath);
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
+    upgradeV6ToV7(connection, databasePath);
     return connection;
   }
 
@@ -499,6 +500,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV3ToV4(connection, databasePath);
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
+    upgradeV6ToV7(connection, databasePath);
     return connection;
   }
 
@@ -510,6 +512,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV3ToV4(connection, databasePath);
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
+    upgradeV6ToV7(connection, databasePath);
     return connection;
   }
 
@@ -520,6 +523,7 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
+    upgradeV6ToV7(connection, databasePath);
     return connection;
   }
 
@@ -529,14 +533,16 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV5ToV6(connection, databasePath);
+    upgradeV6ToV7(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (6)
+  // version === SCHEMA_VERSION (7) or a schema-6 database awaiting the v7 upgrade.
   validateKnownTables(connection, names, KNOWN_TABLES_V6);
   for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V6)) {
     assertRequiredColumns(connection, table, columns);
   }
+  if (version === 6) upgradeV6ToV7(connection, databasePath);
   return connection;
 }
 
@@ -798,6 +804,40 @@ function upgradeV5ToV6(connection: Database.Database, databasePath: string): voi
       connection.exec("ALTER TABLE checkpoints ADD COLUMN topology_extras TEXT NOT NULL DEFAULT '{}'");
     }
     connection.prepare("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
+/**
+ * Upgrade a validated v6 database in place: allow a placement row to carry its
+ * owning world without a known dimension (legacy `.placed` sidecars have no
+ * dimension), and record the schema-7 guard. The table rebuild preserves every
+ * existing row, key and LRU serial.
+ */
+function upgradeV6ToV7(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v7-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.exec(`
+      CREATE TABLE placed_blocks_v7 (
+        key TEXT PRIMARY KEY,
+        world_id TEXT,
+        dim TEXT,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        z INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        lru_at INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        CHECK (world_id IS NOT NULL OR dim IS NULL)
+      );
+      INSERT INTO placed_blocks_v7 (key, world_id, dim, x, y, z, name, lru_at, source)
+        SELECT key, world_id, dim, x, y, z, name, lru_at, source FROM placed_blocks;
+      DROP TABLE placed_blocks;
+      ALTER TABLE placed_blocks_v7 RENAME TO placed_blocks;
+      CREATE INDEX placed_blocks_world_lru ON placed_blocks (world_id, dim, lru_at);
+    `);
+    connection.prepare("UPDATE schema_meta SET value = '7' WHERE key = 'schema_version'").run();
   });
   tx();
 }
@@ -1439,7 +1479,7 @@ function prepareLedger(snapshot: LedgerSnapshot, wId: string, resolved: Resolved
   for (const raw of snapshot.placed) {
     if (raw === null || typeof raw !== 'object') throw ledgerInvalid('ledger placed record must be an object');
     if (raw.worldId !== wId) throw ledgerInvalid('ledger placed record belongs to another world');
-    const dim = requireLedgerString(raw.dim, 'placed dim');
+    const dim = raw.dim === null ? null : requireLedgerString(raw.dim, 'placed dim');
     if (!Number.isSafeInteger(raw.pos?.x) || !Number.isSafeInteger(raw.pos?.y) || !Number.isSafeInteger(raw.pos?.z)) {
       throw ledgerInvalid('ledger placed position must be integer grid coordinates');
     }
@@ -1601,7 +1641,7 @@ function loadLedger(
     .all(wId) as {
       key: string;
       world_id: string;
-      dim: string;
+      dim: string | null;
       x: number;
       y: number;
       z: number;

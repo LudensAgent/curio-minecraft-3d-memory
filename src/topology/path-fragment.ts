@@ -5,6 +5,7 @@
  * passable segments and disconnects the affected navigation edges.
  */
 
+import type { JsonObject } from '../json-value.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 
 export { jsonEscapedByteLength } from '../bytes.js';
@@ -25,6 +26,10 @@ export interface PathFragment {
   createdAt: number;
   lastUsedAt: number;
   uses: number;
+  /** Host identity for the same geometry (e.g. legacy passage id), opaque to the library. */
+  externalRef?: string;
+  /** Opaque host metadata; never interpreted by the library. */
+  metadata?: JsonObject;
 }
 
 /**

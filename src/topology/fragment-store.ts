@@ -21,6 +21,15 @@
  * none of those methods appear here as fake-success stubs.
  */
 
+import type { JsonObject } from '../json-value.js';
+import {
+  cloneJsonObject,
+  DEFAULT_JSON_LIMITS,
+  jsonObjectByteLength,
+  jsonObjectsEqual,
+  snapshotJsonObject,
+  type JsonLimits,
+} from '../json-value.js';
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
 import {
   assertValidMode,
@@ -87,6 +96,8 @@ export interface FragmentStoreOptions {
   maxTraversals?: number;
   /** Maximum items returned by one query page. Defaults to 100. */
   maxQueryBatch?: number;
+  /** Maximum serialized bytes of opaque metadata on one fragment. Defaults to 16 KiB. */
+  maxMetadataBytes?: number;
 }
 
 /** Paginated read filter over fragments. All fields are optional and combined by AND. */
@@ -138,6 +149,10 @@ export interface FragmentChanges {
   deepestY?: number;
   lastUsedAt?: number;
   uses?: number;
+  /** Host identity; an explicitly-`undefined` value clears it. */
+  externalRef?: string;
+  /** Opaque host metadata; an explicitly-`undefined` value clears it. */
+  metadata?: JsonObject;
 }
 
 interface ResolvedLimits {
@@ -147,6 +162,7 @@ interface ResolvedLimits {
   maxLinks: number;
   maxTraversals: number;
   maxQueryBatch: number;
+  json: JsonLimits;
 }
 
 const DEFAULT_LIMITS: ResolvedLimits = {
@@ -156,6 +172,7 @@ const DEFAULT_LIMITS: ResolvedLimits = {
   maxLinks: 4096,
   maxTraversals: 10000,
   maxQueryBatch: 100,
+  json: DEFAULT_JSON_LIMITS,
 };
 
 const FRAGMENT_KINDS: readonly PathFragment['kind'][] = ['dug', 'walked', 'bridge', 'built'];
@@ -537,6 +554,10 @@ function snapshotFragment(worldId: string, f: PathFragment, limits: ResolvedLimi
   if (!Number.isFinite(f.uses) || f.uses < 0) {
     throw new Error(`fragment uses must be a non-negative finite number: ${f.uses}`);
   }
+  if (f.externalRef !== undefined && (typeof f.externalRef !== 'string' || f.externalRef.length === 0)) {
+    throw new Error(`fragment externalRef must be a non-empty string when present`);
+  }
+  if (f.metadata !== undefined) snapshotJsonObject(f.metadata, 'fragment metadata', limits.json);
   for (const p of f.polyline) assertFinitePoint(p, 'polyline point');
   for (const p of f.entrances) assertFinitePoint(p, 'entrance point');
   for (const l of f.links ?? []) {
@@ -581,7 +602,7 @@ export function snapshotEvidence(worldId: string, e: TraversalEvidence): Travers
 }
 
 function cloneFragment(f: PathFragment): PathFragment {
-  return {
+  const clone: PathFragment = {
     id: f.id,
     worldId: f.worldId,
     dim: f.dim,
@@ -598,6 +619,9 @@ function cloneFragment(f: PathFragment): PathFragment {
     lastUsedAt: f.lastUsedAt,
     uses: f.uses,
   };
+  if (f.externalRef !== undefined) clone.externalRef = f.externalRef;
+  if (f.metadata !== undefined) clone.metadata = cloneJsonObject(f.metadata);
+  return clone;
 }
 
 function assertFinitePoint(p: Vec3Like, label: string): void {
@@ -625,7 +649,9 @@ function fragmentsEqual(a: PathFragment, b: PathFragment): boolean {
     a.entrances.every((p, i) => pointsEqual(p, b.entrances[i]!)) &&
     a.polyline.length === b.polyline.length &&
     a.polyline.every((p, i) => pointsEqual(p, b.polyline[i]!)) &&
-    linksEqual(a.links, b.links)
+    linksEqual(a.links, b.links) &&
+    a.externalRef === b.externalRef &&
+    jsonObjectsEqual(a.metadata, b.metadata)
   );
 }
 
@@ -660,6 +686,8 @@ function applyChanges(existing: PathFragment, changes: FragmentChanges): PathFra
     deepestY: pick(changes, 'deepestY', existing.deepestY),
     lastUsedAt: pick(changes, 'lastUsedAt', existing.lastUsedAt),
     uses: pick(changes, 'uses', existing.uses),
+    externalRef: 'externalRef' in changes ? changes.externalRef : existing.externalRef,
+    metadata: 'metadata' in changes ? changes.metadata : existing.metadata,
   };
 }
 
@@ -674,7 +702,7 @@ function pick<K extends keyof FragmentChanges>(
 
 function resolveLimits(options: FragmentStoreOptions): ResolvedLimits {
   const limits: ResolvedLimits = { ...DEFAULT_LIMITS };
-  const overrides: (keyof ResolvedLimits)[] = [
+  const overrides: (keyof FragmentStoreOptions & keyof ResolvedLimits)[] = [
     'maxFragments',
     'maxPolylinePoints',
     'maxEntrances',
@@ -689,6 +717,12 @@ function resolveLimits(options: FragmentStoreOptions): ResolvedLimits {
       throw new Error(`${key} must be a positive integer: ${value}`);
     }
     limits[key] = value;
+  }
+  if (options.maxMetadataBytes !== undefined) {
+    if (!Number.isInteger(options.maxMetadataBytes) || options.maxMetadataBytes < 1) {
+      throw new Error(`maxMetadataBytes must be a positive integer: ${options.maxMetadataBytes}`);
+    }
+    limits.json = { ...limits.json, maxBytes: options.maxMetadataBytes };
   }
   return limits;
 }
@@ -748,6 +782,8 @@ function fragmentStringBytes(f: PathFragment, cost: StringCost): number {
   bytes += f.polyline.length * BYTES_PER_POINT;
   bytes += f.entrances.length * BYTES_PER_POINT;
   bytes += (f.links?.length ?? 0) * BYTES_PER_LINK;
+  bytes += f.externalRef === undefined ? 0 : cost(f.externalRef) + STRING_QUOTES;
+  bytes += f.metadata === undefined ? 0 : jsonObjectByteLength(f.metadata);
   return bytes;
 }
 

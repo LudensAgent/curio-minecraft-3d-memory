@@ -232,9 +232,12 @@ export function resolveJournalLimits(options: JournalLimits | undefined): Resolv
  */
 export interface PlacedBlockRecord {
   key: string;
-  /** Null only for unattributed legacy history; never guessed from a caller's world. */
+  /** Owning world. Null only for a raw schema row opened outside a world-bound ledger. */
   worldId: string | null;
-  /** Null exactly when `worldId` is null. */
+  /**
+   * Dimension, or null for a legacy placement whose sidecar did not record one.
+   * The owning world remains known; dimension-scoped queries do not match these.
+   */
   dim: string | null;
   /** Integer grid position. */
   pos: Vec3Like;

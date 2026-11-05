@@ -15,6 +15,7 @@ export {
   VOXEL_SECTION_PAYLOAD_VERSION,
 } from './constants.js';
 export type { BlockState, MoveMode, Vec3Like, WorldScope } from './types.js';
+export type { JsonLimits, JsonObject, JsonPrimitive, JsonValue } from './json-value.js';
 
 // Observation / evidence
 export {

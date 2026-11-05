@@ -40,6 +40,15 @@ import type {
   NodeSource,
   SpatialNode,
 } from './graph.js';
+import type { JsonObject } from '../json-value.js';
+import {
+  cloneJsonObject,
+  DEFAULT_JSON_LIMITS,
+  jsonObjectByteLength,
+  jsonObjectsEqual,
+  snapshotJsonObject,
+  type JsonLimits,
+} from '../json-value.js';
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
 import {
   assertValidMode,
@@ -205,6 +214,8 @@ export interface TopologyStoreOptions {
   maxPortalTraversalsPerEdge?: number;
   /** Maximum explicit fragment merges retained. Defaults to 1000. */
   maxFragmentMerges?: number;
+  /** Maximum serialized bytes of opaque metadata on one node. Defaults to 16 KiB. */
+  maxMetadataBytes?: number;
   /**
    * Clock used for verification freshness. Defaults to `Date.now`. Tests and
    * replay inject a fixed clock; stored timestamps are never rewritten.
@@ -537,6 +548,9 @@ export interface NodeChanges {
   location?: SpatialNode['location'];
   observedAt?: number;
   externalRef?: string;
+  durable?: boolean;
+  /** Opaque host metadata; an explicitly-`undefined` value clears it. */
+  metadata?: JsonObject;
 }
 
 /**
@@ -660,6 +674,7 @@ interface ResolvedLimits {
   maxPortalEdges: number;
   maxPortalTraversalsPerEdge: number;
   maxFragmentMerges: number;
+  json: JsonLimits;
 }
 
 const DEFAULT_LIMITS: ResolvedLimits = {
@@ -675,6 +690,7 @@ const DEFAULT_LIMITS: ResolvedLimits = {
   maxPortalEdges: 1000,
   maxPortalTraversalsPerEdge: 32,
   maxFragmentMerges: 1000,
+  json: DEFAULT_JSON_LIMITS,
 };
 
 const NODE_KINDS: readonly NodeKind[] = ['entrance', 'place', 'branch', 'turn', 'vertical_junction'];
@@ -757,7 +773,7 @@ export class TopologyStore {
    * and program nodes draw on separate quotas.
    */
   saveNode(node: SpatialNode): SaveResult {
-    const snapshot = snapshotNode(this.worldId, node);
+    const snapshot = snapshotNode(this.worldId, node, this.limits);
     const existing = this.nodeMap.get(node.id);
     if (existing !== undefined) {
       if (nodesEqual(existing, snapshot)) return { status: 'unchanged' };
@@ -805,7 +821,7 @@ export class TopologyStore {
         throw new Error(`node "${id}" is referenced by portal edge(s) ${portalRefs.join(', ')}; remove them before changing location`);
       }
     }
-    const snapshot = snapshotNode(this.worldId, merged);
+    const snapshot = snapshotNode(this.worldId, merged, this.limits);
     if (nodesEqual(existing, snapshot)) return { status: 'unchanged' };
     this.nodeMap.set(id, snapshot);
     this.mutationRevision += 1;
@@ -918,7 +934,7 @@ export class TopologyStore {
         reason: evidence.reason,
       },
     };
-    this.nodeMap.set(nodeId, snapshotNode(this.worldId, merged));
+    this.nodeMap.set(nodeId, snapshotNode(this.worldId, merged, this.limits));
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -1711,7 +1727,7 @@ export class TopologyStore {
     let agentNodes = 0;
     let programNodes = 0;
     for (const raw of snapshot.nodes) {
-      const validated = snapshotNode(this.worldId, raw);
+      const validated = snapshotNode(this.worldId, raw, this.limits);
       if (nodes.has(validated.id)) {
         throw new Error(`duplicate node id "${validated.id}" in snapshot`);
       }
@@ -2210,6 +2226,10 @@ export class TopologyStore {
         this.programNodeOrder.splice(i, 1);
         continue;
       }
+      if (node.durable === true) {
+        i += 1;
+        continue;
+      }
       if ((this.nodeToEdgeIds.get(id)?.size ?? 0) > 0 || this.portalEdgeIdsForNode(id).length > 0) {
         i += 1;
         continue;
@@ -2687,7 +2707,7 @@ export class TopologyStore {
 
 // --- validation + snapshotting (snapshot first, then write, so a failed write leaves no half state) ---
 
-function snapshotNode(worldId: string, n: SpatialNode): SpatialNode {
+function snapshotNode(worldId: string, n: SpatialNode, limits: ResolvedLimits): SpatialNode {
   if (n.worldId !== worldId) {
     throw new Error(`node worldId "${n.worldId}" does not match store worldId "${worldId}"`);
   }
@@ -2715,6 +2735,10 @@ function snapshotNode(worldId: string, n: SpatialNode): SpatialNode {
   if (n.externalRef !== undefined && (typeof n.externalRef !== 'string' || n.externalRef.length === 0)) {
     throw new Error(`node externalRef must be a non-empty string when present`);
   }
+  if (n.durable !== undefined && typeof n.durable !== 'boolean') {
+    throw new Error(`node durable must be a boolean when present`);
+  }
+  if (n.metadata !== undefined) snapshotJsonObject(n.metadata, 'node metadata', limits.json);
   if (n.gone !== undefined && typeof n.gone !== 'boolean') {
     throw new Error(`node gone must be a boolean when present`);
   }
@@ -2763,6 +2787,8 @@ function cloneNode(n: SpatialNode): SpatialNode {
   };
   if (n.observedAt !== undefined) clone.observedAt = n.observedAt;
   if (n.externalRef !== undefined) clone.externalRef = n.externalRef;
+  if (n.durable !== undefined) clone.durable = n.durable;
+  if (n.metadata !== undefined) clone.metadata = cloneJsonObject(n.metadata);
   if (n.gone !== undefined) clone.gone = n.gone;
   if (n.goneAt !== undefined) clone.goneAt = n.goneAt;
   if (n.goneEvidence !== undefined) clone.goneEvidence = cloneGoneEvidence(n.goneEvidence);
@@ -2798,6 +2824,8 @@ function nodesEqual(a: SpatialNode, b: SpatialNode): boolean {
     a.dim === b.dim &&
     a.observedAt === b.observedAt &&
     a.externalRef === b.externalRef &&
+    a.durable === b.durable &&
+    jsonObjectsEqual(a.metadata, b.metadata) &&
     a.gone === b.gone &&
     a.goneAt === b.goneAt &&
     goneEvidenceEqual(a.goneEvidence, b.goneEvidence) &&
@@ -2839,6 +2867,8 @@ function applyNodeChanges(existing: SpatialNode, changes: NodeChanges): SpatialN
     location: 'location' in changes ? (changes.location as SpatialNode['location']) : existing.location,
     observedAt: 'observedAt' in changes ? changes.observedAt : existing.observedAt,
     externalRef: 'externalRef' in changes ? changes.externalRef : existing.externalRef,
+    durable: 'durable' in changes ? changes.durable : existing.durable,
+    metadata: 'metadata' in changes ? changes.metadata : existing.metadata,
   };
   if (existing.gone !== undefined) merged.gone = existing.gone;
   if (existing.goneAt !== undefined) merged.goneAt = existing.goneAt;
@@ -2980,7 +3010,7 @@ function removeFromNodeEdgeIndex(
 
 function resolveLimits(options: TopologyStoreOptions): ResolvedLimits {
   const limits: ResolvedLimits = { ...DEFAULT_LIMITS };
-  const overrides: (keyof ResolvedLimits)[] = [
+  const overrides: (keyof TopologyStoreOptions & keyof ResolvedLimits)[] = [
     'maxAgentNodes',
     'maxProgramNodes',
     'maxEdges',
@@ -3001,6 +3031,12 @@ function resolveLimits(options: TopologyStoreOptions): ResolvedLimits {
       throw new Error(`${key} must be a positive integer: ${value}`);
     }
     limits[key] = value;
+  }
+  if (options.maxMetadataBytes !== undefined) {
+    if (!Number.isInteger(options.maxMetadataBytes) || options.maxMetadataBytes < 1) {
+      throw new Error(`maxMetadataBytes must be a positive integer: ${options.maxMetadataBytes}`);
+    }
+    limits.json = { ...limits.json, maxBytes: options.maxMetadataBytes };
   }
   return limits;
 }
@@ -3493,6 +3529,8 @@ function nodeStringBytes(n: SpatialNode, cost: StringCost): number {
   bytes += n.label === undefined ? 0 : cost(n.label) + STRING_QUOTES;
   bytes += n.observedAt === undefined ? 0 : BYTES_PER_NUMBER;
   bytes += n.externalRef === undefined ? 0 : cost(n.externalRef) + STRING_QUOTES;
+  if (n.durable !== undefined) bytes += 24;
+  bytes += n.metadata === undefined ? 0 : jsonObjectByteLength(n.metadata);
   if (n.gone === true) {
     bytes += 48 + BYTES_PER_NUMBER;
     const evidence = n.goneEvidence;

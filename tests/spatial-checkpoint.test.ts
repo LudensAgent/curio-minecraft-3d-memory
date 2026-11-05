@@ -952,7 +952,7 @@ describe('v1 → latest schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('6');
+    expect(version).toBe('7');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();

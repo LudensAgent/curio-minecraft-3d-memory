@@ -214,6 +214,36 @@ describe('placement / visit / portal ledger persistence', () => {
     await again.close();
   });
 
+  it('persists unattributed legacy placements with a null dimension', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    session.ledger.importUnattributedPlaced({ pos: { x: 7, y: 64, z: 7 }, name: 'minecraft:cobblestone', lruAt: 3 });
+    session.ledger.importPlaced({ dim: DIM, pos: { x: 8, y: 64, z: 7 }, name: 'minecraft:dirt', lruAt: 4 });
+    expect(session.ledger.placedBlocks().map((record) => [record.dim, record.lruAt])).toEqual([
+      [null, 3],
+      [DIM, 4],
+    ]);
+    expect(session.ledger.placedBlocks(null).map((record) => record.name)).toEqual([
+      'minecraft:cobblestone',
+    ]);
+    expect(session.ledger.queryPlacedNear(DIM, { x: 7, y: 64, z: 7 }, 0.5)).toEqual([]);
+    await session.checkpoint();
+    await session.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const records = reopened.ledger.placedBlocks();
+    expect(records.map((record) => [record.dim, record.name, record.lruAt])).toEqual([
+      [null, 'minecraft:cobblestone', 3],
+      [DIM, 'minecraft:dirt', 4],
+    ]);
+    expect(records[0]!.worldId).toBe(WORLD);
+    expect(records[0]!.key).toBe(`${WORLD}:*:7,64,7`);
+    expect(reopened.ledger.queryPlacedNearUnscoped({ x: 7, y: 64, z: 7 }, 0.5).map((hit) => hit.record.name)).toEqual([
+      'minecraft:cobblestone',
+    ]);
+    await reopened.close();
+  });
+
   it('persists deletions and full-replacement semantics', async () => {
     const dbPath = makeDbPath();
     const first = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
@@ -302,7 +332,7 @@ describe('v4 → v5 schema migration and section payload compatibility', () => {
     expect(schemaVersion(dbPath)).toBe('4');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('6');
+    expect(schemaVersion(dbPath)).toBe('7');
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
     // The ledger was not part of v4, so the upgraded database starts with no
     // ledger baseline rather than a synthesized placement.

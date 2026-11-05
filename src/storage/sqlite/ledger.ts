@@ -32,9 +32,13 @@ import type {
   ResolvedLedgerLimits,
 } from './types.js';
 
-/** Canonical placement identity: `worldId:dim:x,y,z`. */
-export function placedBlockKey(worldId: string, dim: string, x: number, y: number, z: number): string {
-  return `${worldId}:${dim}:${x},${y},${z}`;
+/**
+ * Canonical placement identity: `worldId:dim:x,y,z`. Legacy placements whose
+ * dimension is unknown use `*` in place of the dimension; the record itself
+ * keeps `dim: null`.
+ */
+export function placedBlockKey(worldId: string, dim: string | null, x: number, y: number, z: number): string {
+  return `${worldId}:${dim ?? '*'}:${x},${y},${z}`;
 }
 
 /** Canonical chunk-visit identity: `worldId:dim:cx:cz`. */
@@ -225,8 +229,28 @@ export class LedgerStore {
     });
   }
 
+  /**
+   * Import one legacy placement whose dimension is unknown. The owning world is
+   * still known from the data directory that supplied the sidecar, so only the
+   * dimension is left null; queries that require a dimension do not match it.
+   */
+  importUnattributedPlaced(input: {
+    pos: Vec3Like;
+    name: string;
+    lruAt: number;
+    source?: 'legacy' | 'live';
+  }): PlacedBlockRecord {
+    return this.place({
+      dim: null,
+      pos: input.pos,
+      name: requireName(input.name, 'placed name'),
+      lruAt: requireInteger(input.lruAt, 'placed lruAt'),
+      source: input.source ?? 'legacy',
+    });
+  }
+
   private place(input: {
-    dim: string;
+    dim: string | null;
     pos: Vec3Like;
     name: string;
     lruAt: number | undefined;
@@ -266,24 +290,30 @@ export class LedgerStore {
     return cloneRecord(record);
   }
 
-  getPlaced(dim: string, pos: Vec3Like): PlacedBlockRecord | null {
+  getPlaced(dim: string | null, pos: Vec3Like): PlacedBlockRecord | null {
     const grid = floorPos(pos, 'placed pos');
-    const key = placedBlockKey(this.worldId, requireString(dim, 'placed dim'), grid.x, grid.y, grid.z);
+    if (dim !== null) requireString(dim, 'placed dim');
+    const key = placedBlockKey(this.worldId, dim, grid.x, grid.y, grid.z);
     const record = this.placed.get(key);
     return record === undefined ? null : cloneRecord(record);
   }
 
   /** Remove one own placement. A missing cell is a no-op. */
-  removePlaced(dim: string, pos: Vec3Like): boolean {
+  removePlaced(dim: string | null, pos: Vec3Like): boolean {
     const grid = floorPos(pos, 'placed pos');
-    const key = placedBlockKey(this.worldId, requireString(dim, 'placed dim'), grid.x, grid.y, grid.z);
+    if (dim !== null) requireString(dim, 'placed dim');
+    const key = placedBlockKey(this.worldId, dim, grid.x, grid.y, grid.z);
     if (!this.placed.delete(key)) return false;
     this.revisionField += 1;
     return true;
   }
 
-  /** All placements for this world, oldest LRU serial first. */
-  placedBlocks(dim?: string): PlacedBlockRecord[] {
+  /**
+   * All placements for this world, oldest LRU serial first. `undefined` includes
+   * unattributed legacy rows; `null` selects only them; a string selects one
+   * dimension.
+   */
+  placedBlocks(dim?: string | null): PlacedBlockRecord[] {
     return [...this.placed.values()]
       .filter((record) => dim === undefined || record.dim === dim)
       .sort((a, b) => a.lruAt - b.lruAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
@@ -295,13 +325,26 @@ export class LedgerStore {
    * refreshes the LRU serial of returned cells (a lookup is a use); it never
    * changes names or positions.
    */
-  queryPlacedNear(dim: string, pos: Vec3Like, radius: number): { record: PlacedBlockRecord; dist: number }[] {
+  queryPlacedNear(dim: string | null, pos: Vec3Like, radius: number): { record: PlacedBlockRecord; dist: number }[] {
+    const dimFilter = dim === null ? null : requireString(dim, 'placed dim');
+    return this.queryPlacedNearWith(dimFilter, pos, radius);
+  }
+
+  /** Legacy world-wide query: matches every dimension, including unattributed rows. */
+  queryPlacedNearUnscoped(pos: Vec3Like, radius: number): { record: PlacedBlockRecord; dist: number }[] {
+    return this.queryPlacedNearWith(undefined, pos, radius);
+  }
+
+  private queryPlacedNearWith(
+    dim: string | null | undefined,
+    pos: Vec3Like,
+    radius: number,
+  ): { record: PlacedBlockRecord; dist: number }[] {
     const grid = floorPos(pos, 'placed query pos');
     if (!Number.isFinite(radius) || radius < 0) throw invalid('placed query radius must be a non-negative number');
-    const dimName = requireString(dim, 'placed dim');
     const hits: { record: PlacedBlockRecord; dist: number }[] = [];
     for (const record of this.placed.values()) {
-      if (record.dim !== dimName) continue;
+      if (dim !== undefined && record.dim !== dim) continue;
       const dist = Math.hypot(record.pos.x - grid.x, record.pos.y - grid.y, record.pos.z - grid.z);
       if (dist <= radius) hits.push({ record, dist });
     }
@@ -563,7 +606,7 @@ export class LedgerStore {
     let maxLru = 0;
     for (const raw of snapshot.placed) {
       if (raw === null || typeof raw !== 'object') throw invalid('ledger placed record must be an object');
-      const dim = requireString(raw.dim, 'placed dim');
+      const dim = raw.dim === null ? null : requireString(raw.dim, 'placed dim');
       const pos = floorPos(raw.pos, 'placed pos');
       const lruAt = requireInteger(raw.lruAt, 'placed lruAt');
       if (lruAt < 0) throw invalid('placed lruAt must be non-negative');
