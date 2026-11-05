@@ -51,7 +51,7 @@
     "navigation",
     "voxel"
   ],
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.0.0",

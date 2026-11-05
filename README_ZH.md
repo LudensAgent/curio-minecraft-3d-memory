@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/minecraft-1.20.1-62B47A.svg" alt="Minecraft 1.20.1">
   <img src="https://img.shields.io/badge/typescript-5.x-3178C6.svg" alt="TypeScript 5.x">
   <img src="https://img.shields.io/badge/sqlite-optional-003B57.svg" alt="Optional SQLite">
-  <img src="https://img.shields.io/badge/license-UNLICENSED-lightgrey.svg" alt="Private license">
+  <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="Apache 2.0 License">
 </p>
 
 [English](README.md) | 简体中文
@@ -304,4 +304,4 @@ node acceptance/run.mjs
 
 ## License
 
-UNLICENSED（私有）。
+使用 [Apache License 2.0](LICENSE) 许可。

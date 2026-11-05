@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/minecraft-1.20.1-62B47A.svg" alt="Minecraft 1.20.1">
   <img src="https://img.shields.io/badge/typescript-5.x-3178C6.svg" alt="TypeScript 5.x">
   <img src="https://img.shields.io/badge/sqlite-optional-003B57.svg" alt="Optional SQLite">
-  <img src="https://img.shields.io/badge/license-UNLICENSED-lightgrey.svg" alt="Private license">
+  <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="Apache 2.0 License">
 </p>
 
 English | [简体中文](README_ZH.md)
@@ -304,4 +304,4 @@ The examples and tests use Fake perception, Fake bodies and Fake move executors.
 
 ## License
 
-UNLICENSED (private).
+Licensed under the [Apache License, Version 2.0](LICENSE).
