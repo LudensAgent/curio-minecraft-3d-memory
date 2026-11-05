@@ -192,17 +192,22 @@ describe('TopologyStore — nodes', () => {
     expect(store.nodes().total).toBe(2);
   });
 
-  it('enforces separate agent/program quotas without evicting existing nodes', () => {
+  it('keeps agent nodes durable and evicts the oldest unreferenced program node', () => {
     const store = new TopologyStore(stubHistory(), { maxAgentNodes: 1, maxProgramNodes: 2 });
     store.saveNode(node({ id: 'a1' }));
     store.saveNode(node({ id: 'p1', source: 'program' }));
     store.saveNode(node({ id: 'p2', source: 'program' }));
 
+    // Agent-named points are durable: overflow is rejected, never evicted.
     expect(() => store.saveNode(node({ id: 'a2' }))).toThrow(/agent/);
-    expect(() => store.saveNode(node({ id: 'p3', source: 'program' }))).toThrow(/program/);
+    expect(store.getNode('a1')).not.toBeNull();
+    // Program points use bounded oldest-first eviction.
+    expect(store.saveNode(node({ id: 'p3', source: 'program' })).status).toBe('inserted');
+    expect(store.getNode('p1')).toBeNull();
+    expect(store.getNode('p2')).not.toBeNull();
+    expect(store.getNode('p3')).not.toBeNull();
     expect(store.nodes({ source: 'agent' }).total).toBe(1);
     expect(store.nodes({ source: 'program' }).total).toBe(2);
-    expect(store.getNode('a1')).not.toBeNull();
   });
 
   it('filters nodes by dim, source and tag and paginates by stable id', () => {
