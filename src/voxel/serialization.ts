@@ -225,6 +225,9 @@ function migrateLegacyV2Payload(raw: Record<string, unknown>): VoxelSectionSnaps
   const palette = requireStringArray(raw.palette, 'palette');
   const bits = requireInteger(raw.bits, 'bits');
   const revision = requireInteger(raw.revision, 'revision');
+  if (bits !== bitsRequired(palette.length)) {
+    throw new Error(`voxel section payload bits ${bits} does not match palette length ${palette.length}`);
+  }
   const cells = decodeBase64(requireString(raw.cells, 'cells'));
   if (!Array.isArray(raw.evidence)) {
     throw new Error('voxel section payload evidence must be an array');
@@ -303,6 +306,9 @@ function migrateV1Payload(raw: Record<string, unknown>): VoxelSectionSnapshot {
   const palette = requireStringArray(raw.palette, 'palette');
   const bits = requireInteger(raw.bits, 'bits');
   const revision = requireInteger(raw.revision, 'revision');
+  if (bits !== bitsRequired(palette.length)) {
+    throw new Error(`voxel section payload bits ${bits} does not match palette length ${palette.length}`);
+  }
   const cells = decodeBase64(requireString(raw.cells, 'cells'));
   if (!Array.isArray(raw.evidence)) {
     throw new Error('voxel section payload evidence must be an array');

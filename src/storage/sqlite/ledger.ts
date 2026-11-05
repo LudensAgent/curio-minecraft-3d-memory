@@ -235,11 +235,12 @@ export class LedgerStore {
     const pos = floorPos(input.pos, 'placed pos');
     const key = placedBlockKey(this.worldId, input.dim, pos.x, pos.y, pos.z);
     const lruAt = input.lruAt ?? this.lruClock + 1;
-    this.lruClock = Math.max(this.lruClock, lruAt);
     const existing = this.placed.get(key);
     if (existing === undefined && this.placed.size >= this.limits.maxPlacedBlocks) {
       throw new PersistenceError('capacity', `placed ledger exceeds maxPlacedBlocks (${this.placed.size})`);
     }
+    // Only advance the order clock for a write that will actually be kept.
+    this.lruClock = Math.max(this.lruClock, lruAt);
     const record: PlacedBlockRecord = {
       key,
       worldId: this.worldId,
@@ -324,12 +325,15 @@ export class LedgerStore {
     const key = chunkVisitKey(this.worldId, dimName, x, z);
     const existing = this.visits.get(key);
     if (this.lastChunkKey === key) {
-      return { first: false, record: cloneRecord(existing!) };
+      if (existing === undefined) {
+        throw new PersistenceError('data', `visit dedupe state references a missing chunk "${key}"`);
+      }
+      return { first: false, record: cloneRecord(existing) };
     }
-    this.lastChunkKey = key;
     if (existing === undefined && this.visits.size >= this.limits.maxChunkVisits) {
       throw new PersistenceError('capacity', `visit ledger exceeds maxChunkVisits (${this.visits.size})`);
     }
+    this.lastChunkKey = key;
     const record: ChunkVisitRecord = existing === undefined
       ? { key, worldId: this.worldId, dim: dimName, cx: x, cz: z, count: 1, source: 'live' }
       : { ...existing, count: existing.count + 1 };
@@ -634,6 +638,14 @@ export class LedgerStore {
       : validateEndpoint(raw.toEndpoint, 'traversal toEndpoint', this.limits.maxEndpointBytes);
     if (fromEndpoint !== null && fromEndpoint.id !== raw.fromId) throw invalid('stored traversal fromEndpoint.id mismatch');
     if (toEndpoint !== null && toEndpoint.id !== raw.toId) throw invalid('stored traversal toEndpoint.id mismatch');
+    // Portal endpoints name a world too; a restore must not install another
+    // world's endpoint evidence into this ledger.
+    if (fromEndpoint !== null && fromEndpoint.worldId !== this.worldId) {
+      throw invalid(`stored traversal fromEndpoint.worldId "${fromEndpoint.worldId}" does not match "${this.worldId}"`);
+    }
+    if (toEndpoint !== null && toEndpoint.worldId !== this.worldId) {
+      throw invalid(`stored traversal toEndpoint.worldId "${toEndpoint.worldId}" does not match "${this.worldId}"`);
+    }
     const id = portalTraversalIdentity({ ...raw, kind: raw.kind });
     if (id !== raw.id) throw invalid(`stored traversal id "${raw.id}" does not match its evidence`);
     return {

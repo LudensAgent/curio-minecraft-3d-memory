@@ -488,6 +488,18 @@ describe('spatial event kinds and ledger bounds', () => {
     expect(ledgerSession.ledger.placedBlocks()).toHaveLength(1);
     await ledgerSession.close();
 
+    const visitSession = await openSpatialSession({
+      databasePath: makeDbPath(),
+      worldId: WORLD,
+      ledgerLimits: { maxChunkVisits: 1 },
+    });
+    visitSession.ledger.visitChunk(DIM, 0, 0);
+    expect(() => visitSession.ledger.visitChunk(DIM, 1, 0)).toThrow(/maxChunkVisits/);
+    // A refused visit must not leave same-chunk dedupe state pointing at a record
+    // that was never inserted; the retry must throw again, not return undefined.
+    expect(() => visitSession.ledger.visitChunk(DIM, 1, 0)).toThrow(/maxChunkVisits/);
+    await visitSession.close();
+
     const endpointSession = await openSpatialSession({
       databasePath: makeDbPath(),
       worldId: WORLD,
@@ -519,5 +531,40 @@ describe('spatial event kinds and ledger bounds', () => {
     ).toThrow(/maxRecordBytes/);
     expect(journalSession.journal.readPending().events).toEqual([]);
     await journalSession.close();
+  });
+
+  it('rejects restored portal endpoints that belong to another world', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    session.ledger.recordPortalTraversal({
+      fromId: 'ep_a',
+      toId: 'ep_b',
+      ts: 1,
+      fromSession: 's1',
+      toSession: 's2',
+      fromObservation: 1,
+      toObservation: 2,
+      fromEndpoint: endpoint('ep_a', DIM, { x: 0, y: 64, z: 0 }, 1),
+      toEndpoint: endpoint('ep_b', 'the_nether', { x: 1, y: 64, z: 0 }, 2),
+    });
+    await session.checkpoint();
+    await session.close();
+
+    const db = new Database(dbPath);
+    const row = db.prepare('SELECT id, from_endpoint FROM portal_traversals').get() as {
+      id: string;
+      from_endpoint: string;
+    };
+    const stored = JSON.parse(row.from_endpoint) as Record<string, unknown>;
+    stored['worldId'] = 'other-world';
+    db.prepare('UPDATE portal_traversals SET from_endpoint = ? WHERE id = ?').run(
+      JSON.stringify(stored),
+      row.id,
+    );
+    db.close();
+
+    await expect(openSpatialSession({ databasePath: dbPath, worldId: WORLD })).rejects.toMatchObject({
+      kind: 'data',
+    });
   });
 });

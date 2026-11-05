@@ -528,6 +528,41 @@ describe('navigateTo — integrated measured pipeline', () => {
     expect(move.requests.map((request) => request.to)).toEqual([pt(1.5, 0, 0.5)]);
   });
 
+  it('keeps the combined measured trace when every explicit segment ARRIVES', async () => {
+    const map = new VoxelMap('world');
+    openCells(map, [[0, 0], [1, 0], [2, 0]]);
+    const measured = { current: measuredSample(pt(0.5, 0, 0.5)) };
+    const move = new TrackingMoveExecutor(measured);
+    const harness = makeHarness({
+      map,
+      measured: measured.current,
+      sample: () => measured.current,
+      move,
+      segments: [
+        { destination: pt(1.5, 0, 0.5), arrival: { kind: 'exact' } },
+        { destination: pt(2.5, 0, 0.5), arrival: { kind: 'exact' } },
+      ],
+    });
+
+    const { result, record } = await navigateTo(navigateRequest(), harness.env);
+
+    expect(result.outcome).toBe('ARRIVED');
+    expect(result.confirmed).toBe(true);
+    expect(result.trace.map((entry) => entry.pos)).toEqual([
+      pt(1.5, 0, 0.5),
+      pt(2.5, 0, 0.5),
+    ]);
+    expect(record!.confirmed).toBe(true);
+    expect(record!.trace.map((entry) => entry.pos)).toEqual([
+      pt(1.5, 0, 0.5),
+      pt(2.5, 0, 0.5),
+    ]);
+    expect(move.requests.map((request) => request.to)).toEqual([
+      pt(1.5, 0, 0.5),
+      pt(2.5, 0, 0.5),
+    ]);
+  });
+
   it('fails safely without a measured start and never invents a record position', async () => {
     const harness = makeHarness({ sample: () => null });
     const { result, record } = await navigateTo(navigateRequest(), harness.env);

@@ -313,6 +313,7 @@ export async function navigateTo(
   let lastPosition: Vec3Like | undefined;
   let lastObservation: LastObservation | undefined;
   let executed = false;
+  let allConfirmed = true;
   let current = measured;
 
   for (let index = 0; index < segments.length; index++) {
@@ -344,26 +345,13 @@ export async function navigateTo(
 
     const run = await runSegment(environment, request, segment.destination, current, startedAt, ctx);
     executed ||= run.executed;
+    allConfirmed &&= run.result.confirmed;
     trace = trace.concat(copyTrace(run.result.trace));
     lastPosition = run.result.lastPosition === undefined ? lastPosition : cloneVec(run.result.lastPosition);
     lastObservation =
       run.result.lastObservation === undefined ? lastObservation : cloneObservation(run.result.lastObservation);
 
-    if (run.result.outcome === 'ARRIVED') {
-      if (index === segments.length - 1) {
-        return finishNavigate(environment, run.result, {
-          id,
-          delegationId,
-          parentActionId: environment.parentActionId,
-          startedAt,
-          from: measured.sample.pos,
-          executed,
-          delegation,
-          scope: environment,
-        });
-      }
-      continue;
-    }
+    if (run.result.outcome === 'ARRIVED') continue;
 
     const result =
       index === 0
@@ -388,13 +376,19 @@ export async function navigateTo(
     });
   }
 
-  // All segments reported ARRIVED; the loop only reaches here for a non-empty
-  // segments list. Rebuild the combined envelope from measured evidence.
-  if (lastPosition === undefined || lastObservation === undefined) {
+  // All segments reported ARRIVED; rebuild one combined envelope from measured
+  // evidence instead of returning only the last segment's trace.
+  const finalTarget = segments[segments.length - 1]!.destination;
+  const arrivalConfirmed =
+    allConfirmed
+    && lastPosition !== undefined
+    && lastObservation !== undefined
+    && positionsEqual(lastPosition, finalTarget);
+  if (!arrivalConfirmed) {
     const result = failureWithEvidence(
       'FAILED',
-      'the delegation ended without a measured arrival position',
-      { kind: 'unconfirmed_arrival', expected: cloneVec(request.destination) },
+      'the delegation ended without a confirmed measured position at the final target',
+      { kind: 'unconfirmed_arrival', expected: cloneVec(finalTarget) },
       trace,
       lastPosition,
       lastObservation,
@@ -412,9 +406,9 @@ export async function navigateTo(
   }
   const arrived: NavResult = {
     outcome: 'ARRIVED',
-    message: `arrived at exact target ${fmt(request.destination)} after ${segments.length} segments`,
-    lastPosition: cloneVec(lastPosition),
-    lastObservation: cloneObservation(lastObservation),
+    message: `arrived at exact target ${fmt(finalTarget)} after ${segments.length} segments`,
+    lastPosition: cloneVec(lastPosition!),
+    lastObservation: cloneObservation(lastObservation!),
     confirmed: true,
     trace: copyTrace(trace),
     consumption: emptyConsumption(),

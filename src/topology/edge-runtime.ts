@@ -330,10 +330,10 @@ export function directionState(
     ? 'UNSUPPORTED'
     : statuses.includes('BLOCKED')
       ? 'BLOCKED'
-      : statuses.includes('OPEN')
-        ? 'OPEN'
-        : statuses.includes('STALE')
-          ? 'STALE'
+      : statuses.includes('STALE')
+        ? 'STALE'
+        : statuses.includes('OPEN')
+          ? 'OPEN'
           : statuses.every((s) => s === 'UNSUPPORTED')
             ? 'UNSUPPORTED'
             : 'UNKNOWN';

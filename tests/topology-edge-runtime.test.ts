@@ -180,6 +180,18 @@ describe('TopologyStore — runtime edge verification', () => {
     expect(store.route('a', 'b').status).toBe('FOUND');
   });
 
+  it('aggregates a stale mode ahead of another mode still OPEN', () => {
+    const { store, setNow } = setup();
+    store.verifyEdge('e-ab', openVerification({ mode: 'walk', computedAt: 900, validUntil: 4000 }));
+    store.verifyEdge('e-ab', openVerification({ mode: 'drop', computedAt: 900, validUntil: 1500 }));
+    setNow(2000);
+    const view = store.edgeRuntime('e-ab')!;
+    expect(view.forward.modes.find((m) => m.mode === 'walk')!.status).toBe('OPEN');
+    expect(view.forward.modes.find((m) => m.mode === 'drop')!.status).toBe('STALE');
+    // An expired verification must not be hidden behind another OPEN mode.
+    expect(view.forward.status).toBe('STALE');
+  });
+
   it('blocks a direction without deleting the fragment, and excludes it from route/adjacency', () => {
     const { history, store } = setup();
     expect(
