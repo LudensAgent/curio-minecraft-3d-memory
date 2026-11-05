@@ -26,6 +26,19 @@ import type {
 } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelDirectoryEntry } from '../../voxel/residency.js';
+import { readCell } from '../../voxel/palette.js';
+import { SECTION_CELL_COUNT } from '../../constants.js';
+import type { BlockState } from '../../types.js';
+import { chunkVisitKey, placedBlockKey, portalTraversalIdentity } from './ledger.js';
+import { DEFAULT_LEDGER_LIMITS } from './types.js';
+import type {
+  ChunkVisitRecord,
+  LedgerSnapshot,
+  PlacedBlockRecord,
+  PortalEndpointEvidence,
+  PortalTraversalRecord,
+  ResolvedLedgerLimits,
+} from './types.js';
 import {
   MIGRATION_BATCH_BYTES,
   MIGRATION_BATCH_ROWS,
@@ -34,7 +47,7 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -50,6 +63,13 @@ const KNOWN_TABLES_V2 = new Set([...KNOWN_TABLES_V1, 'spatial_sections']);
 const KNOWN_TABLES_V3 = new Set(KNOWN_TABLES_V2);
 
 const KNOWN_TABLES_V4 = new Set([...KNOWN_TABLES_V3, 'action_records', 'spatial_events']);
+
+const KNOWN_TABLES_V5 = new Set([
+  ...KNOWN_TABLES_V4,
+  'placed_blocks',
+  'chunk_visits',
+  'portal_traversals',
+]);
 
 /** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
 const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
@@ -131,6 +151,76 @@ const REQUIRED_COLUMNS_V4: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
   },
 };
 
+/**
+ * Required columns for the v5 schema: explicit section coordinates, the ledger
+ * checkpoint discriminator, and the three legacy-ledger tables.
+ */
+const REQUIRED_COLUMNS_V5: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V4,
+  checkpoints: {
+    checkpoint_id: 'TEXT',
+    world_id: 'TEXT',
+    fragment_revision: 'INTEGER',
+    topology_revision: 'INTEGER',
+    voxel_revision: 'INTEGER',
+    has_voxel: 'INTEGER',
+    journal_revision: 'INTEGER',
+    has_journal: 'INTEGER',
+    ledger_revision: 'INTEGER',
+    has_ledger: 'INTEGER',
+    seq: 'INTEGER',
+  },
+  spatial_sections: {
+    world_id: 'TEXT',
+    seq: 'INTEGER',
+    id: 'TEXT',
+    payload: 'TEXT',
+    observed_cells: 'INTEGER',
+    palette_entries: 'INTEGER',
+    revision: 'INTEGER',
+    dimension: 'TEXT',
+    cx: 'INTEGER',
+    cz: 'INTEGER',
+    sy: 'INTEGER',
+  },
+  placed_blocks: {
+    key: 'TEXT',
+    world_id: 'TEXT',
+    dim: 'TEXT',
+    x: 'INTEGER',
+    y: 'INTEGER',
+    z: 'INTEGER',
+    name: 'TEXT',
+    lru_at: 'INTEGER',
+    source: 'TEXT',
+  },
+  chunk_visits: {
+    key: 'TEXT',
+    world_id: 'TEXT',
+    dim: 'TEXT',
+    cx: 'INTEGER',
+    cz: 'INTEGER',
+    count: 'INTEGER',
+    source: 'TEXT',
+  },
+  portal_traversals: {
+    id: 'TEXT',
+    world_id: 'TEXT',
+    kind: 'TEXT',
+    direction: 'TEXT',
+    from_id: 'TEXT',
+    to_id: 'TEXT',
+    ts: 'INTEGER',
+    from_session: 'TEXT',
+    to_session: 'TEXT',
+    from_observation: 'INTEGER',
+    to_observation: 'INTEGER',
+    from_endpoint: 'TEXT',
+    to_endpoint: 'TEXT',
+    source: 'TEXT',
+  },
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -146,6 +236,8 @@ CREATE TABLE checkpoints (
   has_voxel INTEGER NOT NULL DEFAULT 0,
   journal_revision INTEGER NOT NULL DEFAULT 0,
   has_journal INTEGER NOT NULL DEFAULT 0,
+  ledger_revision INTEGER NOT NULL DEFAULT 0,
+  has_ledger INTEGER NOT NULL DEFAULT 0,
   seq INTEGER NOT NULL
 );
 CREATE INDEX checkpoints_world_seq ON checkpoints (world_id, seq);
@@ -190,8 +282,13 @@ CREATE TABLE spatial_sections (
   observed_cells INTEGER NOT NULL DEFAULT 0,
   palette_entries INTEGER NOT NULL DEFAULT 0,
   revision INTEGER NOT NULL DEFAULT 0,
+  dimension TEXT NOT NULL DEFAULT '',
+  cx INTEGER NOT NULL DEFAULT 0,
+  cz INTEGER NOT NULL DEFAULT 0,
+  sy INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (world_id, id)
 );
+CREATE INDEX spatial_sections_world_coords ON spatial_sections (world_id, dimension, cx, cz, sy);
 
 CREATE TABLE action_records (
   world_id TEXT NOT NULL,
@@ -219,6 +316,51 @@ CREATE TABLE spatial_events (
 );
 CREATE INDEX spatial_events_world_seq ON spatial_events (world_id, seq);
 CREATE INDEX spatial_events_scope_seq ON spatial_events (world_id, session_id, seq);
+
+CREATE TABLE placed_blocks (
+  key TEXT PRIMARY KEY,
+  world_id TEXT,
+  dim TEXT,
+  x INTEGER NOT NULL,
+  y INTEGER NOT NULL,
+  z INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  lru_at INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  CHECK ((world_id IS NULL AND dim IS NULL) OR (world_id IS NOT NULL AND dim IS NOT NULL))
+);
+CREATE INDEX placed_blocks_world_lru ON placed_blocks (world_id, dim, lru_at);
+
+CREATE TABLE chunk_visits (
+  key TEXT PRIMARY KEY,
+  world_id TEXT NOT NULL,
+  dim TEXT NOT NULL,
+  cx INTEGER NOT NULL,
+  cz INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  CHECK (count >= 0)
+);
+CREATE INDEX chunk_visits_world ON chunk_visits (world_id, dim, cx, cz);
+
+CREATE TABLE portal_traversals (
+  id TEXT PRIMARY KEY,
+  world_id TEXT,
+  kind TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  from_id TEXT NOT NULL,
+  to_id TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  from_session TEXT NOT NULL,
+  to_session TEXT NOT NULL,
+  from_observation INTEGER NOT NULL,
+  to_observation INTEGER NOT NULL,
+  from_endpoint TEXT,
+  to_endpoint TEXT,
+  source TEXT NOT NULL,
+  UNIQUE (kind, from_id, to_id, ts, from_session, to_session, from_observation, to_observation)
+);
+CREATE INDEX portal_traversals_world_ts ON portal_traversals (world_id, ts);
 `;
 
 interface PreparedSnapshot {
@@ -234,7 +376,17 @@ interface PreparedSnapshot {
 }
 
 interface PreparedVoxelSnapshot {
-  sections: { id: string; payload: string; observedCells: number; paletteEntries: number; revision: number }[];
+  sections: {
+    id: string;
+    dim: string;
+    cx: number;
+    cz: number;
+    sy: number;
+    payload: string;
+    observedCells: number;
+    paletteEntries: number;
+    revision: number;
+  }[];
   bytes: number;
 }
 
@@ -265,6 +417,7 @@ let db: Database.Database | null = null;
 let worldId: string | null = null;
 let limits: ResolvedSnapshotLimits | null = null;
 let journalLimits: ResolvedJournalLimits | null = null;
+let ledgerLimits: ResolvedLedgerLimits = DEFAULT_LEDGER_LIMITS;
 
 function respond(msg: WorkerResponse): void {
   parentPort!.postMessage(msg);
@@ -310,6 +463,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV1ToV2(connection, databasePath);
     upgradeV2ToV3(connection, databasePath);
     upgradeV3ToV4(connection, databasePath);
+    upgradeV4ToV5(connection, databasePath);
     return connection;
   }
 
@@ -320,6 +474,7 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV2ToV3(connection, databasePath);
     upgradeV3ToV4(connection, databasePath);
+    upgradeV4ToV5(connection, databasePath);
     return connection;
   }
 
@@ -329,12 +484,22 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV3ToV4(connection, databasePath);
+    upgradeV4ToV5(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (4)
-  validateKnownTables(connection, names, KNOWN_TABLES_V4);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V4)) {
+  if (version === 4) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V4);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V4)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV4ToV5(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (5)
+  validateKnownTables(connection, names, KNOWN_TABLES_V5);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V5)) {
     assertRequiredColumns(connection, table, columns);
   }
   return connection;
@@ -486,6 +651,103 @@ function upgradeV3ToV4(connection: Database.Database, databasePath: string): voi
   tx();
 }
 
+/**
+ * Upgrade a validated v4 database in place: write a consistent backup first, then
+ * add the explicit section coordinate columns, the ledger checkpoint
+ * discriminator and the three legacy-ledger tables inside one transaction.
+ *
+ * The section coordinates are backfilled from the existing `id` JSON in bounded
+ * `rowid` windows; the versioned payload is left untouched. The payload's
+ * dimension/coordinates remain self-contained for backward compatibility, but
+ * these columns are now the indexed query identity. No history/voxel/journal row
+ * is rewritten or deleted, and an upgraded database starts with an empty ledger
+ * rather than synthesizing placements, visits or crossings.
+ */
+function upgradeV4ToV5(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v5-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.exec('ALTER TABLE checkpoints ADD COLUMN ledger_revision INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE checkpoints ADD COLUMN has_ledger INTEGER NOT NULL DEFAULT 0');
+    connection.exec("ALTER TABLE spatial_sections ADD COLUMN dimension TEXT NOT NULL DEFAULT ''");
+    connection.exec('ALTER TABLE spatial_sections ADD COLUMN cx INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE spatial_sections ADD COLUMN cz INTEGER NOT NULL DEFAULT 0');
+    connection.exec('ALTER TABLE spatial_sections ADD COLUMN sy INTEGER NOT NULL DEFAULT 0');
+
+    const meta = connection.prepare(
+      'SELECT rowid, id FROM spatial_sections WHERE rowid > ? ORDER BY rowid LIMIT ?',
+    );
+    const update = connection.prepare(
+      'UPDATE spatial_sections SET dimension = ?, cx = ?, cz = ?, sy = ? WHERE rowid = ?',
+    );
+    let cursor = 0;
+    for (;;) {
+      const window = meta.all(cursor, MIGRATION_BATCH_ROWS) as { rowid: number; id: string }[];
+      if (window.length === 0) break;
+      for (const row of window) {
+        const [dim, cx, cz, sy] = parseSectionId(row.id);
+        update.run(dim, cx, cz, sy, row.rowid);
+      }
+      cursor = window[window.length - 1]!.rowid;
+    }
+    connection.exec(
+      'CREATE INDEX spatial_sections_world_coords ON spatial_sections (world_id, dimension, cx, cz, sy)',
+    );
+
+    connection.exec(`
+      CREATE TABLE placed_blocks (
+        key TEXT PRIMARY KEY,
+        world_id TEXT,
+        dim TEXT,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        z INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        lru_at INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        CHECK ((world_id IS NULL AND dim IS NULL) OR (world_id IS NOT NULL AND dim IS NOT NULL))
+      )
+    `);
+    connection.exec('CREATE INDEX placed_blocks_world_lru ON placed_blocks (world_id, dim, lru_at)');
+    connection.exec(`
+      CREATE TABLE chunk_visits (
+        key TEXT PRIMARY KEY,
+        world_id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        cx INTEGER NOT NULL,
+        cz INTEGER NOT NULL,
+        count INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        CHECK (count >= 0)
+      )
+    `);
+    connection.exec('CREATE INDEX chunk_visits_world ON chunk_visits (world_id, dim, cx, cz)');
+    connection.exec(`
+      CREATE TABLE portal_traversals (
+        id TEXT PRIMARY KEY,
+        world_id TEXT,
+        kind TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        from_session TEXT NOT NULL,
+        to_session TEXT NOT NULL,
+        from_observation INTEGER NOT NULL,
+        to_observation INTEGER NOT NULL,
+        from_endpoint TEXT,
+        to_endpoint TEXT,
+        source TEXT NOT NULL,
+        UNIQUE (kind, from_id, to_id, ts, from_session, to_session, from_observation, to_observation)
+      )
+    `);
+    connection.exec('CREATE INDEX portal_traversals_world_ts ON portal_traversals (world_id, ts)');
+
+    connection.prepare("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
 /** Reject a table missing a required column, or whose column has the wrong type affinity. */
 function assertRequiredColumns(
   connection: Database.Database,
@@ -563,10 +825,19 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
   return prepared;
 }
 
-/** Encode a voxel section into its versioned JSON payload. */
+/**
+ * Encode a voxel section into its versioned JSON payload.
+ *
+ * v2 removes the duplicated full block state from every cell's observation: the
+ * palette already stores the canonical state string and the packed `cells` point
+ * at it, so the evidence carries only the remaining observation fields. This
+ * keeps the persisted evidence independent of a later block-state serialization
+ * change and avoids storing the same state twice. The section key stays in the
+ * payload for self-containment and backward compatibility.
+ */
 function encodeVoxelSection(section: VoxelSectionSnapshot): string {
   return JSON.stringify({
-    v: 1,
+    v: 2,
     dim: section.dim,
     cx: section.cx,
     cz: section.cz,
@@ -574,7 +845,19 @@ function encodeVoxelSection(section: VoxelSectionSnapshot): string {
     palette: section.palette,
     bits: section.bits,
     cells: Buffer.from(section.cells).toString('base64'),
-    evidence: section.evidence.map((cell) => ({ i: cell.index, e: cell.evidence })),
+    evidence: section.evidence.map((cell) => {
+      const { state: _state, ...observation } = cell.evidence.observation;
+      return {
+        i: cell.index,
+        e: {
+          observation,
+          revision: cell.evidence.revision,
+          freshness: cell.evidence.freshness,
+          ...(cell.evidence.staleReason === undefined ? {} : { staleReason: cell.evidence.staleReason }),
+          validUntil: cell.evidence.validUntil,
+        },
+      };
+    }),
     revision: section.revision,
   });
 }
@@ -594,6 +877,10 @@ function prepareVoxelSnapshot(snapshot: VoxelCheckpointSnapshot): PreparedVoxelS
     const payload = encodeVoxelSection(section);
     return {
       id: voxelSectionId(section),
+      dim: section.dim,
+      cx: section.cx,
+      cz: section.cz,
+      sy: section.sy,
       payload,
       observedCells: section.evidence.length,
       paletteEntries: section.palette.length,
@@ -752,6 +1039,7 @@ function writeCheckpoint(
   prepared: PreparedSnapshot,
   voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
+  ledger: { mode: 'none' | 'full'; revision: number; prepared: PreparedLedger | null },
   resolved: ResolvedSnapshotLimits,
   resolvedJournal: ResolvedJournalLimits,
 ): void {
@@ -790,10 +1078,22 @@ function writeCheckpoint(
     if (voxel.mode === 'full') {
       connection.prepare('DELETE FROM spatial_sections WHERE world_id = ?').run(wId);
       const insertSection = connection.prepare(
-        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       );
       voxel.sections.forEach((s, i) =>
-        insertSection.run(wId, i, s.id, s.payload, s.observedCells, s.paletteEntries, s.revision),
+        insertSection.run(
+          wId,
+          i,
+          s.id,
+          s.payload,
+          s.observedCells,
+          s.paletteEntries,
+          s.revision,
+          s.dim,
+          s.cx,
+          s.cz,
+          s.sy,
+        ),
       );
     } else if (voxel.mode === 'incremental') {
       // Existing rows keep their `seq` (stable order); new rows are appended after
@@ -804,11 +1104,23 @@ function writeCheckpoint(
         .get(wId) as { n: number };
       const baseSeq = maxSeqRow.n;
       const upsertSection = connection.prepare(
-        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision) VALUES (?, ?, ?, ?, ?, ?, ?) ' +
-          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision',
+        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision, dimension = excluded.dimension, cx = excluded.cx, cz = excluded.cz, sy = excluded.sy',
       );
       voxel.sections.forEach((s, i) =>
-        upsertSection.run(wId, baseSeq + i + 1, s.id, s.payload, s.observedCells, s.paletteEntries, s.revision),
+        upsertSection.run(
+          wId,
+          baseSeq + i + 1,
+          s.id,
+          s.payload,
+          s.observedCells,
+          s.paletteEntries,
+          s.revision,
+          s.dim,
+          s.cx,
+          s.cz,
+          s.sy,
+        ),
       );
       // The resulting full set must still re-open under the same limits: reject
       // (and roll back) before commit if the increments accumulate past capacity.
@@ -822,9 +1134,15 @@ function writeCheckpoint(
       appendJournal(connection, wId, journal.prepared, resolvedJournal);
     }
 
+    // The ledger is a full replacement of this world's ledger rows; unattributed
+    // legacy rows (world_id IS NULL) are not this world's facts and are untouched.
+    if (ledger.mode === 'full') {
+      writeLedger(connection, wId, ledger.prepared ?? { placed: [], visits: [], traversals: [], bytes: 0 });
+    }
+
     connection
       .prepare(
-        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         checkpointId,
@@ -835,6 +1153,8 @@ function writeCheckpoint(
         voxel.mode === 'none' ? 0 : 1,
         journal.mode === 'none' ? 0 : journal.revision,
         journal.mode === 'none' ? 0 : 1,
+        ledger.mode === 'none' ? 0 : ledger.revision,
+        ledger.mode === 'none' ? 0 : 1,
         nextSeq,
       );
   });
@@ -992,6 +1312,328 @@ function readAll(connection: Database.Database, table: string, wId: string): unk
   return rows.map((r) => JSON.parse(r.payload) as unknown);
 }
 
+// --- placement / chunk-visit / portal ledger --------------------------------
+
+const PORTAL_ENDPOINT_KINDS = new Set(['nether_portal', 'end_portal', 'end_gateway']);
+const PORTAL_TRAVERSAL_KINDS = new Set(['traversal', 'gateway']);
+const PORTAL_DIRECTIONS = new Set(['outbound', 'return', 'unclassified']);
+
+interface PreparedTraversal extends PortalTraversalRecord {
+  fromEndpointJson: string | null;
+  toEndpointJson: string | null;
+}
+
+interface PreparedLedger {
+  placed: PlacedBlockRecord[];
+  visits: ChunkVisitRecord[];
+  traversals: PreparedTraversal[];
+  bytes: number;
+}
+
+function ledgerInvalid(message: string): Error {
+  return new Error(message);
+}
+
+function requireLedgerString(value: unknown, what: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw ledgerInvalid(`ledger ${what} must be a non-empty string`);
+  return value;
+}
+
+function validateLedgerEndpoint(
+  raw: PortalEndpointEvidence | null,
+  what: string,
+  wId: string,
+  maxBytes: number,
+): string | null {
+  if (raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw ledgerInvalid(`ledger ${what} must be an object`);
+  if (raw.worldId !== wId) throw ledgerInvalid(`ledger ${what}.worldId does not match "${wId}"`);
+  requireLedgerString(raw.id, `${what}.id`);
+  requireLedgerString(raw.dim, `${what}.dim`);
+  if (!PORTAL_ENDPOINT_KINDS.has(raw.kind)) throw ledgerInvalid(`ledger ${what}.kind is not known`);
+  if (typeof raw.portalObserved !== 'boolean') throw ledgerInvalid(`ledger ${what}.portalObserved must be a boolean`);
+  if (!Number.isFinite(raw.observedAt)) throw ledgerInvalid(`ledger ${what}.observedAt must be finite`);
+  if (!Number.isFinite(raw.pos?.x) || !Number.isFinite(raw.pos?.y) || !Number.isFinite(raw.pos?.z)) {
+    throw ledgerInvalid(`ledger ${what}.pos must be finite`);
+  }
+  const json = JSON.stringify(raw);
+  const bytes = Buffer.byteLength(json, 'utf8');
+  if (bytes > maxBytes) throw ledgerInvalid(`ledger ${what} exceeds maxEndpointBytes (${bytes})`);
+  return json;
+}
+
+/**
+ * Re-validate and bound a complete ledger snapshot at the process/DB boundary,
+ * independently of the main-thread store. The worker never trusts the session's
+ * ordering or capacity checks: a checkpoint either commits a fully valid,
+ * world-scoped ledger or rolls back with the rest of the batch.
+ */
+function prepareLedger(snapshot: LedgerSnapshot, wId: string, resolved: ResolvedLedgerLimits): PreparedLedger {
+  if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    throw ledgerInvalid('ledger snapshot must be an object');
+  }
+  if (snapshot.worldId !== wId) throw ledgerInvalid('ledger snapshot worldId does not match session worldId');
+  if (!Array.isArray(snapshot.placed) || !Array.isArray(snapshot.visits) || !Array.isArray(snapshot.traversals)) {
+    throw ledgerInvalid('ledger snapshot arrays are malformed');
+  }
+  if (snapshot.placed.length > resolved.maxPlacedBlocks) {
+    throw ledgerInvalid(`ledger exceeds maxPlacedBlocks (${snapshot.placed.length})`);
+  }
+  if (snapshot.visits.length > resolved.maxChunkVisits) {
+    throw ledgerInvalid(`ledger exceeds maxChunkVisits (${snapshot.visits.length})`);
+  }
+  if (snapshot.traversals.length > resolved.maxPortalTraversals) {
+    throw ledgerInvalid(`ledger exceeds maxPortalTraversals (${snapshot.traversals.length})`);
+  }
+  const bytes = Buffer.byteLength(JSON.stringify(snapshot), 'utf8');
+  if (bytes > resolved.maxBytes) throw ledgerInvalid(`ledger exceeds maxBytes (${bytes})`);
+
+  const placed: PlacedBlockRecord[] = [];
+  const placedKeys = new Set<string>();
+  for (const raw of snapshot.placed) {
+    if (raw === null || typeof raw !== 'object') throw ledgerInvalid('ledger placed record must be an object');
+    if (raw.worldId !== wId) throw ledgerInvalid('ledger placed record belongs to another world');
+    const dim = requireLedgerString(raw.dim, 'placed dim');
+    if (!Number.isSafeInteger(raw.pos?.x) || !Number.isSafeInteger(raw.pos?.y) || !Number.isSafeInteger(raw.pos?.z)) {
+      throw ledgerInvalid('ledger placed position must be integer grid coordinates');
+    }
+    const key = placedBlockKey(wId, dim, raw.pos.x, raw.pos.y, raw.pos.z);
+    if (raw.key !== key) throw ledgerInvalid(`ledger placed key "${String(raw.key)}" does not match its coordinates`);
+    if (placedKeys.has(key)) throw ledgerInvalid(`duplicate ledger placed key "${key}"`);
+    placedKeys.add(key);
+    requireLedgerString(raw.name, 'placed name');
+    if (!Number.isSafeInteger(raw.lruAt) || raw.lruAt < 0) throw ledgerInvalid('ledger placed lruAt must be non-negative');
+    if (raw.source !== 'legacy' && raw.source !== 'live') throw ledgerInvalid('ledger placed source is not known');
+    placed.push({ ...raw, key, worldId: wId, dim, pos: { x: raw.pos.x, y: raw.pos.y, z: raw.pos.z } });
+  }
+
+  const visits: ChunkVisitRecord[] = [];
+  const visitKeys = new Set<string>();
+  for (const raw of snapshot.visits) {
+    if (raw === null || typeof raw !== 'object') throw ledgerInvalid('ledger visit record must be an object');
+    if (raw.worldId !== wId) throw ledgerInvalid('ledger visit record belongs to another world');
+    const dim = requireLedgerString(raw.dim, 'visit dim');
+    if (!Number.isSafeInteger(raw.cx) || !Number.isSafeInteger(raw.cz)) {
+      throw ledgerInvalid('ledger visit chunk coordinates must be integers');
+    }
+    if (!Number.isSafeInteger(raw.count) || raw.count < 0) throw ledgerInvalid('ledger visit count must be non-negative');
+    const key = chunkVisitKey(wId, dim, raw.cx, raw.cz);
+    if (raw.key !== key) throw ledgerInvalid(`ledger visit key "${String(raw.key)}" does not match its coordinates`);
+    if (visitKeys.has(key)) throw ledgerInvalid(`duplicate ledger visit key "${key}"`);
+    visitKeys.add(key);
+    if (raw.source !== 'legacy' && raw.source !== 'live') throw ledgerInvalid('ledger visit source is not known');
+    visits.push({ ...raw, key, worldId: wId, dim });
+  }
+
+  const traversals: PreparedTraversal[] = [];
+  const traversalIds = new Set<string>();
+  for (const raw of snapshot.traversals) {
+    if (raw === null || typeof raw !== 'object') throw ledgerInvalid('ledger traversal record must be an object');
+    if (raw.worldId !== wId) throw ledgerInvalid('ledger traversal record belongs to another world');
+    requireLedgerString(raw.fromId, 'traversal fromId');
+    requireLedgerString(raw.toId, 'traversal toId');
+    if (!Number.isFinite(raw.ts)) throw ledgerInvalid('ledger traversal ts must be finite');
+    requireLedgerString(raw.fromSession, 'traversal fromSession');
+    requireLedgerString(raw.toSession, 'traversal toSession');
+    if (!Number.isSafeInteger(raw.fromObservation) || !Number.isSafeInteger(raw.toObservation)) {
+      throw ledgerInvalid('ledger traversal observation ids must be integers');
+    }
+    if (!PORTAL_TRAVERSAL_KINDS.has(raw.kind)) throw ledgerInvalid('ledger traversal kind is not known');
+    if (!PORTAL_DIRECTIONS.has(raw.direction)) throw ledgerInvalid('ledger traversal direction is not known');
+    if (raw.source !== 'legacy' && raw.source !== 'live') throw ledgerInvalid('ledger traversal source is not known');
+    const fromEndpointJson = validateLedgerEndpoint(raw.fromEndpoint, 'traversal fromEndpoint', wId, resolved.maxEndpointBytes);
+    const toEndpointJson = validateLedgerEndpoint(raw.toEndpoint, 'traversal toEndpoint', wId, resolved.maxEndpointBytes);
+    if (raw.fromEndpoint !== null && raw.fromEndpoint.id !== raw.fromId) {
+      throw ledgerInvalid('ledger traversal fromEndpoint.id does not match fromId');
+    }
+    if (raw.toEndpoint !== null && raw.toEndpoint.id !== raw.toId) {
+      throw ledgerInvalid('ledger traversal toEndpoint.id does not match toId');
+    }
+    const id = portalTraversalIdentity({ ...raw, kind: raw.kind });
+    if (raw.id !== id) throw ledgerInvalid(`ledger traversal id "${String(raw.id)}" does not match its evidence`);
+    if (traversalIds.has(id)) throw ledgerInvalid(`duplicate ledger traversal id "${id}"`);
+    traversalIds.add(id);
+    traversals.push({ ...raw, id, worldId: wId, fromEndpointJson, toEndpointJson });
+  }
+
+  return { placed, visits, traversals, bytes };
+}
+
+/** Replace this world's ledger rows inside the checkpoint transaction. */
+function writeLedger(connection: Database.Database, wId: string, prepared: PreparedLedger): void {
+  connection.prepare('DELETE FROM placed_blocks WHERE world_id = ?').run(wId);
+  connection.prepare('DELETE FROM chunk_visits WHERE world_id = ?').run(wId);
+  connection.prepare('DELETE FROM portal_traversals WHERE world_id = ?').run(wId);
+
+  const insertPlaced = connection.prepare(
+    'INSERT INTO placed_blocks (key, world_id, dim, x, y, z, name, lru_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const record of prepared.placed) {
+    insertPlaced.run(
+      record.key,
+      wId,
+      record.dim,
+      record.pos.x,
+      record.pos.y,
+      record.pos.z,
+      record.name,
+      record.lruAt,
+      record.source,
+    );
+  }
+
+  const insertVisit = connection.prepare(
+    'INSERT INTO chunk_visits (key, world_id, dim, cx, cz, count, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const record of prepared.visits) {
+    insertVisit.run(record.key, wId, record.dim, record.cx, record.cz, record.count, record.source);
+  }
+
+  const insertTraversal = connection.prepare(
+    'INSERT INTO portal_traversals (id, world_id, kind, direction, from_id, to_id, ts, from_session, to_session, from_observation, to_observation, from_endpoint, to_endpoint, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const record of prepared.traversals) {
+    insertTraversal.run(
+      record.id,
+      wId,
+      record.kind,
+      record.direction,
+      record.fromId,
+      record.toId,
+      record.ts,
+      record.fromSession,
+      record.toSession,
+      record.fromObservation,
+      record.toObservation,
+      record.fromEndpointJson,
+      record.toEndpointJson,
+      record.source,
+    );
+  }
+}
+
+function parseStoredEndpoint(raw: string | null, what: string): PortalEndpointEvidence | null {
+  if (raw === null) return null;
+  const parsed = JSON.parse(raw) as unknown;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw ledgerInvalid(`corrupt ${what} payload`);
+  }
+  return parsed as PortalEndpointEvidence;
+}
+
+/**
+ * Read this world's committed ledger. Payloads are bounded by count before decode;
+ * a world with ledger rows but no ledger baseline is corruption, never an empty
+ * ledger (a later full checkpoint would otherwise erase real rows).
+ */
+function loadLedger(
+  connection: Database.Database,
+  wId: string,
+  resolved: ResolvedLedgerLimits,
+): { baselineCheckpointId: string | null; snapshot: LedgerSnapshot | null; bytes: number } {
+  const cp = connection
+    .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_ledger = 1 ORDER BY seq DESC LIMIT 1')
+    .get(wId) as { checkpoint_id: string } | undefined;
+
+  const placedRows = countRows(connection, 'placed_blocks', wId);
+  const visitRows = countRows(connection, 'chunk_visits', wId);
+  const traversalRows = countRows(connection, 'portal_traversals', wId);
+  if (cp === undefined) {
+    if (placedRows + visitRows + traversalRows > 0) {
+      throw new Error('world has ledger rows but no ledger checkpoint metadata');
+    }
+    return { baselineCheckpointId: null, snapshot: null, bytes: 0 };
+  }
+  if (placedRows > resolved.maxPlacedBlocks) throw new Error(`ledger exceeds maxPlacedBlocks (${placedRows})`);
+  if (visitRows > resolved.maxChunkVisits) throw new Error(`ledger exceeds maxChunkVisits (${visitRows})`);
+  if (traversalRows > resolved.maxPortalTraversals) {
+    throw new Error(`ledger exceeds maxPortalTraversals (${traversalRows})`);
+  }
+
+  const placed = (connection
+    .prepare('SELECT key, world_id, dim, x, y, z, name, lru_at, source FROM placed_blocks WHERE world_id = ? ORDER BY lru_at, key')
+    .all(wId) as {
+      key: string;
+      world_id: string;
+      dim: string;
+      x: number;
+      y: number;
+      z: number;
+      name: string;
+      lru_at: number;
+      source: 'legacy' | 'live';
+    }[]).map((row) => ({
+      key: row.key,
+      worldId: row.world_id,
+      dim: row.dim,
+      pos: { x: row.x, y: row.y, z: row.z },
+      name: row.name,
+      lruAt: row.lru_at,
+      source: row.source,
+    }));
+
+  const visits = (connection
+    .prepare('SELECT key, world_id, dim, cx, cz, count, source FROM chunk_visits WHERE world_id = ? ORDER BY key')
+    .all(wId) as {
+      key: string;
+      world_id: string;
+      dim: string;
+      cx: number;
+      cz: number;
+      count: number;
+      source: 'legacy' | 'live';
+    }[]).map((row) => ({
+      key: row.key,
+      worldId: row.world_id,
+      dim: row.dim,
+      cx: row.cx,
+      cz: row.cz,
+      count: row.count,
+      source: row.source,
+    }));
+
+  const traversals = (connection
+    .prepare(
+      'SELECT id, world_id, kind, direction, from_id, to_id, ts, from_session, to_session, from_observation, to_observation, from_endpoint, to_endpoint, source FROM portal_traversals WHERE world_id = ? ORDER BY ts, id',
+    )
+    .all(wId) as {
+      id: string;
+      world_id: string;
+      kind: PortalTraversalRecord['kind'];
+      direction: PortalTraversalRecord['direction'];
+      from_id: string;
+      to_id: string;
+      ts: number;
+      from_session: string;
+      to_session: string;
+      from_observation: number;
+      to_observation: number;
+      from_endpoint: string | null;
+      to_endpoint: string | null;
+      source: 'legacy' | 'live';
+    }[]).map((row) => ({
+      id: row.id,
+      worldId: row.world_id,
+      kind: row.kind,
+      direction: row.direction,
+      fromId: row.from_id,
+      toId: row.to_id,
+      ts: row.ts,
+      fromSession: row.from_session,
+      toSession: row.to_session,
+      fromObservation: row.from_observation,
+      toObservation: row.to_observation,
+      fromEndpoint: parseStoredEndpoint(row.from_endpoint, 'traversal fromEndpoint'),
+      toEndpoint: parseStoredEndpoint(row.to_endpoint, 'traversal toEndpoint'),
+      source: row.source,
+    }));
+
+  const snapshot: LedgerSnapshot = { worldId: wId, placed, visits, traversals };
+  // Re-validate everything read from disk through the same boundary as a write.
+  const prepared = prepareLedger(snapshot, wId, resolved);
+  return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes: prepared.bytes };
+}
+
 function computeDerivedCounts(snapshot: HistorySnapshot): {
   polylinePoints: number;
   entrancePoints: number;
@@ -1025,7 +1667,9 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
               OR typeof(has_voxel) != 'integer' OR (has_voxel != 0 AND has_voxel != 1)
               OR typeof(voxel_revision) != 'integer' OR voxel_revision < 0
               OR typeof(has_journal) != 'integer' OR (has_journal != 0 AND has_journal != 1)
-              OR typeof(journal_revision) != 'integer' OR journal_revision < 0)`,
+              OR typeof(journal_revision) != 'integer' OR journal_revision < 0
+              OR typeof(has_ledger) != 'integer' OR (has_ledger != 0 AND has_ledger != 1)
+              OR typeof(ledger_revision) != 'integer' OR ledger_revision < 0)`,
     )
     .get(wId) as { n: number };
   if (bad.n > 0) {
@@ -1080,7 +1724,36 @@ function loadWorld(
   return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes };
 }
 
-/** Decode one voxel section payload, validating structure during decode. */
+/**
+ * Parse the canonical palette string back into a block state. Property values are
+ * emitted verbatim by `serializeBlockState`, so the inverse only splits on the
+ * delimiters that serialization itself introduces.
+ */
+function parseSerializedBlockState(serialized: string): BlockState {
+  const open = serialized.indexOf('[');
+  if (open < 0) return { name: serialized, properties: {} };
+  if (!serialized.endsWith(']')) throw new Error('corrupt voxel palette state');
+  const name = serialized.slice(0, open);
+  if (name.length === 0) throw new Error('corrupt voxel palette state name');
+  const body = serialized.slice(open + 1, -1);
+  const properties: Record<string, string> = {};
+  if (body.length > 0) {
+    for (const pair of body.split(',')) {
+      const eq = pair.indexOf('=');
+      if (eq <= 0) throw new Error('corrupt voxel palette state property');
+      properties[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+  }
+  return { name, properties };
+}
+
+/**
+ * Decode one voxel section payload, validating structure during decode.
+ *
+ * v1 payloads carry the full observation (including `state`) inline. v2 payloads
+ * omit that duplicate state and recover it from the palette index recorded in the
+ * packed cells. Both forms decode to the same `VoxelSectionSnapshot`.
+ */
 function decodeVoxelSection(payload: string): VoxelSectionSnapshot {
   const raw = JSON.parse(payload) as {
     v?: unknown;
@@ -1094,9 +1767,10 @@ function decodeVoxelSection(payload: string): VoxelSectionSnapshot {
     evidence?: unknown;
     revision?: unknown;
   };
-  if (raw === null || typeof raw !== 'object' || raw.v !== 1) {
+  if (raw === null || typeof raw !== 'object' || (raw.v !== 1 && raw.v !== 2)) {
     throw new Error('corrupt voxel section payload');
   }
+  const version = raw.v;
   if (typeof raw.dim !== 'string' || raw.dim.length === 0) {
     throw new Error('corrupt voxel section dim');
   }
@@ -1116,20 +1790,48 @@ function decodeVoxelSection(payload: string): VoxelSectionSnapshot {
     throw new Error('corrupt voxel section evidence');
   }
   const cells = new Uint8Array(Buffer.from(raw.cells, 'base64'));
+  const palette = raw.palette as string[];
+  const bits = raw.bits as number;
   const evidence = raw.evidence.map((cell) => {
     const c = cell as { i?: unknown; e?: unknown };
     if (!Number.isInteger(c.i) || c.e === undefined) {
       throw new Error('corrupt voxel section evidence record');
     }
-    return { index: c.i as number, evidence: c.e as VoxelSectionSnapshot['evidence'][number]['evidence'] };
+    const index = c.i as number;
+    const stored = c.e as VoxelSectionSnapshot['evidence'][number]['evidence'];
+    if (version === 1) {
+      return { index, evidence: stored };
+    }
+    if (stored === null || typeof stored !== 'object') {
+      throw new Error('corrupt voxel section evidence record');
+    }
+    const observation = (stored as { observation?: unknown }).observation;
+    if (observation === null || typeof observation !== 'object') {
+      throw new Error('corrupt voxel section evidence observation');
+    }
+    // v2: the observation's `state` was omitted as a duplicate of the palette
+    // entry at this cell's packed index. Reconstruct it from the authoritative
+    // palette/cells pair; never trust a second inline copy.
+    if ((observation as { state?: unknown }).state === undefined) {
+      if (index < 0 || index >= SECTION_CELL_COUNT) {
+        throw new Error('corrupt voxel section evidence index');
+      }
+      const paletteIndex = readCell(cells, bits, index);
+      const serialized = palette[paletteIndex];
+      if (typeof serialized !== 'string') {
+        throw new Error('corrupt voxel section palette index');
+      }
+      (observation as { state?: BlockState }).state = parseSerializedBlockState(serialized);
+    }
+    return { index, evidence: stored };
   });
   return {
     dim: raw.dim,
     cx: raw.cx as number,
     cz: raw.cz as number,
     sy: raw.sy as number,
-    palette: raw.palette as string[],
-    bits: raw.bits as number,
+    palette,
+    bits,
     cells,
     evidence,
     revision: raw.revision as number,
@@ -1228,15 +1930,26 @@ function loadVoxelDirectory(
 
   const rows = connection
     .prepare(
-      'SELECT id, seq, octet_length(payload) AS bytes, observed_cells, palette_entries, revision FROM spatial_sections WHERE world_id = ? ORDER BY seq',
+      'SELECT id, seq, octet_length(payload) AS bytes, observed_cells, palette_entries, revision, dimension, cx, cz, sy FROM spatial_sections WHERE world_id = ? ORDER BY seq',
     )
-    .all(wId) as { id: string; seq: number; bytes: number; observed_cells: number; palette_entries: number; revision: number }[];
+    .all(wId) as {
+      id: string;
+      seq: number;
+      bytes: number;
+      observed_cells: number;
+      palette_entries: number;
+      revision: number;
+      dimension: string;
+      cx: number;
+      cz: number;
+      sy: number;
+    }[];
 
   const directory: VoxelDirectoryEntry[] = [];
   let observedCells = 0;
   let paletteEntries = 0;
   for (const row of rows) {
-    const [dim, cx, cz, sy] = parseSectionId(row.id);
+    const [dim, cx, cz, sy] = sectionIdentity(row);
     observedCells += row.observed_cells;
     paletteEntries += row.palette_entries;
     directory.push({
@@ -1313,18 +2026,41 @@ function parseSectionId(id: string): [string, number, number, number] {
   return [arr[0], arr[1] as number, arr[2] as number, arr[3] as number];
 }
 
+/**
+ * Resolve one section's identity from its explicit columns and verify it against
+ * the legacy `id` JSON. A mismatch is corruption, never a silent preference for
+ * one copy: mixing a column-sourced dimension with a payload from another cell
+ * would otherwise smuggle facts across sections/dimensions.
+ */
+function sectionIdentity(row: {
+  id: string;
+  dimension: string;
+  cx: number;
+  cz: number;
+  sy: number;
+}): [string, number, number, number] {
+  const [dim, cx, cz, sy] = parseSectionId(row.id);
+  if (dim !== row.dimension || cx !== row.cx || cz !== row.cz || sy !== row.sy) {
+    throw new Error('corrupt section identity: explicit coordinates disagree with id');
+  }
+  return [dim, cx, cz, sy];
+}
+
 function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   const connection = openDatabase(msg.databasePath);
   db = connection;
   worldId = msg.worldId;
   limits = msg.limits;
   journalLimits = msg.journalLimits;
+  ledgerLimits = msg.ledgerLimits ?? DEFAULT_LEDGER_LIMITS;
   try {
     const world = loadWorld(connection, msg.worldId, msg.limits);
     const journal = loadJournalMeta(connection, msg.worldId, msg.journalLimits);
     let voxelBaselineCheckpointId: string | null = null;
     let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
     let voxelDirectory: VoxelDirectoryEntry[] | null = null;
+    let ledgerBaselineCheckpointId: string | null = null;
+    let ledgerSnapshot: LedgerSnapshot | null = null;
     if (msg.kind === 'spatial') {
       // Hand the voxel loader the budget left after history, so the shared combined
       // budget is checked against `octet_length` *before* any voxel payload is read
@@ -1338,6 +2074,9 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
         voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
         voxelSnapshot = voxel.voxelSnapshot;
       }
+      const ledger = loadLedger(connection, msg.worldId, ledgerLimits);
+      ledgerBaselineCheckpointId = ledger.baselineCheckpointId;
+      ledgerSnapshot = ledger.snapshot;
     }
     respond({
       type: 'open_ok',
@@ -1351,12 +2090,15 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       journalRevision: journal.revision,
       journalRecordCount: journal.recordCount,
       journalRecordBytes: journal.recordBytes,
+      ledgerBaselineCheckpointId,
+      ledgerSnapshot,
     });
   } catch (err) {
     db = null;
     worldId = null;
     limits = null;
     journalLimits = null;
+    ledgerLimits = DEFAULT_LEDGER_LIMITS;
     connection.close();
     const message = (err as Error).message;
     const kind = /exceeds/.test(message) ? 'capacity' : 'data';
@@ -1389,9 +2131,28 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'journal mode none must not carry records' });
     return;
   }
+  const ledgerMode = msg.ledgerMode ?? 'none';
+  if (ledgerMode !== 'none' && ledgerMode !== 'full') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid ledger save mode' });
+    return;
+  }
+  const ledgerRevision = msg.ledgerRevision ?? 0;
+  if (!Number.isSafeInteger(ledgerRevision) || ledgerRevision < 0) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger revision must be a non-negative safe integer' });
+    return;
+  }
+  if (ledgerMode === 'none' && msg.ledgerSnapshot !== undefined) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode none must not carry a snapshot' });
+    return;
+  }
+  if (ledgerMode === 'full' && msg.ledgerSnapshot === undefined) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode full requires a snapshot' });
+    return;
+  }
   let prepared: PreparedSnapshot;
   let preparedVoxel: PreparedVoxelSnapshot | null = null;
   let preparedJournal: PreparedJournal;
+  let preparedLedger: PreparedLedger | null = null;
   try {
     prepared = prepareSnapshot(msg.snapshot);
     assertWithinLimits(prepared, limits);
@@ -1412,6 +2173,9 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       msg.journalMode === 'none'
         ? { actions: [], events: [], bytes: 0 }
         : prepareJournalBatch(msg.journalBatch, worldId, journalLimits);
+    if (ledgerMode === 'full') {
+      preparedLedger = prepareLedger(msg.ledgerSnapshot!, worldId, ledgerLimits);
+    }
   } catch (err) {
     respond({
       type: 'error',
@@ -1430,6 +2194,10 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       mode: msg.journalMode,
       revision: msg.journalRevision,
       prepared: preparedJournal,
+    }, {
+      mode: ledgerMode,
+      revision: ledgerRevision,
+      prepared: preparedLedger,
     }, limits, journalLimits);
   } catch (err) {
     // Capacity/conflict rejections raised inside the transaction roll the whole

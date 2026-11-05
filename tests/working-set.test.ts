@@ -1111,8 +1111,10 @@ describe('v2 → latest migration (real SQLite)', () => {
     makeV2Db(dbPath, payloads);
 
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    expect(schemaVersion(dbPath)).toBe('4');
-    expect(spatialColumns(dbPath)).toEqual(expect.arrayContaining(['observed_cells', 'palette_entries', 'revision']));
+    expect(schemaVersion(dbPath)).toBe('5');
+    expect(spatialColumns(dbPath)).toEqual(
+      expect.arrayContaining(['observed_cells', 'palette_entries', 'revision', 'dimension', 'cx', 'cz', 'sy']),
+    );
 
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare('SELECT observed_cells, palette_entries, revision FROM spatial_sections WHERE world_id = ? AND id = ?').get(WORLD, sectionId(DIM, 129, 0, 4)) as { observed_cells: number; palette_entries: number; revision: number };

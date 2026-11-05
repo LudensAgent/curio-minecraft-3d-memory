@@ -2,9 +2,10 @@
  * SQLite schema contract (design §9).
  *
  * Table names and their responsibilities are declared here as the stable
- * persistence surface. Actual DDL / migrations land in phase 5 alongside the
- * single persistence worker; the driver is `better-sqlite3` (§9.2), not wired
- * into this scaffold so the public entry stays native-free.
+ * persistence surface. The concrete DDL, forward migrations and the ledger
+ * codecs live in `sqlite/worker.ts` (schema v5) behind the single persistence
+ * worker; the driver is `better-sqlite3` (§9.2), so the root public entry stays
+ * native-free.
  */
 
 export const TABLE_NAMES = {

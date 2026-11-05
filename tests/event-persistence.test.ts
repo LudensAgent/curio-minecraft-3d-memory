@@ -1199,8 +1199,18 @@ function checkpointColumns(dbPath: string): string[] {
   return cols.map((c) => c.name);
 }
 
-/** Turn a v4 fixture into a true v3 shape (journal tables/columns removed). */
+/** Turn a current fixture into a true v3 shape (all later schema objects removed). */
 function downgradeToV3(db: Database.Database): void {
+  db.exec('DROP TABLE IF EXISTS placed_blocks');
+  db.exec('DROP TABLE IF EXISTS chunk_visits');
+  db.exec('DROP TABLE IF EXISTS portal_traversals');
+  db.exec('DROP INDEX IF EXISTS spatial_sections_world_coords');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN ledger_revision');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN has_ledger');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN dimension');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN cx');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN cz');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN sy');
   db.exec('DROP TABLE IF EXISTS action_records');
   db.exec('DROP TABLE IF EXISTS spatial_events');
   db.exec('ALTER TABLE checkpoints DROP COLUMN journal_revision');
@@ -1236,7 +1246,7 @@ describe('v3 → v4 journal migration', () => {
     expect(schemaVersion(dbPath)).toBe('3');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('4');
+    expect(schemaVersion(dbPath)).toBe('5');
     expect(checkpointColumns(dbPath)).toEqual(expect.arrayContaining(['journal_revision', 'has_journal']));
     expect(reopened.history.getFragment('f-v3')).not.toBeNull();
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });

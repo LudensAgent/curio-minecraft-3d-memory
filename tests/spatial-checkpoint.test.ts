@@ -117,12 +117,23 @@ function writeV1Schema(dbPath: string, options: { extraCheckpointColumn?: string
 }
 
 /**
- * Simulate a real v2 database from the current (v4) fixture: remove the v3
- * section-metadata columns plus the v4 journal tables/checkpoint columns, then
- * set the version back to 2. This keeps the migration test honest — it does not
- * leave later-schema objects behind for the v2 validation to accidentally accept.
+ * Simulate a real v2 database from the current fixture: remove every later
+ * schema object (v5 ledger tables/section columns, v4 journal objects, v3 section
+ * metadata), then set the version back to 2. This keeps the migration test honest
+ * — it does not leave later-schema objects behind for the v2 validation to
+ * accidentally accept.
  */
 function downgradeToV2(db: Database.Database): void {
+  db.exec('DROP TABLE IF EXISTS placed_blocks');
+  db.exec('DROP TABLE IF EXISTS chunk_visits');
+  db.exec('DROP TABLE IF EXISTS portal_traversals');
+  db.exec('DROP INDEX IF EXISTS spatial_sections_world_coords');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN ledger_revision');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN has_ledger');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN dimension');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN cx');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN cz');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN sy');
   db.exec('DROP TABLE IF EXISTS action_records');
   db.exec('DROP TABLE IF EXISTS spatial_events');
   db.exec('ALTER TABLE checkpoints DROP COLUMN journal_revision');
@@ -700,7 +711,7 @@ describe('v1 → latest schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('4');
+    expect(version).toBe('5');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();

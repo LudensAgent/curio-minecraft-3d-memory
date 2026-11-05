@@ -11,6 +11,7 @@
 
 import type { ActionRecord } from '../../navigation/types.js';
 import type { Observation, ObservationGap } from '../../observation/types.js';
+import type { LedgerStore } from './ledger.js';
 import type { FragmentStore, FragmentStoreOptions } from '../../topology/fragment-store.js';
 import type { TopologyStore, TopologyStoreOptions } from '../../topology/topology-store.js';
 import type {
@@ -221,9 +222,164 @@ export function resolveJournalLimits(options: JournalLimits | undefined): Resolv
 }
 
 /**
+ * Logical placement ledger (design §9, §9.1).
+ *
+ * `key` is the canonical `worldId:dim:x,y,z` for attributed records. Legacy
+ * placement data has only `x,y,z`, so records whose world/dimension cannot be
+ * proven are kept as unattributed history with a null scope and their original
+ * source key — they are never projected into a live world.
+ */
+export interface PlacedBlockRecord {
+  key: string;
+  /** Null only for unattributed legacy history; never guessed from a caller's world. */
+  worldId: string | null;
+  /** Null exactly when `worldId` is null. */
+  dim: string | null;
+  /** Integer grid position. */
+  pos: Vec3Like;
+  name: string;
+  /**
+   * Legacy LRU serial. It increases when a block is placed or looked up; it is
+   * **not** a placement time or an observation time and is never decayed.
+   */
+  lruAt: number;
+  source: 'legacy' | 'live';
+}
+
+/** One chunk visit counter. `key` is `worldId:dim:cx:cz`. */
+export interface ChunkVisitRecord {
+  key: string;
+  worldId: string;
+  dim: string;
+  cx: number;
+  cz: number;
+  count: number;
+  source: 'legacy' | 'live';
+}
+
+/**
+ * Raw orientation label of one portal crossing. Legacy travel files do not
+ * distinguish outbound and return crossings, so imported records stay
+ * `unclassified`; a return is proven by the reverse crossing, not relabeled.
+ */
+export type PortalTraversalDirection = 'outbound' | 'return' | 'unclassified';
+
+export type PortalTraversalKind = 'traversal' | 'gateway';
+
+/** Raw endpoint evidence as observed at the time of the crossing. */
+export interface PortalEndpointEvidence {
+  id: string;
+  worldId: string;
+  dim: string;
+  pos: Vec3Like;
+  kind: 'nether_portal' | 'end_portal' | 'end_gateway';
+  portalObserved: boolean;
+  observedAt: number;
+}
+
+/**
+ * One raw portal/gateway crossing. All identity, session, observation-id and time
+ * fields are preserved verbatim; `fromEndpoint`/`toEndpoint` keep the endpoint
+ * evidence that was present when the crossing was recorded. `returnVerified` is
+ * derived from a reverse crossing and is never stored as current truth.
+ */
+export interface PortalTraversalRecord {
+  /** Deterministic canonical id derived from the raw crossing fields. */
+  id: string;
+  /** Proven endpoint world, or null when the legacy evidence does not locate one. */
+  worldId: string | null;
+  kind: PortalTraversalKind;
+  direction: PortalTraversalDirection;
+  fromId: string;
+  toId: string;
+  ts: number;
+  fromSession: string;
+  toSession: string;
+  fromObservation: number;
+  toObservation: number;
+  fromEndpoint: PortalEndpointEvidence | null;
+  toEndpoint: PortalEndpointEvidence | null;
+  source: 'legacy' | 'live';
+}
+
+/** Full placement/visit/portal ledger for one world, as captured by a checkpoint. */
+export interface LedgerSnapshot {
+  worldId: string;
+  /** Ascending `lruAt` (oldest first); `lruAt` values are preserved verbatim. */
+  placed: PlacedBlockRecord[];
+  /** Deterministic key order. */
+  visits: ChunkVisitRecord[];
+  /** Ascending `ts`, then canonical id. */
+  traversals: PortalTraversalRecord[];
+}
+
+/**
+ * Storage capacities for the ledger batch. These are implementation limits, not
+ * game rules, and are enforced before a checkpoint is sent and again inside the
+ * worker transaction.
+ */
+export interface LedgerLimits {
+  /** Maximum placed records for one world. Default 50000. */
+  maxPlacedBlocks?: number;
+  /** Maximum chunk visit records for one world. Default 200000. */
+  maxChunkVisits?: number;
+  /** Maximum portal traversal records for one world. Default 5000. */
+  maxPortalTraversals?: number;
+  /** Maximum canonical JSON bytes of one endpoint evidence payload. Default 64 KiB. */
+  maxEndpointBytes?: number;
+  /** Maximum canonical JSON bytes of the whole ledger snapshot. Default 8 MiB. */
+  maxBytes?: number;
+}
+
+/** `LedgerLimits` with every default resolved. */
+export interface ResolvedLedgerLimits {
+  maxPlacedBlocks: number;
+  maxChunkVisits: number;
+  maxPortalTraversals: number;
+  maxEndpointBytes: number;
+  maxBytes: number;
+}
+
+export const DEFAULT_LEDGER_LIMITS: ResolvedLedgerLimits = {
+  maxPlacedBlocks: 50_000,
+  maxChunkVisits: 200_000,
+  maxPortalTraversals: 5_000,
+  maxEndpointBytes: 64 * 1024,
+  maxBytes: 8 * 1024 * 1024,
+};
+
+/** Resolve optional ledger limits with every default filled and validated. */
+export function resolveLedgerLimits(options: LedgerLimits | undefined): ResolvedLedgerLimits {
+  const limits: ResolvedLedgerLimits = { ...DEFAULT_LEDGER_LIMITS };
+  if (options === undefined) return limits;
+  const keys = ['maxPlacedBlocks', 'maxChunkVisits', 'maxPortalTraversals', 'maxEndpointBytes', 'maxBytes'] as const;
+  for (const key of keys) {
+    const value = options[key];
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new PersistenceError('invalid_argument', `${key} must be a positive safe integer: ${String(value)}`);
+    }
+    limits[key] = value;
+  }
+  if (limits.maxEndpointBytes > limits.maxBytes) {
+    throw new PersistenceError(
+      'invalid_argument',
+      `maxEndpointBytes (${limits.maxEndpointBytes}) must not exceed maxBytes (${limits.maxBytes})`,
+    );
+  }
+  return limits;
+}
+
+/**
  * The explicit event vocabulary accepted by the journal. This is deliberately a
  * closed union rather than an arbitrary JSON blob: every variant names the
  * original evidence and scope it rests on.
+ *
+ * `cell_blocked` / `cell_cleared` / `cell_revalidated` classify an important
+ * traversability change for one cell. Their `evidence` is the observation that
+ * established the classification; it must belong to the event's own session and
+ * carry its exact acquisition time. The classification itself is the caller's
+ * statement about traversability, not an inferred game rule.
  */
 export type SpatialEvent =
   | {
@@ -243,6 +399,27 @@ export type SpatialEvent =
       previous?: Observation;
       /** The actual new observation that established this change. Required. */
       current: Observation;
+      /** Only a confirmed own-action attribution; never inferred from time proximity. */
+      actionId?: string;
+    }
+  | {
+      /** Important traversability reclassification for one cell (design §9). */
+      kind: 'cell_blocked' | 'cell_cleared' | 'cell_revalidated';
+      /** Caller-supplied stable id, unique within (worldId, sessionId). */
+      id: string;
+      /** Real time the evidence was acquired, preserved verbatim. */
+      observedAt: number;
+      worldId: string;
+      dim: string;
+      sessionId: string;
+      pos: Vec3Like;
+      /** The actual observation that established this classification. Required. */
+      evidence: Observation;
+      /**
+       * The previous observation when one was retained. Absence means the prior
+       * cell state is unknown — never that it was air.
+       */
+      previous?: Observation;
       /** Only a confirmed own-action attribution; never inferred from time proximity. */
       actionId?: string;
     }
@@ -508,6 +685,8 @@ export interface OpenSpatialSessionOptions {
   snapshotLimits?: SnapshotLimits;
   /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
   journalLimits?: JournalLimits;
+  /** Bounded placement/visit/portal ledger capacities. Defaults are in `DEFAULT_LEDGER_LIMITS`. */
+  ledgerLimits?: LedgerLimits;
   /**
    * Voxel loading mode. `eager` (default) restores every committed section into
    * memory at open, preserving the phase 5B/5C behavior. `manual` reads only the
@@ -541,6 +720,8 @@ export interface SpatialCheckpointResult {
    * captured prefix, never the latest local queue revision.
    */
   journalRevision: number;
+  /** Ledger revision captured and committed with this checkpoint. */
+  ledgerRevision: number;
 }
 
 /**
@@ -568,6 +749,12 @@ export interface SpatialPersistenceState {
   confirmedJournalRevision: number;
   /** Journal restore baseline checkpoint id (null when no journal baseline exists). */
   journalBaselineCheckpointId: string | null;
+  /** Local placement/visit/portal ledger revision (not a save confirmation). */
+  ledgerRevision: number;
+  /** Ledger revision confirmed by the last committed checkpoint. */
+  confirmedLedgerRevision: number;
+  /** Ledger restore baseline checkpoint id (null when no ledger baseline exists). */
+  ledgerBaselineCheckpointId: string | null;
   /**
    * Accepted but not yet ACK-confirmed journal records (a timed-out checkpoint may
    * already have committed).
@@ -593,6 +780,8 @@ export interface SpatialSession {
   readonly voxel: VoxelMap;
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
+  /** World-scoped placement, chunk-visit and portal-crossing ledger. */
+  readonly ledger: LedgerStore;
   /** How voxel sections are loaded at open (`eager` or `manual`). */
   readonly voxelLoading: VoxelLoading;
   /** The resolved working-set bounds used by the manual residency mode. */
@@ -693,6 +882,8 @@ export type WorkerRequest =
       kind: WorkerSessionKind;
       /** How a combined spatial session loads voxel sections at open. */
       voxelLoading: VoxelLoading;
+      /** Bounded ledger capacities (spatial sessions only). */
+      ledgerLimits?: ResolvedLedgerLimits;
     }
   | {
       type: 'checkpoint';
@@ -713,6 +904,16 @@ export type WorkerRequest =
       journalRevision: number;
       /** Captured pending records, in acceptance order (may be empty). */
       journalBatch: { actions: ActionRecord[]; events: SpatialEvent[] };
+      /**
+       * Ledger persistence mode. `none` (default for history-only checkpoints)
+       * never touches ledger rows; `full` replaces this world's ledger rows in the
+       * same transaction.
+       */
+      ledgerMode?: 'none' | 'full';
+      /** Captured ledger revision. */
+      ledgerRevision?: number;
+      /** Complete world-scoped ledger snapshot for `full`. */
+      ledgerSnapshot?: LedgerSnapshot;
     }
   | {
       type: 'load_sections';
@@ -764,6 +965,10 @@ export type WorkerResponse =
       journalRevision: number;
       journalRecordCount: number;
       journalRecordBytes: number;
+      /** Ledger restore baseline (spatial sessions; null when never saved). */
+      ledgerBaselineCheckpointId: string | null;
+      /** Restored world-scoped ledger (spatial sessions only). */
+      ledgerSnapshot: LedgerSnapshot | null;
     }
   | {
       type: 'load_ok';
