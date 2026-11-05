@@ -1,312 +1,122 @@
 # Spatial Memory Library
 
-Spatial facts, historical geometry, traversability verification, and composable navigation helpers for a Minecraft Java 1.20.1 agent — scoped to **land walking** and **surface-water movement** (jumping, steps, ladders, drop transitions, surface swimming, boating, and shore in/out).
+<p>
+  <img src="https://img.shields.io/badge/version-0.9.0-blue.svg" alt="Version 0.9.0">
+  <img src="https://img.shields.io/badge/node-%3E%3D18-339933.svg" alt="Node 18+">
+  <img src="https://img.shields.io/badge/minecraft-1.20.1-62B47A.svg" alt="Minecraft 1.20.1">
+  <img src="https://img.shields.io/badge/typescript-5.x-3178C6.svg" alt="TypeScript 5.x">
+  <img src="https://img.shields.io/badge/sqlite-optional-003B57.svg" alt="Optional SQLite">
+  <img src="https://img.shields.io/badge/license-UNLICENSED-lightgrey.svg" alt="Private license">
+</p>
 
-> 中文说明见 [README_ZH.md](README_ZH.md).
+English | [简体中文](README_ZH.md)
 
-## Overview
+A standalone TypeScript library for Minecraft Java 1.20.1 agents. It records what was last observed at a position, how that position was traversed before, whether current evidence supports passage, and which part of a route needs re-verification. Goals, strategy, resource spend and risk trade-offs remain the agent's decision.
 
-- **Facts and execution assistance only.** Answers *what was last observed here, how it was traversed before, whether current evidence supports passage, and which segment needs re-verification*. Goals, strategy, resource spend, and risk trade-offs remain the agent's decision.
-- **Three-layer data separation.** Historical geometry (never deleted on blockage), recent observation state (versioned, evidence-backed), derived traversability (invalidation-friendly cache).
-- **No host coupling.** Consumes mineflayer/Curio perception and execution through a `WorldAdapter` abstraction; never imports host source.
+The scope is **land walking and surface-water movement** — jumps, steps, ladders, drop transitions, surface swimming, riding a boat, and shore entry/exit. Flight, elytra and underwater 3D navigation are out of scope.
 
-See [`docs/spatial-memory-library-design.md`](docs/spatial-memory-library-design.md) and [`AGENTS.md`](AGENTS.md) for the design rationale and development constraints. Interfaces in the design doc are **target contracts**; this repository lands behavior per design §10.
+**Status: 0.9.0.** The first-version walk navigation pipeline, runtime store composition, topology runtime state and SQLite persistence are implemented and covered by offline tests. Real Minecraft / mineflayer / Curio integration is not yet validated.
 
-### Implemented so far
+## Features
 
-- **Voxel map** (`voxel/`): sparse, versioned observation state with per-cell evidence, session/interruption handling and localized `ChangeReport`s.
-- **Traversability** (`traversability/`): read-only single-step walk evaluation, an invalidation-friendly cache, and bounded route verification over an ordered point list.
-- **Bounded land transition and route verification** (`traversability/`): `evaluateLandTransition` checks one caller-declared transition (`step`, `drop`, `jump`, `ladder`) between exact feet positions against current `VoxelMap` evidence, and `LandRouteVerifier` re-verifies an ordered transition list under per-call work budgets. Results carry `assurance: 'geometry_only'` and `executable: false`; `jump` requires an injected versioned `LandMotionModel`, `ladder` an injected versioned `ClimbRegionProvider`, and nothing here searches, snaps coordinates, moves the body, digs, places, or executes. See `docs/land-route-validation.md`.
-- **Water-surface and mounted-boat validation** (`water/`, `curio-minecraft-3d-memory/water` subpath): `evaluateWaterRoute` sweeps a caller-selected constant-height swimmer or boat route against an injected solid `CollisionShapeProvider` plus a separate versioned `FluidShapeProvider`, and `checkWaterArrival` separately confirms surface / dry-shore / dock goals from measured samples. Neither searches a route, executes a controller, mounts or dismounts a boat, builds or recovers one, or applies a rescue strategy. See `docs/water-validation.md`.
-- **Controlled walk-route execution** (`execution/`): `WalkRouteExecutor` connects a verified route to an injectable single-step `MoveExecutor` with measured body feedback. It only executes the caller's ordered points (same height, ±1 along X/Z), never starts a step without current OPEN evidence, requires a measured `exact` position for `ARRIVED`, and revokes an in-flight segment when its evidence changes.
-- **Navigation API status and read-only route projections** (`navigation/`): `NAVIGATION_CAPABILITIES` is the machine-readable design §7 status table. `inspectRoute` and `frontierCandidates` only project an existing `WalkSearchSnapshot`; they never move, observe, pin, save or start an action. `navigate_to` and `recall_route` are explicitly `not_implemented`, and `follow_known_path` is only the `startKnownWalkRoute` start boundary. See `docs/navigation-api-status.md`.
-- **Historical path store** (`topology/`, phase 4A): `FragmentStore` keeps historical path geometry (`PathFragment`) and confirmed traversal evidence (`TraversalEvidence`) strictly separated from current world state — with idempotent writes, explicit update, delete, paginated reads, capacity limits, and snapshot isolation.
-- **Topology facts store** (`topology/`, phase 4B): `TopologyStore` records explicit spatial nodes and directional connections (`candidate` vs evidence-backed `traversed`), keeps per-edge evidence references, and reports whether those references still resolve — never whether the path is currently passable.
-- **Bounded historical graph queries** (`topology/`, phase 4C): `TopologyStore` adds bounded, read-only `adjacency`, `reachable`, and `route` queries over the recorded topology — finite work budgets, mode filtering, lightweight history reads, and precise `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` results — still never a current-traversability or executable-route claim.
-- **Bounded historical anchor queries** (`topology/`, phase 4D): `TopologyStore.historicalAnchorCandidates` finds the recorded, evidence-resolved anchors reachable from a node (filtered by source/tag/kind, sorted by `bfs`/`highest`/`deepest`, limited), with shared proof segments — never a current-passability, target-selection, or executable-route claim.
-- **Explicit history checkpoint persistence** (`storage/`, phase 5A): `openHistorySession` from the `curio-minecraft-3d-memory/storage/sqlite` subpath persists the four historical facts (`PathFragment`, `TraversalEvidence`, `SpatialNode`, topology edges with their original binding snapshots) through a single SQLite worker. `checkpoint()` is the only explicit save trigger; `flush()`/`close()` never implicitly save new memory changes. See `docs/phase-5a-history-checkpoint-acceptance.md`.
-- **Explicit combined spatial checkpoint persistence** (`storage/`, phase 5B): `openSpatialSession` from the same subpath persists the recent-observation map (`VoxelMap`) together with the historical facts through one SQLite worker and one transaction. On startup the full observed state is restored and uniformly re-marked `STALE`; a new observation refreshes only the actually-observed cell. See `docs/phase-5b-spatial-checkpoint-acceptance.md`.
-- **Incremental voxel checkpoint** (`storage/`, phase 5C): once a voxel save baseline exists, `checkpoint()` copies, encodes and writes only the sections whose facts changed since the last confirmed save, instead of replacing the whole section set. The first save still establishes a full baseline; an empty increment never clears voxel data; the worker re-checks the post-increment full set so small increments cannot build an unreopenable database. See `docs/phase-5c-voxel-incremental-checkpoint-acceptance.md`.
-- **Manual on-demand section residency** (`storage/`, phase 5D1): `openSpatialSession({ voxelLoading: 'manual' })` reads only the committed section *directory* at open and requires explicit `loadSections` before a saved section can be observed. Safe `unloadSections`, bounded `pinSections`/`releasePins` leases, a `sectionResidency` query (`no_record` / `not_resident` / `loading` / `resident` / `load_failed`), and residency-driven local invalidation of the traversability cache and route verifier. Unloaded is never "never-observed", reloading never fabricates a fresh observation or a current `OPEN`, and a partial-resident incremental checkpoint never deletes unloaded records. See `docs/phase-5d1-section-residency-acceptance.md`.
-- **Bounded working-set management** (`storage/`, phase 5D2): `WorkingSetManager` composes a manual session into an explicit `prepare` → protect → evict-LRU-eligible → bounded-load loop that returns an accurate result and a protection lease. `free(target?)` evicts least-recently-used eligible sections to make room (or everything eligible), `stats()` reports the bounded working set, and every load/install/unload/pin still goes through the existing single-worker session. The manager never becomes a second authority over facts, dirty state, or save confirmation. See `docs/phase-5d2-working-set-acceptance.md`.
+- **Evidence-backed observation map** (`voxel/`, `observation/`): sparse, versioned Sections with per-cell evidence, freshness and session handling; a bounded `ObservationQueue`; and localized `ChangeReport`s that invalidate only dependent work.
+- **Historical geometry kept separate from current state** (`topology/`): `FragmentStore` stores path fragments and confirmed traversal evidence; `TopologyStore` stores explicit nodes and directional edges. Blockage elsewhere never deletes history, and history never proves current passability.
+- **Bounded historical queries**: `adjacency`, `reachable`, `route`, and `historicalAnchorCandidates` return recorded facts with finite work budgets — never a live `OPEN`, arrival claim, or executable point list.
+- **Runtime topology state** (`topology/`): directional edge verification, separate portal edges, anchor queries, transient occupancy, and evidence-backed fragment connectivity/merge records. Derived state is invalidated without deleting history.
+- **First-version walk navigation** (`navigation/`): `navigateTo` performs measured start → bounded search → re-verified execution → measured arrival. `followKnownPath` follows an explicit historical fragment; `inspectRoute`, `inspectKnownRoute` and `frontierCandidates` are read-only projections. `recall_route` is not implemented.
+- **Controlled route execution** (`execution/`): `WalkRouteExecutor` drives an injected single-step `MoveExecutor`, requires current `OPEN` evidence before each segment, accepts arrival only from a measured exact position, and revokes in-flight segments when their evidence changes.
+- **Land and water validation** (`traversability/`, `water/`): `evaluateLandTransition` / `LandRouteVerifier` check caller-declared land transitions and routes; `evaluateWaterRoute` / `checkWaterArrival` check surface swimming and mounted-boat geometry. Results carry `assurance: 'geometry_only'` and `executable: false`.
+- **Explicit SQLite persistence** (`storage/`, `curio-minecraft-3d-memory/storage/sqlite`): one worker owns the connection and transactions. `checkpoint()` is the only explicit save trigger; incremental voxel checkpoints, manual Section residency, `WorkingSetManager`, placement/visit/portal ledgers, an append-only journal and an offline legacy-migration dry-run are included.
+- **Host-independent integration surface**: `SpatialMemoryStoreImpl` composes the runtime stores with a scope guard; the library consumes perception and execution through narrow adapter types and never imports host source.
 
-The in-memory layers are validated **with a Fake executor** (see `tests/walk-route-executor.test.ts` and the runnable `examples/walk-route-execution.ts`); the checkpoint layer is validated against **real SQLite + a real worker** (see `tests/storage-checkpoint.test.ts`, `tests/spatial-checkpoint.test.ts`, `examples/history-checkpoint.ts`, and `examples/spatial-checkpoint.ts`). They do **not** yet wire a real mineflayer/Curio body or pathfinding.
+## Requirements
 
-## Historical path store
+- **Node.js `>= 18`** for the core and `water` entries.
+- **Node.js `>= 20` and `better-sqlite3@^12`** for the SQLite entry. `better-sqlite3` is an optional peer dependency and is only loaded by `curio-minecraft-3d-memory/storage/sqlite`.
+- **Minecraft Java 1.20.1 semantics** for collision shapes and fluid interpretation. The library does not depend on a Minecraft client or server at runtime; callers inject versioned providers.
+- An ESM / NodeNext TypeScript consumer. The package ships runtime JavaScript and `.d.ts` declarations from `dist/`.
 
-`FragmentStore` is the phase 4A in-memory layer for historical path facts. It is bound to one immutable `worldId`; every record carries its own `dim`, so records in different worlds or dimensions are never merged by coincidental coordinates.
+## Install and consume
 
-```ts
-import { FragmentStore } from 'curio-minecraft-3d-memory';
+Build the package and create an installable archive:
 
-const store = new FragmentStore('world');
-
-// Historical geometry — saving it never proves a traversal or that it is passable now.
-store.saveFragment({
-  id: 'frag-1', worldId: 'world', dim: 'overworld', kind: 'walked',
-  entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-  polyline: [{ x: 0.5, y: 64, z: 0.5 }, { x: 1.5, y: 64, z: 0.5 }],
-  geometrySource: 'traversal', deepestY: 12,
-  createdAt: 1000, lastUsedAt: 1000, uses: 1,
-});
-
-// Confirmed traversal evidence — explicit, directional (A→B ≠ B→A).
-store.addTraversal({
-  id: 'ev-1', fragmentId: 'frag-1',
-  from: { x: 0.5, y: 64, z: 0.5 }, to: { x: 1.5, y: 64, z: 0.5 },
-  worldId: 'world', dim: 'overworld', sessionId: 's1',
-  observedAt: 1000, source: 'confirmed_walk',
-});
-
-store.fragments({ dim: 'overworld' });   // paginated, id-ordered, read-only snapshots
-store.traversals({ fragmentId: 'frag-1' });
+```bash
+npm install --no-audit --no-fund
+npm run build
+npm pack
 ```
 
-Behavior:
+Consumers install the real `.tgz` into their own project and import by package name and public subpath — never a source path, `../dist`, `npm link`, or a development-machine directory alias:
 
-- **Writes.** `saveFragment` / `addTraversal` insert, or return `unchanged` on an idempotent re-delivery of identical content; the same id with different content is a conflict and throws. `updateFragment(id, changes)` is the explicit update path — it never resets `createdAt`/identity or `uses`/`lastUsedAt` unless the caller supplies them.
-- **Reads.** `getFragment`, `fragments`, and `traversals` return deep-copied snapshots and never mutate time, `uses`, or content. Pagination is by ascending `id` with an exclusive `after` cursor and a `limit` clamped to `maxQueryBatch`; `total` counts all matches.
-- **Delete.** `forgetFragment(id)` removes the fragment and its own traversal evidence, leaving other fragments untouched; deleting an unknown id is a stable no-op.
-- **Capacity.** `maxFragments`, `maxPolylinePoints`, `maxEntrances`, `maxLinks`, `maxTraversals`, and `maxQueryBatch` are configurable; exceeding them throws a clear error (no silent drop, no auto-eviction), and a failed write leaves prior state intact.
-
-History is strictly separated from current state: the store never touches `VoxelMap`, never produces a current `OPEN`, and blockage/staleness elsewhere never deletes recorded history. See [`docs/phase-4a-history-facts-acceptance.md`](docs/phase-4a-history-facts-acceptance.md).
-
-## Topology facts store
-
-`TopologyStore` (phase 4B) records the *explicit* topology the caller submits, and keeps it separate from both historical geometry and current traversability. It is bound to one immutable `worldId` and reads evidence through a narrow read-only interface satisfied directly by `FragmentStore`.
-
-```ts
-import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
-
-const history = new FragmentStore('world');
-const topology = new TopologyStore(history);
-
-// Nodes (existing SpatialNode shape).
-topology.saveNode({ id: 'a', kind: 'place', source: 'agent', worldId: 'world',
-  dim: 'overworld', location: { kind: 'exact', pos: { x: 0.5, y: 64, z: 0.5 } } });
-topology.saveNode({ id: 'b', kind: 'place', source: 'agent', worldId: 'world',
-  dim: 'overworld', location: { kind: 'exact', pos: { x: 1.5, y: 64, z: 0.5 } } });
-
-// A candidate edge: an explicit "to-verify" relation, not a traversed fact.
-topology.saveEdge({ id: 'e-ab', from: 'a', to: 'b', type: 'HORIZONTAL',
-  basis: 'candidate', source: 'manual', evidenceIds: [] });
-
-// A traversed edge: backed by a concrete A→B traversal record.
-topology.saveEdge({ id: 'e-ab2', from: 'a', to: 'b', type: 'HORIZONTAL',
-  basis: 'traversed', evidenceIds: ['ev-1'] });
-```
-
-Behavior:
-
-- **Directed.** A→B and B→A are independent records; saving A→B never generates B→A.
-- **Two bases.** `candidate` is a pending relation (no evidence); `traversed` requires matching `TraversalEvidence` whose `from`/`to` equal the edge endpoints exactly.
-- **Reference resolution.** Each traversed edge is re-resolved against the history on read: `resolved` / `missing` / `mismatch`. Deleting a source fragment leaves the edge record and reports `missing` — it is never translated into a current `BLOCKED`.
-- **Guards.** A node referenced by an edge cannot change `location` or be deleted; removing the edge first is required. Deleting an edge never deletes fragments or evidence.
-- **Capacity.** Separate `agent`/`program` node quotas plus edge/evidence-ref/query limits; overflow is an explicit error, never silent eviction.
-
-Only same-world, same-dimension, exact-endpoint, non-`PORTAL` connections are supported; region nodes can be stored and queried but not used as edge endpoints. See [`docs/phase-4b-topology-facts-acceptance.md`](docs/phase-4b-topology-facts-acceptance.md).
-
-## Bounded historical graph queries
-
-`TopologyStore` (phase 4C) answers three bounded, read-only, synchronous queries over the *recorded* history graph — never whether the world is currently passable or how to walk it:
-
-- **`adjacency(nodeId, options?)`** — the recorded in-edges and out-edges of a node, from the incident index in insertion order. The returned edges are plain `TopologyEdge` snapshots and are *not* reference-resolved here.
-- **`reachable(fromNodeId, options?)`** — the confirmed reachable node ids (including the start at depth 0), by walking only `traversed` out-edges whose evidence fully resolves and whose mode passes the filter.
-- **`route(fromNodeId, toNodeId, options?)`** — one fewest-edges directed historical connection sequence, with per-segment witness evidence, or a precise reason it could not.
-
-```ts
-import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
-
-const history = new FragmentStore('world');
-const topology = new TopologyStore(history);
-// … save nodes a/b/c, save traversed edges e-ab (a→b) and e-bc (b→c) …
-
-const r = topology.route('a', 'c', { mode: 'walk' });
-if (r.status === 'FOUND') {
-  r.nodeIds;   // ['a', 'b', 'c']
-  r.edgeIds;   // ['e-ab', 'e-bc']
-  r.segments;  // [{ edgeId: 'e-ab', evidenceId: 'ev-ab', evidence: … }, …]
+```json
+{
+  "dependencies": {
+    "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.9.0.tgz",
+    "better-sqlite3": "^12.0.0"
+  }
 }
 ```
 
-Behavior:
+| Entry | Contents | Native dependency |
+|---|---|---|
+| `curio-minecraft-3d-memory` | observation, voxel, traversability, topology, navigation, execution and runtime store | none |
+| `curio-minecraft-3d-memory/water` | water-surface and mounted-boat validation | none |
+| `curio-minecraft-3d-memory/storage/sqlite` | SQLite sessions, ledgers, journal and `WorkingSetManager` | `better-sqlite3@^12` |
 
-- **Endpoints.** Reachability/route accept only existing, `exact`, same-world, same-dimension nodes. Missing nodes, region endpoints, and cross-dimension requests fail explicitly (never silently replaced).
-- **Edges that count.** Only `basis: 'traversed'` edges whose every reference resolves (`resolved`) participate; `candidate` / `missing` / `mismatch` edges are excluded (and reported as gaps). Direction is strictly `from → to`.
-- **Mode.** An optional `mode` filter requires a matching explicit evidence mode; unknown-mode evidence yields a `mode_unknown` gap, while known-but-unmatched modes are a normal filter. Without a filter, the adopted evidence's real mode is preserved (unknown stays unknown).
-- **Budgets.** `maxNodes` / `maxEdges` / `maxHistoryReads` / `maxDiagnostics` are finite, clamped to store ceilings, and zero is honored literally. Budget exhaustion is reported as `BUDGET_EXHAUSTED`, never confused with `NO_RECORDED_ROUTE`.
-- **Results.** `FOUND` / `NO_RECORDED_ROUTE` / `INSUFFICIENT_EVIDENCE` / `BUDGET_EXHAUSTED` have precise meanings; diagnostics are bounded and truncation never loses the gap classification.
+## Quick start
 
-These queries return historical facts and never produce a current `OPEN`, a body-arrival claim, or an executable point list. See [`docs/phase-4c-historical-topology-query-acceptance.md`](docs/phase-4c-historical-topology-query-acceptance.md).
+### Open a shared spatial session
 
-## Bounded historical anchor queries
-
-`TopologyStore.historicalAnchorCandidates(fromNodeId, options?)` (phase 4D) answers "from this known node, which recorded anchors are reachable over evidence-resolved, mode-matching `traversed` edges — and which is highest/deepest?".
-
-```ts
-import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
-
-const history = new FragmentStore('world');
-const topology = new TopologyStore(history);
-// … save nodes and traversed edges …
-
-const r = topology.historicalAnchorCandidates('a', { tag: 'resource', order: 'highest', limit: 1 });
-r.items;          // [{ node: SpatialNode, hops: 3 }]
-r.matchedCount;   // candidates before limit
-r.proofSegments;  // union of predecessor paths to the returned candidates
-r.disposition;    // 'complete' | 'evidence_gaps' | 'budget_exhausted'
-```
-
-Behavior:
-
-- **Endpoints.** The start must be an existing, `exact` node. Region endpoints and missing nodes fail explicitly; `maxNodes: 0` returns no unvalidated start.
-- **Filters.** `source` / `tag` / `kind` are AND-combined and only filter the returned candidates — never the traversal. A node with no tag never matches a specified `tag`; a non-matching intermediate node is still traversed.
-- **Ordering.** `bfs` (discovery order), `highest` (descending `pos.y`), `deepest` (ascending `pos.y`); height ties keep BFS order. Height comes only from the node's exact `pos.y`, never from fragment `deepestY` or connection type.
-- **Completeness.** `matchedCount` counts candidates before `limit`; `resultsTruncated` only means the limit cut the list; `disposition` reports whether the search finished. An empty `items` is not by itself "no candidates".
-- **Proof.** `proofSegments` is the deduplicated union of BFS predecessor paths to the returned candidates, ordered predecessor-first, with the witness evidence per segment.
-
-`highest`/`deepest` never claim a surface or a cave floor, and the query never proves current passability or selects an action target. See [`docs/phase-4d-historical-anchor-query-acceptance.md`](docs/phase-4d-historical-anchor-query-acceptance.md).
-
-## History checkpoint persistence
-
-`openHistorySession` (phase 5A, `curio-minecraft-3d-memory/storage/sqlite` subpath) persists the four historical facts through one SQLite worker. Callers keep using the in-memory `FragmentStore` / `TopologyStore` exactly as before; `checkpoint()` is the *only* explicit save trigger.
-
-```ts
-import { openHistorySession } from 'curio-minecraft-3d-memory/storage/sqlite';
-
-const session = await openHistorySession({ databasePath, worldId: 'world' });
-
-session.history.saveFragment({ /* … */ });
-session.topology.saveNode({ /* … */ });
-await session.checkpoint();   // capture + commit the full history in one transaction
-await session.close();        // stop accepting writes, shut the worker down within a bound
-
-const reopened = await openHistorySession({ databasePath, worldId: 'world' });
-reopened.history.fragments(); // committed state restored
-```
-
-Behavior:
-
-- **Explicit save.** Memory writes are queryable immediately; only `checkpoint()` persists them. There is no auto-save, incremental log, or background retry.
-- **Bounded, atomic.** One checkpoint replaces the world's four facts in a single transaction with hard, documented capacity limits (`SnapshotLimits`); over-capacity saves are rejected before any copy, leaving memory and the previous checkpoint intact.
-- **Original bindings.** Edges restore with their original evidence binding snapshots — never re-bound through `saveEdge` — so deleted/replaced evidence keeps reporting `missing`/`mismatch`, and insertion order (which 4C/4D queries depend on) is preserved.
-- **Lifecycle.** `checkpoint()` rejects `busy`/`closing`/`closed`; `flush()` waits only for an accepted checkpoint; `close()` reports the last confirmed checkpoint, unsaved changes, and unconfirmed requests.
-- **Failure semantics.** `PersistenceError` distinguishes capacity/argument rejection, SQL rollback, worker failure, `timeout_unconfirmed` (commit may have landed but was not confirmed), and schema/data validation — never fabricating a save or clearing later dirty state.
-- **Isolation.** `worldId` is explicit and isolated per database; an empty checkpoint clears only its own world.
-
-The native driver (`better-sqlite3` `^12`) is an **optional peer dependency**: the core `curio-minecraft-3d-memory` entry loads no native driver and works on Node `>=18`, while the SQLite subpath additionally requires `better-sqlite3` (Node `>=20`). See [`docs/phase-5a-history-checkpoint-acceptance.md`](docs/phase-5a-history-checkpoint-acceptance.md).
-
-## Combined spatial checkpoint persistence
-
-`openSpatialSession` (phase 5B, `curio-minecraft-3d-memory/storage/sqlite` subpath) persists the recent-observation map (`VoxelMap`) alongside the four historical facts through the same single SQLite worker. `checkpoint()` remains the *only* explicit save trigger and captures all three stores in one transaction.
+A host normally keeps one spatial session per world and reuses its map across perception updates and navigation delegations:
 
 ```ts
 import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
 
-const session = await openSpatialSession({ databasePath, worldId: 'world' });
+const session = await openSpatialSession({
+  databasePath,
+  worldId: 'world',
+  // Optional: 'manual' avoids decoding every committed Section at open.
+  voxelLoading: 'eager',
+});
 
-session.voxel.beginSession('session-a');          // host names the current observation session
-session.voxel.observe({ /* … confirmed Observation … */ });
-session.history.saveFragment({ /* … */ });
+session.voxel.beginSession('session-a');
+session.voxel.observe({ /* confirmed observation */ });
 
-await session.checkpoint();                        // voxel + history in one transaction
+await session.checkpoint(); // the only explicit save trigger
 await session.close();
-
-const reopened = await openSpatialSession({ databasePath, worldId: 'world' });
-reopened.voxel.cellAt('overworld', x, y, z);       // committed facts, re-marked STALE
 ```
 
-Behavior:
+Restored facts keep their original observation times and sources, but saved `FRESH` state comes back `STALE`. A new observation refreshes only the cells actually observed.
 
-- **Explicit save.** Memory writes are queryable immediately; only `checkpoint()` persists them. There is no auto-save, incremental log, or background retry.
-- **Startup restore, not replay.** Restored facts keep their original `observedAt`/`sessionId`/source/attribution, but saved `FRESH` becomes `STALE` — the host names a new observation session and re-observes cells to re-establish freshness; a re-observation refreshes only the observed cell.
-- **Bounded, atomic.** One checkpoint replaces the world's history and voxel in a single transaction under a shared byte budget and finite voxel limits (`maxVoxelSections`, `maxObservedCells`, `maxPaletteEntries`, `maxBytes`). The batch being sent is pre-flighted on the main thread and rejected *before any copy*; the worker additionally re-checks the post-increment full set against the same limits inside the transaction and rolls the whole batch back on overflow.
-- **Incremental after baseline (5C).** The first `checkpoint()` writes the full voxel set; later ones only copy, encode and write the changed sections (`voxelMode: 'incremental'`), leaving unchanged section payloads byte-for-byte intact. History remains full-snapshot this round.
-- **Schema upgrade.** Schema v1 databases are upgraded to v2 (adding `spatial_sections` and voxel checkpoint columns), then v2 → v3 (adding per-section committed metadata columns backfilled from existing payloads), each with a consistent backup and transactional rollback; existing history, ids, order, and bindings are preserved. A history-only `openHistorySession` write replaces only history and never touches voxel.
-- **Lifecycle.** `checkpoint()` rejects `busy`/`closing`/`closed`; `flush()` waits only for an accepted checkpoint; `close()` reports the last confirmed checkpoint, unsaved changes, and unconfirmed requests.
-
-See [`docs/phase-5b-spatial-checkpoint-acceptance.md`](docs/phase-5b-spatial-checkpoint-acceptance.md).
-
-## Manual on-demand section residency
-
-`openSpatialSession({ voxelLoading: 'manual' })` (phase 5D1) keeps the committed section *directory* separate from the resident in-memory working set. A large committed fact set is not fully decoded at open; the caller loads sections explicitly and pins the ones an active route actually depends on.
+### Navigate
 
 ```ts
-import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
-import type { SectionKey } from 'curio-minecraft-3d-memory';
+import { navigateTo } from 'curio-minecraft-3d-memory';
 
-const session = await openSpatialSession({ databasePath, worldId: 'world', voxelLoading: 'manual' });
-const key: SectionKey = { worldId: 'world', dim: 'overworld', cx: 0, cz: 0, sy: 4 };
+const { result, record } = await navigateTo(
+  {
+    destination: { x: 10, y: 64, z: 10 },
+    arrival: { kind: 'exact' },
+    allowedModes: ['walk'],
+    allowDigging: false,
+    allowPlacing: false,
+    allowTower: false,
+    materials: [],
+    exploration: 'known_only',
+  },
+  environment,
+);
 
-session.sectionResidency(key).residency;      // 'no_record' | 'not_resident' | 'loading' | 'resident' | 'load_failed'
-const { loaded, missing } = await session.loadSections([key]); // explicit, bounded load
-session.voxel.beginSession('live');
-session.voxel.observe({ /* … re-observation with its original time … */ });
-await session.checkpoint();                    // incremental; never deletes unloaded records
-
-const lease = session.pinSections([key]);     // protect a route's actual dependency sections
-session.unloadSections([key]);                 // refused while pinned (structured reasons)
-session.releasePins([lease.token]);
-session.unloadSections([key]);                 // safe: committed + clean + unpinned
+if (result.outcome === 'ARRIVED') {
+  // result.confirmed, result.lastPosition and result.lastObservation are measured.
+}
 ```
 
-Behavior:
+`environment` is supplied by the caller and contains the world/dim/session identity, measured body samples, a `WalkRouteSearch` source, a `WalkRouteExecutor` bound to the same map, shape provider, budgets and an optional cancellation signal. The library never scans the world or owns the body.
 
-- **Directory vs resident.** The committed directory (identity, stable order, payload byte size, observed-cell/palette counts, revision) is read at open without decoding payloads and is bounded by the same `maxVoxelSections`/`maxBytes`/`maxObservedCells`/`maxPaletteEntries` limits. The resident working set has its own `maxResidentSections`/`maxResidentBytes` bounds (`ResidencyLimits`), enforced on load, on new-section creation, and on observation growth.
-- **Explicit preload contract.** A write to a saved-but-not-resident (or loading) section throws `VoxelResidencyError` (`requires_load`) *before* any mutation; a brand-new section is accepted subject to the resident bounds. `observeBatch` pre-flights the whole batch, so a not-resident section never leaves a half-applied batch. The caller loads, then re-submits the observation with its original `observedAt`/`sessionId`/`sequence`/source.
-- **Load ≠ observe.** `loadSections` restores the committed evidence re-marked `STALE` (a past observation), never a fresh observation or a current `OPEN`; it never replays `observe`, never dirties a section, and never resets the session/interruption boundary.
-- **Safe unload.** `unloadSections` releases only committed, clean, unpinned sections and returns a structured reason (`pinned` / `dirty` / `not_committed`) for anything else. It releases only the runtime payload — never deletes the directory record, never clears history, never auto-saves, and never marks the section as never-observed.
-- **Pin leases.** `pinSections` returns a token; `releasePins(token)` drops only that lease. Multiple callers may pin the same section, duplicate/unknown-token release is a no-op, and a late old-task release can never drop a newer task's protection. Pinning does not load or refresh evidence.
-- **Residency invalidation.** `unloadSections`/`loadSections` report the changed keys; feed them to `TraversabilityCache.invalidateSections(keys)` / `RouteVerifier.invalidateSections(keys)` so an unloaded section never keeps an old `OPEN` and a reloaded section never keeps a pre-load `UNKNOWN` — unrelated sections are untouched. See `docs/phase-5d1-section-residency-acceptance.md`.
+Follow one explicitly selected historical fragment with `followKnownPath(request, { ...environment, history, drive: true })`; without `drive`, it only returns the start boundary.
 
-This is the manual on-demand residency mechanism only: no automatic LRU/eviction, prefetch, or observation overlay, and no real mineflayer/Curio route protection wiring.
-
-## Bounded working-set management
-
-`WorkingSetManager` (phase 5D2, `curio-minecraft-3d-memory/storage/sqlite`) is an explicit, caller-enabled composition over a manual session. It turns "submit the sections you need now" into a bounded prepare loop — validate the whole request, protect it with a temporary pin lease, evict least-recently-used *eligible* sections within fixed candidate/unload budgets, load the missing sections through the session's single worker, and return an accurate result plus the protection lease.
-
-```ts
-import { WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
-
-const session = await openSpatialSession({ databasePath, worldId: 'world', voxelLoading: 'manual', residencyLimits: { maxResidentSections: 8 } });
-const manager = new WorkingSetManager(session);
-
-const result = await manager.prepare([a, b, c]);
-result.status;      // 'ready' | 'incomplete' | 'failed'
-result.prepared;    // the full request when ready; empty otherwise
-result.loaded;      // loaded this call
-result.noRecord;    // no committed record — never fabricated, never observed
-result.notReady;    // loading / load_failed — not prepared now
-result.evicted;     // LRU-eligible sections evicted this call
-result.capacity;    // null on success, or a structured gap (request_too_large / count_capacity / byte_capacity / …)
-result.lease;       // valid (non-empty) only when status === 'ready'; the caller owns release
-
-// Make room before accepting new observations, then release when done.
-session.releasePins([result.lease.token]);
-manager.free({ sections: 4 });   // evict LRU-eligible until ≤ 4 resident sections
-manager.stats();                 // bounded read-only snapshot (no load/evict/save/world scan)
-```
-
-Behavior:
-
-- **Explicit enablement.** Default eager loading is untouched; the caller constructs a `WorkingSetManager` to opt in. It requires a `manual`-residency session.
-- **Session gate.** `prepare`/`free` acquire a session-level operation gate (held by the `SpatialSession`, shared across every manager and the direct `loadSections`/`checkpoint` entries) before any pin/LRU/unload, so a busy, closing, closed session, or a concurrent operation is rejected up front — never "evict first, then report busy".
-- **Accurate cost.** `prepare` measures the exact resident cost of the to-load sections via a bounded decode (`measureSections`) *before* evicting, then installs (`installSections`) — it never evicts or rejects on a conservative byte estimate. A request that fits the exact byte boundary is accepted.
-- **Result/lease consistency.** `status` distinguishes `ready` (all resident + protected), `incomplete` (some `noRecord`/`notReady`, no lease), and `failed` (a capacity gap or read failure, no lease). `prepared` always reflects the actual protection state.
-- **Deterministic LRU.** A successful `prepare` hit (already-resident) and a successful load both advance a section's LRU position; a fresh section has a deterministic initial position. The LRU is runtime cache metadata only — never persisted, never substitutes for `observedAt`/`sequence`/`revision`/save batch, and never refreshes evidence time. The eviction loop snapshots the LRU once and walks it with a cursor, so every candidate is visited at most once.
-- **Safe eviction.** Candidates are chosen oldest-first, skipping the current request set; the final unload always goes through `session.unloadSections`, so dirty, pinned and uncommitted sections are reported as structured rejections (`dirty` / `pinned` / `not_committed`), never guessed from stale metadata. Only committed, clean, unpinned sections are released; an obviously-unfittable request is rejected before any eviction.
-- **Bounded failure.** `no_record` and `load_failed` are reported separately and never reported as "prepared". A hard failure (read failure / capacity) releases the temporary lease; a partial eviction followed by a failed load is reported accurately, never as a silent rollback, and never deletes database facts or clears unrelated dirty state. A count overflow is distinguished from a byte overflow in the structured gap.
-- **Consistent index.** After a direct `loadSections` / `unloadSections` / `observe` that bypasses the manager, `stats()` reconciles the LRU index with the real resident set (bounded in-memory enumeration), so the manager never requires the caller to abandon the existing public entries.
-
-The route-pin closed loop is demonstrated in `examples/working-set.ts`: prepare a route's actual dependency sections → restore current evidence → verify → protect the dependencies → execute a Fake walk route → release → free. This phase adds bounded working-set management only — no predictive prefetch, background eviction, automatic checkpoint, observation overlay, new pathfinding, or real mineflayer/Curio wiring.
-
-## Land and water validation
-
-Both validators are read-only and bounded. They consume evidence already accepted by a `VoxelMap` and never scan,
-load, generate, search a route, execute movement, dig, place, build, mount or dismount a boat, or apply a rescue
-strategy.
-
-### Land transitions and routes
+### Validate land and water geometry
 
 ```ts
 import {
@@ -314,137 +124,130 @@ import {
   LandRouteVerifier,
   resolveLandLimits,
 } from 'curio-minecraft-3d-memory';
+import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
 
-const evaluation = evaluateLandTransition(
+const transition = evaluateLandTransition(
   map,
-  { worldId, dim, sessionId, body, transition }, // transition.kind is explicit
-  { shapeProvider, jumpModel, climbProvider },  // jumpModel / climbProvider only for those kinds
+  { worldId, dim, sessionId, body, transition: declaredTransition },
+  { shapeProvider, jumpModel, climbProvider },
   Date.now(),
   resolveLandLimits({ maxWork: 4096 }),
 );
 
-const verifier = new LandRouteVerifier(map, { limits: { maxWork: 8192 } });
-verifier.register({ worldId, dim, sessionId, body, rules, transitions });
-```
-
-`body.feet` must exactly equal `transition.from`; coordinates are never rounded or snapped. Result and snapshot
-types expose `assurance: 'geometry_only'` and `executable: false`. `step` / `drop` / `jump` / `ladder` are the only
-supported geometry subsets; `jump` requires an injected versioned `LandMotionModel` and `ladder` an injected
-versioned `ClimbRegionProvider`. A missing model or provider yields `UNSUPPORTED`, never an inferred traversal. See
-[`docs/land-route-validation.md`](docs/land-route-validation.md).
-
-### Water surface and mounted boat
-
-```ts
-import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
-
-const route = evaluateWaterRoute(map, {
-  worldId, dim, sessionId,
-  points,                // caller-selected, ordered, exactly the same Y
-  profile,               // surface_swim | mounted_boat
-  solidShapeProvider,
-  fluidShapeProvider,
-}, Date.now());
+const route = evaluateWaterRoute(
+  map,
+  {
+    worldId, dim, sessionId,
+    points,
+    profile: 'surface_swim',
+    solidShapeProvider,
+    fluidShapeProvider,
+  },
+  Date.now(),
+);
 
 const arrival = checkWaterArrival({ goal, scope, map, samples, now, maxSampleAgeMs });
 ```
 
-Routes must be constant-height with a fixed 90° orientation; vertical transitions and arbitrary yaw return
-`UNSUPPORTED`. Solid collision and fluid/surface interpretation are separate versioned authorities, and every
-provider neighbour read is budgeted and recorded as a Section dependency. `OPEN` covers only the bounded
-geometry/evidence contract — never arrival, authorization, executor support, or absence of risk.
-`checkWaterArrival` is a separate completion check over measured, ordered samples and returns `ARRIVED` or
-`UNCONFIRMED`. Neither function searches, controls the body, or manipulates a boat. See
-[`docs/water-validation.md`](docs/water-validation.md).
+Land validation supports `step`, `drop`, `jump` and `ladder`; `jump` requires an injected versioned `LandMotionModel`, and `ladder` an injected versioned `ClimbRegionProvider`. Water routes must be constant-height with a fixed 90° orientation. Neither validator searches a route, moves the body, digs, places, mounts a boat, or applies a rescue strategy.
 
-## Install & consume
-
-```bash
-npm install --no-audit --no-fund          # dev dependencies
-npm run build                             # emits dist/ (NodeNext ESM + type declarations)
-npm pack                                  # emits curio-minecraft-3d-memory-<version>.tgz
-```
-
-Consumers install the real `.tgz` into their own project and import by package name and public subpath
-(never a source path, `../dist`, `npm link`, or a dev-machine directory alias):
-
-```json
-{ "dependencies": { "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.8.0.tgz", "better-sqlite3": "^12.0.0" } }
-```
+### Keep history and topology
 
 ```ts
-import {
-  LandRouteVerifier,
-  RouteVerifier,
-  WalkRouteExecutor,
-  evaluateLandTransition,
-} from 'curio-minecraft-3d-memory';
-import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
-import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
+import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
+
+const history = new FragmentStore('world');
+const topology = new TopologyStore(history);
+
+topology.saveNode({ id: 'a', kind: 'place', source: 'agent', worldId: 'world',
+  dim: 'overworld', location: { kind: 'exact', pos: { x: 0.5, y: 64, z: 0.5 } } });
+topology.saveNode({ id: 'b', kind: 'place', source: 'agent', worldId: 'world',
+  dim: 'overworld', location: { kind: 'exact', pos: { x: 1.5, y: 64, z: 0.5 } } });
+
+topology.saveEdge({ id: 'e-ab', from: 'a', to: 'b', type: 'HORIZONTAL',
+  basis: 'traversed', evidenceIds: ['ev-1'] });
+
+const route = topology.route('a', 'b', { mode: 'walk' });
+// route.status: FOUND | NO_RECORDED_ROUTE | INSUFFICIENT_EVIDENCE | BUDGET_EXHAUSTED
 ```
 
-Requires Node `>= 18`. The core entry (`curio-minecraft-3d-memory`), the water entry
-(`curio-minecraft-3d-memory/water`) and the land validators re-exported from the core entry have no native
-dependency and never start a worker; the SQLite entry (`curio-minecraft-3d-memory/storage/sqlite`) uses
-`better-sqlite3` (an optional peer dependency) inside a single worker thread, so SQLite consumers must install
-`better-sqlite3@^12` explicitly. The one-shot independent-install acceptance is `node acceptance/run.mjs`
-(pack → throwaway install → runtime assertions + type-check; any failure exits non-zero).
+A→B and B→A are independent records. Only `traversed` edges whose evidence still resolves participate in historical queries. A candidate edge is a relation to verify, not proof that a traversal happened. See the acceptance documents linked below for full result and failure semantics.
 
-## Host shared session lifecycle
+### Manage a bounded working set
 
-The library provides facts and execution assistance; the host (Curio) owns the connection, real perception, and
-body control. See `examples/shared-session-lifecycle.ts` for the wiring order (default `eager` loading, for worlds
-that fit the session budget):
+```ts
+import { WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
 
-1. **Startup** — the host supplies the database path and `worldId`; `await openSpatialSession({ databasePath, worldId })`
-   resolves before you use the returned `session.voxel`; do not recreate the map per action.
-2. **Shared map** — continuous perception and multiple walk delegations reuse `session.voxel`; sharing the map
-   does not share each delegation's execution ownership.
-3. **Connect / reconnect** — the observation `sessionId` comes from the real connection lifecycle; reconnecting the
-   same world does not change `worldId`. Switch with `map.beginSession(sessionId)`; late old-session evidence is
-   rejected and cannot re-mark cells FRESH.
-4. **Perception update** — the host writes `map.observe(...)` first, then forwards the returned `ChangeReport` to
-   the active route (`RouteVerifier.apply` / `WalkRouteExecutor.observe`); the library never scans the world.
-5. **Route lifecycle** — load, prepare, and protect the real route dependencies (`WorkingSetManager.prepare` + the
-   lease), then `releasePins`; cancelling one action does not close the shared session. For on-demand residency see
-   "Manual on-demand section residency" / "Bounded working-set management".
-6. **Save & close** — `checkpoint()` captures and commits current changes (the only save trigger); `flush()` only
-   waits for an already-accepted save; `close()` does a bounded shutdown. Order: stop accepting writes → final
-   `checkpoint` → check confirmation → `close`.
-7. **Restore** — restore brings back history and original evidence times; current passability must be re-established,
-   never read back from disk as a fresh observation.
+const session = await openSpatialSession({
+  databasePath,
+  worldId: 'world',
+  voxelLoading: 'manual',
+  residencyLimits: { maxResidentSections: 8 },
+});
+const manager = new WorkingSetManager(session);
+
+const prepared = await manager.prepare(routeDependencySections);
+// prepared.status: 'ready' | 'incomplete' | 'failed'
+// prepared.lease is valid only when status === 'ready'; the caller owns release.
+```
+
+`prepare` validates the whole request, protects it with a temporary pin lease, evicts only committed, clean, unpinned LRU-eligible Sections, and loads the rest through the session's single worker. `free()` makes room for new observations and `stats()` reports a read-only snapshot.
+
+## Host integration lifecycle
+
+The library provides facts and execution assistance; the host owns the connection, legal perception and body control. See `examples/shared-session-lifecycle.ts` for the runnable Fake example.
+
+1. **Startup** — the host supplies an absolute database path and `worldId`; await `openSpatialSession()` before using `session.voxel`. Do not recreate the map per action.
+2. **Shared map** — continuous perception and multiple walk delegations reuse `session.voxel`; sharing the map does not share execution ownership.
+3. **Connect / reconnect** — the observation `sessionId` comes from the real connection lifecycle. A reconnect to the same world keeps `worldId`; switch with `map.beginSession(sessionId)`. Late old-session evidence is rejected.
+4. **Perception update** — write `map.observe(...)` first, then forward the returned `ChangeReport` to the active verifier or executor. The library never scans the world.
+5. **Route lifecycle** — load and protect the actual route dependencies (`WorkingSetManager.prepare` + lease), verify, execute, then release. Cancelling one delegation never closes the shared session.
+6. **Save and close** — `checkpoint()` captures and commits current changes; `flush()` only waits for an already-accepted save; `close()` shuts down within a bound. Stop accepting writes → final checkpoint → check confirmation → close.
+7. **Restore** — history and original evidence times come back; current passability must be re-established and is never read from disk as a fresh observation.
+
+## Navigation capability status
+
+| Design §7 name | Status | Public entry | Boundary |
+|---|---|---|---|
+| `navigate_to` | implemented | `navigateTo` | Walk only; exact arrival; same height, ±1 block along X/Z; caller-supplied search, executor and measured samples |
+| `follow_known_path` | implemented | `followKnownPath`, `startKnownWalkRoute` | Walk only; one explicitly selected fragment; `followKnownPath` drives only when `drive: true` |
+| `inspect_route` | read-only | `inspectRoute`, `inspectKnownRoute` | Projects an existing snapshot or historical fragment; never moves, observes, pins or saves |
+| `frontier_candidates` | read-only | `frontierCandidates` | Projects bounded unknown boundary candidates; never selects a target or starts exploration |
+| `recall_route` | not implemented | — | No public runtime entry; historical queries do not become route recall or execution |
+
+`navigateTo` explicitly rejects `near` / `reach_block` arrival, non-walk modes, digging, placing, towering, non-empty material lists, non-empty `avoid` constraints and `allow_frontier`. Those rejections are structured results, never silently ignored settings.
 
 ## Project structure
 
 ```
 src/
 ├── index.ts            # public API entry (minimal, explicit export surface)
-├── constants.ts        # single-source config constants (section size, PASSAGE_LINK, …)
+├── constants.ts        # shared configuration constants
 ├── types.ts            # base primitives (Vec3Like / BlockState / WorldScope / MoveMode)
-├── observation/        # World Observer: Observation / evidence / freshness (§3.2)
-├── voxel/              # Spatial Mapper: Section / Palette / bit-packing (§4)
-├── traversability/     # derived traversability + bounded land transition/route validation (§3.3)
-├── water/              # read-only water-surface and mounted-boat validation (subpath /water)
-├── topology/           # Topology Manager: path fragments / nodes / edges (§3.1, §5)
-├── adapter/            # WorldAdapter target surface (§2.1)
-├── navigation/         # L2 navigation primitives and result envelope (§7)
-├── execution/          # controlled walk-route execution loop (§7 first step, phase 3)
-├── store/              # SpatialMemoryStore runtime interface (§9)
-├── storage/            # SQLite persistence and worker (§9, phase 5)
-└── compat/             # legacy WorldMemory entry compatibility layer (§8, §9.1)
+├── observation/        # Observation / evidence / freshness and bounded queue
+├── voxel/              # sparse Sections, palette, bit-packing and evidence history
+├── traversability/     # derived traversability + bounded land transition/route validation
+├── water/              # water-surface and mounted-boat validation (subpath /water)
+├── topology/           # history, explicit topology, runtime edges, portals, anchors, occupancy
+├── adapter/            # WorldAdapter target surface
+├── navigation/         # walk search, navigateTo, followKnownPath and read-only projections
+├── execution/          # controlled walk-route execution loop
+├── store/              # SpatialMemoryStore runtime composition and scope guard
+├── storage/            # SQLite persistence, ledgers, journal and worker
+└── compat/             # legacy WorldMemory compatibility and migration dry-run
 
 examples/
-├── walk-route-execution.ts         # runnable Fake demo of the execution loop
-├── fragment-store-history.ts       # runnable Fake demo of historical facts vs current blockage
-├── topology-facts.ts               # runnable Fake demo of explicit topology facts vs current blockage
-├── historical-topology-query.ts    # runnable Fake demo of bounded historical graph queries
-├── historical-anchor-query.ts      # runnable Fake demo of bounded historical anchor queries
-├── history-checkpoint.ts           # runnable demo of the SQLite history checkpoint lifecycle
-├── spatial-checkpoint.ts           # runnable demo of the combined spatial checkpoint lifecycle
-├── spatial-checkpoint-incremental.ts # runnable demo of the incremental voxel checkpoint
-├── spatial-residency.ts            # runnable demo of manual on-demand section residency
-├── working-set.ts                  # runnable demo of bounded working-set management + Fake route
-└── shared-session-lifecycle.ts     # runnable reference for the host shared-session lifecycle
+├── walk-route-execution.ts         # Fake execution loop
+├── fragment-store-history.ts       # historical facts vs current blockage
+├── topology-facts.ts               # explicit topology facts vs current blockage
+├── historical-topology-query.ts    # bounded historical graph queries
+├── historical-anchor-query.ts      # bounded historical anchor queries
+├── history-checkpoint.ts           # SQLite history checkpoint lifecycle
+├── spatial-checkpoint.ts           # combined spatial checkpoint lifecycle
+├── spatial-checkpoint-incremental.ts # incremental voxel checkpoint
+├── spatial-residency.ts            # manual on-demand Section residency
+├── working-set.ts                  # bounded working set + Fake route
+└── shared-session-lifecycle.ts     # host shared-session lifecycle reference
 ```
 
 ## Development
@@ -454,24 +257,50 @@ npm install
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run
 npm run build       # emits dist/ (NodeNext ESM + type declarations)
-npx tsx examples/walk-route-execution.ts    # run the Fake execution demo
-npx tsx examples/fragment-store-history.ts  # run the Fake historical-facts demo
-npx tsx examples/topology-facts.ts          # run the Fake explicit-topology demo
-npx tsx examples/historical-topology-query.ts # run the Fake bounded-query demo
-npx tsx examples/historical-anchor-query.ts   # run the Fake bounded-anchor-query demo
-npx tsx examples/history-checkpoint.ts        # run the SQLite checkpoint-lifecycle demo
-npx tsx examples/spatial-checkpoint.ts        # run the combined spatial checkpoint-lifecycle demo
-npx tsx examples/spatial-checkpoint-incremental.ts # run the incremental voxel checkpoint demo
-npx tsx examples/spatial-residency.ts         # run the manual on-demand section residency demo
-npx tsx examples/working-set.ts               # run the bounded working-set + Fake route demo
-npx tsx examples/shared-session-lifecycle.ts  # run the host shared-session lifecycle reference
-npx vitest run tests/land-transition.test.ts tests/land-route.test.ts tests/water-validation.test.ts
-node acceptance/run.mjs                       # run the independent consumer acceptance (pack + install + assertions + type-check)
 ```
 
-> `examples/fragment-store-history.ts`, `examples/topology-facts.ts`, `examples/historical-topology-query.ts`, `examples/historical-anchor-query.ts`, and `examples/history-checkpoint.ts` import the built package by its public name (`curio-minecraft-3d-memory`, with `history-checkpoint.ts` using the `curio-minecraft-3d-memory/storage/sqlite` subpath) rather than the source path, so they exercise the package `exports` entry — run `npm run build` first.
+Run the examples with `tsx`:
 
-> The persistence entry (`curio-minecraft-3d-memory/storage/sqlite`) uses `better-sqlite3` (an optional peer dependency) inside a single worker thread. The core entry (`curio-minecraft-3d-memory`) and the `curio-minecraft-3d-memory/water` entry have no native dependency and never start a worker.
+```bash
+npx tsx examples/walk-route-execution.ts
+npx tsx examples/shared-session-lifecycle.ts
+npx tsx examples/working-set.ts
+# …see the examples/ directory for the full list
+```
+
+Run the independent consumer acceptance (pack → throwaway install → runtime assertions + type-check):
+
+```bash
+node acceptance/run.mjs
+```
+
+The examples and tests use Fake perception, Fake bodies and Fake move executors. The persistence tests use a real SQLite database and a real worker. None of these tests start a Minecraft server or connect a mineflayer bot; in-game validation remains outstanding.
+
+> Examples that import the package by its public name (`curio-minecraft-3d-memory`, or the `curio-minecraft-3d-memory/storage/sqlite` subpath) exercise the package `exports` entries. Run `npm run build` first.
+
+## Documentation
+
+- [Design and development constraints](docs/spatial-memory-library-design.md) — target contracts, data model, and implementation order.
+- [AGENTS.md](AGENTS.md) — repository development rules and boundaries.
+- [Navigation API status](docs/navigation-api-status.md) — the current §7 capability table and unsupported cases.
+- [Runtime store composition](docs/spatial-memory-store.md) — `SpatialMemoryStoreImpl` behavior and known truth gaps.
+- [Land route validation](docs/land-route-validation.md) — transition and route geometry contract.
+- [Water validation](docs/water-validation.md) — surface-swim and mounted-boat contract.
+- [0.9.0 implementation progress](docs/design-progress-0.9.0.md) — implemented sections, verification, and remaining gaps.
+- Persistence acceptance: [5A](docs/phase-5a-history-checkpoint-acceptance.md), [5B](docs/phase-5b-spatial-checkpoint-acceptance.md), [5C](docs/phase-5c-voxel-incremental-checkpoint-acceptance.md), [5D1](docs/phase-5d1-section-residency-acceptance.md), [5D2](docs/phase-5d2-working-set-acceptance.md), [storage ledger](docs/phase-l5-storage-ledger-acceptance.md).
+- [Event and action journal](docs/event-persistence.md) — append-only journal semantics.
+
+## Known limitations
+
+- **No live game validation.** Body samples, world adapters, search instances and shape/fluid providers are caller-supplied. Fake tests prove library logic, not mineflayer control or Minecraft physics.
+- **Walk scope only.** `navigateTo` supports same-height, single-cell X/Z walking with exact arrival. Jumps, steps, ladders, drops, swimming, boats, `near` / `reach_block`, digging, placing, towering, materials, non-empty `avoid` and frontier exploration are not executable navigation modes.
+- **`recall_route` is not implemented.** Historical route and anchor queries are facts, not an executable route selection or an arrival claim.
+- **Land and water validators are geometry-only.** They never search a route, move the body, manage a boat, or apply a rescue strategy. Results are marked `assurance: 'geometry_only'` and `executable: false`.
+- **Persistence is explicit.** There is no auto-save or background retry; only `checkpoint()` commits. Restored observations are `STALE`, and current passability must be re-established. The JSON → SQLite authority switch was not performed; only an offline migration dry-run exists.
+- **Perception is host-owned.** The library does not scan the client world, load chunks, or treat raw `blockUpdate` events as evidence. It records only observations the host legally supplies.
+- **Containers and inventory remain host-led.** The library associates locations and reachability evidence; it does not copy or maintain item counts.
+- **No flight, elytra, or underwater 3D navigation.** These are outside the library's scope.
+- **Known store truth gaps.** `markTraversed` / `markModified` are not available on the current `VoxelMap`; `SpatialEdge` is a lossy projection of `TopologyStore`; portal edges are separate from the walk graph; `Frontier.historicalConnection` cannot express unknown. Use the detailed reads and inspection APIs named in the store documentation.
 
 ## License
 
