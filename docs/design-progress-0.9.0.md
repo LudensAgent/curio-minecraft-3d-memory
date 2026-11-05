@@ -20,7 +20,7 @@
 
 ```text
 npx vitest run --exclude 'acceptance/**'
--> 37 files passed; 956 tests passed
+-> 37 files passed; 959 tests passed
 
 npx tsc --noEmit            (integration worktree)
 -> exit 0
@@ -30,4 +30,4 @@ npx tsc --noEmit            (integration worktree)
 -> 严格 NodeNext 类型 PASS
 ```
 
-0.9.0 制品交付在 Curio 仓库 `vendor/curio-minecraft-3d-memory-0.9.0.tgz`，SHA256 `bf598df5600d41cc6889784d28b1c106b378c8a3a45f61111be741c5f75de774`，来源提交 `c7707b6567ec054062a2693d6391db494e45bd0a`。真实 Java 1.20.1 / mineflayer 联机验收未在本次执行。
+0.9.0 制品交付在 Curio 仓库 `vendor/curio-minecraft-3d-memory-0.9.0.tgz`，SHA256 `962ee3172de99df2fc815021051684fd60f61424916ccf360ed359488f9202d2`，来源提交 `76157f1d5612fc04cf28ff15a6b0c81b302e20ba`。真实 Java 1.20.1 / mineflayer 联机验收未在本次执行。
