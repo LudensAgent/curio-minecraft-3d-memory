@@ -7,17 +7,36 @@
  */
 
 // Base primitives + configuration
-export { AIR_PALETTE_INDEX, PASSAGE_LINK, SECTION_CELL_COUNT, SECTION_SIZE } from './constants.js';
+export {
+  AIR_PALETTE_INDEX,
+  PASSAGE_LINK,
+  SECTION_CELL_COUNT,
+  SECTION_SIZE,
+  VOXEL_SECTION_PAYLOAD_VERSION,
+} from './constants.js';
 export type { BlockState, MoveMode, Vec3Like, WorldScope } from './types.js';
 
 // Observation / evidence
+export {
+  ObservationQueue,
+  cloneCellEvidence,
+  cloneObservation,
+  cloneObservationGap,
+  validateObservation,
+  validateObservationGap,
+} from './observation/index.js';
 export type {
   CellEvidence,
   EvidenceKind,
   Freshness,
   Observation,
+  ObservationBacklog,
   ObservationBatch,
+  ObservationDrainResult,
+  ObservationEnqueueResult,
   ObservationGap,
+  ObservationOverflow,
+  ObservationQueueOptions,
   ObservationSource,
 } from './observation/index.js';
 
@@ -65,6 +84,18 @@ export type {
   VoxelDirtyMeasure,
   VoxelMapOptions,
   VoxelSectionSnapshot,
+} from './voxel/index.js';
+export {
+  decodeVoxelSectionPayload,
+  deserializeBlockState,
+  encodeVoxelSectionPayload,
+  voxelSectionPayloadId,
+} from './voxel/index.js';
+export type {
+  BatchChangeReport,
+  CellHistoryView,
+  VoxelCellPayloadV2,
+  VoxelSectionPayloadV2,
 } from './voxel/index.js';
 
 // Traversability
@@ -200,6 +231,44 @@ export type {
   TraversalPage,
   TraversalQuery,
 } from './topology/index.js';
+// Topology runtime state (design §5): edge verification, portals, anchors,
+// fragmentation, occupancy. Derived state never deletes history.
+export { TransientOccupancy } from './topology/index.js';
+export type {
+  AnchorQueryOptions,
+  AnchorResult,
+  ComponentReport,
+  ConnectivityLink,
+  EdgeBlockInput,
+  EdgeDependency,
+  EdgeDirection,
+  EdgeDirectionState,
+  EdgeModeState,
+  EdgeRuntimeShape,
+  EdgeRuntimeView,
+  EdgeUsability,
+  EdgeUsabilityReason,
+  EdgeVerification,
+  EdgeVerificationInput,
+  EdgeVerificationStatus,
+  FragmentConnectivityInput,
+  FragmentMerge,
+  FragmentPiece,
+  FragmentSegment,
+  FragmentSegmentsResult,
+  FragmentSegmentsView,
+  FragmentationResult,
+  GoneEvidence,
+  OccupancyObservationInput,
+  OccupancyOptions,
+  OccupancyQuery,
+  OccupancyRecord,
+  PortalEdgeInput,
+  PortalEdgeView,
+  PortalTraversalEvidence,
+  RecordNodeOptions,
+  RuntimeQueryOptions,
+} from './topology/index.js';
 
 // Adapter
 export type {
@@ -218,17 +287,34 @@ export type {
 
 // Navigation
 export {
+  followKnownPath,
   frontierCandidates,
+  inspectKnownRoute,
   inspectRoute,
   NAVIGATION_CAPABILITIES,
   NAVIGATION_CAPABILITY_STATUSES,
+  navigateTo,
   startKnownWalkRoute,
   WalkRouteSearch,
 } from './navigation/index.js';
 export type {
   ActionRecord,
   ArrivalSpec,
+  FollowKnownPathEnvironment,
+  FollowKnownPathOutcome,
   FollowKnownPathRequest,
+  InspectKnownRouteOptions,
+  KnownRouteCurrentFacts,
+  KnownRouteEvidence,
+  KnownRouteInspection,
+  KnownRouteInspectionResult,
+  KnownRouteNotFound,
+  KnownRouteTraversalView,
+  NavigateEnvironment,
+  NavigateOutcome,
+  NavigateSearchSource,
+  NavigateSegment,
+  NavigationMemoryWrite,
   Frontier,
   FrontierCandidateView,
   FrontierCandidatesResult,
@@ -278,8 +364,26 @@ export type {
   WalkRouteStatus,
 } from './execution/index.js';
 
-// Store
-export type { SpatialMemoryStore } from './store/index.js';
+// Store — runtime composition and scope guard (design §9)
+export {
+  FRAGMENTATION_HOP_DISTANCE,
+  FRAGMENTATION_LINK_DISTANCE,
+  SpatialMemoryScopeError,
+  SpatialMemoryStoreImpl,
+  SpatialMemoryUnsupportedError,
+} from './store/index.js';
+export type {
+  FrontierInspection,
+  HistoricalRouteInspection,
+  SpatialEdgeRecord,
+  SpatialMemoryCapabilities,
+  SpatialMemoryCapability,
+  SpatialMemoryCapabilityName,
+  SpatialMemoryStore,
+  SpatialMemoryStoreOptions,
+  SpatialMemoryStoreSnapshot,
+  WalkSearchSnapshotProvider,
+} from './store/index.js';
 
 // Storage
 export { TABLE_NAMES } from './storage/index.js';

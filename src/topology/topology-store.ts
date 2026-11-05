@@ -1754,7 +1754,7 @@ export class TopologyStore {
       }
       if (left === right) throw new Error(`fragment merge cannot reference one fragment twice`);
       const pair: FragmentMerge = left < right ? { a: left, b: right } : { a: right, b: left };
-      const key = `${pair.a} ${pair.b}`;
+      const key = `${pair.a}\u0000${pair.b}`;
       if (seenMerges.has(key)) continue;
       seenMerges.add(key);
       merges.push(pair);
