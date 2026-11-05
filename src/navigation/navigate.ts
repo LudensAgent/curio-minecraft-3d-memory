@@ -94,6 +94,8 @@ export interface NavigateEnvironment {
   segments?: readonly NavigateSegment[];
   /** Cancellation signal owned by the caller's task. */
   signal?: AbortSignal;
+  /** Provenance for a caller-signal abort; defaults to `unknown`, never `agent`. */
+  cancellationOrigin?: 'agent' | 'user' | 'scheduler' | 'lifecycle' | 'unknown';
   /**
    * Cooperative wait between slices. It must yield a macrotask so body-adapter
    * timers and move results can run; defaults to a macrotask yield.
@@ -130,6 +132,8 @@ export interface FollowKnownPathEnvironment {
   deadlineMs?: number;
   budget?: number;
   signal?: AbortSignal;
+  /** Provenance for a caller-signal abort; defaults to `unknown`, never `agent`. */
+  cancellationOrigin?: 'agent' | 'user' | 'scheduler' | 'lifecycle' | 'unknown';
   wait?: () => Promise<void>;
   /** Per-delegation sequence assigned to the measured start sample. Defaults to 1. */
   startSequence?: number;
@@ -308,6 +312,43 @@ export async function navigateTo(
       ? {}
       : { constraints: { avoid: (request.constraints.avoid ?? []).map(cloneVec) } }),
   };
+
+  // Cancellation/deadline is checked before the already-at-target shortcut or
+  // any executor start: an aborted delegation must not report ARRIVED or replace
+  // an active executor delegation.
+  if (ctx.signal?.aborted === true) {
+    return finishNavigate(
+      environment,
+      cancelledResult(
+        measured.sample,
+        abortReason(ctx.signal),
+        [],
+        environment.cancellationOrigin ?? 'unknown',
+      ),
+      {
+        id,
+        delegationId,
+        parentActionId: environment.parentActionId,
+        startedAt,
+        from: measured.sample.pos,
+        executed: false,
+        delegation,
+        scope: environment,
+      },
+    );
+  }
+  if (ctx.now() >= ctx.deadlineMs) {
+    return finishNavigate(environment, timeoutResult(measured.sample, []), {
+      id,
+      delegationId,
+      parentActionId: environment.parentActionId,
+      startedAt,
+      from: measured.sample.pos,
+      executed: false,
+      delegation,
+      scope: environment,
+    });
+  }
 
   let trace: Trace = [];
   let lastPosition: Vec3Like | undefined;
@@ -512,6 +553,29 @@ export async function followKnownPath(
     };
   }
 
+  // An already-aborted or expired delegation must not start/replace the executor.
+  if (environment.signal?.aborted === true) {
+    return {
+      kind: 'rejected',
+      start: null,
+      result: cancelledResult(
+        measured.sample,
+        abortReason(environment.signal),
+        [],
+        environment.cancellationOrigin ?? 'unknown',
+      ),
+      record: null,
+    };
+  }
+  if (now() >= deadlineMs) {
+    return {
+      kind: 'rejected',
+      start: null,
+      result: timeoutResult(measured.sample, []),
+      record: null,
+    };
+  }
+
   const walkRequest: KnownWalkRouteRequest = {
     worldId: environment.worldId,
     dim: environment.dim,
@@ -691,6 +755,7 @@ async function runSegment(
     shapeProvider: environment.shapeProvider,
     deadlineMs: ctx.deadlineMs,
     timeoutMs: resolveTimeout(environment.moveTimeoutMs ?? environment.timeoutMs, 'environment.moveTimeoutMs'),
+    startSample: measured.sample,
   });
   const result = await driveWalkRoute(environment.executor, status, measured.sample, destination, ctx);
   return { result: finalizeWalkResult(result, destination), executed: true };
@@ -1282,11 +1347,16 @@ function failureWithEvidence(
   };
 }
 
-function cancelledResult(sample: BodySample, reason: string, trace: Trace): NavResult {
+function cancelledResult(
+  sample: BodySample,
+  reason: string,
+  trace: Trace,
+  by: 'agent' | 'user' | 'scheduler' | 'lifecycle' | 'unknown' = 'unknown',
+): NavResult {
   return failureResult(
     'CANCELLED',
     `navigation was cancelled before the exact target was confirmed: ${reason}`,
-    { kind: 'cancelled', by: 'agent', reason },
+    { kind: 'cancelled', by, reason },
     sample,
     trace,
   );

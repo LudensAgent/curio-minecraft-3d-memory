@@ -250,6 +250,9 @@ class SpatialSessionImpl implements SpatialSession {
     this.voxel = new VoxelMap(options.worldId, {
       validityWindowMs: options.voxelOptions?.validityWindowMs,
       now: options.voxelOptions?.now,
+      ...(options.voxelOptions?.onChange === undefined
+        ? {}
+        : { onChange: options.voxelOptions.onChange }),
       requireSession: true,
       manualResidency: this.voxelLoadingField === 'manual',
       residencyLimits: options.residencyLimits,

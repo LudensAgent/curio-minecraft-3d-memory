@@ -558,7 +558,7 @@ export function importLegacyPlaced(
   plan.restoredValues = values.restored;
   plan.timesMatch = collected.accepted.every((entry) => values.restored[entry.id] === entry.lruAt);
   plan.detail = collected.unattributed.length > 0
-    ? '无来源证明 world/dim 的放置记录保留为未归属历史，不写入任何世界账本'
+    ? '无来源证明 world/dim 的放置记录只在本报告中列为未归属，当前库没有未归属存储，因此不会写入任何世界账本'
     : undefined;
   return finalizePlan(plan);
 }
@@ -724,8 +724,27 @@ function crossingPayloadMatches(
     restored.toSession === crossing.toSession &&
     restored.fromObservation === crossing.fromObservation &&
     restored.toObservation === crossing.toObservation &&
-    JSON.stringify(restored.fromEndpoint) === JSON.stringify(fromEndpoint) &&
-    JSON.stringify(restored.toEndpoint) === JSON.stringify(toEndpoint)
+    endpointEvidenceEqual(restored.fromEndpoint, fromEndpoint) &&
+    endpointEvidenceEqual(restored.toEndpoint, toEndpoint)
+  );
+}
+
+/** Field-by-field endpoint comparison; JSON key order is not semantic. */
+function endpointEvidenceEqual(
+  restored: PortalTraversalRecord['fromEndpoint'],
+  expected: LegacyTravelEndpoint,
+): boolean {
+  if (restored === null || restored === undefined) return false;
+  return (
+    restored.id === expected.id &&
+    restored.worldId === expected.worldId &&
+    restored.dim === expected.dim &&
+    restored.kind === expected.kind &&
+    restored.portalObserved === expected.portalObserved &&
+    restored.observedAt === expected.observedAt &&
+    restored.pos.x === expected.pos.x &&
+    restored.pos.y === expected.pos.y &&
+    restored.pos.z === expected.pos.z
   );
 }
 
@@ -840,7 +859,9 @@ function planOnlyBatch(
   }
   plan.expectedIds = expectedIds;
   plan.expectedValues = expectedValues;
-  plan.restoredValues = { ...expectedValues };
+  // Planned batches were never written or read back; do not fabricate a
+  // "restored" value map from the expected one.
+  plan.restoredValues = null;
   plan.importedIds = [...expectedIds];
   plan.importedRecords = expectedIds.length;
   plan.detail = '存储目的地由拓扑 spatial_nodes 承担；本轮仅核对 ID/时间/字段保留，未写入竞争副本';
@@ -901,6 +922,15 @@ export function verifyLegacyLedgerImport(
       plan.expectedValues = values.expected;
       plan.restoredValues = values.restored;
       plan.timesMatch = placed.accepted.every((entry) => values.restored[entry.id] === entry.lruAt);
+      // Verify the restored key set, not only the ids we expected to find:
+      // unexpected/resurrected rows must fail the batch.
+      const restoredKeys = new Set(ledger.placedBlocks().map((record) => record.key));
+      const expectedKeys = new Set(plan.expectedIds);
+      const unexpected = [...restoredKeys].filter((key) => !expectedKeys.has(key));
+      const resurrected = (deletions.placedKeys ?? []).filter((key) => restoredKeys.has(key));
+      plan.importedRecords = restoredKeys.size;
+      plan.countsMatch =
+        unexpected.length === 0 && resurrected.length === 0 && restoredKeys.size === plan.expectedIds.length;
       return finalizePlan(plan);
     })(),
     (() => {
@@ -918,6 +948,13 @@ export function verifyLegacyLedgerImport(
       plan.expectedValues = values.expected;
       plan.restoredValues = values.restored;
       plan.timesMatch = visits.accepted.every((entry) => values.restored[entry.id] === entry.count);
+      const restoredKeys = new Set(ledger.chunkVisits().map((record) => record.key));
+      const expectedKeys = new Set(plan.expectedIds);
+      const unexpected = [...restoredKeys].filter((key) => !expectedKeys.has(key));
+      const resurrected = (deletions.chunkVisitKeys ?? []).filter((key) => restoredKeys.has(key));
+      plan.importedRecords = restoredKeys.size;
+      plan.countsMatch =
+        unexpected.length === 0 && resurrected.length === 0 && restoredKeys.size === plan.expectedIds.length;
       return finalizePlan(plan);
     })(),
     planOnlyBatch(snapshot, deletions, 'travelEndpoints'),
@@ -940,6 +977,16 @@ export function verifyLegacyLedgerImport(
       plan.restoredValues = values.restored;
       plan.timesMatch = collected.accepted.every((entry) => values.restored[entry.id] === entry.crossing.ts);
       plan.evidenceIntact = values.evidenceIntact;
+      const restoredIds = ledger
+        .portalTraversals({ kind })
+        .map((record) => portalTraversalIdentity({ ...record, kind }));
+      const expectedIds = new Set(plan.expectedIds);
+      const unexpected = restoredIds.filter((id) => !expectedIds.has(id));
+      const deletedIds = new Set(deletions.traversalKeys ?? []);
+      const resurrected = restoredIds.filter((id) => deletedIds.has(id));
+      plan.importedRecords = restoredIds.length;
+      plan.countsMatch =
+        unexpected.length === 0 && resurrected.length === 0 && restoredIds.length === plan.expectedIds.length;
       return finalizePlan(plan);
     }),
   ];
@@ -1040,10 +1087,20 @@ export async function runLegacyMigrationDryRun(options: LegacyMigrationDryRunOpt
     } else {
       const checkpoint = await first.checkpoint();
       const state = first.getPersistenceState();
+      const savedClean = state.dirty === false && state.lifecycle === 'open';
       stageB = {
-        status: 'passed',
+        status: savedClean ? 'passed' : 'failed',
         ...imported,
-        problems: [],
+        problems: savedClean
+          ? []
+          : [
+              {
+                code: 'field_mismatch' as const,
+                detail: state.dirty
+                  ? 'checkpoint left the session dirty; accepted data is not confirmed saved'
+                  : `session lifecycle is "${state.lifecycle}", not open`,
+              },
+            ],
         batchPlans,
         ledgerOk,
         checkpointId: checkpoint.checkpointId,
@@ -1181,7 +1238,13 @@ export async function runLegacyMigrationDryRun(options: LegacyMigrationDryRunOpt
     crossWorldRecords: batchPlans.reduce((sum, plan) => sum + plan.crossWorldRecords, 0),
     invalidRecords: batchPlans.reduce((sum, plan) => sum + plan.invalidRecords, 0),
     deletedRecords: batchPlans.reduce((sum, plan) => sum + plan.deletedRecords, 0),
-    allVerified: batchPlans.every((plan) => plan.ok),
+    // `planned` batches were never written or read back; they cannot count as
+    // verified. A failed stage also invalidates the aggregate claim.
+    allVerified:
+      stageB.status === 'passed' &&
+      stageC.status === 'passed' &&
+      stageD.status === 'passed' &&
+      batchPlans.every((plan) => plan.ok && plan.status !== 'planned'),
   };
 
   return {

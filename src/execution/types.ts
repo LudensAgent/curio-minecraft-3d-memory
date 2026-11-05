@@ -138,6 +138,12 @@ export interface WalkRouteRequest {
   arrival: ArrivalSpec;
   /** Require grounded, dry, stable measured arrival within these explicit tolerances. */
   bodyArrival?: GroundedArrival;
+  /**
+   * Measured sample captured immediately before this delegation starts. It only
+   * seeds the sample-ordering floor (a search may have run between measurement
+   * and start); it is never counted as arrival, trace, or a control result.
+   */
+  startSample?: BodySample;
   constraints?: StepConstraints;
   shapeProvider: CollisionShapeProvider;
   /** Original delegation deadline (epoch ms). */

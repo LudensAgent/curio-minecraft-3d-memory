@@ -1834,13 +1834,33 @@ function loadVoxel(
   }
 
   const rows = connection
-    .prepare('SELECT payload FROM spatial_sections WHERE world_id = ? ORDER BY seq')
-    .all(wId) as { payload: string }[];
+    .prepare(
+      'SELECT id, dimension, cx, cz, sy, payload FROM spatial_sections WHERE world_id = ? ORDER BY seq',
+    )
+    .all(wId) as {
+    id: string;
+    dimension: string;
+    cx: number;
+    cz: number;
+    sy: number;
+    payload: string;
+  }[];
   const decoded: VoxelSectionSnapshot[] = [];
   let observedCells = 0;
   let paletteEntries = 0;
   for (const row of rows) {
+    // The explicit columns are the indexed identity; they must agree with the id
+    // JSON on every read, not only in manual directory loading.
+    sectionIdentity(row);
     const section = decodeVoxelSection(row.payload);
+    if (
+      section.dim !== row.dimension ||
+      section.cx !== row.cx ||
+      section.cz !== row.cz ||
+      section.sy !== row.sy
+    ) {
+      throw new Error('corrupt section identity: payload coordinates disagree with row columns');
+    }
     observedCells += section.evidence.length;
     paletteEntries += section.palette.length;
     if (observedCells > resolved.maxObservedCells) {
@@ -2194,7 +2214,9 @@ function handleLoadSections(msg: WorkerRequest & { type: 'load_sections' }): voi
   }
   try {
     const metaStmt = db.prepare('SELECT octet_length(payload) AS bytes FROM spatial_sections WHERE world_id = ? AND id = ?');
-    const loadStmt = db.prepare('SELECT payload FROM spatial_sections WHERE world_id = ? AND id = ?');
+    const loadStmt = db.prepare(
+      'SELECT id, dimension, cx, cz, sy, payload FROM spatial_sections WHERE world_id = ? AND id = ?',
+    );
     const existing: { id: string; bytes: number }[] = [];
     const missing: { dim: string; cx: number; cz: number; sy: number }[] = [];
     let totalBytes = 0;
@@ -2211,7 +2233,27 @@ function handleLoadSections(msg: WorkerRequest & { type: 'load_sections' }): voi
     if (totalBytes > limits.maxBytes) {
       throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
     }
-    const sections = existing.map((entry) => decodeVoxelSection((loadStmt.get(worldId, entry.id) as { payload: string }).payload));
+    const sections = existing.map((entry) => {
+      const row = loadStmt.get(worldId, entry.id) as {
+        id: string;
+        dimension: string;
+        cx: number;
+        cz: number;
+        sy: number;
+        payload: string;
+      };
+      sectionIdentity(row);
+      const section = decodeVoxelSection(row.payload);
+      if (
+        section.dim !== row.dimension ||
+        section.cx !== row.cx ||
+        section.cz !== row.cz ||
+        section.sy !== row.sy
+      ) {
+        throw new Error('corrupt section identity: payload coordinates disagree with row columns');
+      }
+      return section;
+    });
     respond({ type: 'load_ok', requestId: msg.requestId, sections, missing });
   } catch (err) {
     const message = (err as Error).message;

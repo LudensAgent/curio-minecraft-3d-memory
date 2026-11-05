@@ -796,8 +796,14 @@ export class TopologyStore {
       throw new Error(`unknown node "${id}"`);
     }
     const merged = applyNodeChanges(existing, changes);
-    if (!locationsEqual(existing.location, merged.location) && this.nodeToEdgeIds.get(id)?.size) {
-      throw new Error(`node "${id}" is referenced by an edge; remove the edges before changing location`);
+    if (!locationsEqual(existing.location, merged.location)) {
+      if (this.nodeToEdgeIds.get(id)?.size) {
+        throw new Error(`node "${id}" is referenced by an edge; remove the edges before changing location`);
+      }
+      const portalRefs = this.portalEdgeIdsForNode(id);
+      if (portalRefs.length > 0) {
+        throw new Error(`node "${id}" is referenced by portal edge(s) ${portalRefs.join(', ')}; remove them before changing location`);
+      }
     }
     const snapshot = snapshotNode(this.worldId, merged);
     if (nodesEqual(existing, snapshot)) return { status: 'unchanged' };
@@ -817,6 +823,10 @@ export class TopologyStore {
     const refs = this.nodeToEdgeIds.get(id);
     if (refs !== undefined && refs.size > 0) {
       throw new Error(`node "${id}" is referenced by ${refs.size} edge(s); remove them first`);
+    }
+    const portalRefs = this.portalEdgeIdsForNode(id);
+    if (portalRefs.length > 0) {
+      throw new Error(`node "${id}" is referenced by portal edge(s) ${portalRefs.join(', ')}; remove them first`);
     }
     const existed = this.nodeMap.delete(id);
     this.nodeToEdgeIds.delete(id);
@@ -1045,6 +1055,11 @@ export class TopologyStore {
   verifyEdge(id: string, verification: EdgeVerificationInput): SaveResult {
     if (verification.status === 'BLOCKED') {
       throw new Error(`use blockEdge to record a BLOCKED verification with evidence`);
+    }
+    if (verification.status === 'OPEN' && (verification.dependencies?.length ?? 0) === 0) {
+      // OPEN must name the section revisions it actually depended on; without
+      // them the library cannot tell whether the evidence is still current.
+      throw new Error(`OPEN verification requires at least one section dependency`);
     }
     return this.applyVerification(id, verification);
   }
@@ -1319,12 +1334,15 @@ export class TopologyStore {
     const back = traversals.filter((t) => t.direction === 'reverse');
     const from = this.nodeMap.get(edge.from);
     const to = this.nodeMap.get(edge.to);
+    if (from === undefined || to === undefined) {
+      throw new Error(`portal edge "${edge.id}" references a missing endpoint node`);
+    }
     const view: PortalEdgeView = {
       id: edge.id,
       from: edge.from,
       to: edge.to,
-      fromDim: from?.dim ?? '',
-      toDim: to?.dim ?? '',
+      fromDim: from.dim,
+      toDim: to.dim,
       directed: edge.directed,
       traversals,
       outbound,
@@ -1423,18 +1441,16 @@ export class TopologyStore {
         (pointKeys.has(pointKey(fromNode.location.pos)) &&
           pointKeys.has(pointKey(toNode.location.pos)));
       if (!associated) continue;
-      const forward = directionUsability(edge, 'forward', undefined, now);
-      const reverse = directionUsability(edge, 'reverse', undefined, now);
-      const cutForward =
-        !forward.usable &&
-        forward.reason !== 'mode_mismatch' &&
-        forward.reason !== 'no_direction';
-      const cutReverse =
-        !reverse.usable &&
-        reverse.reason !== 'mode_mismatch' &&
-        reverse.reason !== 'no_direction' &&
-        !edge.directed;
-      if (!cutForward && !cutReverse) continue;
+      // A segment is only cut when no recorded mode remains usable in either
+      // allowed direction. A blocked swim mode must not cut a walk segment.
+      const modes = [...new Set(edge.verifications.map((v) => v.mode))];
+      if (modes.length === 0) continue;
+      const usable = modes.some(
+        (mode) =>
+          directionUsability(edge, 'forward', mode, now).usable ||
+          (!edge.directed && directionUsability(edge, 'reverse', mode, now).usable),
+      );
+      if (usable) continue;
       blockedEdgeIds.add(edge.id);
       addCut(fromNode.location.pos);
       addCut(toNode.location.pos);
@@ -1561,6 +1577,10 @@ export class TopologyStore {
 
     const now = this.resolveNow(options);
     const reach = this.reachable(start.id, { now });
+    // A budget-truncated reachable set cannot prove which anchor is highest/lowest.
+    // Evidence gaps are reported in the query stats and do not turn the proven
+    // reachable subset into a fabricated global extreme.
+    if (reach.exhausted !== undefined) return null;
     const reachableIds = new Set(reach.nodes);
     let excludedRegionNodes = 0;
     const candidates: SpatialNode[] = [];
@@ -2190,7 +2210,7 @@ export class TopologyStore {
         this.programNodeOrder.splice(i, 1);
         continue;
       }
-      if ((this.nodeToEdgeIds.get(id)?.size ?? 0) > 0) {
+      if ((this.nodeToEdgeIds.get(id)?.size ?? 0) > 0 || this.portalEdgeIdsForNode(id).length > 0) {
         i += 1;
         continue;
       }
@@ -2201,6 +2221,15 @@ export class TopologyStore {
       return true;
     }
     return false;
+  }
+
+  /** Portal edge ids whose endpoints reference `nodeId` (separate from walk edges). */
+  private portalEdgeIdsForNode(nodeId: string): string[] {
+    const ids: string[] = [];
+    for (const edge of this.portalEdgeMap.values()) {
+      if (edge.from === nodeId || edge.to === nodeId) ids.push(edge.id);
+    }
+    return ids.sort();
   }
 
   private invalidateEdgeComponents(edge: StoredEdge): void {
@@ -2594,14 +2623,17 @@ export class TopologyStore {
     if (raw.verifications !== undefined && !Array.isArray(raw.verifications)) {
       throw new Error(`edge "${raw.id}" verifications must be an array`);
     }
-    const verifications = (raw.verifications ?? []).reduce<EdgeVerification[]>(
-      (acc, rawVerification) =>
-        withVerification(
-          acc,
-          snapshotEdgeVerification(rawVerification, this.now(), directed, { allowExpiredOpen: true }),
-        ),
-      [],
-    );
+    const verifications = (raw.verifications ?? []).reduce<EdgeVerification[]>((acc, rawVerification) => {
+      const verification = snapshotEdgeVerification(rawVerification, this.now(), directed, {
+        allowExpiredOpen: true,
+      });
+      if (modes.length > 0 && !modes.includes(verification.mode)) {
+        throw new Error(
+          `edge "${raw.id}" verification mode "${verification.mode}" is not one of its recorded modes`,
+        );
+      }
+      return withVerification(acc, verification);
+    }, []);
 
     const refs: StoredEvidenceRef[] = [];
     const rawRefs = raw.refs;

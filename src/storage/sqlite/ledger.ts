@@ -235,6 +235,9 @@ export class LedgerStore {
     const pos = floorPos(input.pos, 'placed pos');
     const key = placedBlockKey(this.worldId, input.dim, pos.x, pos.y, pos.z);
     const lruAt = input.lruAt ?? this.lruClock + 1;
+    if (lruAt < 0) {
+      throw new PersistenceError('data', `placed lruAt must be a non-negative integer: ${lruAt}`);
+    }
     const existing = this.placed.get(key);
     if (existing === undefined && this.placed.size >= this.limits.maxPlacedBlocks) {
       throw new PersistenceError('capacity', `placed ledger exceeds maxPlacedBlocks (${this.placed.size})`);

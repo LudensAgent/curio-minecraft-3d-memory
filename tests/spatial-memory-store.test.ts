@@ -471,9 +471,8 @@ describe('SpatialMemoryStoreImpl — frontier candidates', () => {
       // The stance is OPEN-validated; the boundary itself is not claimed passable.
       expect(frontier.reachability).toBe('OPEN');
       expect(frontier.basis.length).toBeGreaterThan(0);
-      // `unknown` cannot be expressed by the interface boolean; false means
-      // "not established", never "disproved".
-      expect(frontier.historicalConnection).toBe(false);
+      // No history lookup was supplied, so this is unknown, never a fabricated false.
+      expect(frontier.historicalConnection).toBe('unknown');
     }
 
     const inspection = store.frontierInspection(DIM, here);

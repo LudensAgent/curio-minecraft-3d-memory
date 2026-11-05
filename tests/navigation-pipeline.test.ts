@@ -243,6 +243,54 @@ describe('navigateTo — integrated measured pipeline', () => {
     expect(record).toBe(captured);
   });
 
+  it('accepts a measured start older than executor.start after a bounded search (real clock)', async () => {
+    const map = new VoxelMap('world');
+    openCells(map, [[0, 0], [1, 0], [2, 0]]);
+    const measured = { current: measuredSample(pt(0.5, 0, 0.5)) };
+    const move = new TrackingMoveExecutor(measured);
+    let clock = NOW;
+    const harness = makeHarness({
+      map,
+      measured: measured.current,
+      sample: () => measured.current,
+      move,
+      clock: () => {
+        clock += 10;
+        return clock;
+      },
+    });
+
+    const { result } = await navigateTo(navigateRequest(), harness.env);
+
+    expect(result.outcome).toBe('ARRIVED');
+    expect(result.confirmed).toBe(true);
+    expect(result.lastPosition).toEqual(pt(2.5, 0, 0.5));
+  });
+
+  it('does not report ARRIVED or start the executor when the delegation is already aborted', async () => {
+    const map = new VoxelMap('world');
+    openCells(map, [[0, 0], [1, 0], [2, 0]]);
+    const measured = { current: measuredSample(pt(2.5, 0, 0.5)) };
+    const move = new TrackingMoveExecutor(measured);
+    const controller = new AbortController();
+    controller.abort('user stopped');
+    const harness = makeHarness({
+      map,
+      measured: measured.current,
+      sample: () => measured.current,
+      move,
+      signal: controller.signal,
+    });
+
+    const { result, record } = await navigateTo(navigateRequest(), harness.env);
+
+    expect(result.outcome).toBe('CANCELLED');
+    expect(result.confirmed).toBe(false);
+    expect(result.lastPosition).toEqual(pt(2.5, 0, 0.5));
+    expect(move.requests).toEqual([]);
+    expect(record?.result).toBe(result);
+  });
+
   it('returns ARRIVED from an already-measured exact target without starting a search or a route', async () => {
     const measured = { current: measuredSample(pt(2.5, 0, 0.5)) };
     const move = new TrackingMoveExecutor(measured);

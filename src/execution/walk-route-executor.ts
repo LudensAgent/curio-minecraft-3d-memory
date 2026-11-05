@@ -186,7 +186,11 @@ export class WalkRouteExecutor {
 
     this.request = snapshotRequest(request, points, body);
     this.startedAt = this.currentNow();
-    this.lastSampleObservedAt = this.startedAt;
+    // A measured start may predate startedAt (a bounded search can run between
+    // measurement and start). Seed only the ordering floor; the sample still has
+    // to be delivered through onSample and confirmed like any other sample.
+    this.lastSampleObservedAt =
+      request.startSample !== undefined ? request.startSample.observedAt : this.startedAt;
     this.lastSampleSequence = 0;
     this.nextPointIndex = 1;
     this.lastPosition = null;

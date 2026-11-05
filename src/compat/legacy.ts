@@ -221,6 +221,7 @@ interface DeletionSets {
   placed: Set<string>;
   endpoints: Set<string>;
   chunkVisits: Set<string>;
+  traversals: Set<string>;
 }
 
 const clone = <T>(value: T): T => structuredClone(value);
@@ -240,6 +241,23 @@ export function legacyChunkVisitKey(worldId: string, dim: string, cx: number, cz
   return `${worldId}:${dim}:${cx}:${cz}`;
 }
 
+/** Canonical crossing identity, identical to `portalTraversalIdentity`. */
+function legacyCrossingKey(
+  crossing: LegacyTravelCrossing,
+  kind: 'traversal' | 'gateway',
+): string {
+  return JSON.stringify([
+    kind,
+    crossing.fromId,
+    crossing.toId,
+    crossing.ts,
+    crossing.fromSession,
+    crossing.toSession,
+    crossing.fromObservation,
+    crossing.toObservation,
+  ]);
+}
+
 /**
  * Parse a legacy `x,y,z` placement key. The legacy writer floors positions, so a
  * non-integer or malformed key is reported rather than rounded into a plausible
@@ -248,6 +266,9 @@ export function legacyChunkVisitKey(worldId: string, dim: string, cx: number, cz
 export function parseLegacyPlacedKey(key: string): Vec3Like | null {
   const parts = key.split(',');
   if (parts.length !== 3) return null;
+  // Only exact decimal integers are real cell coordinates. `Number('')`,
+  // whitespace and exponent forms would otherwise fabricate a position.
+  if (!parts.every((part) => /^-?\d+$/.test(part))) return null;
   const [x, y, z] = parts.map(Number);
   if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || !Number.isSafeInteger(z)) return null;
   return { x: x!, y: y!, z: z! };
@@ -310,8 +331,11 @@ export function parseLegacyChunkVisitKey(
   if (!key.startsWith(prefix)) return null;
   const parts = key.slice(prefix.length).split(':');
   if (parts.length < 3) return null;
-  const cz = Number(parts[parts.length - 1]);
-  const cx = Number(parts[parts.length - 2]);
+  const czRaw = parts[parts.length - 1]!;
+  const cxRaw = parts[parts.length - 2]!;
+  if (!/^-?\d+$/.test(cxRaw) || !/^-?\d+$/.test(czRaw)) return null;
+  const cz = Number(czRaw);
+  const cx = Number(cxRaw);
   if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cz)) return null;
   const dim = parts.slice(0, -2).join(':');
   if (dim.length === 0) return null;
@@ -328,6 +352,7 @@ function deletionSets(deletions: LegacyDeletionSet | undefined): DeletionSets {
     placed: new Set(deletions?.placedKeys ?? []),
     endpoints: new Set(deletions?.endpointIds ?? []),
     chunkVisits: new Set(deletions?.chunkVisitKeys ?? []),
+    traversals: new Set(deletions?.traversalKeys ?? []),
   };
 }
 
@@ -382,13 +407,18 @@ export function createLegacyReadBackend(
       return {
         chests: Object.fromEntries(
           Object.entries(snapshot.chests ?? {})
+            .filter(([key]) => key.startsWith(`${worldId}:`))
             .filter(([key]) => !deleted.chests.has(key))
             .map(([key, value]) => [key, clone(value)]),
         ),
         furnaces: (snapshot.furnaces ?? [])
+          .filter((furnace) => legacyRecordWorldId(furnace) === worldId)
           .filter((furnace) => !deleted.furnaces.has(legacyBlockKey(furnace)))
           .map(clone),
-        farms: (snapshot.farms ?? []).filter((farm) => !deleted.farms.has(farm.id)).map(clone),
+        farms: (snapshot.farms ?? [])
+          .filter((farm) => legacyRecordWorldId(farm) === worldId)
+          .filter((farm) => !deleted.farms.has(farm.id))
+          .map(clone),
         placed: Object.fromEntries(
           Object.entries(snapshot.placed ?? {})
             .filter(([key]) => !deleted.placed.has(key))
@@ -401,10 +431,15 @@ export function createLegacyReadBackend(
         ),
         travel: {
           endpoints: (snapshot.travel?.endpoints ?? [])
+            .filter((endpoint) => endpoint.worldId === worldId)
             .filter((endpoint) => !deleted.endpoints.has(endpoint.id))
             .map(clone),
-          traversals: (snapshot.travel?.traversals ?? []).map(clone),
-          gateways: (snapshot.travel?.gateways ?? []).map(clone),
+          traversals: (snapshot.travel?.traversals ?? [])
+            .filter((crossing) => !deleted.traversals.has(legacyCrossingKey(crossing, 'traversal')))
+            .map(clone),
+          gateways: (snapshot.travel?.gateways ?? [])
+            .filter((crossing) => !deleted.traversals.has(legacyCrossingKey(crossing, 'gateway')))
+            .map(clone),
         },
       };
     },

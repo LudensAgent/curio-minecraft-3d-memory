@@ -21,6 +21,7 @@ import type {
   EdgeVerificationStatus,
 } from './graph.js';
 import { MOVE_MODES } from './path-fragment.js';
+import { cloneObservation } from '../observation/index.js';
 import type { HazardFact, ObstacleEvidence } from '../traversability/types.js';
 import type { MoveMode } from '../types.js';
 
@@ -153,7 +154,7 @@ function cloneObstacleEvidence(e: ObstacleEvidence): ObstacleEvidence {
       sessionId: e.sessionId,
     };
   }
-  return { kind: 'block', observation: { ...e.observation } };
+  return { kind: 'block', observation: cloneObservation(e.observation) };
 }
 
 export function edgeVerificationsEqual(a: EdgeVerification[], b: EdgeVerification[]): boolean {

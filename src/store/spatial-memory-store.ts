@@ -841,7 +841,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
         ? {
             available: true,
             reason:
-              'Projects only a caller-supplied WalkSearchSnapshot; never starts a search. historicalConnection is reported false for unknown.',
+              'Projects only a caller-supplied WalkSearchSnapshot; never starts a search. historicalConnection is `unknown` when no history lookup was made.',
           }
         : {
             available: false,
@@ -1105,9 +1105,7 @@ function toFrontier(candidate: FrontierCandidateView): Frontier {
     // The stance this boundary is next to was OPEN-validated; the boundary
     // point itself and the gap beyond it are not claimed reachable.
     reachability: candidate.reachability,
-    // Frontier's boolean cannot express the view's `unknown`; `false` means
-    // "not established", never "disproved". Use frontierInspection for the
-    // explicit 'unknown' form.
-    historicalConnection: false,
+    // No history lookup is wired here: report unknown, never a fabricated false.
+    historicalConnection: 'unknown',
   };
 }

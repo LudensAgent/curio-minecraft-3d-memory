@@ -629,8 +629,11 @@ describe('passage snapshot import, verification and temporary switch rehearsal',
       unattributedRecords: 2,
       crossWorldRecords: 2,
       deletedRecords: 5,
-      allVerified: true,
+      // Planned-only batches (landmarks/endpoints) were never written or read
+      // back, so they cannot count as verified.
+      allVerified: false,
     });
+    expect(report.verificationCounts.plannedRecords).toBeGreaterThan(0);
     expect(report.rehearsedBatches).toEqual(
       expect.arrayContaining(['passages', 'placed', 'chunkVisits', 'travelTraversals', 'travelGateways']),
     );

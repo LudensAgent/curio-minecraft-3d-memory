@@ -150,7 +150,8 @@ export interface Frontier {
   pos: Vec3Like;
   basis: Observation[];
   reachability: Traversability;
-  historicalConnection: boolean;
+  /** `'unknown'` when no history lookup was made; never fabricated as false. */
+  historicalConnection: boolean | 'unknown';
 }
 
 /** One delegated navigation/execution, kept for attribution and skill learning. */

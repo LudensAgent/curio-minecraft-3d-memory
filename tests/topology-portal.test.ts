@@ -162,6 +162,16 @@ describe('TopologyStore — portal connections', () => {
     ).toThrow(/different content/);
   });
 
+  it('refuses node deletion or relocation while a portal endpoint references it', () => {
+    const { store } = setup();
+    store.savePortalEdge({ id: 'portal-1', from: 'o', to: 'n' }, [outbound()]);
+    expect(() => store.forgetNode('o')).toThrow(/portal/);
+    expect(() =>
+      store.updateNode('o', { location: { kind: 'exact', pos: pt(11, 64, 10) } }),
+    ).toThrow(/portal/);
+    expect(store.getNode('o')?.location).toMatchObject({ pos: pt(10, 64, 10) });
+  });
+
   it('restores portal edges and traversals from a checkpoint', () => {
     const { store } = setup();
     store.savePortalEdge({ id: 'portal-1', from: 'o', to: 'n' }, [outbound(), back()]);

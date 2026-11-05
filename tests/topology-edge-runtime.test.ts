@@ -79,7 +79,7 @@ function openVerification(overrides: Partial<EdgeVerificationInput> = {}): EdgeV
     validUntil: 2000,
     sessionId: 's1',
     contextKey: 'body:0.6x1.8',
-    dependencies: [],
+    dependencies: [{ key: { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 4 }, revision: 1 }],
     ...overrides,
   };
 }

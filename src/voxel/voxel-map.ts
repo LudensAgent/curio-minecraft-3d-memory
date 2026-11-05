@@ -16,7 +16,7 @@
  * methods appear here as fake-success stubs.
  */
 
-import { VOXEL_SNAPSHOT_SCHEMA_VERSION } from '../constants.js';
+import { SECTION_CELL_COUNT, VOXEL_SNAPSHOT_SCHEMA_VERSION } from '../constants.js';
 import { cloneObservationGap } from '../observation/clone.js';
 import type { CellEvidence, Observation, ObservationBatch, ObservationGap } from '../observation/types.js';
 import { assertIntegerCoords, validateObservation, validateObservationGap } from '../observation/validate.js';
@@ -624,6 +624,18 @@ export class VoxelMap {
 
     const restored = new Map<string, Map<string, Section>>();
     for (const raw of snapshot.sections) {
+      // Schema v2+ persists the history/risk bitmaps. A payload missing them is
+      // corrupt, not "no history": accepting it would silently erase evidence.
+      if ((snapshot.schemaVersion ?? 1) >= 2) {
+        for (const name of ['traversed', 'modified', 'risk'] as const) {
+          const bitmap = raw[name];
+          if (!(bitmap instanceof Uint8Array) || bitmap.length !== SECTION_CELL_COUNT / 8) {
+            throw new Error(
+              `voxel section (${raw.dim}, ${raw.cx}, ${raw.cz}, ${raw.sy}) is missing its ${name} bitmap`,
+            );
+          }
+        }
+      }
       const section = restoreVoxelSection(this.worldId, raw);
       let dimMap = restored.get(raw.dim);
       if (dimMap === undefined) {
