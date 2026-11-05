@@ -48,7 +48,7 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -71,6 +71,8 @@ const KNOWN_TABLES_V5 = new Set([
   'chunk_visits',
   'portal_traversals',
 ]);
+
+const KNOWN_TABLES_V6 = new Set(KNOWN_TABLES_V5);
 
 /** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
 const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
@@ -222,6 +224,18 @@ const REQUIRED_COLUMNS_V5: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
   },
 };
 
+/**
+ * Required columns for the v6 schema: the checkpoint row now also carries the
+ * low-frequency portal-edge + fragment-merge topology extras.
+ */
+const REQUIRED_COLUMNS_V6: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V5,
+  checkpoints: {
+    ...REQUIRED_COLUMNS_V5.checkpoints,
+    topology_extras: 'TEXT',
+  },
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -239,6 +253,9 @@ CREATE TABLE checkpoints (
   has_journal INTEGER NOT NULL DEFAULT 0,
   ledger_revision INTEGER NOT NULL DEFAULT 0,
   has_ledger INTEGER NOT NULL DEFAULT 0,
+  -- Portal edges + evidence-backed fragment merges: low-frequency, nested
+  -- topology facts that do not fit the four walk-edge history arrays.
+  topology_extras TEXT NOT NULL DEFAULT '{}',
   seq INTEGER NOT NULL
 );
 CREATE INDEX checkpoints_world_seq ON checkpoints (world_id, seq);
@@ -369,6 +386,10 @@ interface PreparedSnapshot {
   traversals: { id: string; payload: string }[];
   nodes: { id: string; payload: string }[];
   edges: { id: string; payload: string }[];
+  /** Serialized portal edges + fragment merges stored on the checkpoint row. */
+  extras: string;
+  portalEdges: number;
+  fragmentMerges: number;
   polylinePoints: number;
   entrancePoints: number;
   linkPairs: number;
@@ -465,6 +486,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV2ToV3(connection, databasePath);
     upgradeV3ToV4(connection, databasePath);
     upgradeV4ToV5(connection, databasePath);
+    upgradeV5ToV6(connection, databasePath);
     return connection;
   }
 
@@ -476,6 +498,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV2ToV3(connection, databasePath);
     upgradeV3ToV4(connection, databasePath);
     upgradeV4ToV5(connection, databasePath);
+    upgradeV5ToV6(connection, databasePath);
     return connection;
   }
 
@@ -486,6 +509,7 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV3ToV4(connection, databasePath);
     upgradeV4ToV5(connection, databasePath);
+    upgradeV5ToV6(connection, databasePath);
     return connection;
   }
 
@@ -495,12 +519,22 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV4ToV5(connection, databasePath);
+    upgradeV5ToV6(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (5)
-  validateKnownTables(connection, names, KNOWN_TABLES_V5);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V5)) {
+  if (version === 5) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V5);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V5)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV5ToV6(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (6)
+  validateKnownTables(connection, names, KNOWN_TABLES_V6);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V6)) {
     assertRequiredColumns(connection, table, columns);
   }
   return connection;
@@ -749,6 +783,25 @@ function upgradeV4ToV5(connection: Database.Database, databasePath: string): voi
   tx();
 }
 
+/**
+ * Upgrade a validated v5 database in place: add the checkpoint column that
+ * carries portal edges and evidence-backed fragment merges. Older checkpoints
+ * default to `{}` (no extras); no existing row is rewritten or deleted.
+ */
+function upgradeV5ToV6(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v6-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    const columns = connection.prepare('PRAGMA table_info(checkpoints)').all() as { name: string }[];
+    // Idempotent: a downgraded but not column-stripped fixture may already have it.
+    if (!columns.some((column) => column.name === 'topology_extras')) {
+      connection.exec("ALTER TABLE checkpoints ADD COLUMN topology_extras TEXT NOT NULL DEFAULT '{}'");
+    }
+    connection.prepare("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
 /** Reject a table missing a required column, or whose column has the wrong type affinity. */
 function assertRequiredColumns(
   connection: Database.Database,
@@ -787,16 +840,25 @@ function stringifyRecord(record: unknown): string {
 }
 
 function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
+  const portalEdges = snapshot.portalEdges ?? [];
+  const fragmentMerges = snapshot.fragmentMerges ?? [];
+  const extras =
+    portalEdges.length === 0 && fragmentMerges.length === 0
+      ? '{}'
+      : JSON.stringify({ portalEdges, fragmentMerges });
   const prepared: PreparedSnapshot = {
     fragments: [],
     traversals: [],
     nodes: [],
     edges: [],
+    extras,
+    portalEdges: snapshot.portalEdges?.length ?? 0,
+    fragmentMerges: snapshot.fragmentMerges?.length ?? 0,
     polylinePoints: 0,
     entrancePoints: 0,
     linkPairs: 0,
     edgeEvidenceRefs: 0,
-    bytes: 0,
+    bytes: Buffer.byteLength(extras, 'utf8'),
   };
   for (const f of snapshot.fragments) {
     const payload = stringifyRecord(f);
@@ -992,11 +1054,13 @@ function assertDerivedWithinLimits(
 }
 
 function assertWithinLimits(prepared: PreparedSnapshot, resolved: ResolvedSnapshotLimits): void {
+  // Portal edges and evidence-backed fragment merges are connections too; they
+  // share the topology edge capacity with walk edges.
   assertCountsWithinLimits(
     prepared.fragments.length,
     prepared.traversals.length,
     prepared.nodes.length,
-    prepared.edges.length,
+    prepared.edges.length + prepared.portalEdges + prepared.fragmentMerges,
     prepared.bytes,
     resolved,
   );
@@ -1123,7 +1187,7 @@ function writeCheckpoint(
 
     connection
       .prepare(
-        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, topology_extras, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         checkpointId,
@@ -1136,6 +1200,7 @@ function writeCheckpoint(
         journal.mode === 'none' ? 0 : 1,
         ledger.mode === 'none' ? 0 : ledger.revision,
         ledger.mode === 'none' ? 0 : 1,
+        prepared.extras,
         nextSeq,
       );
   });
@@ -1650,7 +1715,8 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
               OR typeof(has_journal) != 'integer' OR (has_journal != 0 AND has_journal != 1)
               OR typeof(journal_revision) != 'integer' OR journal_revision < 0
               OR typeof(has_ledger) != 'integer' OR (has_ledger != 0 AND has_ledger != 1)
-              OR typeof(ledger_revision) != 'integer' OR ledger_revision < 0)`,
+              OR typeof(ledger_revision) != 'integer' OR ledger_revision < 0
+              OR typeof(topology_extras) != 'text')`,
     )
     .get(wId) as { n: number };
   if (bad.n > 0) {
@@ -1666,8 +1732,8 @@ function loadWorld(
   assertValidCheckpointMetadata(connection, wId);
 
   const cp = connection
-    .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
-    .get(wId) as { checkpoint_id: string } | undefined;
+    .prepare('SELECT checkpoint_id, topology_extras FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
+    .get(wId) as { checkpoint_id: string; topology_extras: string } | undefined;
   if (cp === undefined) {
     const orphans =
       countRows(connection, 'path_fragments', wId) +
@@ -1684,6 +1750,12 @@ function loadWorld(
   const traversals = countRows(connection, 'traversal_evidence', wId);
   const nodes = countRows(connection, 'spatial_nodes', wId);
   const edges = countRows(connection, 'spatial_edges', wId);
+  const extras = JSON.parse(cp.topology_extras) as {
+    portalEdges?: HistorySnapshot['portalEdges'];
+    fragmentMerges?: HistorySnapshot['fragmentMerges'];
+  };
+  const portalEdges = extras.portalEdges ?? [];
+  const fragmentMerges = extras.fragmentMerges ?? [];
   const bytes =
     sumPayloadBytes(connection, 'path_fragments', wId) +
     sumPayloadBytes(connection, 'traversal_evidence', wId) +
@@ -1691,8 +1763,16 @@ function loadWorld(
     sumPayloadBytes(connection, 'spatial_edges', wId) +
     SNAPSHOT_FRAME_BYTES +
     interRecordCommas(fragments, traversals, nodes, edges) +
-    Buffer.byteLength(JSON.stringify(wId), 'utf8');
-  assertCountsWithinLimits(fragments, traversals, nodes, edges, bytes, resolved);
+    Buffer.byteLength(JSON.stringify(wId), 'utf8') +
+    Buffer.byteLength(cp.topology_extras, 'utf8');
+  assertCountsWithinLimits(
+    fragments,
+    traversals,
+    nodes,
+    edges + portalEdges.length + fragmentMerges.length,
+    bytes,
+    resolved,
+  );
 
   const snapshot: HistorySnapshot = {
     worldId: wId,
@@ -1700,6 +1780,8 @@ function loadWorld(
     traversals: readAll(connection, 'traversal_evidence', wId) as HistorySnapshot['traversals'],
     nodes: readAll(connection, 'spatial_nodes', wId) as HistorySnapshot['nodes'],
     edges: readAll(connection, 'spatial_edges', wId) as HistorySnapshot['edges'],
+    portalEdges,
+    fragmentMerges,
   };
   assertDerivedWithinLimits(computeDerivedCounts(snapshot), resolved);
   return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes };

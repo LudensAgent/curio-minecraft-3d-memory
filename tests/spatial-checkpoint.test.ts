@@ -841,9 +841,12 @@ describe('SQLite combined spatial persistence', () => {
     const edges = count('spatial_edges');
     const commas = Math.max(0, fragments - 1) + Math.max(0, traversals - 1) + Math.max(0, nodes - 1) + Math.max(0, edges - 1);
     const escapedWorldId = Buffer.byteLength(JSON.stringify(WORLD), 'utf8');
+    const extras = (db
+      .prepare('SELECT topology_extras FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
+      .get(WORLD) as { topology_extras: string }).topology_extras;
     const historyBytes =
       sumOctet('path_fragments') + sumOctet('traversal_evidence') + sumOctet('spatial_nodes') + sumOctet('spatial_edges') +
-      SNAPSHOT_FRAME_BYTES + commas + escapedWorldId;
+      SNAPSHOT_FRAME_BYTES + commas + escapedWorldId + Buffer.byteLength(extras, 'utf8');
     const sections = count('spatial_sections');
     const voxelBytes = sumOctet('spatial_sections') + VOXEL_FRAME_BYTES + escapedWorldId + Math.max(0, sections - 1);
 
@@ -857,6 +860,68 @@ describe('SQLite combined spatial persistence', () => {
     await expect(
       openSpatialSession({ databasePath: dbPath, worldId: WORLD, snapshotLimits: { maxBytes: exactTotal - 1 } }),
     ).rejects.toMatchObject({ kind: 'capacity' });
+  });
+
+  it('persists portal edges and evidence-backed fragment merges across reopen', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const a = { x: 0.5, y: 64, z: 0.5 };
+    const b = { x: 1.5, y: 64, z: 0.5 };
+    const c = { x: 2.5, y: 64, z: 0.5 };
+    session.history.saveFragment(frag({ id: 'f1', polyline: [{ ...a }, { ...b }] }));
+    session.history.saveFragment(frag({ id: 'f2', polyline: [{ ...b }, { ...c }] }));
+    session.history.addTraversal({
+      id: 't-merge',
+      worldId: WORLD,
+      dim: DIM,
+      fragmentId: 'f1',
+      from: { ...a },
+      to: { ...b },
+      observedAt: 1000,
+      sessionId: 's1',
+      source: 'confirmed_walk',
+    });
+    session.topology.mergeFragments('f1', 'f2', 't-merge');
+    session.topology.saveNode({
+      id: 'portal-o',
+      kind: 'place',
+      source: 'agent',
+      tag: 'portal',
+      worldId: WORLD,
+      dim: DIM,
+      location: { kind: 'exact', pos: { x: 10, y: 64, z: 10 } },
+    });
+    session.topology.saveNode({
+      id: 'portal-n',
+      kind: 'place',
+      source: 'agent',
+      tag: 'portal',
+      worldId: WORLD,
+      dim: 'the_nether',
+      location: { kind: 'exact', pos: { x: 77, y: 40, z: -33 } },
+    });
+    session.topology.savePortalEdge({ id: 'portal-1', from: 'portal-o', to: 'portal-n' }, [
+      {
+        id: 'pt-out',
+        edgeId: 'portal-1',
+        direction: 'forward',
+        sessionId: 's1',
+        observedAt: 1000,
+        observationIds: ['obs-1'],
+        source: 'portal_use',
+      },
+    ]);
+    await session.checkpoint();
+    await session.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.topology.portalEdges()).toHaveLength(1);
+    expect(reopened.topology.portalEdges()[0]!.traversals).toHaveLength(1);
+    expect(reopened.topology.portalEdges()[0]!.returnVerified).toBe(false);
+    // The explicit merge survives: re-applying the same evidence-backed pair is
+    // idempotent rather than unknown.
+    expect(reopened.topology.mergeFragments('f1', 'f2', 't-merge')).toEqual({ status: 'unchanged' });
+    await reopened.close();
   });
 });
 
@@ -887,7 +952,7 @@ describe('v1 → latest schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('5');
+    expect(version).toBe('6');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();
@@ -951,7 +1016,8 @@ describe('v1 → latest schema upgrade', () => {
     db.close();
 
     const escapedWorldId = Buffer.byteLength(JSON.stringify(WORLD), 'utf8');
-    const historyBytes = SNAPSHOT_FRAME_BYTES + escapedWorldId;
+    // No portal edges/merges were written, so the checkpoint extras are `{}`.
+    const historyBytes = SNAPSHOT_FRAME_BYTES + escapedWorldId + Buffer.byteLength('{}', 'utf8');
     const voxelBytes = voxelPayloadBytes + VOXEL_FRAME_BYTES + escapedWorldId + (sections - 1);
     const exactTotal = historyBytes + voxelBytes;
 
@@ -1045,7 +1111,9 @@ describe('v2 → v3 migration scope', () => {
     // less than the whole-database payload total — so the migration must not treat
     // the per-world maxBytes as a database-wide cap.
     const worldIdBytes = Buffer.byteLength(JSON.stringify('worldA'), 'utf8');
-    const maxBytes = SNAPSHOT_FRAME_BYTES + VOXEL_FRAME_BYTES + 2 * worldIdBytes + worldABytes;
+    // Empty history includes the v6 checkpoint extras `{}`.
+    const maxBytes =
+      SNAPSHOT_FRAME_BYTES + VOXEL_FRAME_BYTES + 2 * worldIdBytes + worldABytes + Buffer.byteLength('{}', 'utf8');
     expect(totalBytes).toBeGreaterThan(maxBytes);
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: 'worldA', snapshotLimits: { maxBytes } });

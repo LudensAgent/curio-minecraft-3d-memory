@@ -18,6 +18,7 @@ import type {
   PathFragment,
   SpatialNode,
   TopologyEdgeSnapshot,
+  TopologyPortalEdgeSnapshot,
   TraversalEvidence,
 } from '../../topology/index.js';
 import type { Vec3Like } from '../../types.js';
@@ -584,6 +585,13 @@ export interface HistorySnapshot {
   traversals: TraversalEvidence[];
   nodes: SpatialNode[];
   edges: TopologyEdgeSnapshot[];
+  /**
+   * Portal edges are a separate graph from walk edges; they must survive a
+   * restart together with their raw traversal evidence.
+   */
+  portalEdges?: TopologyPortalEdgeSnapshot[];
+  /** Evidence-backed explicit fragment merges (id pairs). */
+  fragmentMerges?: [string, string][];
 }
 
 /** Options for `openHistorySession`. */

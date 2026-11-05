@@ -1246,8 +1246,10 @@ describe('v3 → v4 journal migration', () => {
     expect(schemaVersion(dbPath)).toBe('3');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('5');
-    expect(checkpointColumns(dbPath)).toEqual(expect.arrayContaining(['journal_revision', 'has_journal']));
+    expect(schemaVersion(dbPath)).toBe('6');
+    expect(checkpointColumns(dbPath)).toEqual(
+      expect.arrayContaining(['journal_revision', 'has_journal', 'topology_extras']),
+    );
     expect(reopened.history.getFragment('f-v3')).not.toBeNull();
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
     expect(reopened.getPersistenceState()).toMatchObject({

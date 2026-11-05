@@ -434,6 +434,8 @@ class SpatialSessionImpl implements SpatialSession {
       traversals: historySnapshot.traversals,
       nodes: topologySnapshot.nodes,
       edges: topologySnapshot.edges,
+      portalEdges: topologySnapshot.portalEdges ?? [],
+      fragmentMerges: topologySnapshot.fragmentMerges ?? [],
     };
     // Deep copy only after the bounded pre-flight passed (before copy/postMessage).
     const voxelSnapshot: VoxelCheckpointSnapshot =

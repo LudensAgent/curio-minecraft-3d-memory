@@ -79,10 +79,9 @@ const store = new SpatialMemoryStoreImpl({
   “Known truth gaps”). `edgesDetailed(dim)` returns the `TopologyStore`
   `EdgeView` records, including `basis` and per-evidence resolution, which is the
   truthful detail read.
-- `portalEdges` is unsupported: `TopologyStore` rejects `PORTAL` edges and this
-  composition has no portal-traversal history store. An empty array would be
-  indistinguishable from “no portals recorded”, so the method raises an explicit
-  error.
+- `portalEdges` delegates to the separate portal graph in `TopologyStore`. Portal
+  edges never mix into `graph()`/`route()`/adjacency; each keeps its raw
+  outbound/return traversal evidence, and `returnVerified` is derived on read.
 
 ### Routing and anchors (historical geometry only)
 
@@ -197,9 +196,10 @@ papered over.
    `TopologyEdge`) would let the interface express a traversed edge directly.
    Today `SpatialEdgeRecord` accepts those optional fields, but
    `SpatialMemoryStore.upsertEdge` does not declare them.
-4. **`portalEdges` has no backing store.** `TopologyStore` rejects `PORTAL`
-   edges by design in this phase; a portal-traversal evidence store is still
-   required before this can return anything truthful.
+4. **Portal edges are separate from the walk graph.** `portalEdges()` returns
+   only the portal graph; walk routing never sees those edges. The checkpoint
+   persists portal edges and evidence-backed fragment merges in the low-frequency
+   `topology_extras` checkpoint column.
 5. **`Frontier.historicalConnection: boolean` cannot express unknown**, and
    `frontierCandidates` cannot express `unavailable` in its `Frontier[]` return
    type. Use `frontierInspection` for the explicit form. A future interface
