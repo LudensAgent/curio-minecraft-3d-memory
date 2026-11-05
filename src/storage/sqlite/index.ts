@@ -38,14 +38,24 @@ import type {
 
 export {
   DEFAULT_JOURNAL_LIMITS,
+  DEFAULT_LEDGER_LIMITS,
   DEFAULT_SNAPSHOT_LIMITS,
   DEFAULT_TIMEOUT_MS,
   PersistenceError,
   resolveJournalLimits,
+  resolveLedgerLimits,
 } from './types.js';
+export {
+  LedgerStore,
+  chunkVisitKey,
+  placedBlockKey,
+  portalTraversalIdentity,
+} from './ledger.js';
+export type { PortalTraversalInput } from './ledger.js';
 export type {
   ActionJournalQuery,
   CheckpointResult,
+  ChunkVisitRecord,
   CloseResult,
   EventJournalQuery,
   FlushResult,
@@ -61,6 +71,8 @@ export type {
   JournalSaveMode,
   JournalWithdrawalResult,
   JournalWithdrawalSelector,
+  LedgerLimits,
+  LedgerSnapshot,
   LoadSectionsResult,
   MeasureSectionsResult,
   OpenHistorySessionOptions,
@@ -68,7 +80,13 @@ export type {
   PendingJournalSnapshot,
   PersistenceErrorKind,
   PersistenceState,
+  PlacedBlockRecord,
+  PortalEndpointEvidence,
+  PortalTraversalDirection,
+  PortalTraversalKind,
+  PortalTraversalRecord,
   ResolvedJournalLimits,
+  ResolvedLedgerLimits,
   ResolvedSnapshotLimits,
   SessionLifecycle,
   SnapshotLimits,

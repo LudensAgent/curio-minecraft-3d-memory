@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { CellEvidence, Observation } from '../src/observation/types.js';
+import type { CellEvidence, Observation, ObservationGap } from '../src/observation/types.js';
 import {
   blockToSection,
   cellIndex,
@@ -9,7 +9,7 @@ import {
   serializeBlockState,
   VoxelMap,
 } from '../src/index.js';
-import type { Section } from '../src/index.js';
+import type { ChangeReport, Section } from '../src/index.js';
 import { bitsRequired, getBit, readCell, repack, writeCell } from '../src/voxel/palette.js';
 
 const air = { name: 'minecraft:air', properties: {} };
@@ -517,5 +517,227 @@ describe('conflicting and invalid observations', () => {
   it('rejects a non-finite interruption clock', () => {
     const map = new VoxelMap('world', { now: () => Number.NaN });
     expect(() => map.markStale('overworld', 'unloaded')).toThrow(/finite/);
+  });
+});
+
+describe('history marks (traversed / modified)', () => {
+  it('marks traversed from a measured stance without inventing evidence', () => {
+    const map = new VoxelMap('world');
+    const report = map.markTraversed('overworld', { x: 3, y: 4, z: 5 });
+
+    expect(report.sections).toHaveLength(1);
+    expect(report.sections[0]!.cells[0]!.kind).toBe('traversed');
+    expect(report.sections[0]!.invalidated).toBe(false);
+
+    // The cell is history-only: never observed, never air, never explored.
+    expect(map.cellAt('overworld', 3, 4, 5)).toEqual({ observed: false });
+    expect(map.historyAt('overworld', 3, 4, 5)).toEqual({
+      explored: false,
+      traversed: true,
+      modified: false,
+      risk: false,
+      stale: false,
+    });
+    const section = sectionAt(map, 'overworld', 3, 4, 5);
+    expect(getBit(section.traversed, cellIndex(3, 4, 5))).toBe(true);
+    expect(getBit(section.explored, cellIndex(3, 4, 5))).toBe(false);
+    expect(section.evidence.size).toBe(0);
+
+    // Idempotent: re-marking does not dirty the section again.
+    const revision = map.saveRevision;
+    expect(map.markTraversed('overworld', { x: 3, y: 4, z: 5 }).sections).toEqual([]);
+    expect(map.saveRevision).toBe(revision);
+  });
+
+  it('handles negative coordinates and does not touch block-content revision', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: -1, y: -1, z: -1 } }));
+    const sectionRevision = sectionAt(map, 'overworld', -1, -1, -1).revision;
+
+    const report = map.markTraversed('overworld', { x: -1, y: -1, z: -1 });
+    expect(report.sections[0]!.revision).toBe(sectionRevision);
+    expect(sectionAt(map, 'overworld', -1, -1, -1).revision).toBe(sectionRevision);
+    expect(getBit(sectionAt(map, 'overworld', -1, -1, -1).traversed, cellIndex(15, 15, 15))).toBe(true);
+    expect(map.historyAt('overworld', -1, -1, -1)).toMatchObject({ traversed: true, explored: true });
+  });
+
+  it('requires a confirmed actionId for modified and never infers a stance', () => {
+    const map = new VoxelMap('world');
+    expect(() => map.markModified('overworld', { x: 0, y: 0, z: 0 }, '')).toThrow(/actionId/);
+
+    const report = map.markModified('overworld', { x: 0, y: 0, z: 0 }, 'act-1');
+    expect(report.sections[0]!.cells[0]!.kind).toBe('modified');
+    expect(map.historyAt('overworld', 0, 0, 0)).toMatchObject({
+      traversed: false,
+      modified: true,
+      explored: false,
+    });
+    expect(map.cellAt('overworld', 0, 0, 0)).toEqual({ observed: false });
+  });
+
+  it('unknown cells are never marked by reads or rejected input', () => {
+    const map = new VoxelMap('world');
+    expect(map.historyAt('overworld', 10, 10, 10)).toEqual({
+      explored: false,
+      traversed: false,
+      modified: false,
+      risk: false,
+      stale: false,
+    });
+    expect(() => map.markTraversed('overworld', { x: 0.5, y: 0, z: 0 })).toThrow(/integer/);
+    expect(map.historyAt('overworld', 0, 0, 0)).toMatchObject({ traversed: false, explored: false });
+  });
+});
+
+describe('pending action effects', () => {
+  it('invalidates the old conclusion without writing an expected new state', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+
+    const report = map.invalidatePendingEffect('overworld', { x: 0, y: 0, z: 0 }, 'act-1');
+    expect(report.sections[0]!.invalidated).toBe(true);
+    expect(report.sections[0]!.cells[0]!.kind).toBe('staled');
+
+    const view = evidenceAt(map, 'overworld', 0, 0, 0);
+    expect(view.freshness).toBe('STALE');
+    expect(view.staleReason).toBe('pending_effect');
+    expect(view.revision).toBe(2);
+    expect(view.observation.state).toEqual(stone); // no guessed air/new state
+    expect(map.historyAt('overworld', 0, 0, 0).stale).toBe(true);
+
+    // Repeating the same pending effect is a no-op.
+    expect(map.invalidatePendingEffect('overworld', { x: 0, y: 0, z: 0 }, 'act-1').sections).toEqual([]);
+
+    // Unknown cells stay unknown.
+    expect(map.invalidatePendingEffect('overworld', { x: 5, y: 0, z: 0 }, 'act-2').sections).toEqual([]);
+    expect(map.cellAt('overworld', 5, 0, 0)).toEqual({ observed: false });
+  });
+
+  it('does not invalidate evidence already confirmed by that same action', () => {
+    const map = new VoxelMap('world');
+    map.observe(
+      obs({
+        state: stone,
+        pos: { x: 0, y: 0, z: 0 },
+        source: 'agent_action',
+        evidence: 'confirmed_effect',
+        actionId: 'act-1',
+      }),
+    );
+
+    expect(map.invalidatePendingEffect('overworld', { x: 0, y: 0, z: 0 }, 'act-1').sections).toEqual([]);
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('FRESH');
+
+    // A different pending action still invalidates the old conclusion.
+    expect(map.invalidatePendingEffect('overworld', { x: 0, y: 0, z: 0 }, 'act-2').sections).toHaveLength(1);
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).staleReason).toBe('pending_effect');
+  });
+});
+
+describe('observation boundary validation', () => {
+  it('rejects unknown enums, bad scopes and inconsistent evidence semantics', () => {
+    const map = new VoxelMap('world');
+    expect(() => map.observe(obs({ source: 'radio' as unknown as Observation['source'] }))).toThrow(/source/);
+    expect(() => map.observe(obs({ evidence: 'guess' as unknown as Observation['evidence'] }))).toThrow(/evidence/);
+    expect(() => map.observe(obs({ dim: '' }))).toThrow(/dim/);
+    expect(() => map.observe(obs({ sessionId: '' }))).toThrow(/sessionId/);
+    expect(() => map.observe(obs({ stateComplete: 'yes' as unknown as boolean }))).toThrow(/stateComplete/);
+    expect(() => map.observe(obs({ sequence: 1.5 }))).toThrow(/sequence/);
+    expect(() => map.observe(obs({ observedWorldTick: Number.NaN }))).toThrow(/observedWorldTick/);
+    expect(() => map.observe(obs({ state: { name: '', properties: {} } }))).toThrow(/state name/);
+    expect(() =>
+      map.observe(obs({ state: { name: 'minecraft:stone', properties: { a: 1 as unknown as string } } })),
+    ).toThrow(/strings/);
+  });
+
+  it('requires verified action attribution for confirmed effects', () => {
+    const map = new VoxelMap('world');
+    expect(() => map.observe(obs({ evidence: 'confirmed_effect' }))).toThrow(/actionId/);
+    expect(() => map.observe(obs({ actionId: 'act-1' }))).toThrow(/confirmed_effect/);
+    expect(() => map.observe(obs({ source: 'agent_action' }))).toThrow(/confirmed_effect/);
+
+    expect(() =>
+      map.observe(
+        obs({ source: 'agent_action', evidence: 'confirmed_effect', actionId: 'act-1', pos: { x: 0, y: 0, z: 0 } }),
+      ),
+    ).not.toThrow();
+    expect(map.cellAt('overworld', 0, 0, 0).observed).toBe(true);
+  });
+});
+
+describe('batch gaps', () => {
+  it('returns bounded gaps without writing them as cells or air', () => {
+    const map = new VoxelMap('world');
+    const report = map.observeBatch({
+      observations: [obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })],
+      unobserved: [
+        { pos: { x: 1, y: 0, z: 0 }, reason: 'occluded' },
+        { pos: { x: 2, y: 0, z: 0 }, reason: 'budget_not_scanned' },
+      ],
+    });
+
+    expect(report.gaps).toEqual([
+      { pos: { x: 1, y: 0, z: 0 }, reason: 'occluded' },
+      { pos: { x: 2, y: 0, z: 0 }, reason: 'budget_not_scanned' },
+    ]);
+    expect(map.cellAt('overworld', 1, 0, 0)).toEqual({ observed: false });
+    expect(map.cellAt('overworld', 2, 0, 0)).toEqual({ observed: false });
+    expect(map.historyAt('overworld', 1, 0, 0).explored).toBe(false);
+
+    // The returned gaps are copies: mutating them cannot reach the map.
+    report.gaps[0]!.pos.x = 99;
+    expect(map.cellAt('overworld', 99, 0, 0)).toEqual({ observed: false });
+  });
+
+  it('rejects malformed gap positions and reasons before writing anything', () => {
+    const map = new VoxelMap('world');
+    expect(() =>
+      map.observeBatch({
+        observations: [obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })],
+        unobserved: [{ pos: { x: 0.5, y: 0, z: 0 }, reason: 'unknown' }],
+      }),
+    ).toThrow(/integer/);
+    expect(() =>
+      map.observeBatch({
+        observations: [],
+        unobserved: [{ pos: { x: 0, y: 0, z: 0 }, reason: 'guessed' as unknown as ObservationGap['reason'] }],
+      }),
+    ).toThrow(/reason/);
+    expect(map.cellAt('overworld', 0, 0, 0)).toEqual({ observed: false });
+  });
+});
+
+describe('synchronous change hook', () => {
+  it('fires once per batch, after the fact is applied, and not for no-ops', () => {
+    const reports: ChangeReport[] = [];
+    const map = new VoxelMap('world', { onChange: (report) => reports.push(report) });
+
+    let observedDuringCallback = false;
+    const observingMap = new VoxelMap('world', {
+      onChange: () => {
+        observedDuringCallback = observingMap.cellAt('overworld', 0, 0, 0).observed;
+      },
+    });
+    observingMap.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(observedDuringCallback).toBe(true);
+
+    map.observeBatch({
+      observations: [
+        obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }),
+        obs({ state: dirt, pos: { x: 1, y: 0, z: 0 } }),
+      ],
+      unobserved: [],
+    });
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.sections[0]!.cells).toHaveLength(2);
+
+    // Idempotent duplicate → no report → no callback.
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    expect(reports).toHaveLength(1);
+
+    // Lifecycle invalidation also fires once with its report.
+    map.markStale('overworld', 'unloaded');
+    expect(reports).toHaveLength(2);
+    expect(reports[1]!.sections[0]!.invalidated).toBe(true);
   });
 });

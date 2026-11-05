@@ -276,6 +276,26 @@ function validateEvent(event: SpatialEvent, worldId: string): void {
     if (event.actionId !== undefined) requireString(event.actionId, 'observed_cell_change.actionId');
     return;
   }
+  if (
+    event.kind === 'cell_blocked' ||
+    event.kind === 'cell_cleared' ||
+    event.kind === 'cell_revalidated'
+  ) {
+    const label = event.kind;
+    if (!isRecord(event.pos)) throw invalid(`${label}.pos must be a position object`);
+    validateObservationScope(event.evidence, { worldId, dim, pos: event.pos }, `${label}.evidence`);
+    if (event.evidence.sessionId !== event.sessionId) {
+      throw invalid(`${label}.evidence.sessionId does not match the event sessionId`);
+    }
+    if (event.evidence.observedAt !== event.observedAt) {
+      throw invalid(`${label}.evidence.observedAt does not match the event observedAt`);
+    }
+    if (event.previous !== undefined) {
+      validateObservationScope(event.previous, { worldId, dim, pos: event.pos }, `${label}.previous`);
+    }
+    if (event.actionId !== undefined) requireString(event.actionId, `${label}.actionId`);
+    return;
+  }
   if (event.kind === 'observation_gap') {
     if (!EVENT_REASONS.has(event.reason)) {
       throw invalid(`observation_gap.reason is not supported: ${String(event.reason)}`);

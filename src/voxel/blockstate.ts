@@ -29,3 +29,38 @@ export function serializeBlockState(state: BlockState): string {
   if (entries.length === 0) return name;
   return `${name}[${entries.map(([key, value]) => `${key}=${value}`).join(',')}]`;
 }
+
+/**
+ * Parse a palette entry back into a block state (design §4).
+ *
+ * Persisted evidence stores only the palette + packable metadata; the state is
+ * reconstructed here. The parser accepts exactly the canonical form produced by
+ * `serializeBlockState`; malformed entries throw so a corrupt snapshot is
+ * rejected instead of silently becoming a guessed block.
+ */
+export function deserializeBlockState(serialized: string): BlockState {
+  if (typeof serialized !== 'string' || serialized.length === 0) {
+    throw new Error('serialized block state must be a non-empty string');
+  }
+  const open = serialized.indexOf('[');
+  if (open === -1) return { name: serialized, properties: {} };
+  if (serialized[serialized.length - 1] !== ']') {
+    throw new Error(`malformed block state (unterminated properties): "${serialized}"`);
+  }
+  const name = serialized.slice(0, open);
+  if (name.length === 0) {
+    throw new Error(`malformed block state (empty name): "${serialized}"`);
+  }
+  const properties: Record<string, string> = {};
+  const body = serialized.slice(open + 1, -1);
+  if (body.length > 0) {
+    for (const pair of body.split(',')) {
+      const eq = pair.indexOf('=');
+      if (eq <= 0) {
+        throw new Error(`malformed block state property "${pair}" in "${serialized}"`);
+      }
+      properties[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+  }
+  return { name, properties };
+}

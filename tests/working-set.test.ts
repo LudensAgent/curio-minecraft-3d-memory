@@ -1043,6 +1043,10 @@ describe('working-set + Fake walk-route lifecycle', () => {
 // ==============================================================================
 
 function voxelPayload(dim: string, cx: number, cz: number, sy: number): string {
+  // Palette index 1 (stone) at cell 0 matches the evidence state below; a
+  // disagreement here would be a corrupt section, not a migration fixture.
+  const cells = Buffer.alloc(Math.ceil((4096 * 1) / 8), 0);
+  cells[0] = 1;
   return JSON.stringify({
     v: 1,
     dim,
@@ -1051,7 +1055,7 @@ function voxelPayload(dim: string, cx: number, cz: number, sy: number): string {
     sy,
     palette: ['minecraft:air', 'minecraft:stone'],
     bits: 1,
-    cells: Buffer.alloc(Math.ceil((4096 * 1) / 8), 0).toString('base64'),
+    cells: cells.toString('base64'),
     evidence: [{ i: 0, e: { observation: { worldId: WORLD, dim, sessionId: 's', observedAt: 1, sequence: 1, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:stone', properties: {} }, pos: { x: cx * 16, y: sy * 16, z: 0 } }, revision: 1, freshness: 'FRESH', validUntil: 1 } }],
     revision: 1,
   });
@@ -1111,8 +1115,10 @@ describe('v2 → latest migration (real SQLite)', () => {
     makeV2Db(dbPath, payloads);
 
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    expect(schemaVersion(dbPath)).toBe('4');
-    expect(spatialColumns(dbPath)).toEqual(expect.arrayContaining(['observed_cells', 'palette_entries', 'revision']));
+    expect(schemaVersion(dbPath)).toBe('5');
+    expect(spatialColumns(dbPath)).toEqual(
+      expect.arrayContaining(['observed_cells', 'palette_entries', 'revision', 'dimension', 'cx', 'cz', 'sy']),
+    );
 
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare('SELECT observed_cells, palette_entries, revision FROM spatial_sections WHERE world_id = ? AND id = ?').get(WORLD, sectionId(DIM, 129, 0, 4)) as { observed_cells: number; palette_entries: number; revision: number };

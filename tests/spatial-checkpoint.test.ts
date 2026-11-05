@@ -6,9 +6,10 @@ import Database from 'better-sqlite3';
 
 import { FragmentStore, TopologyStore, VoxelMap } from '../src/index.js';
 import type { CellView, Observation, PathFragment, VoxelCheckpointSnapshot } from '../src/index.js';
+import { decodeVoxelSectionPayload, encodeVoxelSectionPayload } from '../src/voxel/serialization.js';
+import { estimateVoxelSectionSnapshotBytes } from '../src/voxel/snapshot.js';
 import { openHistorySession, openSpatialSession, PersistenceError } from '../dist/storage/sqlite/index.js';
 import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from '../src/storage/sqlite/types.js';
-import * as distBytes from '../dist/bytes.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -117,12 +118,23 @@ function writeV1Schema(dbPath: string, options: { extraCheckpointColumn?: string
 }
 
 /**
- * Simulate a real v2 database from the current (v4) fixture: remove the v3
- * section-metadata columns plus the v4 journal tables/checkpoint columns, then
- * set the version back to 2. This keeps the migration test honest — it does not
- * leave later-schema objects behind for the v2 validation to accidentally accept.
+ * Simulate a real v2 database from the current fixture: remove every later
+ * schema object (v5 ledger tables/section columns, v4 journal objects, v3 section
+ * metadata), then set the version back to 2. This keeps the migration test honest
+ * — it does not leave later-schema objects behind for the v2 validation to
+ * accidentally accept.
  */
 function downgradeToV2(db: Database.Database): void {
+  db.exec('DROP TABLE IF EXISTS placed_blocks');
+  db.exec('DROP TABLE IF EXISTS chunk_visits');
+  db.exec('DROP TABLE IF EXISTS portal_traversals');
+  db.exec('DROP INDEX IF EXISTS spatial_sections_world_coords');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN ledger_revision');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN has_ledger');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN dimension');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN cx');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN cz');
+  db.exec('ALTER TABLE spatial_sections DROP COLUMN sy');
   db.exec('DROP TABLE IF EXISTS action_records');
   db.exec('DROP TABLE IF EXISTS spatial_events');
   db.exec('ALTER TABLE checkpoints DROP COLUMN journal_revision');
@@ -193,7 +205,8 @@ describe('VoxelMap checkpoint snapshot', () => {
 
     snap.sections[0]!.palette.length = 0;
     snap.sections[0]!.cells[0] = 255;
-    snap.sections[0]!.evidence[0]!.evidence.observation.state.name = 'minecraft:air';
+    snap.sections[0]!.evidence[0]!.evidence.validUntil = 0;
+    snap.sections[0]!.traversed![0] = 255; // history bitmaps are copies too
 
     expect(map.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
     expect(evidence(map, 0, 0, 0).observation.state).toEqual(stone);
@@ -314,30 +327,55 @@ describe('VoxelMap restoreSnapshot', () => {
     rev.sections[0]!.revision = 99;
     expect(() => new VoxelMap(WORLD).restoreSnapshot(rev)).toThrow(/revision/);
 
-    // palette/evidence disagree.
+    // A non-canonical palette entry cannot be reconstructed unambiguously.
     const mismatch = source.checkpointSnapshot();
-    mismatch.sections[0]!.evidence[0]!.evidence.observation.state = dirt;
-    expect(() => new VoxelMap(WORLD).restoreSnapshot(mismatch)).toThrow(/disagree/);
+    mismatch.sections[0]!.palette[1] = 'minecraft:stone[z=1,a=2]';
+    expect(() => new VoxelMap(WORLD).restoreSnapshot(mismatch)).toThrow(/canonical/);
   });
 
-  it('rejects an observation whose position belongs to another section or dimension', () => {
+  it('still validates a migrated v1 cell whose position belongs to another section or dimension', () => {
     const source = new VoxelMap(WORLD);
     source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
 
+    const legacySnapshot = (mutate: (observation: Observation) => void): VoxelCheckpointSnapshot => {
+      const snapshot = source.checkpointSnapshot();
+      const compact = snapshot.sections[0]!.evidence[0]!;
+      const observation = obs({ state: stone, pos: { x: 0, y: 0, z: 0 } });
+      mutate(observation);
+      snapshot.schemaVersion = 1; // no history bitmaps; v1 embedded full observations
+      snapshot.sections[0]!.evidence = [
+        {
+          index: compact.index,
+          evidence: {
+            observation,
+            revision: compact.evidence.revision,
+            freshness: 'FRESH',
+            validUntil: 61_000,
+          },
+        },
+      ] as unknown as VoxelCheckpointSnapshot['sections'][number]['evidence'];
+      return snapshot;
+    };
+
     // Position moved to a different section (cx=1) — must be rejected.
-    const wrongSection = source.checkpointSnapshot();
-    wrongSection.sections[0]!.evidence[0]!.evidence.observation.pos = { x: 16, y: 0, z: 0 };
-    expect(() => new VoxelMap(WORLD).restoreSnapshot(wrongSection)).toThrow(/section/);
+    expect(() =>
+      new VoxelMap(WORLD).restoreSnapshot(legacySnapshot((o) => { o.pos = { x: 16, y: 0, z: 0 }; })),
+    ).toThrow(/section/);
 
     // Position moved within the section but to a different local cell.
-    const wrongCell = source.checkpointSnapshot();
-    wrongCell.sections[0]!.evidence[0]!.evidence.observation.pos = { x: 1, y: 0, z: 0 };
-    expect(() => new VoxelMap(WORLD).restoreSnapshot(wrongCell)).toThrow(/cell index/);
+    expect(() =>
+      new VoxelMap(WORLD).restoreSnapshot(legacySnapshot((o) => { o.pos = { x: 1, y: 0, z: 0 }; })),
+    ).toThrow(/cell index/);
 
     // Observation from a different dimension.
-    const wrongDim = source.checkpointSnapshot();
-    wrongDim.sections[0]!.evidence[0]!.evidence.observation.dim = 'the_nether';
-    expect(() => new VoxelMap(WORLD).restoreSnapshot(wrongDim)).toThrow(/dim/);
+    expect(() =>
+      new VoxelMap(WORLD).restoreSnapshot(legacySnapshot((o) => { o.dim = 'the_nether'; })),
+    ).toThrow(/dim/);
+
+    // The unmodified v1 cell still restores (migration path).
+    const target = new VoxelMap(WORLD);
+    target.restoreSnapshot(legacySnapshot(() => {}));
+    expect(evidence(target, 0, 0, 0).observation.state).toEqual(stone);
   });
 
   it('rejects restore into a map that was already activated, even with no sections', () => {
@@ -375,6 +413,157 @@ describe('VoxelMap restoreSnapshot', () => {
     const exact = snapshot.sections.reduce((sum, s) => sum + exactVoxelSectionBytes(s), 0);
     const estimate = map.checkpointMeasure().bytes;
     expect(estimate).toBeGreaterThanOrEqual(exact);
+  });
+});
+
+describe('VoxelMap evidence snapshots (schema v2)', () => {
+  it('persists traversed/modified bitmaps and restores them with STALE observations', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    source.markTraversed(DIM, { x: 0, y: 0, z: 0 });
+    source.markModified(DIM, { x: 0, y: 0, z: 0 }, 'act-1');
+    source.markTraversed(DIM, { x: 2, y: 0, z: 0 }); // history without any observation
+
+    const snapshot = source.checkpointSnapshot();
+    expect(snapshot.schemaVersion).toBe(2);
+    const target = new VoxelMap(WORLD);
+    target.restoreSnapshot(snapshot);
+
+    expect(target.historyAt(DIM, 0, 0, 0)).toEqual({
+      explored: true,
+      traversed: true,
+      modified: true,
+      risk: false,
+      stale: true,
+    });
+    expect(evidence(target, 0, 0, 0).freshness).toBe('STALE');
+
+    // A traversed cell never observed is still history-only, not known air.
+    expect(target.historyAt(DIM, 2, 0, 0)).toMatchObject({ traversed: true, explored: false });
+    expect(target.cellAt(DIM, 2, 0, 0)).toEqual({ observed: false });
+  });
+
+  it('migrates a v1 snapshot (no history bitmaps) to empty history', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    source.markTraversed(DIM, { x: 0, y: 0, z: 0 });
+
+    const v1 = source.checkpointSnapshot();
+    delete v1.schemaVersion;
+    delete v1.sections[0]!.traversed;
+    delete v1.sections[0]!.modified;
+    delete v1.sections[0]!.risk;
+
+    const target = new VoxelMap(WORLD);
+    target.restoreSnapshot(v1);
+    expect(evidence(target, 0, 0, 0).freshness).toBe('STALE');
+    expect(target.historyAt(DIM, 0, 0, 0)).toMatchObject({ explored: true, traversed: false, modified: false });
+  });
+
+  it('rejects a future schema version without touching the map', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    const future = source.checkpointSnapshot();
+    future.schemaVersion = 3;
+
+    const target = new VoxelMap(WORLD);
+    expect(() => target.restoreSnapshot(future)).toThrow(/schemaVersion/);
+    expect(target.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
+  });
+
+  it('does not duplicate the full blockstate in persisted evidence', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: doorClosed, pos: { x: 0, y: 0, z: 0 }, observedAt: 1111 }));
+    source.observe(obs({ state: dirt, pos: { x: 1, y: 0, z: 0 }, observedAt: 2222 }));
+    source.markTraversed(DIM, { x: 1, y: 0, z: 0 });
+
+    const section = source.checkpointSnapshot().sections[0]!;
+    expect(Object.prototype.hasOwnProperty.call(section.evidence[0]!.evidence, 'observation')).toBe(false);
+    expect(JSON.stringify(section.palette)).toContain('minecraft:oak_door');
+    expect(JSON.stringify(section.evidence)).not.toContain('minecraft:oak_door');
+
+    const payload = encodeVoxelSectionPayload(section);
+    expect(payload.v).toBe(2);
+    expect(payload.palette).toContain('minecraft:oak_door[half=lower,open=false]');
+
+    // JSON round-trip through the versioned persisted form.
+    const decoded = decodeVoxelSectionPayload(JSON.parse(JSON.stringify(payload)));
+    const target = new VoxelMap(WORLD);
+    target.restoreSnapshot({ worldId: WORLD, sections: [decoded] });
+    expect(evidence(target, 0, 0, 0).observation.state).toEqual(doorClosed);
+    expect(evidence(target, 0, 0, 0).observation.observedAt).toBe(1111);
+    expect(evidence(target, 1, 0, 0).observation.state).toEqual(dirt);
+    expect(target.historyAt(DIM, 1, 0, 0).traversed).toBe(true);
+  });
+
+  it('keeps the snapshot byte estimate conservative against the v2 payload', () => {
+    const source = new VoxelMap(WORLD);
+    const props: Record<string, string> = {};
+    for (let i = 0; i < 200; i++) props[`p${i}`] = `v${i}`;
+    source.observe(obs({ state: { name: 'minecraft:oak_door', properties: props }, pos: { x: 0, y: 0, z: 0 } }));
+    source.markTraversed(DIM, { x: 0, y: 0, z: 0 });
+
+    const section = source.checkpointSnapshot().sections[0]!;
+    const exact = Buffer.byteLength(JSON.stringify(encodeVoxelSectionPayload(section)), 'utf8');
+    expect(estimateVoxelSectionSnapshotBytes(section)).toBeGreaterThanOrEqual(exact);
+  });
+
+  it('decodes a v1 payload carrying the compact in-memory evidence shape', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: dirt, pos: { x: 1, y: 0, z: 0 }, observedAt: 5555 }));
+    source.markModified(DIM, { x: 1, y: 0, z: 0 }, 'act-9');
+    const section = source.checkpointSnapshot().sections[0]!;
+    const payload = encodeVoxelSectionPayload(section);
+
+    // Shape produced by the old worker: v1 envelope, in-memory compact evidence.
+    const legacyEnvelope = {
+      ...payload,
+      v: 1,
+      evidence: section.evidence.map((cell) => ({ i: cell.index, e: cell.evidence })),
+    };
+    const decoded = decodeVoxelSectionPayload(JSON.parse(JSON.stringify(legacyEnvelope)));
+    const target = new VoxelMap(WORLD);
+    target.restoreSnapshot({ worldId: WORLD, sections: [decoded] });
+    expect(evidence(target, 1, 0, 0).observation.state).toEqual(dirt);
+    expect(evidence(target, 1, 0, 0).observation.observedAt).toBe(5555);
+  });
+
+  it('restores an old v1 payload whose evidence embeds full observations', () => {
+    const source = new VoxelMap(WORLD);
+    source.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 4444 }));
+    const section = source.checkpointSnapshot().sections[0]!;
+    const compact = section.evidence[0]!;
+
+    const v1Payload = {
+      v: 1,
+      dim: section.dim,
+      cx: section.cx,
+      cz: section.cz,
+      sy: section.sy,
+      palette: section.palette,
+      bits: section.bits,
+      cells: encodeVoxelSectionPayload(section).cells,
+      evidence: [
+        {
+          i: compact.index,
+          e: {
+            observation: obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 4444 }),
+            revision: compact.evidence.revision,
+            freshness: 'FRESH',
+            validUntil: 64_444,
+          },
+        },
+      ],
+      revision: section.revision,
+    };
+
+    const decoded = decodeVoxelSectionPayload(v1Payload);
+    const target = new VoxelMap(WORLD);
+    target.restoreSnapshot({ worldId: WORLD, sections: [decoded] });
+    const restored = evidence(target, 0, 0, 0);
+    expect(restored.observation.state).toEqual(stone);
+    expect(restored.observation.observedAt).toBe(4444);
+    expect(restored.freshness).toBe('STALE');
   });
 });
 
@@ -582,12 +771,12 @@ describe('SQLite combined spatial persistence', () => {
       worldId: 'w'.repeat(1024 * 1024),
       snapshotLimits: { maxBytes: 1024 },
     });
-    // The cheap worldId `.length` bound must reject *before* the escaped UTF-8
-    // string scan and before any store is measured or snapshotted. The escaped-byte
-    // scan (`jsonEscapedByteLength`) is the full per-character pass; observing that
-    // it never runs pins the early stop to the cheap length check rather than to the
-    // later envelope check or the store measures.
-    const escapedSpy = vi.spyOn(distBytes, 'jsonEscapedByteLength');
+    // The cheap worldId `.length` bound must reject *before* any store is measured
+    // or snapshotted, which pins the early stop to the cheap length check rather
+    // than to the later envelope check or the store measures. (The escaped-byte
+    // string scan itself is private to the built storage module and is exercised
+    // by the envelope-path tests below; it cannot be spied through an ESM
+    // namespace binding.)
     const measureSpies = [
       vi.spyOn(session.voxel, 'checkpointMeasure'),
       vi.spyOn(session.voxel, 'checkpointDirtyMeasure'),
@@ -603,9 +792,7 @@ describe('SQLite combined spatial persistence', () => {
 
     await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
 
-    expect(escapedSpy).not.toHaveBeenCalled();
     for (const spy of [...measureSpies, ...snapshotSpies]) expect(spy).not.toHaveBeenCalled();
-    escapedSpy.mockRestore();
     await session.close();
   });
 
@@ -700,7 +887,7 @@ describe('v1 → latest schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('4');
+    expect(version).toBe('5');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();

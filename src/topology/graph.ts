@@ -6,8 +6,9 @@
  * there and what does it connect to", not "can we walk it right now".
  */
 
-import type { ObstacleEvidence, TraversabilityEntry } from '../traversability/types.js';
+import type { HazardFact, ObstacleEvidence } from '../traversability/types.js';
 import type { MoveMode, Vec3Like } from '../types.js';
+import type { SectionKey } from '../voxel/section.js';
 
 export type ConnectionType =
   | 'HORIZONTAL'
@@ -38,11 +39,25 @@ export type LandmarkTag =
 /**
  * Who recorded this anchor (design §5 "命名空间分流"). Drives separate capacity
  * quotas and the display namespace: `agent` and `program` nodes draw on their own
- * quotas and must not share a display namespace. In this phase both kinds are
- * capacity-bounded with explicit rejection on overflow — no oldest-first eviction
- * is implemented here (a later phase may add durability-based eviction).
+ * quotas and must not share a display namespace. Agent nodes are durable: an
+ * overflow is rejected, never evicted. Program nodes may be evicted oldest-first
+ * within the program quota (never an agent node, never a node still referenced by
+ * an edge).
  */
 export type NodeSource = 'agent' | 'program';
+
+/** Evidence that a node's object is no longer there. */
+export interface GoneEvidence {
+  /** Session the disappearance was actually observed in; never fabricated. */
+  sessionId: string;
+  /** Real observation time; never a receive time, save batch, or `Date.now()` guess. */
+  observedAt: number;
+  /** Caller-supplied provenance label (e.g. `"vision_scan"`); opaque to the library. */
+  source: string;
+  /** Host observation ids that witnessed the absence, when available. */
+  observationIds?: string[];
+  reason?: string;
+}
 
 export interface SpatialNode {
   id: string;
@@ -57,6 +72,62 @@ export interface SpatialNode {
   location:
     | { kind: 'exact'; pos: Vec3Like }
     | { kind: 'region'; center: Vec3Like; radius: number };
+  /** Real time the node's location/object was last actually observed. */
+  observedAt?: number;
+  /** Host identity for the same object (e.g. landmark id, chest key), opaque to the library. */
+  externalRef?: string;
+  /**
+   * The object at this anchor was observed to be gone. The node record and its
+   * history are kept; `markGone` requires real observation evidence.
+   */
+  gone?: boolean;
+  /** Real observation time of the disappearance; only present when `gone` is true. */
+  goneAt?: number;
+  /** What proved the disappearance. */
+  goneEvidence?: GoneEvidence;
+}
+
+/** Direction of a traversal relative to an edge's stored `from → to`. */
+export type EdgeDirection = 'forward' | 'reverse';
+
+/**
+ * Current passage status for one direction + mode of one edge. `UNSUPPORTED` is
+ * structural (mode not carried by the edge, or reverse of a directed edge), not
+ * an observation that the world is blocked.
+ */
+export type EdgeVerificationStatus = 'OPEN' | 'BLOCKED' | 'UNKNOWN' | 'STALE' | 'UNSUPPORTED';
+
+/** One section revision the verification actually depended on. */
+export interface EdgeDependency {
+  key: SectionKey;
+  revision: number;
+}
+
+/**
+ * A verification of one edge direction under one movement mode. It is derived
+ * evidence, not history: deleting/replacing it never deletes the edge's
+ * `PathFragment`. `OPEN` is only valid while `validUntil > now`; an expired
+ * `OPEN` reads as `STALE` and is never treated as passable.
+ */
+export interface EdgeVerification {
+  direction: EdgeDirection;
+  mode: MoveMode;
+  status: EdgeVerificationStatus;
+  reason?: string;
+  /** Evidence for `BLOCKED`; pure contact may prove blockage without a block name. */
+  blockedAt?: ObstacleEvidence;
+  /** Independent risk facts; `OPEN` does not mean risk-free. */
+  hazards: HazardFact[];
+  /** Section revisions read to reach this verdict. */
+  dependencies: EdgeDependency[];
+  /** Body size/pose/capabilities/mode plus delegation constraints. */
+  contextKey: string;
+  /** Session the verification was computed in; absent is never back-filled. */
+  sessionId: string;
+  /** Real computation/observation time. */
+  computedAt: number;
+  /** Finite evidence-reuse ceiling. */
+  validUntil: number;
 }
 
 export interface SpatialEdge {
@@ -64,15 +135,20 @@ export interface SpatialEdge {
   from: string;
   to: string;
   type: ConnectionType;
-  /** true = only traversable along from→to (e.g. a DROP). */
-  directed: boolean;
+  /**
+   * `true` = only traversable along from→to (e.g. a DROP). Absent defaults to
+   * `true`, matching historical one-directional records. `false` means both
+   * directions have their own traversal evidence and their own verification.
+   */
+  directed?: boolean;
   /** Candidate modes supported by evidence; does not replace per-delegation authorization. */
-  modes: MoveMode[];
+  modes?: MoveMode[];
   /** Owning PathFragment, for provenance. */
   fragmentId?: string;
-  /** Direction / mode / context verification; blockedAt only marks the current edge, never deletes the fragment. */
-  verifications: (Omit<TraversabilityEntry, 'pos' | 'to'> & {
-    direction: 'forward' | 'reverse';
-    blockedAt?: ObstacleEvidence;
-  })[];
+  /**
+   * Direction / mode / context verification; blockedAt only marks the current
+   * edge, never deletes the fragment. Each `(direction, mode)` pair has at most
+   * one record; forward OPEN never backs the reverse direction.
+   */
+  verifications?: EdgeVerification[];
 }
