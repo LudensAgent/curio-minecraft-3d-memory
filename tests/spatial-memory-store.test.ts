@@ -95,7 +95,7 @@ function makeStore(
 ): StoreParts {
   const map = overrides.map ?? new VoxelMap(WORLD, { now: () => 5000 });
   const fragments = overrides.fragments ?? new FragmentStore(WORLD);
-  const topology = overrides.topology ?? new TopologyStore(fragments);
+  const topology = overrides.topology ?? new TopologyStore(fragments, { now: () => 5000 });
   const store = new SpatialMemoryStoreImpl({
     worldId: WORLD,
     map,
@@ -250,12 +250,13 @@ describe('SpatialMemoryStoreImpl — fragments, nodes and edges', () => {
     fragments[0]?.polyline.push({ x: 9, y: 9, z: 9 });
     expect(store.fragments(DIM)[0]?.polyline).toHaveLength(2);
 
-    const a = store.recordNode(DIM, 'home', A, 'base');
-    const b = store.recordNode(DIM, 'shaft', B);
-    expect(a.id).toMatch(/^agent:home/);
+    const a = store.recordNode('home', A, 'base', { dim: DIM });
+    const b = store.recordNode('shaft', B, undefined, { dim: DIM });
+    expect(a.id).toMatch(/^agent:.*:home$/);
     expect(a.tag).toBe('base');
     expect(a.location).toEqual({ kind: 'exact', pos: A });
-    expect(store.recordNode(DIM, 'home', A).id).not.toBe(a.id);
+    // Same label + exact position is the same stable agent node, not a new one.
+    expect(store.recordNode('home', A, undefined, { dim: DIM }).id).toBe(a.id);
     expect(() => store.upsertNode({ ...a, label: 'changed' })).toThrow(/already exists/);
 
     store.upsertEdge({
@@ -269,9 +270,7 @@ describe('SpatialMemoryStoreImpl — fragments, nodes and edges', () => {
     });
 
     const graph = store.graph(DIM);
-    expect(graph.nodes.map((node) => node.id).sort()).toEqual(
-      [a.id, 'agent:home:2', b.id].sort(),
-    );
+    expect(graph.nodes.map((node) => node.id).sort()).toEqual([a.id, b.id].sort());
     expect(graph.edges).toHaveLength(1);
     expect(graph.edges[0]).toMatchObject({
       id: 'e-candidate',
@@ -312,8 +311,8 @@ describe('SpatialMemoryStoreImpl — fragments, nodes and edges', () => {
   it('records traversed edges only with evidence, routes over them, and keeps history on severance', () => {
     const { store, map, fragments } = makeStore();
     store.saveFragment(makeFragment('f1'));
-    const a = store.recordNode(DIM, 'a', A);
-    const b = store.recordNode(DIM, 'b', B);
+    const a = store.recordNode('a', A, undefined, { dim: DIM });
+    const b = store.recordNode('b', B, undefined, { dim: DIM });
     fragments.addTraversal(makeEvidence('t1', 'f1', A, B));
 
     store.upsertEdge({
@@ -359,9 +358,9 @@ describe('SpatialMemoryStoreImpl — fragments, nodes and edges', () => {
   it('returns connected anchors without a whole-network fallback', () => {
     const { store, fragments } = makeStore();
     store.saveFragment(makeFragment('f1'));
-    const start = store.recordNode(DIM, 'start', { x: 0.5, y: 60, z: 0.5 }, 'base');
-    const top = store.recordNode(DIM, 'top', { x: 0.5, y: 80, z: 0.5 });
-    const deep = store.recordNode(DIM, 'deep', { x: 0.5, y: 40, z: 0.5 });
+    const start = store.recordNode('start', { x: 0.5, y: 60, z: 0.5 }, 'base', { dim: DIM });
+    const top = store.recordNode('top', { x: 0.5, y: 80, z: 0.5 }, undefined, { dim: DIM });
+    const deep = store.recordNode('deep', { x: 0.5, y: 40, z: 0.5 }, undefined, { dim: DIM });
     fragments.addTraversal(
       makeEvidence('t-top', 'f1', { x: 0.5, y: 60, z: 0.5 }, { x: 0.5, y: 80, z: 0.5 }),
     );
@@ -389,15 +388,22 @@ describe('SpatialMemoryStoreImpl — fragments, nodes and edges', () => {
       evidenceIds: ['t-deep'],
     });
 
-    expect(store.surfaceAnchor(DIM, { x: 0.5, y: 60, z: 0.5 })).toEqual({ x: 0.5, y: 80, z: 0.5 });
-    expect(store.deepestAnchor(DIM, { x: 0.5, y: 60, z: 0.5 })).toEqual({ x: 0.5, y: 40, z: 0.5 });
+    expect(store.surfaceAnchor(DIM, { x: 0.5, y: 60, z: 0.5 })?.pos).toEqual({
+      x: 0.5,
+      y: 80,
+      z: 0.5,
+    });
+    expect(store.deepestAnchor(DIM, { x: 0.5, y: 60, z: 0.5 })?.pos).toEqual({
+      x: 0.5,
+      y: 40,
+      z: 0.5,
+    });
     // No connected start = no anchor; never the global deepest node.
-    expect(store.deepestAnchor(DIM)).toBeNull();
     expect(store.deepestAnchor(DIM, { x: 100.5, y: 60, z: 100.5 })).toBeNull();
     expect(store.surfaceAnchor(DIM, { x: 100.5, y: 60, z: 100.5 })).toBeNull();
   });
 
-  it('counts fragment components with recorded links and cross-record proximity', () => {
+  it('counts fragment components from recorded links and shared coordinates only', () => {
     const { store } = makeStore();
     store.saveFragment(makeFragment('f1', { polyline: [{ ...A }, { ...B }], links: [{ a: A, b: B }] }));
     store.saveFragment(
@@ -407,21 +413,20 @@ describe('SpatialMemoryStoreImpl — fragments, nodes and edges', () => {
       }),
     );
 
-    expect(store.fragmentation(DIM)).toEqual({
+    expect(store.fragmentation(DIM)).toMatchObject({
       records: 2,
       points: 4,
       components: 2,
-      pieces: [
-        { points: 2, records: 1 },
-        { points: 2, records: 1 },
-      ],
     });
 
-    // A polyline starting on an existing point joins that component.
+    // A shared coordinate joins the union-find component; no proximity edge is
+    // invented for FAR/FAR_NEXT.
     store.saveFragment(makeFragment('f3', { polyline: [{ ...B }, { ...C }] }));
     const merged = store.fragmentation(DIM);
-    expect(merged).toMatchObject({ records: 3, points: 5, components: 2 });
-    expect(merged.pieces[0]).toEqual({ points: 3, records: 2 });
+    // A/B are linked and f3 starts at B; FAR/FAR_NEXT form their own component;
+    // C is a new coordinate with no connecting evidence, so it stays separate.
+    expect(merged).toMatchObject({ records: 3, points: 5, components: 3 });
+    expect(merged.pieces.some((piece) => piece.fragmentIds.includes('f3'))).toBe(true);
   });
 });
 
@@ -504,15 +509,15 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
   it('leaves revisions, pins, residency and evidence untouched across read-only queries', () => {
     const map = new VoxelMap(WORLD, { now: () => 2000 });
     const fragments = new FragmentStore(WORLD);
-    const topology = new TopologyStore(fragments);
+    const topology = new TopologyStore(fragments, { now: () => 2000 });
     const seed = new SpatialMemoryStoreImpl({ worldId: WORLD, map, fragments, topology });
     seed.observe(obs(STONE, { x: 0, y: -1, z: 0 }));
     seed.observe(obs(AIR, { x: 0, y: 0, z: 0 }));
     seed.observe(obs(AIR, { x: 0, y: 1, z: 0 }));
     seed.observe(obs(AIR, { x: 1, y: 0, z: 0 }));
     seed.saveFragment(makeFragment('f1'));
-    const a = seed.recordNode(DIM, 'a', A);
-    const b = seed.recordNode(DIM, 'b', B);
+    const a = seed.recordNode('a', A, undefined, { dim: DIM });
+    const b = seed.recordNode('b', B, undefined, { dim: DIM });
     fragments.addTraversal(makeEvidence('t1', 'f1', A, B));
     seed.upsertEdge({
       id: 'e1',
@@ -566,7 +571,6 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
     store.routeInspection(DIM, A, B);
     store.surfaceAnchor(DIM, A);
     store.deepestAnchor(DIM, A);
-    store.deepestAnchor(DIM);
     store.fragmentation(DIM);
     store.describeCapabilities();
     store.snapshot();
@@ -577,72 +581,63 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
     expect(capture()).toEqual(before);
   });
 
-  it('reports unavailable methods honestly and forwards markers when the map implements them', () => {
-    const { store } = makeStore();
-    expect(() => store.markTraversed(DIM, A)).toThrow(SpatialMemoryUnsupportedError);
-    expect(() => store.markModified(DIM, A, 'act-1')).toThrow(SpatialMemoryUnsupportedError);
-    expect(() => store.portalEdges()).toThrow(SpatialMemoryUnsupportedError);
+  it('records measured history flags and exposes an empty portal graph honestly', () => {
+    const { store, map } = makeStore();
+    expect(store.describeCapabilities().markTraversed.available).toBe(true);
+    expect(store.describeCapabilities().markModified.available).toBe(true);
+    expect(store.describeCapabilities().portalEdges.available).toBe(true);
+    expect(store.portalEdges()).toEqual([]);
 
-    class MarkingMap extends VoxelMap {
-      readonly traversed: { dim: string; pos: Vec3Like }[] = [];
-      readonly modified: { dim: string; pos: Vec3Like; actionId: string }[] = [];
-
-      markTraversed(dim: string, pos: Vec3Like): void {
-        this.traversed.push({ dim, pos: { ...pos } });
-      }
-
-      markModified(dim: string, pos: Vec3Like, actionId: string): void {
-        this.modified.push({ dim, pos: { ...pos }, actionId });
-      }
-    }
-
-    const map = new MarkingMap(WORLD, { now: () => 5000 });
-    const fragments = new FragmentStore(WORLD);
-    const topology = new TopologyStore(fragments);
-    const marking = new SpatialMemoryStoreImpl({
-      worldId: WORLD,
-      map,
-      fragments,
-      topology,
+    const cell = { x: 0, y: 64, z: 0 };
+    store.markTraversed(DIM, cell);
+    store.markModified(DIM, cell, 'act-1');
+    expect(map.historyAt(DIM, cell.x, cell.y, cell.z)).toMatchObject({
+      traversed: true,
+      modified: true,
     });
-
-    expect(marking.describeCapabilities().markTraversed.available).toBe(true);
-    expect(marking.describeCapabilities().markModified.available).toBe(true);
-    marking.markTraversed(DIM, A);
-    marking.markModified(DIM, A, 'act-1');
-    expect(map.traversed).toEqual([{ dim: DIM, pos: A }]);
-    expect(map.modified).toEqual([{ dim: DIM, pos: A, actionId: 'act-1' }]);
+    expect(store.markModified.bind(store, DIM, cell, '')).toThrow(/actionId/);
   });
 
   it('summarizes runtime counts and capabilities without changing them', () => {
     const { store, map } = makeStore();
     store.observe(obs(STONE, { x: 0, y: 0, z: 0 }));
     store.saveFragment(makeFragment('f1'));
-    store.recordNode(DIM, 'home', A);
+    store.recordNode('home', A, undefined, { dim: DIM });
 
     const capabilities = store.describeCapabilities();
     expect(Object.keys(capabilities).sort()).toEqual([
+      'addPortalTraversal',
+      'blockEdge',
+      'clearEdgeBlock',
+      'components',
       'deepestAnchor',
+      'displayNodes',
       'dropEdge',
+      'edgeRuntime',
       'forgetFragment',
       'fragmentation',
       'fragments',
       'frontierCandidates',
+      'goneNear',
       'graph',
+      'markGone',
       'markModified',
       'markTraversed',
+      'mergeFragments',
       'observe',
       'portalEdges',
       'recordNode',
       'route',
       'saveFragment',
+      'savePortalEdge',
       'sectionAt',
+      'segments',
       'surfaceAnchor',
       'upsertEdge',
       'upsertNode',
+      'verifyEdge',
     ]);
-    expect(capabilities.portalEdges.available).toBe(false);
-    expect(capabilities.portalEdges.reason).toMatch(/PORTAL/);
+    expect(capabilities.portalEdges.available).toBe(true);
     expect(capabilities.frontierCandidates.available).toBe(false);
     expect(capabilities.observe.available).toBe(true);
 

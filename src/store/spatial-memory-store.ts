@@ -43,14 +43,30 @@ import type {
 import type { WalkSearchSnapshot } from '../navigation/walk-search.js';
 import type {
   AnchorOrder,
+  AnchorQueryOptions,
+  AnchorResult,
+  ComponentReport,
+  EdgeBlockInput,
+  EdgeDirection,
+  EdgeRuntimeView,
+  EdgeVerificationInput,
   EdgeView,
+  FragmentSegmentsResult,
+  FragmentationResult,
+  GoneEvidence,
   LandmarkTag,
+  NodeSource,
   PathFragment,
+  PortalEdgeInput,
+  PortalEdgeView,
+  PortalTraversalEvidence,
   QueryBudgetKey,
   QueryStats,
+  RecordNodeOptions,
   RouteQueryResult,
   RouteQueryStatus,
   RouteSegment,
+  RuntimeQueryOptions,
   SearchDiagnostic,
   SearchGapKind,
   SpatialEdge,
@@ -262,14 +278,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
   markTraversed(dim: string, pos: Vec3Like): void {
     this.assertDim(dim, 'markTraversed');
     assertFinitePoint(pos, 'markTraversed');
-    const marker = this.markers.markTraversed;
-    if (typeof marker !== 'function') {
-      throw new SpatialMemoryUnsupportedError(
-        'markTraversed',
-        'the injected VoxelMap has no markTraversed method in this build; traversed marking is not implemented and is not faked',
-      );
-    }
-    marker.call(this.voxel, dim, copyPoint(pos));
+    this.voxel.markTraversed(dim, copyPoint(pos));
   }
 
   markModified(dim: string, pos: Vec3Like, actionId: string): void {
@@ -278,14 +287,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
     if (typeof actionId !== 'string' || actionId.length === 0) {
       throw new Error('markModified: actionId must be a non-empty string');
     }
-    const marker = this.markers.markModified;
-    if (typeof marker !== 'function') {
-      throw new SpatialMemoryUnsupportedError(
-        'markModified',
-        'the injected VoxelMap has no markModified method in this build; confirmed-modification marking is not implemented and is not faked',
-      );
-    }
-    marker.call(this.voxel, dim, copyPoint(pos), actionId);
+    this.voxel.markModified(dim, copyPoint(pos), actionId);
   }
 
   // --- Paths (historical geometry) ---
@@ -313,27 +315,15 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
    * Record an agent-named place at an exact position. The id is generated
    * deterministically from the label and is unique within the bound topology.
    */
-  recordNode(dim: string, label: string, pos: Vec3Like, tag?: LandmarkTag): SpatialNode {
+  recordNode(label: string, pos: Vec3Like, tag?: LandmarkTag, options?: RecordNodeOptions): SpatialNode {
+    const dim = options?.dim;
+    if (typeof dim !== 'string' || dim.length === 0) {
+      throw new Error('recordNode: options.dim is required');
+    }
     this.assertDim(dim, 'recordNode');
     assertFinitePoint(pos, 'recordNode');
-    if (typeof label !== 'string') {
-      throw new Error('recordNode: label must be a string');
-    }
-    const node: SpatialNode = {
-      id: this.nextNodeId(label),
-      kind: 'place',
-      source: 'agent',
-      worldId: this.worldId,
-      dim,
-      location: { kind: 'exact', pos: copyPoint(pos) },
-    };
-    if (label.length > 0) node.label = label;
-    if (tag !== undefined) node.tag = tag;
-    this.topologyStore.saveNode(node);
-    const stored = this.topologyStore.getNode(node.id);
-    if (stored === null) {
-      throw new Error(`recordNode: topology store did not retain node "${node.id}"`);
-    }
+    const stored = this.topologyStore.recordNode(label, copyPoint(pos), tag, { ...options, dim });
+    this.assertWorld(stored.worldId, 'recordNode');
     return stored;
   }
 
@@ -404,11 +394,49 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
     return this.drainEdges({ dim });
   }
 
-  portalEdges(): SpatialEdge[] {
-    throw new SpatialMemoryUnsupportedError(
-      'portalEdges',
-      'TopologyStore rejects PORTAL edges and no portal-traversal history store is composed; portal connectivity cannot be read without inventing it',
-    );
+  portalEdges(): PortalEdgeView[] {
+    return this.topologyStore.portalEdges();
+  }
+
+  // --- Node display / gone, edge verification, portal writes ---
+
+  displayNodes(query: { dim?: string; namespace?: NodeSource; limit?: number; after?: string } = {}) {
+    if (query.dim !== undefined) this.assertDim(query.dim, 'displayNodes');
+    return this.topologyStore.displayNodes(query);
+  }
+
+  markGone(nodeId: string, evidence: GoneEvidence): void {
+    this.topologyStore.markGone(nodeId, evidence);
+  }
+
+  goneNear(dim: string, pos: Vec3Like, radius = 3.5): SpatialNode[] {
+    this.assertDim(dim, 'goneNear');
+    assertFinitePoint(pos, 'goneNear');
+    return this.topologyStore.goneNear(dim, pos, radius);
+  }
+
+  verifyEdge(id: string, verification: EdgeVerificationInput): void {
+    this.topologyStore.verifyEdge(id, verification);
+  }
+
+  blockEdge(id: string, input: EdgeBlockInput): void {
+    this.topologyStore.blockEdge(id, input);
+  }
+
+  clearEdgeBlock(id: string, direction?: EdgeDirection, mode?: Parameters<TopologyStore['clearEdgeBlock']>[2]): void {
+    this.topologyStore.clearEdgeBlock(id, direction, mode);
+  }
+
+  edgeRuntime(id: string, options?: RuntimeQueryOptions): EdgeRuntimeView | null {
+    return this.topologyStore.edgeRuntime(id, options);
+  }
+
+  savePortalEdge(edge: PortalEdgeInput, traversals: PortalTraversalEvidence[]): void {
+    this.topologyStore.savePortalEdge(edge, traversals);
+  }
+
+  addPortalTraversal(edgeId: string, traversal: PortalTraversalEvidence): void {
+    this.topologyStore.addPortalTraversal(edgeId, traversal);
   }
 
   // --- Routing & anchors (geometry memory, unverified against current terrain) ---
@@ -507,10 +535,10 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
    * Highest reachable recorded node by exact `y`, as a point candidate. It is
    * not a surface/opening guarantee and never falls back to the whole network.
    */
-  surfaceAnchor(dim: string, here: Vec3Like): Vec3Like | null {
+  surfaceAnchor(dim: string, here: Vec3Like, options: AnchorQueryOptions = {}): AnchorResult | null {
     this.assertDim(dim, 'surfaceAnchor');
     assertFinitePoint(here, 'surfaceAnchor');
-    return this.anchorPoint(dim, here, 'highest', DEFAULT_ANCHOR_NEAR);
+    return this.topologyStore.surfaceAnchor(dim, here, options);
   }
 
   /**
@@ -518,12 +546,26 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
    * recorded node within `near`) it returns `null` instead of the legacy
    * whole-network fallback, which did not establish a connection.
    */
-  deepestAnchor(dim: string, here?: Vec3Like, opts: { near?: number } = {}): Vec3Like | null {
+  deepestAnchor(dim: string, here: Vec3Like, options: AnchorQueryOptions = {}): AnchorResult | null {
     this.assertDim(dim, 'deepestAnchor');
-    if (here === undefined) return null;
     assertFinitePoint(here, 'deepestAnchor');
-    const near = resolveNear(opts.near, DEFAULT_ANCHOR_NEAR, 'deepestAnchor');
-    return this.anchorPoint(dim, here, 'deepest', near);
+    return this.topologyStore.deepestAnchor(dim, here, options);
+  }
+
+  /** Explicit connectivity components over recorded evidence (never proximity). */
+  components(dim: string): ComponentReport {
+    this.assertDim(dim, 'components');
+    return this.topologyStore.components(dim);
+  }
+
+  /** Current-passable pieces of one fragment; the fragment history is kept. */
+  segments(fragmentId: string): FragmentSegmentsResult {
+    return this.topologyStore.segments(fragmentId);
+  }
+
+  /** Merge two fragments only with actual traversal evidence connecting them. */
+  mergeFragments(aId: string, bId: string, evidenceId: string): void {
+    this.topologyStore.mergeFragments(aId, bId, evidenceId);
   }
 
   /**
@@ -532,7 +574,13 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
    * proximity within `FRAGMENTATION_LINK_DISTANCE` is a legacy geometric
    * heuristic, not evidence of current passability.
    */
-  fragmentation(dim: string): {
+  fragmentation(dim: string): FragmentationResult {
+    this.assertDim(dim, 'fragmentation');
+    return this.topologyStore.fragmentation(dim);
+  }
+
+  /** Legacy geometric projection retained for callers that need it; not evidence. */
+  private fragmentationGeometric(dim: string): {
     records: number;
     points: number;
     components: number;
@@ -676,8 +724,6 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
   // --- Capability and snapshot reports ---
 
   describeCapabilities(): SpatialMemoryCapabilities {
-    const hasTraversedMarker = typeof this.markers.markTraversed === 'function';
-    const hasModifiedMarker = typeof this.markers.markModified === 'function';
     const hasFrontierSource = this.frontierSource !== undefined;
     return {
       observe: { available: true },
@@ -685,20 +731,14 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
         available: true,
         reason: 'null means the Section is not resident or was never allocated; it is not empty air.',
       },
-      markTraversed: hasTraversedMarker
-        ? { available: true }
-        : {
-            available: false,
-            reason:
-              'The injected VoxelMap has no markTraversed method in this build; traversed marking is not implemented.',
-          },
-      markModified: hasModifiedMarker
-        ? { available: true }
-        : {
-            available: false,
-            reason:
-              'The injected VoxelMap has no markModified method in this build; confirmed-modification marking is not implemented.',
-          },
+      markTraversed: {
+        available: true,
+        reason: 'Measured stance history only; never inferred from proximity or requests.',
+      },
+      markModified: {
+        available: true,
+        reason: 'Requires a confirmed actionId; block-content revision is not advanced.',
+      },
       saveFragment: { available: true },
       forgetFragment: { available: true },
       fragments: { available: true },
@@ -725,10 +765,57 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
         reason:
           'Recorded topology projection. directed=true means only from→to is supported, not that the reverse was disproved; modes/verifications are empty because they are not represented here.',
       },
+      displayNodes: {
+        available: true,
+        reason: 'Separate display namespace: program points never share the agent default surface.',
+      },
+      markGone: {
+        available: true,
+        reason: 'Requires real observation evidence; the node record and history are kept.',
+      },
+      goneNear: {
+        available: true,
+        reason: 'Gone anchors near a position, nearest first; history is not deleted.',
+      },
+      verifyEdge: {
+        available: true,
+        reason: 'Per-direction/mode verification; BLOCKED must go through blockEdge with evidence.',
+      },
+      blockEdge: {
+        available: true,
+        reason: 'Blocks one direction/mode with obstacle evidence; never deletes a fragment.',
+      },
+      clearEdgeBlock: {
+        available: true,
+        reason: 'Replaces a blockage with UNKNOWN; never restores OPEN without fresh evidence.',
+      },
+      edgeRuntime: {
+        available: true,
+        reason: 'Direction/mode separated current status; unverified or expired is never OPEN.',
+      },
+      savePortalEdge: {
+        available: true,
+        reason: 'Portal connectivity is stored separately from the walk graph with raw traversals.',
+      },
+      addPortalTraversal: {
+        available: true,
+        reason: 'Appends raw return/outbound evidence; returnVerified stays derived.',
+      },
+      components: {
+        available: true,
+        reason: 'Node components over evidence-backed edges with local invalidation.',
+      },
+      segments: {
+        available: true,
+        reason: 'Current-passable pieces from edge verification; fragment history is kept.',
+      },
+      mergeFragments: {
+        available: true,
+        reason: 'Requires traversal evidence that actually connects both fragments.',
+      },
       portalEdges: {
-        available: false,
-        reason:
-          'TopologyStore rejects PORTAL edges and no portal-traversal history store is composed.',
+        available: true,
+        reason: 'Separate portal graph; never mixed into walk route/adjacency.',
       },
       route: {
         available: true,

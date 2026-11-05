@@ -1043,6 +1043,10 @@ describe('working-set + Fake walk-route lifecycle', () => {
 // ==============================================================================
 
 function voxelPayload(dim: string, cx: number, cz: number, sy: number): string {
+  // Palette index 1 (stone) at cell 0 matches the evidence state below; a
+  // disagreement here would be a corrupt section, not a migration fixture.
+  const cells = Buffer.alloc(Math.ceil((4096 * 1) / 8), 0);
+  cells[0] = 1;
   return JSON.stringify({
     v: 1,
     dim,
@@ -1051,7 +1055,7 @@ function voxelPayload(dim: string, cx: number, cz: number, sy: number): string {
     sy,
     palette: ['minecraft:air', 'minecraft:stone'],
     bits: 1,
-    cells: Buffer.alloc(Math.ceil((4096 * 1) / 8), 0).toString('base64'),
+    cells: cells.toString('base64'),
     evidence: [{ i: 0, e: { observation: { worldId: WORLD, dim, sessionId: 's', observedAt: 1, sequence: 1, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:stone', properties: {} }, pos: { x: cx * 16, y: sy * 16, z: 0 } }, revision: 1, freshness: 'FRESH', validUntil: 1 } }],
     revision: 1,
   });

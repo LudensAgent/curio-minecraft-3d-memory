@@ -351,18 +351,52 @@ describe('v4 → v5 schema migration and section payload compatibility', () => {
     const payload = JSON.parse(row.payload) as {
       v: number;
       palette: string[];
-      evidence: { i: number; e: { observation: Record<string, unknown> } }[];
+      bits: number;
+      cells: string;
+      revision: number;
+      evidence: { i: number; sc: boolean; e: string; at: number; s: string; ses: string }[];
     };
     expect(payload.v).toBe(2);
     expect(payload.palette).toContain('minecraft:stone');
     expect(payload.evidence).toHaveLength(1);
-    expect(payload.evidence[0]!.e.observation['state']).toBeUndefined();
+    expect(payload.evidence[0]).toMatchObject({ sc: true, e: 'seen', s: 'vision' });
+    expect('observation' in payload.evidence[0]!).toBe(false);
 
     // Rewrite the same section as a v1 payload (full observation state inline),
     // then verify the worker still decodes it.
-    const v1 = JSON.parse(row.payload) as typeof payload;
-    v1.v = 1;
-    v1.evidence[0]!.e.observation['state'] = stone;
+    const v1 = {
+      v: 1,
+      dim: DIM,
+      cx: 0,
+      cz: 0,
+      sy: 0,
+      palette: payload.palette,
+      bits: payload.bits,
+      cells: payload.cells,
+      evidence: [
+        {
+          i: 0,
+          e: {
+            observation: {
+              worldId: WORLD,
+              dim: DIM,
+              sessionId: 's1',
+              observedAt: 1000,
+              sequence: 1,
+              source: 'vision',
+              evidence: 'seen',
+              stateComplete: true,
+              state: stone,
+              pos: { x: 0, y: 0, z: 0 },
+            },
+            revision: 1,
+            freshness: 'FRESH',
+            validUntil: 61000,
+          },
+        },
+      ],
+      revision: payload.revision,
+    };
     db.prepare('UPDATE spatial_sections SET payload = ? WHERE world_id = ?').run(JSON.stringify(v1), WORLD);
     db.close();
 

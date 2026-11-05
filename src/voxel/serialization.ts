@@ -140,6 +140,10 @@ export function decodeVoxelSectionPayload(payload: unknown): VoxelSectionSnapsho
   if (raw.v !== VOXEL_SECTION_PAYLOAD_VERSION) {
     throw new Error(`unsupported voxel section payload version: ${String(raw.v)}`);
   }
+  // Older 0.8.x builds wrote a v2 payload without the explicit explored/stale
+  // bitmaps and with `e.observation` nested under each cell. It is still a v2
+  // row, so migrate it rather than rejecting a database the agent already has.
+  if (raw.explored === undefined) return migrateLegacyV2Payload(raw);
   const dim = requireString(raw.dim, 'dim');
   const cx = requireInteger(raw.cx, 'cx');
   const cz = requireInteger(raw.cz, 'cz');
@@ -205,6 +209,85 @@ function decodeV2Cell(raw: unknown): VoxelCellSnapshot {
     validUntil: requireNumber(c.vu, 'vu'),
   };
   return { index: requireInteger(c.i, 'i'), evidence };
+}
+
+/**
+ * Migrate the legacy 0.8.x v2 payload: no explicit bitmaps, and each cell's
+ * evidence still nested as `e.observation`. The state is reconstructed from the
+ * palette on restore (and validated here when the legacy payload still carried
+ * it). History bitmaps did not exist in that format, so they start empty.
+ */
+function migrateLegacyV2Payload(raw: Record<string, unknown>): VoxelSectionSnapshot {
+  const dim = requireString(raw.dim, 'dim');
+  const cx = requireInteger(raw.cx, 'cx');
+  const cz = requireInteger(raw.cz, 'cz');
+  const sy = requireInteger(raw.sy, 'sy');
+  const palette = requireStringArray(raw.palette, 'palette');
+  const bits = requireInteger(raw.bits, 'bits');
+  const revision = requireInteger(raw.revision, 'revision');
+  const cells = decodeBase64(requireString(raw.cells, 'cells'));
+  if (!Array.isArray(raw.evidence)) {
+    throw new Error('voxel section payload evidence must be an array');
+  }
+  const evidence: VoxelCellSnapshot[] = raw.evidence.map((cell) => {
+    if (cell === null || typeof cell !== 'object') {
+      throw new Error('voxel cell payload must be an object');
+    }
+    const c = cell as { i?: unknown; e?: unknown };
+    const index = requireInteger(c.i, 'i');
+    const stored = c.e;
+    if (stored === null || typeof stored !== 'object') {
+      throw new Error('legacy voxel cell evidence must be an object');
+    }
+    const legacy = stored as {
+      observation?: {
+        state?: Parameters<typeof serializeBlockState>[0];
+        stateComplete?: unknown;
+        evidence?: unknown;
+        observedAt?: unknown;
+        observedWorldTick?: unknown;
+        source?: unknown;
+        sessionId?: unknown;
+        originObservationId?: unknown;
+        sequence?: unknown;
+        actionId?: unknown;
+      };
+      revision?: unknown;
+      freshness?: unknown;
+      staleReason?: unknown;
+      validUntil?: unknown;
+    };
+    const observation = legacy.observation;
+    if (observation === undefined) {
+      throw new Error('legacy voxel cell evidence is missing its observation');
+    }
+    if (observation.state !== undefined) {
+      const paletteIndex = readCell(cells, bits, index);
+      if (palette[paletteIndex] !== serializeBlockState(observation.state)) {
+        throw new Error(`voxel cell ${index} palette/evidence disagree`);
+      }
+    }
+    const compact: VoxelCellEvidenceSnapshot = {
+      stateComplete: observation.stateComplete as boolean,
+      evidence: observation.evidence as EvidenceKind,
+      observedAt: observation.observedAt as number,
+      observedWorldTick: observation.observedWorldTick as number | undefined,
+      source: observation.source as ObservationSource,
+      sessionId: observation.sessionId as string,
+      originObservationId: observation.originObservationId as number | undefined,
+      sequence: observation.sequence as number,
+      actionId: observation.actionId as string | undefined,
+      revision: requireInteger(legacy.revision, 'revision'),
+      freshness: legacy.freshness as Freshness,
+      staleReason: legacy.staleReason as VoxelCellEvidenceSnapshot['staleReason'],
+      validUntil: legacy.validUntil as number,
+    };
+    return { index, evidence: compact };
+  });
+  if (cells.length !== Math.ceil((SECTION_CELL_COUNT * bits) / 8)) {
+    throw new Error(`voxel section payload cells length ${cells.length} does not match bits ${bits}`);
+  }
+  return { dim, cx, cz, sy, palette, bits, cells, evidence, revision };
 }
 
 /**

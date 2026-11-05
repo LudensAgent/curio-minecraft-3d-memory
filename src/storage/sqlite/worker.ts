@@ -26,9 +26,10 @@ import type {
 } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelDirectoryEntry } from '../../voxel/residency.js';
-import { readCell } from '../../voxel/palette.js';
-import { SECTION_CELL_COUNT } from '../../constants.js';
-import type { BlockState } from '../../types.js';
+import {
+  decodeVoxelSectionPayload,
+  encodeVoxelSectionPayload,
+} from '../../voxel/serialization.js';
 import { chunkVisitKey, placedBlockKey, portalTraversalIdentity } from './ledger.js';
 import { DEFAULT_LEDGER_LIMITS } from './types.js';
 import type {
@@ -836,30 +837,10 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
  * payload for self-containment and backward compatibility.
  */
 function encodeVoxelSection(section: VoxelSectionSnapshot): string {
-  return JSON.stringify({
-    v: 2,
-    dim: section.dim,
-    cx: section.cx,
-    cz: section.cz,
-    sy: section.sy,
-    palette: section.palette,
-    bits: section.bits,
-    cells: Buffer.from(section.cells).toString('base64'),
-    evidence: section.evidence.map((cell) => {
-      const { state: _state, ...observation } = cell.evidence.observation;
-      return {
-        i: cell.index,
-        e: {
-          observation,
-          revision: cell.evidence.revision,
-          freshness: cell.evidence.freshness,
-          ...(cell.evidence.staleReason === undefined ? {} : { staleReason: cell.evidence.staleReason }),
-          validUntil: cell.evidence.validUntil,
-        },
-      };
-    }),
-    revision: section.revision,
-  });
+  // Delegate to the versioned voxel serializer: palette + packed cells + the
+  // history/risk bitmaps + compact per-cell evidence. Keeping one encoder avoids
+  // silently diverging snapshot formats between the map and the worker.
+  return JSON.stringify(encodeVoxelSectionPayload(section));
 }
 
 /** Stable id for one voxel section row. */
@@ -1724,118 +1705,16 @@ function loadWorld(
   return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes };
 }
 
-/**
- * Parse the canonical palette string back into a block state. Property values are
- * emitted verbatim by `serializeBlockState`, so the inverse only splits on the
- * delimiters that serialization itself introduces.
- */
-function parseSerializedBlockState(serialized: string): BlockState {
-  const open = serialized.indexOf('[');
-  if (open < 0) return { name: serialized, properties: {} };
-  if (!serialized.endsWith(']')) throw new Error('corrupt voxel palette state');
-  const name = serialized.slice(0, open);
-  if (name.length === 0) throw new Error('corrupt voxel palette state name');
-  const body = serialized.slice(open + 1, -1);
-  const properties: Record<string, string> = {};
-  if (body.length > 0) {
-    for (const pair of body.split(',')) {
-      const eq = pair.indexOf('=');
-      if (eq <= 0) throw new Error('corrupt voxel palette state property');
-      properties[pair.slice(0, eq)] = pair.slice(eq + 1);
-    }
-  }
-  return { name, properties };
-}
 
 /**
- * Decode one voxel section payload, validating structure during decode.
+ * Decode one voxel section payload through the shared versioned decoder.
  *
- * v1 payloads carry the full observation (including `state`) inline. v2 payloads
- * omit that duplicate state and recover it from the palette index recorded in the
- * packed cells. Both forms decode to the same `VoxelSectionSnapshot`.
+ * v1 payloads (full state inline) and v2 payloads (palette-referenced state,
+ * history bitmaps) both decode to the same `VoxelSectionSnapshot`. The worker
+ * must not maintain a second, divergent decoder.
  */
 function decodeVoxelSection(payload: string): VoxelSectionSnapshot {
-  const raw = JSON.parse(payload) as {
-    v?: unknown;
-    dim?: unknown;
-    cx?: unknown;
-    cz?: unknown;
-    sy?: unknown;
-    palette?: unknown;
-    bits?: unknown;
-    cells?: unknown;
-    evidence?: unknown;
-    revision?: unknown;
-  };
-  if (raw === null || typeof raw !== 'object' || (raw.v !== 1 && raw.v !== 2)) {
-    throw new Error('corrupt voxel section payload');
-  }
-  const version = raw.v;
-  if (typeof raw.dim !== 'string' || raw.dim.length === 0) {
-    throw new Error('corrupt voxel section dim');
-  }
-  if (!Number.isInteger(raw.cx) || !Number.isInteger(raw.cz) || !Number.isInteger(raw.sy)) {
-    throw new Error('corrupt voxel section coordinates');
-  }
-  if (!Array.isArray(raw.palette) || raw.palette.length === 0) {
-    throw new Error('corrupt voxel section palette');
-  }
-  if (typeof raw.bits !== 'number') {
-    throw new Error('corrupt voxel section bits');
-  }
-  if (typeof raw.cells !== 'string') {
-    throw new Error('corrupt voxel section cells');
-  }
-  if (!Array.isArray(raw.evidence)) {
-    throw new Error('corrupt voxel section evidence');
-  }
-  const cells = new Uint8Array(Buffer.from(raw.cells, 'base64'));
-  const palette = raw.palette as string[];
-  const bits = raw.bits as number;
-  const evidence = raw.evidence.map((cell) => {
-    const c = cell as { i?: unknown; e?: unknown };
-    if (!Number.isInteger(c.i) || c.e === undefined) {
-      throw new Error('corrupt voxel section evidence record');
-    }
-    const index = c.i as number;
-    const stored = c.e as VoxelSectionSnapshot['evidence'][number]['evidence'];
-    if (version === 1) {
-      return { index, evidence: stored };
-    }
-    if (stored === null || typeof stored !== 'object') {
-      throw new Error('corrupt voxel section evidence record');
-    }
-    const observation = (stored as { observation?: unknown }).observation;
-    if (observation === null || typeof observation !== 'object') {
-      throw new Error('corrupt voxel section evidence observation');
-    }
-    // v2: the observation's `state` was omitted as a duplicate of the palette
-    // entry at this cell's packed index. Reconstruct it from the authoritative
-    // palette/cells pair; never trust a second inline copy.
-    if ((observation as { state?: unknown }).state === undefined) {
-      if (index < 0 || index >= SECTION_CELL_COUNT) {
-        throw new Error('corrupt voxel section evidence index');
-      }
-      const paletteIndex = readCell(cells, bits, index);
-      const serialized = palette[paletteIndex];
-      if (typeof serialized !== 'string') {
-        throw new Error('corrupt voxel section palette index');
-      }
-      (observation as { state?: BlockState }).state = parseSerializedBlockState(serialized);
-    }
-    return { index, evidence: stored };
-  });
-  return {
-    dim: raw.dim,
-    cx: raw.cx as number,
-    cz: raw.cz as number,
-    sy: raw.sy as number,
-    palette,
-    bits,
-    cells,
-    evidence,
-    revision: raw.revision as number,
-  };
+  return decodeVoxelSectionPayload(JSON.parse(payload));
 }
 
 function loadVoxel(
