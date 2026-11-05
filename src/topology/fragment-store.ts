@@ -285,6 +285,20 @@ export class FragmentStore {
   }
 
   /**
+   * Alias of `fragments` for `TopologyHistorySource.listFragments`; kept as a
+   * distinct name so a history adapter may expose a plain listing without
+   * colliding with a field called `fragments`.
+   */
+  listFragments(query: FragmentQuery = {}): FragmentPage {
+    return this.fragments(query);
+  }
+
+  /** Alias of `traversals` for `TopologyHistorySource.listTraversals`. */
+  listTraversals(query: TraversalQuery = {}): TraversalPage {
+    return this.traversals(query);
+  }
+
+  /**
    * Record confirmed traversal evidence, or no-op when the same id + content is
    * re-delivered. The referenced fragment must already exist and share world/dim.
    */

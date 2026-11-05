@@ -1,12 +1,47 @@
 export type { PathFragment, TraversalEvidence } from './path-fragment.js';
 export type {
   ConnectionType,
+  EdgeDependency,
+  EdgeDirection,
+  EdgeVerification,
+  EdgeVerificationStatus,
+  GoneEvidence,
   LandmarkTag,
   NodeKind,
   NodeSource,
   SpatialEdge,
   SpatialNode,
 } from './graph.js';
+export type {
+  EdgeDirectionState,
+  EdgeModeState,
+  EdgeRuntimeShape,
+  EdgeRuntimeView,
+  EdgeUsability,
+  EdgeUsabilityReason,
+  EdgeVerificationInput,
+} from './edge-runtime.js';
+export type {
+  PortalEdgeInput,
+  PortalEdgeView,
+  PortalTraversalEvidence,
+} from './portal.js';
+export { TransientOccupancy } from './occupancy.js';
+export type {
+  OccupancyObservationInput,
+  OccupancyOptions,
+  OccupancyQuery,
+  OccupancyRecord,
+} from './occupancy.js';
+export type {
+  ConnectivityLink,
+  FragmentConnectivityInput,
+  FragmentMerge,
+  FragmentPiece,
+  FragmentSegment,
+  FragmentSegmentsView,
+  FragmentationResult,
+} from './connectivity.js';
 export { FragmentStore } from './fragment-store.js';
 export type {
   FragmentChanges,
@@ -26,12 +61,17 @@ export type {
   AdjacencyOptions,
   AdjacencyResult,
   AnchorOrder,
+  AnchorQueryOptions,
+  AnchorResult,
+  ComponentReport,
   EdgeBasis,
+  EdgeBlockInput,
   EdgeChanges,
   EdgePage,
   EdgeQuery,
   EdgeReference,
   EdgeView,
+  FragmentSegmentsResult,
   HistoricalAnchorCandidate,
   HistoricalAnchorQueryOptions,
   HistoricalAnchorQueryResult,
@@ -42,10 +82,12 @@ export type {
   QueryBudgetKey,
   QueryStats,
   ReachabilityResult,
+  RecordNodeOptions,
   ReferenceStatus,
   RouteQueryResult,
   RouteQueryStatus,
   RouteSegment,
+  RuntimeQueryOptions,
   SearchDiagnostic,
   SearchDisposition,
   SearchGapKind,
@@ -55,6 +97,7 @@ export type {
   TopologyEdgeSnapshot,
   TopologyEvidenceRefSnapshot,
   TopologyHistorySource,
+  TopologyPortalEdgeSnapshot,
   TopologyQueryOptions,
   TopologyStoreOptions,
 } from './topology-store.js';

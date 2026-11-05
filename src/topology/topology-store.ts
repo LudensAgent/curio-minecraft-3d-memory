@@ -28,7 +28,18 @@
  * binding snapshot used for matching and display.
  */
 
-import type { ConnectionType, LandmarkTag, NodeKind, NodeSource, SpatialNode } from './graph.js';
+import type {
+  ConnectionType,
+  EdgeDependency,
+  EdgeDirection,
+  EdgeVerification,
+  EdgeVerificationStatus,
+  GoneEvidence,
+  LandmarkTag,
+  NodeKind,
+  NodeSource,
+  SpatialNode,
+} from './graph.js';
 import type { PathFragment, TraversalEvidence } from './path-fragment.js';
 import {
   assertValidMode,
@@ -38,7 +49,45 @@ import {
 } from './path-fragment.js';
 import type { FragmentScope, SaveResult } from './fragment-store.js';
 import { estimateTraversalBytes, snapshotEvidence, traversalLowerBound } from './fragment-store.js';
+import type { ObstacleEvidence } from '../traversability/types.js';
 import type { MoveMode, Vec3Like } from '../types.js';
+import type { EdgeRuntimeView, EdgeVerificationInput } from './edge-runtime.js';
+import {
+  cloneEdgeVerification,
+  directionState,
+  directionUsability,
+  edgeDirectionModes,
+  edgeVerificationsEqual,
+  modeState,
+  resolveEdgeDirected,
+  runtimeView,
+  snapshotEdgeModes,
+  snapshotEdgeVerification,
+  withVerification,
+} from './edge-runtime.js';
+import type {
+  FragmentMerge,
+  FragmentSegment,
+  FragmentationResult,
+} from './connectivity.js';
+import {
+  computeFragmentation,
+  fragmentPointKeys,
+  pointKey,
+  splitPolyline,
+  traversalConnectsFragments,
+} from './connectivity.js';
+import type {
+  PortalEdgeInput,
+  PortalEdgeView,
+  PortalTraversalEvidence,
+} from './portal.js';
+import {
+  clonePortalTraversal,
+  portalReturnVerified,
+  portalTraversalsEqual,
+  snapshotPortalTraversal,
+} from './portal.js';
 
 /** How a topology edge is justified. */
 export type EdgeBasis = 'candidate' | 'traversed';
@@ -64,6 +113,15 @@ export interface TopologyEdge {
   source?: string;
   /** Traversal evidence ids backing a `traversed` edge; empty for `candidate`. */
   evidenceIds: string[];
+  /**
+   * `true` (or absent, for legacy records) = only from→to. `false` = both
+   * directions have their own evidence and their own verification.
+   */
+  directed?: boolean;
+  /** Candidate modes supported by evidence; empty/absent = no mode filter. */
+  modes?: MoveMode[];
+  /** Per-direction, per-mode current verification (derived state, never history). */
+  verifications?: EdgeVerification[];
 }
 
 /** Resolution of one evidence reference, re-read from the authoritative history. */
@@ -78,10 +136,15 @@ export interface EdgeReference {
 
 /** Read projection of an edge: the record plus per-reference resolution. */
 export interface EdgeView extends TopologyEdge {
+  directed: boolean;
+  modes: MoveMode[];
+  verifications: EdgeVerification[];
   /** Per-evidence resolution; empty for `candidate` edges. */
   references: EdgeReference[];
   /** Aggregate resolution for `traversed` edges, or `null` for `candidate` (nothing to resolve). */
   resolution: ReferenceStatus | null;
+  /** Direction/mode separated current status (never implies current passability for unverified modes). */
+  runtime: EdgeRuntimeView;
 }
 
 /**
@@ -98,6 +161,22 @@ export interface TopologyHistorySource {
    * scope fields.
    */
   getFragmentScope?(id: string): FragmentScope | null;
+  /**
+   * Optional paginated fragment listing used by `fragmentation`/`segments`.
+   * `FragmentStore.fragments` satisfies this signature. Sources without it can
+   * still answer node/edge queries; connectivity queries then report clearly.
+   */
+  listFragments?(query?: { dim?: string; limit?: number; after?: string }): {
+    items: PathFragment[];
+    total: number;
+    nextAfter?: string;
+  };
+  /** Optional traversal listing used by `fragmentation` to add actual link evidence. */
+  listTraversals?(query?: { dim?: string; limit?: number; after?: string }): {
+    items: TraversalEvidence[];
+    total: number;
+    nextAfter?: string;
+  };
 }
 
 /** Capacity limits. These are implementation capacities, not game rules. */
@@ -120,6 +199,17 @@ export interface TopologyStoreOptions {
   maxQueryHistoryReads?: number;
   /** Ceiling for the per-query `maxDiagnostics` budget. Defaults to 100. */
   maxQueryDiagnostics?: number;
+  /** Maximum portal edges retained. Defaults to 1000. */
+  maxPortalEdges?: number;
+  /** Maximum raw traversals retained per portal edge. Defaults to 32. */
+  maxPortalTraversalsPerEdge?: number;
+  /** Maximum explicit fragment merges retained. Defaults to 1000. */
+  maxFragmentMerges?: number;
+  /**
+   * Clock used for verification freshness. Defaults to `Date.now`. Tests and
+   * replay inject a fixed clock; stored timestamps are never rewritten.
+   */
+  now?: () => number;
 }
 
 /** Paginated read filter over nodes. All fields optional and combined by AND. */
@@ -156,6 +246,89 @@ export interface EdgePage {
   nextAfter?: string;
 }
 
+// --- runtime edge verification (design §5) ---
+
+/** Block one direction+mode with concrete obstacle evidence. Never deletes history. */
+export interface EdgeBlockInput {
+  /** Defaults to `forward`; reverse of a directed edge is rejected. */
+  direction?: EdgeDirection;
+  mode: MoveMode;
+  /** Required: collision/contact/block evidence for the blockage. */
+  blockedAt: ObstacleEvidence;
+  reason?: string;
+  hazards?: EdgeVerification['hazards'];
+  dependencies?: EdgeDependency[];
+  contextKey?: string;
+  sessionId?: string;
+  computedAt: number;
+  validUntil: number;
+}
+
+/** Options for `edgeRuntime` and runtime-clamped read paths. */
+export interface RuntimeQueryOptions {
+  /**
+   * Clock override for freshness (milliseconds). Absent uses the store clock.
+   * This never rewrites stored times; it only selects the cutoff.
+   */
+  now?: number;
+}
+
+/** Options for `recordNode`. `dim` is required; the other fields are optional provenance. */
+export interface RecordNodeOptions {
+  dim: string;
+  kind?: NodeKind;
+  /** Caller-supplied stable id; when absent a deterministic agent id is used. */
+  id?: string;
+  observedAt?: number;
+  externalRef?: string;
+}
+
+/** Runtime anchor result. Region nodes are never returned as exact interaction targets. */
+export interface AnchorResult {
+  nodeId: string;
+  pos: Vec3Like;
+  y: number;
+  precision: 'exact';
+  source: NodeSource;
+  observedAt?: number;
+  externalRef?: string;
+  /** Hops from the nearest node to `here` in the reachable component. */
+  hops: number;
+  componentSize: number;
+  /** Region nodes in the component, excluded because they are not exact targets. */
+  excludedRegionNodes: number;
+  startNodeId: string;
+}
+
+/** Options for surface/deepest anchor queries. */
+export interface AnchorQueryOptions extends RuntimeQueryOptions {
+  /** Selection radius for mapping `here` to an exact node. Defaults to 3.5; never creates an edge. */
+  near?: number;
+}
+
+/** Node-level connected components for one dimension. */
+export interface ComponentReport {
+  components: number;
+  /** Node ids by component, sorted for determinism. */
+  groups: string[][];
+  /** Node id → component index. */
+  byNode: Map<string, number>;
+  /**
+   * Nodes recomputed by this call. Unaffected components reuse the cache, so this
+   * is not a full-graph recomputation claim.
+   */
+  recomputedNodes: number;
+}
+
+/** Derived current-passable segments of one historical fragment. */
+export interface FragmentSegmentsResult {
+  fragmentId: string;
+  segments: FragmentSegment[];
+  blockedEdgeIds: string[];
+  cuts: Vec3Like[];
+  totalPoints: number;
+}
+
 // --- bounded historical graph queries (phase 4C) ---
 
 /** Finite per-query work budgets. Zero is honored literally, never defaulted. */
@@ -171,7 +344,7 @@ export interface QueryBudget {
 }
 
 /** Options shared by the bounded reachability and route queries. */
-export interface TopologyQueryOptions extends QueryBudget {
+export interface TopologyQueryOptions extends QueryBudget, RuntimeQueryOptions {
   /** Optional movement-mode filter; absent means "do not filter by mode". */
   mode?: MoveMode;
 }
@@ -179,13 +352,31 @@ export interface TopologyQueryOptions extends QueryBudget {
 /** Options for a bounded adjacency read (edge budget only). */
 export interface AdjacencyOptions {
   maxEdges?: number;
+  /**
+   * Include directions with an explicit blocked/stale/unsupported verification.
+   * Defaults to false: blocked directions are excluded, matching routing.
+   */
+  includeBlocked?: boolean;
+  /** Clock override for verification freshness. */
+  now?: number;
 }
 
 /** Which budget stopped a bounded search before it finished. */
 export type QueryBudgetKey = 'maxNodes' | 'maxEdges' | 'maxHistoryReads';
 
-/** The kinds of evidence gap a bounded search can observe on its frontier. */
-export type SearchGapKind = 'candidate' | 'missing' | 'mismatch' | 'mode_unknown';
+/**
+ * The kinds of evidence gap a bounded search can observe on its frontier.
+ * `blocked` and `stale` come from runtime verification; `unsupported` is a
+ * structural direction/mode constraint, not a world observation.
+ */
+export type SearchGapKind =
+  | 'candidate'
+  | 'missing'
+  | 'mismatch'
+  | 'mode_unknown'
+  | 'blocked'
+  | 'stale'
+  | 'unsupported';
 
 /** A bounded description of one evidence gap encountered during a search. */
 export interface SearchDiagnostic {
@@ -259,6 +450,8 @@ export interface RouteSegment {
   from: string;
   to: string;
   type: ConnectionType;
+  /** Direction actually traversed; `reverse` is only possible on an undirected edge. */
+  direction: EdgeDirection;
   /** The witness evidence actually used (smallest evidenceId among matching resolved refs). */
   evidenceId: string;
   /** The witness evidence as read now (authoritative clone), preserving its original meaning. */
@@ -342,6 +535,8 @@ export interface NodeChanges {
   tag?: LandmarkTag;
   label?: string;
   location?: SpatialNode['location'];
+  observedAt?: number;
+  externalRef?: string;
 }
 
 /**
@@ -355,6 +550,9 @@ export interface EdgeChanges {
   basis?: EdgeBasis;
   source?: string;
   evidenceIds?: string[];
+  /** `true` (default) or `false` for a bidirectional historical connection. */
+  directed?: boolean;
+  modes?: MoveMode[];
 }
 
 /** One preserved evidence binding: the id plus the immutable snapshot it was bound to. */
@@ -378,6 +576,22 @@ export interface TopologyEdgeSnapshot {
   basis: EdgeBasis;
   source?: string;
   refs: TopologyEvidenceRefSnapshot[];
+  /** Optional for backward-compatible restore; absent means legacy `true`. */
+  directed?: boolean;
+  modes?: MoveMode[];
+  /** Runtime verification records. Derived state, restored only with their stored times. */
+  verifications?: EdgeVerification[];
+}
+
+/** Persistent form of a portal edge: raw traversals only — never a `returnVerified` flag. */
+export interface TopologyPortalEdgeSnapshot {
+  id: string;
+  from: string;
+  to: string;
+  directed: boolean;
+  fragmentId?: string;
+  source?: string;
+  traversals: PortalTraversalEvidence[];
 }
 
 /** Measured size of the topology store, used for the bounded checkpoint pre-flight. */
@@ -386,6 +600,9 @@ export interface TopologyCheckpointMeasure {
   edges: number;
   edgeEvidenceRefs: number;
   bytes: number;
+  portalEdges?: number;
+  portalTraversals?: number;
+  fragmentMerges?: number;
 }
 
 /** A deep-copied, insertion-ordered snapshot of the store's full topology. */
@@ -393,6 +610,10 @@ export interface TopologyCheckpointSnapshot {
   worldId: string;
   nodes: SpatialNode[];
   edges: TopologyEdgeSnapshot[];
+  /** Optional for older callers/snapshots: portal edges are a separate map. */
+  portalEdges?: TopologyPortalEdgeSnapshot[];
+  /** Explicit fragment merges (evidence-backed); pairs of fragment ids. */
+  fragmentMerges?: [string, string][];
 }
 
 /** Internal edge record: the public shape plus the immutable binding snapshots. */
@@ -405,6 +626,20 @@ interface StoredEdge {
   basis: EdgeBasis;
   source?: string;
   refs: StoredEvidenceRef[];
+  directed: boolean;
+  modes: MoveMode[];
+  verifications: EdgeVerification[];
+}
+
+/** Internal portal edge record: raw traversal evidence only. */
+interface StoredPortalEdge {
+  id: string;
+  from: string;
+  to: string;
+  directed: boolean;
+  fragmentId?: string;
+  source?: string;
+  traversals: PortalTraversalEvidence[];
 }
 
 interface StoredEvidenceRef {
@@ -422,6 +657,9 @@ interface ResolvedLimits {
   maxQueryEdges: number;
   maxQueryHistoryReads: number;
   maxQueryDiagnostics: number;
+  maxPortalEdges: number;
+  maxPortalTraversalsPerEdge: number;
+  maxFragmentMerges: number;
 }
 
 const DEFAULT_LIMITS: ResolvedLimits = {
@@ -434,6 +672,9 @@ const DEFAULT_LIMITS: ResolvedLimits = {
   maxQueryEdges: 10000,
   maxQueryHistoryReads: 1000,
   maxQueryDiagnostics: 100,
+  maxPortalEdges: 1000,
+  maxPortalTraversalsPerEdge: 32,
+  maxFragmentMerges: 1000,
 };
 
 const NODE_KINDS: readonly NodeKind[] = ['entrance', 'place', 'branch', 'turn', 'vertical_junction'];
@@ -467,6 +708,21 @@ export class TopologyStore {
   private readonly limits: ResolvedLimits;
   private readonly nodeMap = new Map<string, SpatialNode>();
   private readonly edgeMap = new Map<string, StoredEdge>();
+  /** Portal edges live in their own map; the walk graph never sees them. */
+  private readonly portalEdgeMap = new Map<string, StoredPortalEdge>();
+  /** Portal traversal id → raw evidence (insertion-ordered). */
+  private readonly portalTraversalMap = new Map<string, PortalTraversalEvidence>();
+  /** Evidence-backed fragment merges, canonical `[a,b]` with `a < b`. */
+  private fragmentMerges: FragmentMerge[] = [];
+  /** Program node insertion order, for oldest-first eviction. */
+  private programNodeOrder: string[] = [];
+  /**
+   * Per-dimension node component cache. Invalidation touches only the
+   * component(s) incident to a changed edge; untouched components are reused.
+   */
+  private readonly componentCache = new Map<string, Map<string, number>>();
+  private readonly componentNext = new Map<string, number>();
+  private readonly clock: () => number;
   /** node id → edge ids that reference it (for location-update and delete guards). */
   private readonly nodeToEdgeIds = new Map<string, Set<string>>();
   /**
@@ -480,6 +736,12 @@ export class TopologyStore {
     this.worldId = history.worldId;
     this.history = history;
     this.limits = resolveLimits(options);
+    this.clock = options.now ?? Date.now;
+  }
+
+  /** Current store clock (ms). Injected for deterministic freshness tests. */
+  now(): number {
+    return this.clock();
   }
 
   /** Current mutation revision (see `mutationRevision`). */
@@ -504,11 +766,20 @@ export class TopologyStore {
     const capacity =
       snapshot.source === 'agent' ? this.limits.maxAgentNodes : this.limits.maxProgramNodes;
     if (this.countNodes(snapshot.source) >= capacity) {
-      throw new Error(
-        `node capacity for source "${snapshot.source}" (${capacity}) reached; nothing was written`,
-      );
+      if (snapshot.source === 'agent') {
+        // Agent-named places are durable: reject rather than silently forget one.
+        throw new Error(
+          `node capacity for source "agent" (${capacity}) reached; nothing was written`,
+        );
+      }
+      if (!this.evictOldestProgramNode()) {
+        throw new Error(
+          `program node capacity (${capacity}) reached and every program node is referenced by an edge`,
+        );
+      }
     }
     this.nodeMap.set(node.id, snapshot);
+    if (snapshot.source === 'program') this.programNodeOrder.push(snapshot.id);
     this.mutationRevision += 1;
     return { status: 'inserted' };
   }
@@ -549,7 +820,123 @@ export class TopologyStore {
     }
     const existed = this.nodeMap.delete(id);
     this.nodeToEdgeIds.delete(id);
-    if (existed) this.mutationRevision += 1;
+    if (existed) {
+      this.invalidateNodeComponent(id);
+      this.mutationRevision += 1;
+    }
+  }
+
+  /**
+   * First-class "remember this named place" primitive (design §5). Always
+   * agent-sourced and therefore durable. Re-recording the same label+position
+   * updates tags/observation metadata instead of creating a duplicate; the
+   * label is opaque to the library.
+   */
+  recordNode(
+    label: string,
+    pos: Vec3Like,
+    tag?: LandmarkTag,
+    options: RecordNodeOptions = { dim: '' },
+  ): SpatialNode {
+    if (typeof label !== 'string' || label.length === 0) {
+      throw new Error(`recordNode label must be a non-empty string`);
+    }
+    if (typeof options.dim !== 'string' || options.dim.length === 0) {
+      throw new Error(`recordNode requires a non-empty dim`);
+    }
+    assertFinitePoint(pos, 'recordNode position');
+    const id =
+      options.id ??
+      `agent:${options.dim}:${pos.x},${pos.y},${pos.z}:${label}`;
+    const existing = this.nodeMap.get(id);
+    if (existing !== undefined) {
+      if (existing.source !== 'agent') {
+        throw new Error(`recordNode id "${id}" belongs to a program node`);
+      }
+      const changes: NodeChanges = {
+        kind: options.kind ?? existing.kind,
+        tag: tag ?? existing.tag,
+        label,
+      };
+      if (options.observedAt !== undefined) changes.observedAt = options.observedAt;
+      if (options.externalRef !== undefined) changes.externalRef = options.externalRef;
+      this.updateNode(id, changes);
+      return this.getNode(id)!;
+    }
+    const node: SpatialNode = {
+      id,
+      kind: options.kind ?? 'place',
+      source: 'agent',
+      worldId: this.worldId,
+      dim: options.dim,
+      location: { kind: 'exact', pos: { x: pos.x, y: pos.y, z: pos.z } },
+    };
+    if (tag !== undefined) node.tag = tag;
+    node.label = label;
+    if (options.observedAt !== undefined) node.observedAt = options.observedAt;
+    if (options.externalRef !== undefined) node.externalRef = options.externalRef;
+    this.saveNode(node);
+    return this.getNode(id)!;
+  }
+
+  /**
+   * Mark an anchor's object gone. The node record and all history are kept; only
+   * real observation evidence (session, time, source) is accepted. Evidence older
+   * than the node's last observation is rejected rather than rewriting history.
+   */
+  markGone(nodeId: string, evidence: GoneEvidence): SaveResult {
+    const existing = this.nodeMap.get(nodeId);
+    if (existing === undefined) {
+      throw new Error(`unknown node "${nodeId}"`);
+    }
+    validateGoneEvidence(evidence);
+    if (existing.gone === true) return { status: 'unchanged' };
+    if (existing.observedAt !== undefined && evidence.observedAt < existing.observedAt) {
+      throw new Error(
+        `gone evidence for "${nodeId}" is older than its last observation; nothing was written`,
+      );
+    }
+    const merged: SpatialNode = {
+      ...cloneNode(existing),
+      gone: true,
+      goneAt: evidence.observedAt,
+      goneEvidence: {
+        sessionId: evidence.sessionId,
+        observedAt: evidence.observedAt,
+        source: evidence.source,
+        observationIds: evidence.observationIds?.slice(),
+        reason: evidence.reason,
+      },
+    };
+    this.nodeMap.set(nodeId, snapshotNode(this.worldId, merged));
+    this.mutationRevision += 1;
+    return { status: 'updated' };
+  }
+
+  /** Gone anchors whose center is within `radius` of `pos`, nearest first. */
+  goneNear(dim: string, pos: Vec3Like, radius = 3.5): SpatialNode[] {
+    assertFinitePoint(pos, 'goneNear position');
+    if (!Number.isFinite(radius) || radius < 0) {
+      throw new Error(`goneNear radius must be a non-negative finite number`);
+    }
+    return [...this.nodeMap.values()]
+      .filter((node) => node.dim === dim && node.gone === true)
+      .map((node) => ({
+        node,
+        distance: distanceToLocation(node.location, pos),
+      }))
+      .filter((entry) => entry.distance <= radius)
+      .sort((a, b) => a.distance - b.distance || a.node.id.localeCompare(b.node.id))
+      .map((entry) => cloneNode(entry.node));
+  }
+
+  /**
+   * Display namespace read: program-generated points never share the default
+   * (agent) display surface, so they cannot bury named places.
+   */
+  displayNodes(query: NodeQuery & { namespace?: NodeSource } = {}): NodePage {
+    const { namespace = 'agent', ...rest } = query;
+    return this.nodes({ ...rest, source: namespace });
   }
 
   /** Paginated, read-only node listing (id-ordered, exclusive cursor, clamped limit). */
@@ -581,9 +968,24 @@ export class TopologyStore {
    * a `candidate` edge must not cite any evidence.
    */
   saveEdge(edge: TopologyEdge): SaveResult {
+    if (this.portalEdgeMap.has(edge.id)) {
+      throw new Error(`edge id "${edge.id}" is already used by a portal edge`);
+    }
     const shape = this.validateEdgeShape(edge);
-    const refs = this.resolveRefs(edge, shape.fromPos, shape.toPos, shape.dim);
-    const stored = this.assembleStoredEdge(edge, refs);
+    if (edge.verifications !== undefined && !Array.isArray(edge.verifications)) {
+      throw new Error(`edge verifications must be an array`);
+    }
+    const verifications = (edge.verifications ?? []).reduce<EdgeVerification[]>((acc, raw) => {
+      const verification = snapshotEdgeVerification(raw, this.now(), shape.directed);
+      if (shape.modes.length > 0 && !shape.modes.includes(verification.mode)) {
+        throw new Error(
+          `mode "${verification.mode}" is not a recorded candidate mode of edge "${edge.id}"`,
+        );
+      }
+      return withVerification(acc, verification);
+    }, []);
+    const refs = this.resolveRefs(edge, shape.fromPos, shape.toPos, shape.dim, shape.directed);
+    const stored = this.assembleStoredEdge(edge, refs, verifications);
     const existing = this.edgeMap.get(edge.id);
     if (existing !== undefined) {
       if (storedEdgesEqual(existing, stored)) return { status: 'unchanged' };
@@ -594,6 +996,7 @@ export class TopologyStore {
     }
     this.edgeMap.set(edge.id, stored);
     this.indexEdge(stored);
+    this.invalidateEdgeComponents(stored);
     this.mutationRevision += 1;
     return { status: 'inserted' };
   }
@@ -614,12 +1017,16 @@ export class TopologyStore {
     const rebind = 'evidenceIds' in changes;
     const merged = applyEdgeChanges(existing, changes);
     const shape = this.validateEdgeShape(merged);
+    if (shape.directed && existing.verifications.some((v) => v.direction === 'reverse')) {
+      throw new Error(`edge "${id}" has reverse verification; it cannot become directed`);
+    }
     const refs = rebind
-      ? this.resolveRefs(merged, shape.fromPos, shape.toPos, shape.dim)
+      ? this.resolveRefs(merged, shape.fromPos, shape.toPos, shape.dim, shape.directed)
       : this.preservedRefs(merged, existing);
-    const stored = this.assembleStoredEdge(merged, refs);
+    const stored = this.assembleStoredEdge(merged, refs, existing.verifications);
     if (storedEdgesEqual(existing, stored)) return { status: 'unchanged' };
     this.edgeMap.set(id, stored);
+    this.invalidateEdgeComponents(stored);
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -631,6 +1038,107 @@ export class TopologyStore {
   }
 
   /**
+   * Record a fresh verification for one direction+mode. This never deletes a
+   * fragment, traversal or edge. `BLOCKED` must go through `blockEdge` so it
+   * always carries obstacle evidence; an `OPEN` result must be fresh right now.
+   */
+  verifyEdge(id: string, verification: EdgeVerificationInput): SaveResult {
+    if (verification.status === 'BLOCKED') {
+      throw new Error(`use blockEdge to record a BLOCKED verification with evidence`);
+    }
+    return this.applyVerification(id, verification);
+  }
+
+  /** Block one direction+mode with concrete obstacle evidence. Never deletes history. */
+  blockEdge(id: string, input: EdgeBlockInput): SaveResult {
+    if (input.blockedAt === undefined || input.blockedAt === null) {
+      throw new Error(`blockEdge requires obstacle evidence`);
+    }
+    return this.applyVerification(id, {
+      direction: input.direction,
+      mode: input.mode,
+      status: 'BLOCKED',
+      blockedAt: input.blockedAt,
+      reason: input.reason,
+      hazards: input.hazards,
+      dependencies: input.dependencies,
+      contextKey: input.contextKey,
+      sessionId: input.sessionId,
+      computedAt: input.computedAt,
+      validUntil: input.validUntil,
+    });
+  }
+
+  /**
+   * Clear a recorded blockage by replacing it with an explicit `UNKNOWN`. This
+   * never restores `OPEN`: routing stays excluded until `verifyEdge` records a
+   * fresh OPEN with current evidence. Returns `unchanged` when nothing was blocked.
+   */
+  clearEdgeBlock(id: string, direction: EdgeDirection = 'forward', mode: MoveMode = 'walk'): SaveResult {
+    const stored = this.edgeMap.get(id);
+    if (stored === undefined) {
+      throw new Error(`unknown edge "${id}"`);
+    }
+    const current = stored.verifications.find(
+      (v) => v.direction === direction && v.mode === mode && v.status === 'BLOCKED',
+    );
+    if (current === undefined) return { status: 'unchanged' };
+    const now = this.now();
+    const cleared: EdgeVerificationInput = {
+      direction,
+      mode,
+      status: 'UNKNOWN',
+      reason: 'block_cleared_pending_revalidation',
+      dependencies: current.dependencies,
+      computedAt: now,
+      validUntil: now,
+    };
+    if (current.contextKey.length > 0) cleared.contextKey = current.contextKey;
+    if (current.sessionId.length > 0) cleared.sessionId = current.sessionId;
+    return this.applyVerification(id, cleared);
+  }
+
+  /**
+   * Direction/mode separated current status. A mode without a verification reads
+   * `UNKNOWN` (`verified: false`), never `OPEN`; an expired OPEN reads `STALE`.
+   */
+  edgeRuntime(id: string, options: RuntimeQueryOptions = {}): EdgeRuntimeView | null {
+    const stored = this.edgeMap.get(id);
+    if (stored === undefined) return null;
+    return runtimeView(id, stored, this.resolveNow(options));
+  }
+
+  private applyVerification(id: string, input: EdgeVerificationInput): SaveResult {
+    const stored = this.edgeMap.get(id);
+    if (stored === undefined) {
+      throw new Error(`unknown edge "${id}"`);
+    }
+    const verification = snapshotEdgeVerification(input, this.now(), stored.directed);
+    if (!stored.modes.includes(verification.mode) && stored.modes.length > 0) {
+      throw new Error(
+        `mode "${verification.mode}" is not a recorded candidate mode of edge "${id}"`,
+      );
+    }
+    const verifications = withVerification(stored.verifications, verification);
+    if (edgeVerificationsEqual(stored.verifications, verifications)) {
+      return { status: 'unchanged' };
+    }
+    this.edgeMap.set(id, { ...stored, verifications });
+    // Verification is derived state: it excludes routes but never rewrites
+    // historical connectivity/components or deletes fragments.
+    this.mutationRevision += 1;
+    return { status: 'updated' };
+  }
+
+  private resolveNow(options: RuntimeQueryOptions): number {
+    if (options.now === undefined) return this.now();
+    if (!Number.isFinite(options.now)) {
+      throw new Error(`now must be a finite number: ${options.now}`);
+    }
+    return options.now;
+  }
+
+  /**
    * Delete an edge record and its node-reference indices only. It never deletes
    * fragments or traversal evidence from the history store; unknown id is a no-op.
    */
@@ -639,6 +1147,7 @@ export class TopologyStore {
     if (stored === undefined) return;
     this.edgeMap.delete(id);
     this.unindexEdge(stored);
+    this.invalidateEdgeComponents(stored);
     this.mutationRevision += 1;
   }
 
@@ -671,6 +1180,430 @@ export class TopologyStore {
     };
   }
 
+  // --- portal connections (explicitly outside the walk graph) ---
+
+  /**
+   * Record a portal connection and its raw traversal evidence. Endpoints may live
+   * in different dimensions; only observed coordinates are used (no 8:1 or other
+   * scaling). At least one outbound traversal record is required. `returnVerified`
+   * is derived on read and is never a stored field.
+   */
+  savePortalEdge(
+    edge: PortalEdgeInput,
+    traversals: PortalTraversalEvidence[],
+  ): SaveResult {
+    if (typeof edge.id !== 'string' || edge.id.length === 0) {
+      throw new Error(`portal edge id must be a non-empty string`);
+    }
+    if (this.edgeMap.has(edge.id)) {
+      throw new Error(`edge id "${edge.id}" is already used by a walk edge`);
+    }
+    const directed = edge.directed ?? false;
+    if (typeof directed !== 'boolean') {
+      throw new Error(`portal edge directed must be a boolean when present`);
+    }
+    if (edge.fragmentId !== undefined && (typeof edge.fragmentId !== 'string' || edge.fragmentId.length === 0)) {
+      throw new Error(`portal edge fragmentId must be a non-empty string when present`);
+    }
+    if (edge.source !== undefined && (typeof edge.source !== 'string' || edge.source.length === 0)) {
+      throw new Error(`portal edge source must be a non-empty string when present`);
+    }
+    const fromNode = this.nodeMap.get(edge.from);
+    const toNode = this.nodeMap.get(edge.to);
+    if (fromNode === undefined) throw new Error(`portal edge references unknown node "${edge.from}"`);
+    if (toNode === undefined) throw new Error(`portal edge references unknown node "${edge.to}"`);
+    if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
+      throw new Error(`portal edge endpoints must be exact locations, not regions`);
+    }
+    if (!Array.isArray(traversals) || traversals.length === 0) {
+      throw new Error(`portal edges require at least one raw traversal record`);
+    }
+    const existing = this.portalEdgeMap.get(edge.id);
+    const normalized = traversals.map((raw) => {
+      const traversal = snapshotPortalTraversal(raw);
+      if (traversal.edgeId !== edge.id) {
+        throw new Error(`portal traversal "${traversal.id}" belongs to edge "${traversal.edgeId}"`);
+      }
+      if (traversal.direction === 'reverse' && directed) {
+        throw new Error(`a directed portal has no reverse traversal`);
+      }
+      return traversal;
+    });
+    assertUniquePortalTraversalIds(normalized);
+    if (!normalized.some((t) => t.direction === 'forward')) {
+      throw new Error(`portal edges require at least one outbound (forward) traversal`);
+    }
+    const stored: StoredPortalEdge = {
+      id: edge.id,
+      from: edge.from,
+      to: edge.to,
+      directed,
+      traversals: normalized,
+    };
+    if (edge.fragmentId !== undefined) stored.fragmentId = edge.fragmentId;
+    if (edge.source !== undefined) stored.source = edge.source;
+    if (existing !== undefined) {
+      if (storedPortalEdgesEqual(existing, stored)) return { status: 'unchanged' };
+      throw new Error(`portal edge "${edge.id}" already exists with different content`);
+    }
+    if (this.portalEdgeMap.size >= this.limits.maxPortalEdges) {
+      throw new Error(`portal edge capacity ${this.limits.maxPortalEdges} reached; nothing was written`);
+    }
+    if (normalized.length > this.limits.maxPortalTraversalsPerEdge) {
+      throw new Error(
+        `portal edge references ${normalized.length} traversals, exceeding ${this.limits.maxPortalTraversalsPerEdge}`,
+      );
+    }
+    for (const traversal of normalized) {
+      if (this.portalTraversalMap.has(traversal.id)) {
+        throw new Error(`portal traversal id "${traversal.id}" already exists`);
+      }
+    }
+    this.portalEdgeMap.set(edge.id, stored);
+    for (const traversal of normalized) this.portalTraversalMap.set(traversal.id, traversal);
+    this.mutationRevision += 1;
+    return { status: 'inserted' };
+  }
+
+  /** Append raw traversal evidence (e.g. a later return trip) to an existing portal edge. */
+  addPortalTraversal(edgeId: string, raw: PortalTraversalEvidence): SaveResult {
+    const edge = this.portalEdgeMap.get(edgeId);
+    if (edge === undefined) {
+      throw new Error(`unknown portal edge "${edgeId}"`);
+    }
+    const traversal = snapshotPortalTraversal(raw);
+    if (traversal.edgeId !== edgeId) {
+      throw new Error(`portal traversal "${traversal.id}" belongs to edge "${traversal.edgeId}"`);
+    }
+    if (traversal.direction === 'reverse' && edge.directed) {
+      throw new Error(`a directed portal has no reverse traversal`);
+    }
+    const existing = this.portalTraversalMap.get(traversal.id);
+    if (existing !== undefined) {
+      if (portalTraversalsEqual(existing, traversal)) return { status: 'unchanged' };
+      throw new Error(`portal traversal "${traversal.id}" already exists with different content`);
+    }
+    if (edge.traversals.length >= this.limits.maxPortalTraversalsPerEdge) {
+      throw new Error(
+        `portal edge traversal capacity ${this.limits.maxPortalTraversalsPerEdge} reached`,
+      );
+    }
+    edge.traversals.push(traversal);
+    this.portalTraversalMap.set(traversal.id, traversal);
+    this.mutationRevision += 1;
+    return { status: 'inserted' };
+  }
+
+  /** Portal edges only; never mixed into `edges()`/`adjacency()`/`route()`. */
+  portalEdges(): PortalEdgeView[] {
+    return [...this.portalEdgeMap.values()].map((edge) => this.toPortalView(edge));
+  }
+
+  getPortalEdge(id: string): PortalEdgeView | null {
+    const edge = this.portalEdgeMap.get(id);
+    return edge === undefined ? null : this.toPortalView(edge);
+  }
+
+  /** Explicit portal-edge deletion; fragments and traversals elsewhere are untouched. */
+  forgetPortalEdge(id: string): void {
+    const edge = this.portalEdgeMap.get(id);
+    if (edge === undefined) return;
+    this.portalEdgeMap.delete(id);
+    for (const traversal of edge.traversals) this.portalTraversalMap.delete(traversal.id);
+    this.mutationRevision += 1;
+  }
+
+  private toPortalView(edge: StoredPortalEdge): PortalEdgeView {
+    const traversals = edge.traversals.map(clonePortalTraversal);
+    const outbound = traversals.filter((t) => t.direction === 'forward');
+    const back = traversals.filter((t) => t.direction === 'reverse');
+    const from = this.nodeMap.get(edge.from);
+    const to = this.nodeMap.get(edge.to);
+    const view: PortalEdgeView = {
+      id: edge.id,
+      from: edge.from,
+      to: edge.to,
+      fromDim: from?.dim ?? '',
+      toDim: to?.dim ?? '',
+      directed: edge.directed,
+      traversals,
+      outbound,
+      return: back,
+      returnVerified: portalReturnVerified(traversals),
+    };
+    if (edge.fragmentId !== undefined) view.fragmentId = edge.fragmentId;
+    if (edge.source !== undefined) view.source = edge.source;
+    return view;
+  }
+
+  // --- fragment connectivity (union-find over actual links/evidence) ---
+
+  /**
+   * Connected pieces of the recorded history for one dimension: union-find over
+   * fragment `links` and actual traversal evidence only. Proximity, adjacency of
+   * coordinates, and shared labels never create a connection.
+   */
+  fragmentation(dim: string): FragmentationResult {
+    const fragments = this.listFragments(dim);
+    const links = this.listTraversalLinks(dim);
+    const fragmentIds = new Set(fragments.map((f) => f.id));
+    return computeFragmentation({
+      fragments,
+      links,
+      merges: this.fragmentMerges.filter((m) => fragmentIds.has(m.a) && fragmentIds.has(m.b)),
+    });
+  }
+
+  /**
+   * Explicitly merge two fragments as one piece. Only actual traversal evidence
+   * whose endpoints lie in the two fragments is accepted; proximity is refused.
+   * Neither fragment's geometry or history is deleted.
+   */
+  mergeFragments(aId: string, bId: string, evidenceId: string): SaveResult {
+    if (aId === bId) {
+      throw new Error(`cannot merge a fragment with itself`);
+    }
+    const a = this.history.getFragment(aId);
+    const b = this.history.getFragment(bId);
+    if (a === null) throw new Error(`unknown fragment "${aId}"`);
+    if (b === null) throw new Error(`unknown fragment "${bId}"`);
+    if (a.dim !== b.dim) {
+      throw new Error(`fragments span dimensions "${a.dim}" and "${b.dim}"`);
+    }
+    const evidence = this.history.getTraversal(evidenceId);
+    if (evidence === null) {
+      throw new Error(`unknown traversal evidence "${evidenceId}"`);
+    }
+    if (evidence.dim !== a.dim || evidence.worldId !== this.worldId) {
+      throw new Error(`traversal evidence scope does not match the fragments`);
+    }
+    if (!traversalConnectsFragments(evidence, a, b)) {
+      throw new Error(
+        `traversal evidence "${evidenceId}" does not connect fragments "${aId}" and "${bId}"`,
+      );
+    }
+    const pair: FragmentMerge = aId < bId ? { a: aId, b: bId } : { a: bId, b: aId };
+    const exists = this.fragmentMerges.some((m) => m.a === pair.a && m.b === pair.b);
+    if (exists) return { status: 'unchanged' };
+    if (this.fragmentMerges.length >= this.limits.maxFragmentMerges) {
+      throw new Error(`fragment merge capacity ${this.limits.maxFragmentMerges} reached`);
+    }
+    this.fragmentMerges.push(pair);
+    this.mutationRevision += 1;
+    return { status: 'inserted' };
+  }
+
+  /**
+   * Current-passable pieces of one fragment, derived from edge verification.
+   * A blocked/stale/unsupported edge cuts the polyline; the fragment record and
+   * its history remain untouched.
+   */
+  segments(fragmentId: string): FragmentSegmentsResult {
+    const fragment = this.history.getFragment(fragmentId);
+    if (fragment === null) {
+      throw new Error(`unknown fragment "${fragmentId}"`);
+    }
+    const now = this.now();
+    const pointKeys = fragmentPointKeys(fragment);
+    const blockedEdgeIds = new Set<string>();
+    const cuts: Vec3Like[] = [];
+    const addCut = (pos: Vec3Like): void => {
+      if (!cuts.some((c) => pointKey(c) === pointKey(pos))) {
+        cuts.push({ x: pos.x, y: pos.y, z: pos.z });
+      }
+    };
+    for (const edge of this.edgeMap.values()) {
+      const fromNode = this.nodeMap.get(edge.from);
+      const toNode = this.nodeMap.get(edge.to);
+      if (fromNode === undefined || toNode === undefined) continue;
+      if (fromNode.dim !== fragment.dim || toNode.dim !== fragment.dim) continue;
+      if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') continue;
+      const associated =
+        edge.fragmentId === fragmentId ||
+        (pointKeys.has(pointKey(fromNode.location.pos)) &&
+          pointKeys.has(pointKey(toNode.location.pos)));
+      if (!associated) continue;
+      const forward = directionUsability(edge, 'forward', undefined, now);
+      const reverse = directionUsability(edge, 'reverse', undefined, now);
+      const cutForward =
+        !forward.usable &&
+        forward.reason !== 'mode_mismatch' &&
+        forward.reason !== 'no_direction';
+      const cutReverse =
+        !reverse.usable &&
+        reverse.reason !== 'mode_mismatch' &&
+        reverse.reason !== 'no_direction' &&
+        !edge.directed;
+      if (!cutForward && !cutReverse) continue;
+      blockedEdgeIds.add(edge.id);
+      addCut(fromNode.location.pos);
+      addCut(toNode.location.pos);
+    }
+    return {
+      fragmentId,
+      segments: splitPolyline(fragment.polyline, cuts),
+      blockedEdgeIds: [...blockedEdgeIds].sort(),
+      cuts,
+      totalPoints: fragment.polyline.length,
+    };
+  }
+
+  /**
+   * Node connected components for one dimension, computed from recorded
+   * evidence-backed edges. Cache invalidation is local to the component(s)
+   * incident to a changed edge; untouched components are reused.
+   */
+  components(dim: string): ComponentReport {
+    const cache = this.componentCache.get(dim) ?? new Map<string, number>();
+    this.componentCache.set(dim, cache);
+    const dimNodes = [...this.nodeMap.values()].filter((n) => n.dim === dim);
+    for (const id of [...cache.keys()]) {
+      const node = this.nodeMap.get(id);
+      if (node === undefined || node.dim !== dim) cache.delete(id);
+    }
+    const adjacency = new Map<string, string[]>();
+    for (const node of dimNodes) adjacency.set(node.id, []);
+    for (const edge of this.edgeMap.values()) {
+      if (edge.basis !== 'traversed') continue;
+      const from = this.nodeMap.get(edge.from);
+      const to = this.nodeMap.get(edge.to);
+      if (from === undefined || to === undefined) continue;
+      if (from.dim !== dim || to.dim !== dim) continue;
+      adjacency.get(edge.from)?.push(edge.to);
+      adjacency.get(edge.to)?.push(edge.from);
+    }
+    let recomputedNodes = 0;
+    const starts = dimNodes.map((n) => n.id).sort();
+    for (const start of starts) {
+      if (cache.has(start)) continue;
+      const component: string[] = [];
+      const seen = new Set<string>([start]);
+      const queue: string[] = [start];
+      let cursor = 0;
+      while (cursor < queue.length) {
+        const id = queue[cursor++]!;
+        component.push(id);
+        for (const neighbor of adjacency.get(id) ?? []) {
+          if (seen.has(neighbor)) continue;
+          const staleComponent = cache.get(neighbor);
+          if (staleComponent !== undefined) {
+            // The cached component is now joined to this new one; drop its ids
+            // so they are recomputed together instead of keeping a stale split.
+            for (const [cachedId, cachedComponent] of [...cache]) {
+              if (cachedComponent === staleComponent) cache.delete(cachedId);
+            }
+          }
+          seen.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+      const componentId = this.componentNext.get(dim) ?? 0;
+      this.componentNext.set(dim, componentId + 1);
+      for (const id of component) cache.set(id, componentId);
+      recomputedNodes += component.length;
+    }
+    const groups = new Map<number, string[]>();
+    for (const node of dimNodes) {
+      const component = cache.get(node.id);
+      if (component === undefined) continue;
+      const group = groups.get(component);
+      if (group === undefined) groups.set(component, [node.id]);
+      else group.push(node.id);
+    }
+    const ordered = [...groups.values()]
+      .map((group) => group.sort())
+      .sort((a, b) => a[0]!.localeCompare(b[0]!));
+    const byNode = new Map<string, number>();
+    ordered.forEach((group, index) => {
+      for (const id of group) byNode.set(id, index);
+    });
+    return { components: ordered.length, groups: ordered, byNode, recomputedNodes };
+  }
+
+  /**
+   * Highest exact anchor reachable from the node nearest `here` (never a global
+   * maximum). Region nodes are excluded from the result and reported separately.
+   */
+  surfaceAnchor(dim: string, here: Vec3Like, options: AnchorQueryOptions = {}): AnchorResult | null {
+    return this.anchorFromHere(dim, here, options, 'surface');
+  }
+
+  /** Lowest exact anchor reachable from the node nearest `here` (never a global minimum). */
+  deepestAnchor(dim: string, here: Vec3Like, options: AnchorQueryOptions = {}): AnchorResult | null {
+    return this.anchorFromHere(dim, here, options, 'deepest');
+  }
+
+  private anchorFromHere(
+    dim: string,
+    here: Vec3Like,
+    options: AnchorQueryOptions,
+    order: 'surface' | 'deepest',
+  ): AnchorResult | null {
+    assertFinitePoint(here, 'anchor query position');
+    const near = options.near ?? 3.5;
+    if (!Number.isFinite(near) || near < 0) {
+      throw new Error(`anchor query near must be a non-negative finite number`);
+    }
+    const start = [...this.nodeMap.values()]
+      .filter(
+        (node) =>
+          node.dim === dim &&
+          node.gone !== true &&
+          node.location.kind === 'exact' &&
+          distanceToLocation(node.location, here) <= near,
+      )
+      .sort(
+        (a, b) =>
+          distanceToLocation(a.location, here) - distanceToLocation(b.location, here) ||
+          a.id.localeCompare(b.id),
+      )[0];
+    if (start === undefined) return null;
+
+    const now = this.resolveNow(options);
+    const reach = this.reachable(start.id, { now });
+    const reachableIds = new Set(reach.nodes);
+    let excludedRegionNodes = 0;
+    const candidates: SpatialNode[] = [];
+    for (const id of reachableIds) {
+      const node = this.nodeMap.get(id);
+      if (node === undefined || node.gone === true) continue;
+      if (node.location.kind !== 'exact') {
+        excludedRegionNodes += 1;
+        continue;
+      }
+      candidates.push(node);
+    }
+    if (candidates.length === 0) return null;
+    const best = candidates.reduce((winner, node) => {
+      const a = yOf(node);
+      const b = yOf(winner);
+      if (a !== b) {
+        return order === 'surface' ? (a > b ? node : winner) : a < b ? node : winner;
+      }
+      return node.id < winner.id ? node : winner;
+    });
+    const anchor: AnchorResult = {
+      nodeId: best.id,
+      pos: { ...(best.location as { kind: 'exact'; pos: Vec3Like }).pos },
+      y: yOf(best),
+      precision: 'exact',
+      source: best.source,
+      hops: best.id === start.id ? 0 : this.hopsBetween(start.id, best.id, now),
+      componentSize: reach.nodes.length,
+      excludedRegionNodes,
+      startNodeId: start.id,
+    };
+    if (best.observedAt !== undefined) anchor.observedAt = best.observedAt;
+    if (best.externalRef !== undefined) anchor.externalRef = best.externalRef;
+    return anchor;
+  }
+
+  private hopsBetween(fromId: string, toId: string, now: number): number {
+    if (fromId === toId) return 0;
+    const result = this.route(fromId, toId, { now });
+    return result.status === 'FOUND' ? result.nodeIds.length - 1 : Number.POSITIVE_INFINITY;
+  }
+
   // --- checkpoint support (phase 5A): bounded export + validated restore ---
 
   /**
@@ -682,16 +1615,23 @@ export class TopologyStore {
   checkpointMeasure(maxBytes = Number.POSITIVE_INFINITY): TopologyCheckpointMeasure {
     let edgeEvidenceRefs = 0;
     for (const edge of this.edgeMap.values()) edgeEvidenceRefs += edge.refs.length;
+    let portalTraversals = 0;
+    for (const edge of this.portalEdgeMap.values()) portalTraversals += edge.traversals.length;
 
     let lowerBound = 0;
     for (const node of this.nodeMap.values()) lowerBound += nodeLowerBound(node);
     for (const edge of this.edgeMap.values()) lowerBound += edgeLowerBound(edge);
+    for (const edge of this.portalEdgeMap.values()) lowerBound += portalEdgeLowerBound(edge);
+    lowerBound += this.fragmentMerges.length * 128;
     if (lowerBound > maxBytes) {
       return {
         nodes: this.nodeMap.size,
         edges: this.edgeMap.size,
         edgeEvidenceRefs,
         bytes: lowerBound,
+        portalEdges: this.portalEdgeMap.size,
+        portalTraversals,
+        fragmentMerges: this.fragmentMerges.length,
       };
     }
 
@@ -704,11 +1644,18 @@ export class TopologyStore {
       bytes += estimateEdgeBytes(edge);
       if (bytes > maxBytes) break;
     }
+    for (const edge of this.portalEdgeMap.values()) {
+      bytes += estimatePortalEdgeBytes(edge);
+      if (bytes > maxBytes) break;
+    }
     return {
       nodes: this.nodeMap.size,
       edges: this.edgeMap.size,
       edgeEvidenceRefs,
       bytes,
+      portalEdges: this.portalEdgeMap.size,
+      portalTraversals,
+      fragmentMerges: this.fragmentMerges.length,
     };
   }
 
@@ -723,6 +1670,8 @@ export class TopologyStore {
       worldId: this.worldId,
       nodes: [...this.nodeMap.values()].map(cloneNode),
       edges: [...this.edgeMap.values()].map(toEdgeSnapshot),
+      portalEdges: [...this.portalEdgeMap.values()].map(toPortalEdgeSnapshot),
+      fragmentMerges: this.fragmentMerges.map((m) => [m.a, m.b] as [string, string]),
     };
   }
 
@@ -770,12 +1719,68 @@ export class TopologyStore {
       addToNodeEdgeIndex(nodeToEdgeIds, stored.from, stored.id);
       addToNodeEdgeIndex(nodeToEdgeIds, stored.to, stored.id);
     }
+    const portalEdges = new Map<string, StoredPortalEdge>();
+    const portalTraversals = new Map<string, PortalTraversalEvidence>();
+    for (const raw of snapshot.portalEdges ?? []) {
+      const stored = this.restorePortalEdge(raw, nodes);
+      if (portalEdges.has(stored.id)) {
+        throw new Error(`duplicate portal edge id "${stored.id}" in snapshot`);
+      }
+      if (edges.has(stored.id)) {
+        throw new Error(`portal edge id "${stored.id}" collides with a walk edge in snapshot`);
+      }
+      for (const traversal of stored.traversals) {
+        if (portalTraversals.has(traversal.id)) {
+          throw new Error(`duplicate portal traversal id "${traversal.id}" in snapshot`);
+        }
+        portalTraversals.set(traversal.id, traversal);
+      }
+      portalEdges.set(stored.id, stored);
+    }
+    if (portalEdges.size > this.limits.maxPortalEdges) {
+      throw new Error(
+        `snapshot has ${portalEdges.size} portal edges, exceeding ${this.limits.maxPortalEdges}`,
+      );
+    }
+    const merges: FragmentMerge[] = [];
+    const seenMerges = new Set<string>();
+    for (const raw of snapshot.fragmentMerges ?? []) {
+      if (!Array.isArray(raw) || raw.length !== 2) {
+        throw new Error(`fragment merge entries must be [a, b] pairs`);
+      }
+      const [left, right] = raw;
+      if (typeof left !== 'string' || left.length === 0 || typeof right !== 'string' || right.length === 0) {
+        throw new Error(`fragment merge ids must be non-empty strings`);
+      }
+      if (left === right) throw new Error(`fragment merge cannot reference one fragment twice`);
+      const pair: FragmentMerge = left < right ? { a: left, b: right } : { a: right, b: left };
+      const key = `${pair.a} ${pair.b}`;
+      if (seenMerges.has(key)) continue;
+      seenMerges.add(key);
+      merges.push(pair);
+    }
+    if (merges.length > this.limits.maxFragmentMerges) {
+      throw new Error(
+        `snapshot has ${merges.length} fragment merges, exceeding ${this.limits.maxFragmentMerges}`,
+      );
+    }
+
     this.nodeMap.clear();
     for (const [id, value] of nodes) this.nodeMap.set(id, value);
     this.edgeMap.clear();
     for (const [id, value] of edges) this.edgeMap.set(id, value);
     this.nodeToEdgeIds.clear();
     for (const [id, value] of nodeToEdgeIds) this.nodeToEdgeIds.set(id, value);
+    this.portalEdgeMap.clear();
+    for (const [id, value] of portalEdges) this.portalEdgeMap.set(id, value);
+    this.portalTraversalMap.clear();
+    for (const [id, value] of portalTraversals) this.portalTraversalMap.set(id, value);
+    this.fragmentMerges = merges;
+    this.programNodeOrder = [...nodes.values()]
+      .filter((node) => node.source === 'program')
+      .map((node) => node.id);
+    this.componentCache.clear();
+    this.componentNext.clear();
     // Restore is a mutation: it replaces the store's facts, so it must mark the
     // store dirty. Only a session initializer (which then sets the confirmed
     // baseline to the post-restore revision) treats it as a clean baseline.
@@ -797,6 +1802,8 @@ export class TopologyStore {
       throw new Error(`unknown node "${nodeId}"`);
     }
     const maxEdges = resolveQueryBudgetField('maxEdges', options.maxEdges, this.limits.maxQueryEdges);
+    const now = this.resolveNow(options);
+    const includeBlocked = options.includeBlocked ?? false;
     const outEdges: TopologyEdge[] = [];
     const inEdges: TopologyEdge[] = [];
     const incident = this.nodeToEdgeIds.get(nodeId);
@@ -813,8 +1820,16 @@ export class TopologyStore {
         edgesChecked += 1;
         const stored = this.edgeMap.get(edgeId);
         if (stored === undefined) continue;
-        if (stored.from === nodeId) outEdges.push(toTopologyEdgeSnapshot(stored));
-        else inEdges.push(toTopologyEdgeSnapshot(stored));
+        if (stored.from === nodeId) {
+          if (includeBlocked || adjacencyUsable(stored, 'forward', now)) {
+            outEdges.push(toTopologyEdgeSnapshot(stored));
+          }
+          continue;
+        }
+        // In-edges are informational; only an explicit blocked/stale/unsupported
+        // reverse verification removes one (a directed reverse is not a direction).
+        const reverseUsable = stored.directed || adjacencyUsable(stored, 'reverse', now);
+        if (includeBlocked || reverseUsable) inEdges.push(toTopologyEdgeSnapshot(stored));
       }
     }
     return { nodeId, outEdges, inEdges, edgesChecked, complete, exhausted };
@@ -877,6 +1892,7 @@ export class TopologyStore {
           from: entry.viaEdge.from,
           to: entry.viaEdge.to,
           type: entry.viaEdge.type,
+          direction: entry.direction,
           evidenceId: entry.witness.evidenceId,
           evidence: cloneTraversalEvidence(entry.witness.evidence),
         });
@@ -975,6 +1991,7 @@ export class TopologyStore {
     options: TopologyQueryOptions,
   ): SearchOutput {
     assertValidMode(options.mode);
+    const now = this.resolveNow(options);
     const budget = new SearchBudget(resolveQueryBudget(options, this.limits));
 
     const nodeCache = new Map<string, SpatialNode | null>();
@@ -1074,8 +2091,28 @@ export class TopologyStore {
         if (!budget.tryEdge()) break;
         const edge = this.edgeMap.get(edgeId);
         if (edge === undefined) continue;
-        if (edge.from !== nodeId) continue;
-        const resolved = resolveSearchEdge(edge, this.worldId, options.mode, budget, readTraversal, readFragmentScope);
+        const direction: EdgeDirection = edge.from === nodeId ? 'forward' : 'reverse';
+        if (direction === 'reverse' && (edge.directed || edge.to !== nodeId)) continue;
+        const edgeFrom = this.nodeMap.get(edge.from);
+        const edgeTo = this.nodeMap.get(edge.to);
+        if (edgeFrom?.location.kind !== 'exact' || edgeTo?.location.kind !== 'exact') continue;
+        const usability = directionUsability(edge, direction, options.mode, now);
+        if (!usability.usable) {
+          const gap = usabilityGap(usability.reason);
+          if (gap !== undefined) recordGap(gap, edge);
+          continue;
+        }
+        const resolved = resolveSearchEdge(
+          edge,
+          direction,
+          edgeFrom.location.pos,
+          edgeTo.location.pos,
+          this.worldId,
+          options.mode,
+          budget,
+          readTraversal,
+          readFragmentScope,
+        );
         if (resolved.budgetExhausted) {
           // Preserve gaps confirmed before the budget ran out; the unread
           // references are never marked missing, and the edge is not traversed.
@@ -1087,7 +2124,7 @@ export class TopologyStore {
           continue;
         }
         if (!resolved.usable) continue; // known-mode mismatch is a normal filter, not a gap
-        const neighborId = edge.to;
+        const neighborId = direction === 'forward' ? edge.to : edge.from;
         if (visited.has(neighborId)) continue;
         const neighbor = readNode(neighborId);
         if (budget.exhausted !== null) break;
@@ -1097,7 +2134,12 @@ export class TopologyStore {
         queue.push(neighborId);
         depth.set(neighborId, (depth.get(nodeId) ?? 0) + 1);
         nodes.set(neighborId, neighbor);
-        parent.set(neighborId, { viaNode: nodeId, viaEdge: edge, witness: resolved.witness! });
+        parent.set(neighborId, {
+          viaNode: nodeId,
+          viaEdge: edge,
+          direction,
+          witness: resolved.witness!,
+        });
         if (toNodeId !== undefined && neighborId === toNodeId) foundTarget = true;
       }
     }
@@ -1107,22 +2149,105 @@ export class TopologyStore {
 
   // --- internals ---
 
+  private listFragments(dim: string): PathFragment[] {
+    const list = this.history.listFragments?.bind(this.history);
+    if (list === undefined) {
+      throw new Error(`history source does not support fragment listing`);
+    }
+    const out: PathFragment[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page = list({ dim, after });
+      out.push(...page.items);
+      if (page.nextAfter === undefined) return out;
+      after = page.nextAfter;
+    }
+  }
+
+  private listTraversalLinks(dim: string): { a: Vec3Like; b: Vec3Like }[] {
+    const list = this.history.listTraversals?.bind(this.history);
+    if (list === undefined) return [];
+    const links: { a: Vec3Like; b: Vec3Like }[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page = list({ dim, after });
+      for (const evidence of page.items) {
+        links.push({
+          a: { ...evidence.from },
+          b: { ...evidence.to },
+        });
+      }
+      if (page.nextAfter === undefined) return links;
+      after = page.nextAfter;
+    }
+  }
+
+  private evictOldestProgramNode(): boolean {
+    for (let i = 0; i < this.programNodeOrder.length; ) {
+      const id = this.programNodeOrder[i]!;
+      const node = this.nodeMap.get(id);
+      if (node === undefined || node.source !== 'program') {
+        this.programNodeOrder.splice(i, 1);
+        continue;
+      }
+      if ((this.nodeToEdgeIds.get(id)?.size ?? 0) > 0) {
+        i += 1;
+        continue;
+      }
+      this.nodeMap.delete(id);
+      this.nodeToEdgeIds.delete(id);
+      this.programNodeOrder.splice(i, 1);
+      this.invalidateNodeComponent(id);
+      return true;
+    }
+    return false;
+  }
+
+  private invalidateEdgeComponents(edge: StoredEdge): void {
+    this.invalidateNodeComponent(edge.from);
+    this.invalidateNodeComponent(edge.to);
+  }
+
+  /** Drop the cached component membership of the component containing `nodeId`. */
+  private invalidateNodeComponent(nodeId: string): void {
+    const node = this.nodeMap.get(nodeId);
+    if (node === undefined) return;
+    const cache = this.componentCache.get(node.dim);
+    if (cache === undefined) return;
+    const component = cache.get(nodeId);
+    if (component === undefined) {
+      cache.delete(nodeId);
+      return;
+    }
+    for (const [cachedId, cachedComponent] of [...cache]) {
+      if (cachedComponent === component) cache.delete(cachedId);
+    }
+  }
+
   private countNodes(source: NodeSource): number {
     let count = 0;
     for (const node of this.nodeMap.values()) if (node.source === source) count += 1;
     return count;
   }
 
-  private validateEdgeShape(edge: TopologyEdge): { fromPos: Vec3Like; toPos: Vec3Like; dim: string } {
+  private validateEdgeShape(edge: TopologyEdge): {
+    fromPos: Vec3Like;
+    toPos: Vec3Like;
+    dim: string;
+    directed: boolean;
+    modes: MoveMode[];
+  } {
     if (typeof edge.id !== 'string' || edge.id.length === 0) {
       throw new Error(`edge id must be a non-empty string`);
     }
     if (edge.type === 'PORTAL') {
-      throw new Error(`PORTAL edges are not supported in this phase`);
+      throw new Error(`PORTAL edges use savePortalEdge and never enter the walk graph`);
     }
     if (!NON_PORTAL_CONNECTION_TYPES.includes(edge.type)) {
       throw new Error(`edge type "${String(edge.type)}" is not a known connection type`);
     }
+    const directed = resolveEdgeDirected(edge.directed);
+    const modes = snapshotEdgeModes(edge.modes);
     if (edge.basis !== 'candidate' && edge.basis !== 'traversed') {
       throw new Error(`edge basis "${String(edge.basis)}" is not known (candidate|traversed)`);
     }
@@ -1153,7 +2278,13 @@ export class TopologyStore {
     if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
       throw new Error(`edge endpoints must be exact locations, not regions`);
     }
-    return { fromPos: fromNode.location.pos, toPos: toNode.location.pos, dim: fromNode.dim };
+    return {
+      fromPos: fromNode.location.pos,
+      toPos: toNode.location.pos,
+      dim: fromNode.dim,
+      directed,
+      modes,
+    };
   }
 
   private resolveRefs(
@@ -1161,6 +2292,7 @@ export class TopologyStore {
     fromPos: Vec3Like,
     toPos: Vec3Like,
     dim: string,
+    directed: boolean,
   ): StoredEvidenceRef[] {
     const evidenceIds = edge.evidenceIds ?? [];
     if (!Array.isArray(evidenceIds)) {
@@ -1185,7 +2317,9 @@ export class TopologyStore {
     // each index makes every hole surface as a non-string id and be rejected.
     const refs: StoredEvidenceRef[] = [];
     for (let i = 0; i < evidenceIds.length; i++) {
-      refs.push(this.resolveEvidenceRef(evidenceIds[i], edge.fragmentId, fromPos, toPos, dim));
+      refs.push(
+        this.resolveEvidenceRef(evidenceIds[i], edge.fragmentId, fromPos, toPos, dim, directed),
+      );
     }
     return refs;
   }
@@ -1211,7 +2345,11 @@ export class TopologyStore {
     return existing.refs;
   }
 
-  private assembleStoredEdge(edge: TopologyEdge, refs: StoredEvidenceRef[]): StoredEdge {
+  private assembleStoredEdge(
+    edge: TopologyEdge,
+    refs: StoredEvidenceRef[],
+    verifications: EdgeVerification[],
+  ): StoredEdge {
     const stored: StoredEdge = {
       id: edge.id,
       from: edge.from,
@@ -1219,6 +2357,9 @@ export class TopologyStore {
       type: edge.type,
       basis: edge.basis,
       refs,
+      directed: resolveEdgeDirected(edge.directed),
+      modes: snapshotEdgeModes(edge.modes),
+      verifications: verifications.map(cloneEdgeVerification),
     };
     if (edge.fragmentId !== undefined) stored.fragmentId = edge.fragmentId;
     if (edge.source !== undefined) stored.source = edge.source;
@@ -1231,6 +2372,7 @@ export class TopologyStore {
     fromPos: Vec3Like,
     toPos: Vec3Like,
     dim: string,
+    directed = true,
   ): StoredEvidenceRef {
     if (typeof evidenceId !== 'string' || evidenceId.length === 0) {
       throw new Error(`edge evidence id must be a non-empty string`);
@@ -1252,7 +2394,9 @@ export class TopologyStore {
     if (evidence.dim !== dim) {
       throw new Error(`edge evidence "${evidenceId}" dim does not match endpoint dim`);
     }
-    if (!pointsEqual(evidence.from, fromPos) || !pointsEqual(evidence.to, toPos)) {
+    const forwardMatch = pointsEqual(evidence.from, fromPos) && pointsEqual(evidence.to, toPos);
+    const reverseMatch = pointsEqual(evidence.from, toPos) && pointsEqual(evidence.to, fromPos);
+    if (!forwardMatch && !(directed === false && reverseMatch)) {
       throw new Error(`edge evidence "${evidenceId}" endpoints do not match edge from→to`);
     }
     if (edgeFragmentId !== undefined && edgeFragmentId !== evidence.fragmentId) {
@@ -1278,8 +2422,12 @@ export class TopologyStore {
       basis: stored.basis,
       source: stored.source,
       evidenceIds: stored.refs.map((ref) => ref.evidenceId),
+      directed: stored.directed,
+      modes: [...stored.modes],
+      verifications: stored.verifications.map(cloneEdgeVerification),
       references,
       resolution,
+      runtime: runtimeView(stored.id, stored, this.now()),
     };
   }
 
@@ -1316,6 +2464,79 @@ export class TopologyStore {
   private unindexEdge(stored: StoredEdge): void {
     removeFromNodeEdgeIndex(this.nodeToEdgeIds, stored.from, stored.id);
     removeFromNodeEdgeIndex(this.nodeToEdgeIds, stored.to, stored.id);
+  }
+
+  /** Restore one portal edge from its checkpoint form (raw traversals only). */
+  private restorePortalEdge(
+    raw: TopologyPortalEdgeSnapshot,
+    nodes: Map<string, SpatialNode>,
+  ): StoredPortalEdge {
+    if (typeof raw.id !== 'string' || raw.id.length === 0) {
+      throw new Error(`portal edge id must be a non-empty string`);
+    }
+    if (typeof raw.from !== 'string' || raw.from.length === 0) {
+      throw new Error(`portal edge from must be a non-empty node id`);
+    }
+    if (typeof raw.to !== 'string' || raw.to.length === 0) {
+      throw new Error(`portal edge to must be a non-empty node id`);
+    }
+    if (typeof raw.directed !== 'boolean') {
+      throw new Error(`portal edge directed must be a boolean`);
+    }
+    if (raw.fragmentId !== undefined && (typeof raw.fragmentId !== 'string' || raw.fragmentId.length === 0)) {
+      throw new Error(`portal edge fragmentId must be a non-empty string when present`);
+    }
+    if (raw.source !== undefined && (typeof raw.source !== 'string' || raw.source.length === 0)) {
+      throw new Error(`portal edge source must be a non-empty string when present`);
+    }
+    const fromNode = nodes.get(raw.from);
+    const toNode = nodes.get(raw.to);
+    if (fromNode === undefined) {
+      throw new Error(`portal edge "${raw.id}" references unknown node "${raw.from}"`);
+    }
+    if (toNode === undefined) {
+      throw new Error(`portal edge "${raw.id}" references unknown node "${raw.to}"`);
+    }
+    if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
+      throw new Error(`portal edge "${raw.id}" endpoints must be exact locations`);
+    }
+    if (!Array.isArray(raw.traversals) || raw.traversals.length === 0) {
+      throw new Error(`portal edge "${raw.id}" must carry at least one traversal`);
+    }
+    if (raw.traversals.length > this.limits.maxPortalTraversalsPerEdge) {
+      throw new Error(
+        `portal edge "${raw.id}" has ${raw.traversals.length} traversals, exceeding ${this.limits.maxPortalTraversalsPerEdge}`,
+      );
+    }
+    const traversals: PortalTraversalEvidence[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < raw.traversals.length; i++) {
+      const traversal = snapshotPortalTraversal(raw.traversals[i]!);
+      if (traversal.edgeId !== raw.id) {
+        throw new Error(`portal traversal "${traversal.id}" does not belong to edge "${raw.id}"`);
+      }
+      if (traversal.direction === 'reverse' && raw.directed) {
+        throw new Error(`directed portal "${raw.id}" has a reverse traversal`);
+      }
+      if (seen.has(traversal.id)) {
+        throw new Error(`duplicate portal traversal id "${traversal.id}"`);
+      }
+      seen.add(traversal.id);
+      traversals.push(traversal);
+    }
+    if (!traversals.some((t) => t.direction === 'forward')) {
+      throw new Error(`portal edge "${raw.id}" has no outbound traversal`);
+    }
+    const stored: StoredPortalEdge = {
+      id: raw.id,
+      from: raw.from,
+      to: raw.to,
+      directed: raw.directed,
+      traversals,
+    };
+    if (raw.fragmentId !== undefined) stored.fragmentId = raw.fragmentId;
+    if (raw.source !== undefined) stored.source = raw.source;
+    return stored;
   }
 
   /**
@@ -1365,6 +2586,23 @@ export class TopologyStore {
       throw new Error(`edge "${raw.id}" endpoints must be exact locations, not regions`);
     }
 
+    const directed = raw.directed === undefined ? true : raw.directed;
+    if (typeof directed !== 'boolean') {
+      throw new Error(`edge "${raw.id}" directed must be a boolean when present`);
+    }
+    const modes = snapshotEdgeModes(raw.modes);
+    if (raw.verifications !== undefined && !Array.isArray(raw.verifications)) {
+      throw new Error(`edge "${raw.id}" verifications must be an array`);
+    }
+    const verifications = (raw.verifications ?? []).reduce<EdgeVerification[]>(
+      (acc, rawVerification) =>
+        withVerification(
+          acc,
+          snapshotEdgeVerification(rawVerification, this.now(), directed, { allowExpiredOpen: true }),
+        ),
+      [],
+    );
+
     const refs: StoredEvidenceRef[] = [];
     const rawRefs = raw.refs;
     if (!Array.isArray(rawRefs)) {
@@ -1385,7 +2623,17 @@ export class TopologyStore {
       }
     }
     for (let i = 0; i < rawRefs.length; i++) {
-      refs.push(restoreEvidenceRef(this.worldId, raw.id, rawRefs[i], fromNode, toNode, raw.fragmentId));
+      refs.push(
+        restoreEvidenceRef(
+          this.worldId,
+          raw.id,
+          rawRefs[i],
+          fromNode,
+          toNode,
+          raw.fragmentId,
+          directed,
+        ),
+      );
     }
 
     const stored: StoredEdge = {
@@ -1395,6 +2643,9 @@ export class TopologyStore {
       type: raw.type,
       basis: raw.basis,
       refs,
+      directed,
+      modes,
+      verifications,
     };
     if (raw.fragmentId !== undefined) stored.fragmentId = raw.fragmentId;
     if (raw.source !== undefined) stored.source = raw.source;
@@ -1426,6 +2677,23 @@ function snapshotNode(worldId: string, n: SpatialNode): SpatialNode {
   if (n.label !== undefined && typeof n.label !== 'string') {
     throw new Error(`node label must be a string when present`);
   }
+  if (n.observedAt !== undefined && !Number.isFinite(n.observedAt)) {
+    throw new Error(`node observedAt must be a finite number when present`);
+  }
+  if (n.externalRef !== undefined && (typeof n.externalRef !== 'string' || n.externalRef.length === 0)) {
+    throw new Error(`node externalRef must be a non-empty string when present`);
+  }
+  if (n.gone !== undefined && typeof n.gone !== 'boolean') {
+    throw new Error(`node gone must be a boolean when present`);
+  }
+  if (n.gone === true) {
+    if (!Number.isFinite(n.goneAt)) {
+      throw new Error(`a gone node must carry a finite goneAt`);
+    }
+    if (n.goneEvidence !== undefined) validateGoneEvidence(n.goneEvidence);
+  } else if (n.goneAt !== undefined || n.goneEvidence !== undefined) {
+    throw new Error(`goneAt/goneEvidence are only valid when gone is true`);
+  }
   validateLocation(n.location);
   return cloneNode(n);
 }
@@ -1451,7 +2719,7 @@ function validateLocation(loc: SpatialNode['location']): void {
 }
 
 function cloneNode(n: SpatialNode): SpatialNode {
-  return {
+  const clone: SpatialNode = {
     id: n.id,
     kind: n.kind,
     source: n.source,
@@ -1461,6 +2729,23 @@ function cloneNode(n: SpatialNode): SpatialNode {
     dim: n.dim,
     location: cloneLocation(n.location),
   };
+  if (n.observedAt !== undefined) clone.observedAt = n.observedAt;
+  if (n.externalRef !== undefined) clone.externalRef = n.externalRef;
+  if (n.gone !== undefined) clone.gone = n.gone;
+  if (n.goneAt !== undefined) clone.goneAt = n.goneAt;
+  if (n.goneEvidence !== undefined) clone.goneEvidence = cloneGoneEvidence(n.goneEvidence);
+  return clone;
+}
+
+function cloneGoneEvidence(e: GoneEvidence): GoneEvidence {
+  const clone: GoneEvidence = {
+    sessionId: e.sessionId,
+    observedAt: e.observedAt,
+    source: e.source,
+  };
+  if (e.observationIds !== undefined) clone.observationIds = [...e.observationIds];
+  if (e.reason !== undefined) clone.reason = e.reason;
+  return clone;
 }
 
 function cloneLocation(loc: SpatialNode['location']): SpatialNode['location'] {
@@ -1479,7 +2764,24 @@ function nodesEqual(a: SpatialNode, b: SpatialNode): boolean {
     a.label === b.label &&
     a.worldId === b.worldId &&
     a.dim === b.dim &&
+    a.observedAt === b.observedAt &&
+    a.externalRef === b.externalRef &&
+    a.gone === b.gone &&
+    a.goneAt === b.goneAt &&
+    goneEvidenceEqual(a.goneEvidence, b.goneEvidence) &&
     locationsEqual(a.location, b.location)
+  );
+}
+
+function goneEvidenceEqual(a: GoneEvidence | undefined, b: GoneEvidence | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (
+    a.sessionId === b.sessionId &&
+    a.observedAt === b.observedAt &&
+    a.source === b.source &&
+    a.reason === b.reason &&
+    (a.observationIds?.length ?? 0) === (b.observationIds?.length ?? 0) &&
+    (a.observationIds ?? []).every((id, i) => id === b.observationIds![i])
   );
 }
 
@@ -1494,7 +2796,7 @@ function locationsEqual(a: SpatialNode['location'], b: SpatialNode['location']):
 }
 
 function applyNodeChanges(existing: SpatialNode, changes: NodeChanges): SpatialNode {
-  return {
+  const merged: SpatialNode = {
     id: existing.id,
     worldId: existing.worldId,
     dim: existing.dim,
@@ -1503,7 +2805,13 @@ function applyNodeChanges(existing: SpatialNode, changes: NodeChanges): SpatialN
     tag: 'tag' in changes ? changes.tag : existing.tag,
     label: 'label' in changes ? changes.label : existing.label,
     location: 'location' in changes ? (changes.location as SpatialNode['location']) : existing.location,
+    observedAt: 'observedAt' in changes ? changes.observedAt : existing.observedAt,
+    externalRef: 'externalRef' in changes ? changes.externalRef : existing.externalRef,
   };
+  if (existing.gone !== undefined) merged.gone = existing.gone;
+  if (existing.goneAt !== undefined) merged.goneAt = existing.goneAt;
+  if (existing.goneEvidence !== undefined) merged.goneEvidence = existing.goneEvidence;
+  return merged;
 }
 
 function storedEdgesEqual(a: StoredEdge, b: StoredEdge): boolean {
@@ -1515,6 +2823,10 @@ function storedEdgesEqual(a: StoredEdge, b: StoredEdge): boolean {
     a.fragmentId === b.fragmentId &&
     a.basis === b.basis &&
     a.source === b.source &&
+    a.directed === b.directed &&
+    a.modes.length === b.modes.length &&
+    a.modes.every((mode, i) => mode === b.modes[i]) &&
+    edgeVerificationsEqual(a.verifications, b.verifications) &&
     refsEqual(a.refs, b.refs)
   );
 }
@@ -1538,6 +2850,8 @@ function applyEdgeChanges(existing: StoredEdge, changes: EdgeChanges): TopologyE
     basis: 'basis' in changes ? (changes.basis as EdgeBasis) : existing.basis,
     source: 'source' in changes ? changes.source : existing.source,
     evidenceIds: 'evidenceIds' in changes ? (changes.evidenceIds ?? []) : existing.refs.map((ref) => ref.evidenceId),
+    directed: 'directed' in changes ? (changes.directed as boolean) : existing.directed,
+    modes: 'modes' in changes ? (changes.modes as MoveMode[]) : existing.modes,
   };
 }
 
@@ -1553,6 +2867,63 @@ function assertFinitePoint(p: Vec3Like, label: string): void {
   if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
     throw new Error(`${label} must have finite coordinates: (${p.x}, ${p.y}, ${p.z})`);
   }
+}
+
+function validateGoneEvidence(e: GoneEvidence): void {
+  if (typeof e.sessionId !== 'string' || e.sessionId.length === 0) {
+    throw new Error(`gone evidence requires a non-empty sessionId`);
+  }
+  if (!Number.isFinite(e.observedAt) || e.observedAt < 0) {
+    throw new Error(`gone evidence requires a non-negative finite observedAt`);
+  }
+  if (typeof e.source !== 'string' || e.source.length === 0) {
+    throw new Error(`gone evidence requires a non-empty source`);
+  }
+  if (e.observationIds !== undefined) {
+    if (!Array.isArray(e.observationIds)) {
+      throw new Error(`gone evidence observationIds must be an array when present`);
+    }
+    for (const id of e.observationIds) {
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new Error(`gone evidence observationIds must contain non-empty strings`);
+      }
+    }
+  }
+  if (e.reason !== undefined && typeof e.reason !== 'string') {
+    throw new Error(`gone evidence reason must be a string when present`);
+  }
+}
+
+function distanceToLocation(location: SpatialNode['location'], pos: Vec3Like): number {
+  const center = location.kind === 'exact' ? location.pos : location.center;
+  return Math.hypot(center.x - pos.x, center.y - pos.y, center.z - pos.z);
+}
+
+function yOf(node: SpatialNode): number {
+  return node.location.kind === 'exact' ? node.location.pos.y : node.location.center.y;
+}
+
+function assertUniquePortalTraversalIds(traversals: PortalTraversalEvidence[]): void {
+  const seen = new Set<string>();
+  for (const traversal of traversals) {
+    if (seen.has(traversal.id)) {
+      throw new Error(`duplicate portal traversal id "${traversal.id}"`);
+    }
+    seen.add(traversal.id);
+  }
+}
+
+function storedPortalEdgesEqual(a: StoredPortalEdge, b: StoredPortalEdge): boolean {
+  return (
+    a.id === b.id &&
+    a.from === b.from &&
+    a.to === b.to &&
+    a.directed === b.directed &&
+    a.fragmentId === b.fragmentId &&
+    a.source === b.source &&
+    a.traversals.length === b.traversals.length &&
+    a.traversals.every((t, i) => portalTraversalsEqual(t, b.traversals[i]!))
+  );
 }
 
 function addToNodeEdgeIndex(index: Map<string, Set<string>>, nodeId: string, edgeId: string): void {
@@ -1587,6 +2958,9 @@ function resolveLimits(options: TopologyStoreOptions): ResolvedLimits {
     'maxQueryEdges',
     'maxQueryHistoryReads',
     'maxQueryDiagnostics',
+    'maxPortalEdges',
+    'maxPortalTraversalsPerEdge',
+    'maxFragmentMerges',
   ];
   for (const key of overrides) {
     const value = options[key];
@@ -1631,6 +3005,7 @@ function firstIndexAfter(sortedIds: string[], after: string): number {
 interface ParentEntry {
   viaNode: string;
   viaEdge: StoredEdge;
+  direction: EdgeDirection;
   witness: { evidenceId: string; evidence: TraversalEvidence };
 }
 
@@ -1746,6 +3121,24 @@ function classifyReference(
   return traversalEvidenceEqual(current, snapshot) ? 'resolved' : 'mismatch';
 }
 
+/** Map a usability rejection to a search gap; `mode_mismatch`/`no_direction` are normal filters. */
+function usabilityGap(reason: ReturnType<typeof directionUsability>['reason']): SearchGapKind | undefined {
+  if (reason === 'blocked') return 'blocked';
+  if (reason === 'stale') return 'stale';
+  if (reason === 'unsupported') return 'unsupported';
+  return undefined;
+}
+
+/** Whether a direction has no explicit blocked/stale/unsupported verification. */
+function adjacencyUsable(
+  edge: StoredEdge,
+  direction: EdgeDirection,
+  now: number,
+): boolean {
+  const usability = directionUsability(edge, direction, undefined, now);
+  return usability.reason === undefined || usability.reason === 'mode_mismatch' || usability.reason === 'no_direction';
+}
+
 /** Project a stored edge to its public `TopologyEdge` snapshot without resolving references. */
 function toTopologyEdgeSnapshot(stored: StoredEdge): TopologyEdge {
   const edge: TopologyEdge = {
@@ -1755,6 +3148,9 @@ function toTopologyEdgeSnapshot(stored: StoredEdge): TopologyEdge {
     type: stored.type,
     basis: stored.basis,
     evidenceIds: stored.refs.map((ref) => ref.evidenceId),
+    directed: stored.directed,
+    modes: [...stored.modes],
+    verifications: stored.verifications.map(cloneEdgeVerification),
   };
   if (stored.fragmentId !== undefined) edge.fragmentId = stored.fragmentId;
   if (stored.source !== undefined) edge.source = stored.source;
@@ -1779,6 +3175,9 @@ interface EdgeSearchResult {
  */
 function resolveSearchEdge(
   edge: StoredEdge,
+  direction: EdgeDirection,
+  fromPos: Vec3Like,
+  toPos: Vec3Like,
   worldId: string,
   mode: MoveMode | undefined,
   budget: SearchBudget,
@@ -1826,20 +3225,33 @@ function resolveSearchEdge(
   }
   if (anyMissing) return { budgetExhausted: false, usable: false, gap: 'missing', evidenceIds: gapEvidenceIds };
   if (anyMismatch) return { budgetExhausted: false, usable: false, gap: 'mismatch', evidenceIds: gapEvidenceIds };
-  if (mode === undefined) {
-    return { budgetExhausted: false, usable: true, witness: pickWitness(resolved) };
+
+  // Only evidence that actually traversed this direction can witness it. A
+  // forward record never backs the reverse direction even on an undirected edge.
+  const directional = resolved.filter((r) =>
+    direction === 'forward'
+      ? pointsEqual(r.evidence.from, fromPos) && pointsEqual(r.evidence.to, toPos)
+      : pointsEqual(r.evidence.from, toPos) && pointsEqual(r.evidence.to, fromPos),
+  );
+  if (directional.length === 0) {
+    // The edge is undirected but this direction was never traversed: a normal
+    // historical absence, not a missing reference.
+    return { budgetExhausted: false, usable: false };
   }
-  const matching = resolved.filter((r) => r.evidence.mode === mode);
+  if (mode === undefined) {
+    return { budgetExhausted: false, usable: true, witness: pickWitness(directional) };
+  }
+  const matching = directional.filter((r) => r.evidence.mode === mode);
   if (matching.length > 0) {
     return { budgetExhausted: false, usable: true, witness: pickWitness(matching) };
   }
-  const hasUnknownMode = resolved.some((r) => r.evidence.mode === undefined);
+  const hasUnknownMode = directional.some((r) => r.evidence.mode === undefined);
   if (hasUnknownMode) {
     return {
       budgetExhausted: false,
       usable: false,
       gap: 'mode_unknown',
-      evidenceIds: resolved.map((r) => r.evidenceId),
+      evidenceIds: directional.map((r) => r.evidenceId),
     };
   }
   return { budgetExhausted: false, usable: false };
@@ -1934,6 +3346,7 @@ function buildProofSegments(
       from: entry.viaEdge.from,
       to: entry.viaEdge.to,
       type: entry.viaEdge.type,
+      direction: entry.direction,
       evidenceId: entry.witness.evidenceId,
       evidence: cloneTraversalEvidence(entry.witness.evidence),
     };
@@ -1954,6 +3367,23 @@ function toEdgeSnapshot(edge: StoredEdge): TopologyEdgeSnapshot {
       evidenceId: ref.evidenceId,
       snapshot: cloneTraversalEvidence(ref.snapshot),
     })),
+    directed: edge.directed,
+    modes: [...edge.modes],
+    verifications: edge.verifications.map(cloneEdgeVerification),
+  };
+  if (edge.fragmentId !== undefined) out.fragmentId = edge.fragmentId;
+  if (edge.source !== undefined) out.source = edge.source;
+  return out;
+}
+
+/** Project a stored portal edge to its persistent form; `returnVerified` is never included. */
+function toPortalEdgeSnapshot(edge: StoredPortalEdge): TopologyPortalEdgeSnapshot {
+  const out: TopologyPortalEdgeSnapshot = {
+    id: edge.id,
+    from: edge.from,
+    to: edge.to,
+    directed: edge.directed,
+    traversals: edge.traversals.map(clonePortalTraversal),
   };
   if (edge.fragmentId !== undefined) out.fragmentId = edge.fragmentId;
   if (edge.source !== undefined) out.source = edge.source;
@@ -1975,6 +3405,7 @@ function restoreEvidenceRef(
   fromNode: SpatialNode,
   toNode: SpatialNode,
   edgeFragmentId: string | undefined,
+  directed = true,
 ): StoredEvidenceRef {
   if (raw === null || typeof raw !== 'object') {
     throw new Error(`edge "${edgeId}" binding reference must be an object`);
@@ -2000,7 +3431,13 @@ function restoreEvidenceRef(
   if (fromNode.location.kind !== 'exact' || toNode.location.kind !== 'exact') {
     throw new Error(`edge "${edgeId}" endpoints must be exact locations`);
   }
-  if (!pointsEqual(validated.from, fromNode.location.pos) || !pointsEqual(validated.to, toNode.location.pos)) {
+  const forwardMatch =
+    pointsEqual(validated.from, fromNode.location.pos) &&
+    pointsEqual(validated.to, toNode.location.pos);
+  const reverseMatch =
+    pointsEqual(validated.from, toNode.location.pos) &&
+    pointsEqual(validated.to, fromNode.location.pos);
+  if (!forwardMatch && !(directed === false && reverseMatch)) {
     throw new Error(`edge "${edgeId}" binding "${evidenceId}" endpoints do not match edge from→to`);
   }
   return { evidenceId, snapshot: validated };
@@ -2022,6 +3459,18 @@ function nodeStringBytes(n: SpatialNode, cost: StringCost): number {
   bytes += cost(n.source) + STRING_QUOTES;
   bytes += n.tag === undefined ? 0 : cost(n.tag) + STRING_QUOTES;
   bytes += n.label === undefined ? 0 : cost(n.label) + STRING_QUOTES;
+  bytes += n.observedAt === undefined ? 0 : BYTES_PER_NUMBER;
+  bytes += n.externalRef === undefined ? 0 : cost(n.externalRef) + STRING_QUOTES;
+  if (n.gone === true) {
+    bytes += 48 + BYTES_PER_NUMBER;
+    const evidence = n.goneEvidence;
+    if (evidence !== undefined) {
+      bytes += 160 + cost(evidence.sessionId) + cost(evidence.source);
+      bytes += evidence.reason === undefined ? 0 : cost(evidence.reason) + STRING_QUOTES;
+      bytes += (evidence.observationIds?.length ?? 0) * 48;
+      for (const id of evidence.observationIds ?? []) bytes += cost(id) + STRING_QUOTES;
+    }
+  }
   // exact: `{"kind":"exact","pos":{…}}`; region adds `"center":{…}` and `"radius":…`.
   bytes += n.location.kind === 'exact' ? BYTES_PER_POINT + 24 : BYTES_PER_POINT + BYTES_PER_NUMBER + 48;
   return bytes;
@@ -2036,11 +3485,58 @@ function edgeStringBytes(e: StoredEdge, cost: StringCost, traversalCost: Travers
   bytes += cost(e.basis) + STRING_QUOTES;
   bytes += e.fragmentId === undefined ? 0 : cost(e.fragmentId) + STRING_QUOTES;
   bytes += e.source === undefined ? 0 : cost(e.source) + STRING_QUOTES;
+  bytes += 8; // directed
+  for (const mode of e.modes) bytes += cost(mode) + STRING_QUOTES;
+  for (const verification of e.verifications) bytes += verificationStringBytes(verification, cost);
   // Each binding carries a full immutable traversal snapshot — count its real
   // string/point cost, not a fixed per-ref constant.
   for (const ref of e.refs) {
     bytes += cost(ref.evidenceId) + STRING_QUOTES + traversalCost(ref.snapshot);
   }
+  return bytes;
+}
+
+function verificationStringBytes(v: EdgeVerification, cost: StringCost): number {
+  let bytes = 256;
+  bytes += cost(v.direction) + STRING_QUOTES;
+  bytes += cost(v.mode) + STRING_QUOTES;
+  bytes += cost(v.status) + STRING_QUOTES;
+  bytes += cost(v.contextKey) + STRING_QUOTES;
+  bytes += cost(v.sessionId) + STRING_QUOTES;
+  bytes += v.reason === undefined ? 0 : cost(v.reason) + STRING_QUOTES;
+  bytes += 2 * BYTES_PER_NUMBER;
+  if (v.blockedAt !== undefined) {
+    bytes += v.blockedAt.kind === 'contact' ? 160 : 512;
+  }
+  bytes += v.hazards.length * 256;
+  for (const hazard of v.hazards) bytes += cost(hazard.detail);
+  for (const dependency of v.dependencies) {
+    bytes += 96 + cost(dependency.key.dim) + BYTES_PER_NUMBER;
+  }
+  return bytes;
+}
+
+function portalTraversalStringBytes(
+  t: PortalTraversalEvidence,
+  cost: StringCost,
+): number {
+  let bytes = 160;
+  bytes += cost(t.id) + cost(t.edgeId) + cost(t.direction) + cost(t.sessionId);
+  bytes += cost(t.source) + STRING_QUOTES * 5;
+  bytes += BYTES_PER_NUMBER;
+  bytes += t.executionId === undefined ? 0 : cost(t.executionId) + STRING_QUOTES;
+  bytes += t.actionId === undefined ? 0 : cost(t.actionId) + STRING_QUOTES;
+  for (const id of t.observationIds) bytes += cost(id) + STRING_QUOTES + 24;
+  return bytes;
+}
+
+function portalEdgeStringBytes(e: StoredPortalEdge, cost: StringCost): number {
+  let bytes = 160;
+  bytes += cost(e.id) + cost(e.from) + cost(e.to) + STRING_QUOTES * 3;
+  bytes += 8; // directed
+  bytes += e.fragmentId === undefined ? 0 : cost(e.fragmentId) + STRING_QUOTES;
+  bytes += e.source === undefined ? 0 : cost(e.source) + STRING_QUOTES;
+  for (const traversal of e.traversals) bytes += portalTraversalStringBytes(traversal, cost);
   return bytes;
 }
 
@@ -2060,4 +3556,12 @@ function estimateEdgeBytes(e: StoredEdge): number {
 
 function edgeLowerBound(e: StoredEdge): number {
   return edgeStringBytes(e, (s) => s.length, traversalLowerBound);
+}
+
+function estimatePortalEdgeBytes(e: StoredPortalEdge): number {
+  return portalEdgeStringBytes(e, jsonEscapedByteLength);
+}
+
+function portalEdgeLowerBound(e: StoredPortalEdge): number {
+  return portalEdgeStringBytes(e, (s) => s.length);
 }

@@ -79,7 +79,7 @@ export interface TraversalEvidence {
   mode?: MoveMode;
 }
 
-const MOVE_MODES: readonly MoveMode[] = ['walk', 'jump', 'sneak', 'swim', 'climb', 'ladder', 'drop'];
+export const MOVE_MODES: readonly MoveMode[] = ['walk', 'jump', 'sneak', 'swim', 'climb', 'ladder', 'drop'];
 
 /** Whether a `MoveMode` string is one of the known modes (kept internal — consumers validate via the store). */
 function isMoveMode(value: unknown): value is MoveMode {
