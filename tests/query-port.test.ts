@@ -101,6 +101,42 @@ describe('SpatialQueryPort — request boundary', () => {
     invalid(parts, { kind: 'nodes', tag: 'container' });
     invalid(parts, { kind: 'edges', basis: 'guess' });
   });
+
+  it('keeps the exact invalid_request detail for representative fields', () => {
+    const parts = makeQueryParts();
+    const detailOf = (request: unknown): string | undefined => {
+      const problem = parts.store.query(request as SpatialQueryRequest).problem;
+      return problem?.kind === 'invalid_request' ? problem.detail : undefined;
+    };
+    expect(detailOf({ kind: 'nope' })).toBe('unknown query kind "nope"');
+    expect(detailOf({ kind: 'fragments', source: 'legacy' })).toBe(
+      'unknown field "source" for query kind "fragments"',
+    );
+    expect(detailOf({ kind: 'components' })).toBe(
+      'components.dim must be a non-empty string',
+    );
+    expect(detailOf({ kind: 'segments' })).toBe(
+      'segments.fragmentId must be a non-empty string',
+    );
+    expect(detailOf({ kind: 'nodes', tag: 'container' })).toBe(
+      'nodes.tag must be one of: base, resource, danger, discovery, death, waypoint, herd, portal',
+    );
+    expect(detailOf({ kind: 'anchor', dim: DIM, here: A })).toBe(
+      'anchor.order is required and must be one of: surface, deepest',
+    );
+    expect(detailOf({ kind: 'fragments', limit: 1001 })).toBe(
+      'limit must be an integer in [1, 1000]',
+    );
+    expect(detailOf({ kind: 'historyRoute', dim: DIM, from: A, to: B, near: -1 })).toBe(
+      'near must be a finite non-negative number',
+    );
+    expect(
+      detailOf({ kind: 'historyRoute', dim: DIM, from: { ...A, w: 1 }, to: B }),
+    ).toBe('historyRoute.from must have finite x, y, z and no other fields');
+    expect(
+      detailOf({ kind: 'cells', dim: DIM, positions: [{ x: 0.5, y: 64, z: 0 }] }),
+    ).toBe('cells.positions[0] must have finite integer x, y, z and no other fields');
+  });
 });
 
 describe('SpatialQueryPort — envelope and read-only boundary', () => {

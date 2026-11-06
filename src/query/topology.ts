@@ -8,12 +8,52 @@
 
 import { makeQueryResult } from './envelope.js';
 import { collectQueryPages, pagePortalEdges, resolveLimit } from './paging.js';
-import type { SpatialQueryContext, SpatialQueryRequest, SpatialQueryResult } from './types.js';
+import type { QueryPage } from './paging.js';
+import type {
+  SpatialQueryContext,
+  SpatialQueryData,
+  SpatialQueryKind,
+  SpatialQueryRequest,
+  SpatialQueryResult,
+} from './types.js';
 
 export type TopologyQuery = Extract<
   SpatialQueryRequest,
   { kind: 'fragments' | 'traversals' | 'nodes' | 'edges' | 'portals' }
 >;
+
+/** Kinds whose response data is one bounded page window. */
+type PagedQueryKind = Extract<
+  SpatialQueryKind,
+  | 'fragments'
+  | 'traversals'
+  | 'nodes'
+  | 'edges'
+  | 'portals'
+  | 'resourceAnchors'
+  | 'containerAnchors'
+>;
+type PagedQueryData<K extends PagedQueryKind> = Extract<SpatialQueryData, { kind: K }>;
+
+/**
+ * Shared envelope for every paged query kind (topology lists and anchors).
+ * `data` is exactly `{ kind, ...page }`; `total`/`nextAfter` mirror the page
+ * window on the result envelope.
+ */
+export function pagedQueryResult<K extends PagedQueryKind>(
+  context: SpatialQueryContext,
+  kind: K,
+  page: QueryPage<PagedQueryData<K>['items'][number]>,
+  dim?: string,
+): SpatialQueryResult {
+  return makeQueryResult(context, {
+    status: 'ok',
+    ...(dim === undefined ? {} : { dim }),
+    data: { kind, ...page } as PagedQueryData<K>,
+    total: page.total,
+    nextAfter: page.nextAfter,
+  });
+}
 
 export function queryTopology(
   context: SpatialQueryContext,
@@ -34,13 +74,7 @@ export function queryTopology(
         request.after,
         limit,
       );
-      return makeQueryResult(context, {
-        status: 'ok',
-        dim: request.dim,
-        data: { kind: 'fragments', ...page },
-        total: page.total,
-        nextAfter: page.nextAfter,
-      });
+      return pagedQueryResult(context, 'fragments', page, request.dim);
     }
     case 'traversals': {
       const page = collectQueryPages(
@@ -54,13 +88,7 @@ export function queryTopology(
         request.after,
         limit,
       );
-      return makeQueryResult(context, {
-        status: 'ok',
-        dim: request.dim,
-        data: { kind: 'traversals', ...page },
-        total: page.total,
-        nextAfter: page.nextAfter,
-      });
+      return pagedQueryResult(context, 'traversals', page, request.dim);
     }
     case 'nodes': {
       const page = collectQueryPages(
@@ -76,13 +104,7 @@ export function queryTopology(
         request.after,
         limit,
       );
-      return makeQueryResult(context, {
-        status: 'ok',
-        dim: request.dim,
-        data: { kind: 'nodes', ...page },
-        total: page.total,
-        nextAfter: page.nextAfter,
-      });
+      return pagedQueryResult(context, 'nodes', page, request.dim);
     }
     case 'edges': {
       const page = collectQueryPages(
@@ -99,13 +121,7 @@ export function queryTopology(
         request.after,
         limit,
       );
-      return makeQueryResult(context, {
-        status: 'ok',
-        dim: request.dim,
-        data: { kind: 'edges', ...page },
-        total: page.total,
-        nextAfter: page.nextAfter,
-      });
+      return pagedQueryResult(context, 'edges', page, request.dim);
     }
     case 'portals': {
       const page = pagePortalEdges(
@@ -113,12 +129,7 @@ export function queryTopology(
         request.after,
         limit,
       );
-      return makeQueryResult(context, {
-        status: 'ok',
-        data: { kind: 'portals', ...page },
-        total: page.total,
-        nextAfter: page.nextAfter,
-      });
+      return pagedQueryResult(context, 'portals', page);
     }
   }
 }
