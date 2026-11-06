@@ -29,7 +29,10 @@
  * executable routes. See `docs/spatial-memory-store.md` for the full mapping.
  */
 
-import type { ChangeReportSink } from '../memory/change-reports.js';
+import type {
+  ChangeReportSink,
+  ChangeReportSubscriptionOptions,
+} from '../memory/change-reports.js';
 import type { MemoryIngest, SpatialEdgeRecord } from '../memory/ingest.js';
 import type { Observation, ObservationBatch } from '../observation/types.js';
 import type { Frontier } from '../navigation/types.js';
@@ -259,12 +262,18 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest 
    * Validate the batch's world scope before a single cell is written, then
    * return the `VoxelMap` change report unchanged. Schema/gap validation stays
    * in `VoxelMap.observeBatch` (the boundary that owns `Observation`), which
-   * also keeps the whole batch atomic. The report covers only the sections this
-   * batch touched; gaps are diagnostics and never become cells.
+   * also keeps the whole batch atomic. A malformed batch is delegated as-is so
+   * the owner reports its structured error instead of this loop throwing a
+   * native `TypeError`. The report covers only the sections this batch touched;
+   * gaps are diagnostics and never become cells.
    */
   observeBatch(batch: ObservationBatch): BatchChangeReport {
-    for (const observation of batch.observations) {
-      this.assertWorld(observation.worldId, 'observeBatch');
+    if (batch !== null && typeof batch === 'object' && Array.isArray(batch.observations)) {
+      for (const observation of batch.observations) {
+        if (observation !== null && typeof observation === 'object') {
+          this.assertWorld(observation.worldId, 'observeBatch');
+        }
+      }
     }
     return this.voxel.observeBatch(batch);
   }
@@ -284,8 +293,11 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest 
   }
 
   /** Forward accepted-change reports to an active verifier/executor. */
-  subscribeChanges(sink: ChangeReportSink): () => void {
-    return this.voxel.subscribeChanges(sink);
+  subscribeChanges(
+    sink: ChangeReportSink,
+    options?: ChangeReportSubscriptionOptions,
+  ): () => void {
+    return this.voxel.subscribeChanges(sink, options);
   }
 
   /** `null` means the Section is not resident/allocated — it is never empty air. */
@@ -785,7 +797,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest 
       subscribeChanges: {
         available: true,
         reason:
-          'Synchronous report forwarding from the same VoxelMap that accepted the write; empty reports are not delivered.',
+          'Synchronous report forwarding from the same VoxelMap that accepted the write; empty reports are not delivered, and subscriber failures are reported as ChangeReportDeliveryError with committed:true.',
       },
       sectionAt: {
         available: true,

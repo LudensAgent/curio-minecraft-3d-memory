@@ -100,6 +100,51 @@ export interface BatchChangeReport extends ChangeReport {
 /** Synchronous subscriber for accepted-change reports. */
 export type ChangeReportListener = (report: ChangeReport) => void;
 
+/** Called instead of propagating when a subscriber throws and opts into isolation. */
+export type ChangeReportErrorHandler = (error: unknown, report: ChangeReport) => void;
+
+export interface ChangeReportSubscriptionOptions {
+  /**
+   * Handle this subscriber's error locally. Without it, a throwing subscriber is
+   * collected and reported as a `ChangeReportDeliveryError` after the write has
+   * already been committed.
+   */
+  onError?: ChangeReportErrorHandler;
+}
+
+export interface ChangeReportDeliveryFailure {
+  listener: ChangeReportListener;
+  error: unknown;
+}
+
+/**
+ * A subscriber failed after the change was already accepted and applied.
+ *
+ * `committed` is always true: the memory write happened. A host must not treat
+ * this as a rejected observation or retry the write; the failure concerns
+ * report forwarding, not evidence acceptance.
+ */
+export class ChangeReportDeliveryError extends Error {
+  readonly code = 'change_report_delivery_failed';
+  readonly committed = true as const;
+  readonly report: ChangeReport;
+  readonly failures: readonly ChangeReportDeliveryFailure[];
+
+  constructor(report: ChangeReport, failures: readonly ChangeReportDeliveryFailure[]) {
+    super(
+      `change report delivery failed for ${failures.length} subscriber(s); the local write was already applied`,
+    );
+    this.name = 'ChangeReportDeliveryError';
+    this.report = report;
+    this.failures = [...failures];
+  }
+}
+
+interface ChangeSubscriber {
+  listener: ChangeReportListener;
+  onError: ChangeReportErrorHandler | undefined;
+}
+
 /** Read-only history/validity flags for one cell. Never mutates or refreshes. */
 export interface CellHistoryView {
   /** A precise observation (including confirmed air) exists. */
@@ -149,8 +194,10 @@ export interface VoxelMapOptions {
    * Synchronous change-report hook, invoked once per accepted update/batch that
    * changed at least one section. Hosts use it to invalidate derived caches (e.g.
    * a `TraversabilityCache`) before the next read. The callback must return
-   * synchronously and must not be used to perform hidden world reads; errors
-   * propagate to the caller. Restore (the initialization path) never fires it.
+   * synchronously and must not be used to perform hidden world reads. A throw
+   * after the write is applied becomes a `ChangeReportDeliveryError` (with
+   * `committed: true`) after the remaining subscribers are notified. Restore
+   * (the initialization path) never fires it.
    */
   onChange?: ChangeReportListener;
 }
@@ -176,7 +223,7 @@ export class VoxelMap {
   private readonly manualResidency: boolean;
   private readonly residentLimits: ResolvedResidencyLimits;
   private readonly onChange: ((report: ChangeReport) => void) | undefined;
-  private readonly changeListeners = new Set<ChangeReportListener>();
+  private readonly changeListeners = new Set<ChangeSubscriber>();
   /**
    * Committed section directory (manual mode only), keyed by a dim|coords key.
    * Read once at open from the worker without decoding any payload.
@@ -260,13 +307,20 @@ export class VoxelMap {
    * Empty reports are not delivered, and restore (the initialization path) never
    * fires. The returned function unsubscribes; it is safe to call more than once.
    */
-  subscribeChanges(listener: ChangeReportListener): () => void {
+  subscribeChanges(
+    listener: ChangeReportListener,
+    options: ChangeReportSubscriptionOptions = {},
+  ): () => void {
     if (typeof listener !== 'function') {
       throw new Error('change listener must be a function');
     }
-    this.changeListeners.add(listener);
+    if (options.onError !== undefined && typeof options.onError !== 'function') {
+      throw new Error('change listener onError must be a function when present');
+    }
+    const subscriber: ChangeSubscriber = { listener, onError: options.onError };
+    this.changeListeners.add(subscriber);
     return () => {
-      this.changeListeners.delete(listener);
+      this.changeListeners.delete(subscriber);
     };
   }
 
@@ -1075,13 +1129,41 @@ export class VoxelMap {
 
   /**
    * Fire the synchronous change hook and subscribers once per non-empty report.
-   * The listener set is copied so subscribing/unsubscribing from inside a
-   * callback cannot skip or repeat another listener.
+   * The subscriber set is copied so subscribing/unsubscribing from inside a
+   * callback cannot skip or repeat another subscriber.
+   *
+   * Delivery failures are collected rather than aborting the remaining
+   * subscribers: every subscriber sees the report, and the caller receives one
+   * `ChangeReportDeliveryError` that states the write was already committed.
+   * A subscriber that supplies `onError` handles its own failure and does not
+   * contribute to the aggregate error.
    */
   private emit<T extends ChangeReport>(report: T): T {
     if (report.sections.length === 0) return report;
-    if (this.onChange !== undefined) this.onChange(report);
-    for (const listener of [...this.changeListeners]) listener(report);
+    const failures: ChangeReportDeliveryFailure[] = [];
+    if (this.onChange !== undefined) {
+      try {
+        this.onChange(report);
+      } catch (error) {
+        failures.push({ listener: this.onChange, error });
+      }
+    }
+    for (const subscriber of [...this.changeListeners]) {
+      try {
+        subscriber.listener(report);
+      } catch (error) {
+        if (subscriber.onError === undefined) {
+          failures.push({ listener: subscriber.listener, error });
+          continue;
+        }
+        try {
+          subscriber.onError(error, report);
+        } catch (handlerError) {
+          failures.push({ listener: subscriber.listener, error: handlerError });
+        }
+      }
+    }
+    if (failures.length > 0) throw new ChangeReportDeliveryError(report, failures);
     return report;
   }
 

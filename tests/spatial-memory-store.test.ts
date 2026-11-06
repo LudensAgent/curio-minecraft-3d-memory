@@ -7,6 +7,7 @@ import {
   WalkRouteSearch,
 } from '../src/index.js';
 import type {
+  Observation,
   ObservationBatch,
   ObservationGap,
   SpatialNode,
@@ -285,6 +286,17 @@ describe('SpatialMemoryStoreImpl — batch and lifecycle write ports', () => {
     expect(() =>
       store.observeBatch({ observations: [] } as unknown as ObservationBatch),
     ).toThrow(/observations and unobserved arrays/);
+    // Malformed input is rejected by the owning validator, not by a native
+    // TypeError from the store's scope pre-check.
+    expect(() => store.observeBatch(null as unknown as ObservationBatch)).toThrow(
+      /observations and unobserved arrays/,
+    );
+    expect(() =>
+      store.observeBatch({
+        observations: [null as unknown as Observation],
+        unobserved: [],
+      }),
+    ).toThrow(/observation must be an object/);
     expect(fragments.revision).toBe(0);
   });
 

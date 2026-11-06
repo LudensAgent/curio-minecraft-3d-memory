@@ -44,6 +44,7 @@ export type {
 // Voxel — sparse in-memory observation map (coordinate math, palette, `VoxelMap`)
 export {
   AIR_BLOCK_NAME,
+  ChangeReportDeliveryError,
   DEFAULT_RESIDENCY_LIMITS,
   LruOrder,
   estimateVoxelSectionResidentBytesFromCommitted,
@@ -64,7 +65,10 @@ export type {
   CellChangeKind,
   CellView,
   ChangeReport,
+  ChangeReportDeliveryFailure,
+  ChangeReportErrorHandler,
   ChangeReportListener,
+  ChangeReportSubscriptionOptions,
   CommittedSectionInfo,
   PinLease,
   ResidencyLimits,

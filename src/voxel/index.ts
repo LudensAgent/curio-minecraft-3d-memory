@@ -45,7 +45,7 @@ export {
   voxelSectionPayloadId,
 } from './serialization.js';
 export type { VoxelCellPayloadV2, VoxelSectionPayloadV2 } from './serialization.js';
-export { VoxelMap } from './voxel-map.js';
+export { ChangeReportDeliveryError, VoxelMap } from './voxel-map.js';
 export type {
   BatchChangeReport,
   CellChange,
@@ -53,7 +53,10 @@ export type {
   CellHistoryView,
   CellView,
   ChangeReport,
+  ChangeReportDeliveryFailure,
+  ChangeReportErrorHandler,
   ChangeReportListener,
+  ChangeReportSubscriptionOptions,
   SectionChange,
   StaleReason,
   VoxelMapOptions,

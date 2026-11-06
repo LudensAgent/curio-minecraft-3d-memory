@@ -154,6 +154,8 @@ export function snapshotVoxelSection(section: Section): VoxelSectionSnapshot {
 
 // --- restore: validation + reconstruction --------------------------------------
 
+type StaleReason = NonNullable<CellEvidence['staleReason']>;
+
 /** The single runtime list of known stale reasons, shared with `VoxelMap.markStale`. */
 export const STALE_REASONS = [
   'unloaded',
@@ -161,7 +163,13 @@ export const STALE_REASONS = [
   'expired',
   'pending_effect',
   'conflict',
-] as const;
+] as const satisfies readonly StaleReason[];
+
+// Compile-time exhaustiveness: adding a `StaleReason` without listing it above
+// makes `MissingStaleReason` non-`never` and fails the constraint.
+type MissingStaleReason = Exclude<StaleReason, (typeof STALE_REASONS)[number]>;
+type AssertNever<T extends never> = T;
+type _AllStaleReasonsListed = AssertNever<MissingStaleReason>;
 /** Longest known stale reason, used to bill the worst-case resident footprint. */
 const WORST_CASE_STALE_REASON = 'observation_gap';
 

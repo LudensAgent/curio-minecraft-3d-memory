@@ -955,6 +955,7 @@ export interface ChangeReport {
 3. 执行器在当前段依据失效时 MUST 停止该段并返回 `INVALIDATED`。
 4. 无关远处变化不得打断当前委托；只失效依赖该 Section 的验证。
 5. 不得把 `ChangeReport` 当成世界事实广播；它只描述本次接受证据造成的本地失效。
+6. 监听器/verifier 回调抛错时，**写入已经提交**。运行时应通知其余订阅者，并报告带 `committed:true` 的 `ChangeReportDeliveryError`；宿主不得把该错误当成“观测被拒绝”而重试写入。订阅者可通过 `subscribeChanges(sink, { onError })` 隔离自己的失败。
 
 ### 8.2 会话状态
 
@@ -1092,6 +1093,13 @@ export interface ChangeReport {
 - 请求未知字段：拒绝；响应未知字段：忽略但记录。
 - 旧的 `routeId` 不跨契约版本复用；升级后重新规划。
 
+### 12.4 M1 兼容性记录
+
+- `SpatialMemoryStore` 新增必选 `observeBatch`、`beginSession`、`markStale`、`addTraversal`、`subscribeChanges`。调用方源码兼容；外部实现者必须补齐这些方法。
+- `SpatialMemoryStore.observeBatch` 新增到接口并返回 `BatchChangeReport`；`addTraversal` 返回 `SaveResult`。忽略返回值的调用不受影响。
+- `VoxelMap` 的订阅者（以及 `onChange`）异常不再原样冒泡，而是继续通知其余订阅者后聚合为 `ChangeReportDeliveryError`（`committed:true`）。
+- 包版本仍为 `0.10.0`；正式发布时按 §12.3 决定 minor/major，并同步宿主与能力报告。
+
 ---
 
 ## 13. 宿主接线步骤（Checklist）
@@ -1209,8 +1217,8 @@ export interface ChangeReport {
 | `FragmentStore.addTraversal` | 已实现 | `src/topology/fragment-store.ts` |
 | `SpatialMemoryStore.addTraversal` | 已实现 | store 作用域检查后委托；返回 `SaveResult` |
 | 统一 `MemoryIngest` | 已实现 | `src/memory/ingest.ts`；`SpatialMemoryStoreImpl` 实现 |
-| `ChangeReport` 订阅/转发 | 已实现 | `VoxelMap.subscribeChanges`、store `ChangeReportSource` |
-| `contact` 证据的方块名 | 部分实现 | `Observation.state.name` 必填，模型无法表达“名称未知”；`validateObservation` 要求 contact 必须 `stateComplete:false`，未看见的名称不得由宿主提交 |
+| `ChangeReport` 订阅/转发 | 已实现 | `VoxelMap.subscribeChanges`、store `ChangeReportSource`；投递失败聚合为 `ChangeReportDeliveryError`（`committed:true`） |
+| `contact` 证据的方块名 | 部分实现 | `Observation.state.name` 必填，模型无法表达“名称未知”；`validateObservation` 要求 contact 必须 `stateComplete:false`，未看见的名称不得由宿主提交；可表达未知名称的 state 模型列为后续任务 |
 | 旧 `sequence` 拒绝 | 部分实现 | 新旧由 `observedAt` 判定；`sequence` 是接收顺序，不用于覆盖判断。契约 §4.2 规则 6 的措辞待与实现对齐 |
 | `SpatialMemoryStore` 查询方法 | 已实现（分散） | `src/store/store.ts` |
 | 统一 `SpatialQueryPort` | 待实现 | 需要只读投影层 |

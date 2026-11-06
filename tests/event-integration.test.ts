@@ -8,7 +8,12 @@ import type {
   Vec3Like,
   WalkRouteRequest,
 } from '../src/index.js';
-import { SpatialMemoryStoreImpl, VoxelMap, WalkRouteExecutor } from '../src/index.js';
+import {
+  ChangeReportDeliveryError,
+  SpatialMemoryStoreImpl,
+  VoxelMap,
+  WalkRouteExecutor,
+} from '../src/index.js';
 import { AIR, bodyAt, fakeProvider, obs, STONE } from './fakes.js';
 
 const WORLD = 'world';
@@ -129,6 +134,95 @@ describe('change-report forwarding', () => {
     expect(emptyStale.sections).toEqual([]);
     expect(seen).toHaveLength(3);
     expect(staled.sections).toHaveLength(0);
+  });
+
+  it('reports subscriber failures as committed writes and still notifies other subscribers', () => {
+    const map = new VoxelMap(WORLD, { now: () => 2000 });
+    const store = new SpatialMemoryStoreImpl({ worldId: WORLD, map });
+    const seen: ChangeReport[] = [];
+    store.subscribeChanges(() => {
+      throw new Error('executor failed');
+    });
+    store.subscribeChanges((report) => seen.push(report));
+
+    let thrown: unknown;
+    try {
+      store.observeBatch({
+        observations: [obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 2000 })],
+        unobserved: [],
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ChangeReportDeliveryError);
+    const delivery = thrown as ChangeReportDeliveryError;
+    expect(delivery.code).toBe('change_report_delivery_failed');
+    expect(delivery.committed).toBe(true);
+    expect(delivery.failures).toHaveLength(1);
+    // Every other subscriber still received the report.
+    expect(seen).toHaveLength(1);
+    // The write itself was committed before delivery failed.
+    expect(map.cellAt(DIM, 0, 0, 0).observed).toBe(true);
+  });
+
+  it('reports a delivery failure when the onError handler itself throws', () => {
+    const map = new VoxelMap(WORLD, { now: () => 2000 });
+    const store = new SpatialMemoryStoreImpl({ worldId: WORLD, map });
+    store.subscribeChanges(
+      () => {
+        throw new Error('listener failed');
+      },
+      {
+        onError: () => {
+          throw new Error('handler failed');
+        },
+      },
+    );
+
+    let thrown: unknown;
+    try {
+      store.observeBatch({
+        observations: [obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 2000 })],
+        unobserved: [],
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ChangeReportDeliveryError);
+    const delivery = thrown as ChangeReportDeliveryError;
+    expect(delivery.failures).toHaveLength(1);
+    expect((delivery.failures[0]?.error as Error).message).toBe('handler failed');
+    expect(delivery.committed).toBe(true);
+    expect(map.cellAt(DIM, 0, 0, 0).observed).toBe(true);
+  });
+
+  it('lets a subscriber isolate its own delivery failure', () => {
+    const map = new VoxelMap(WORLD, { now: () => 2000 });
+    const store = new SpatialMemoryStoreImpl({ worldId: WORLD, map });
+    let captured: unknown;
+
+    store.subscribeChanges(
+      () => {
+        throw new Error('executor failed');
+      },
+      {
+        onError: (error) => {
+          captured = error;
+        },
+      },
+    );
+
+    const report = store.observeBatch({
+      observations: [obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 2000 })],
+      unobserved: [],
+    });
+
+    expect(report.sections).toHaveLength(1);
+    expect(captured).toBeInstanceOf(Error);
+    expect((captured as Error).message).toBe('executor failed');
+    expect(map.cellAt(DIM, 0, 0, 0).observed).toBe(true);
   });
 
   it('does not deliver rejected (older) or old-session writes', () => {

@@ -6,5 +6,10 @@
  * module exists now so the write/change ports have a navigation-free home.
  */
 
-export type { ChangeReportSink, ChangeReportSource } from './change-reports.js';
+export type {
+  ChangeReportErrorHandler,
+  ChangeReportSink,
+  ChangeReportSource,
+  ChangeReportSubscriptionOptions,
+} from './change-reports.js';
 export type { MemoryIngest, SpatialEdgeRecord } from './ingest.js';

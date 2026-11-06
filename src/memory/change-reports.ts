@@ -7,7 +7,15 @@
  * so without importing the navigation or execution layers.
  */
 
-import type { ChangeReportListener } from '../voxel/voxel-map.js';
+import type {
+  ChangeReportListener,
+  ChangeReportSubscriptionOptions,
+} from '../voxel/voxel-map.js';
+
+export type {
+  ChangeReportErrorHandler,
+  ChangeReportSubscriptionOptions,
+} from '../voxel/voxel-map.js';
 
 /**
  * Synchronous consumer of accepted-change reports.
@@ -27,5 +35,8 @@ export interface ChangeReportSource {
    * Register a sink for accepted-change reports. Empty reports are not
    * delivered. The returned function unsubscribes and is safe to call twice.
    */
-  subscribeChanges(sink: ChangeReportSink): () => void;
+  subscribeChanges(
+    sink: ChangeReportSink,
+    options?: ChangeReportSubscriptionOptions,
+  ): () => void;
 }
