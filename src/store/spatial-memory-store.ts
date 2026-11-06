@@ -38,6 +38,10 @@ import type { Observation, ObservationBatch } from '../observation/types.js';
 import type { Frontier } from '../navigation/types.js';
 import { createSpatialQueryPort } from '../query/index.js';
 import type {
+  HistoricalRouteInspection,
+  SpatialMemoryCapabilities,
+  SpatialMemoryCapabilityName,
+  SpatialMemoryStoreSnapshot,
   SpatialQueryOptions,
   SpatialQueryPort,
   SpatialQueryRequest,
@@ -73,16 +77,11 @@ import type {
   PortalEdgeInput,
   PortalEdgeView,
   PortalTraversalEvidence,
-  QueryBudgetKey,
-  QueryStats,
   RecordNodeOptions,
   RouteQueryResult,
   RouteQueryStatus,
-  RouteSegment,
   RuntimeQueryOptions,
   SaveResult,
-  SearchDiagnostic,
-  SearchGapKind,
   SpatialEdge,
   SpatialNode,
   TopologyEdge,
@@ -97,6 +96,17 @@ import { VoxelMap } from '../voxel/voxel-map.js';
 import type { SpatialMemoryStore } from './store.js';
 
 export type { SpatialEdgeRecord } from '../memory/ingest.js';
+
+// The capability/snapshot/route-inspection shapes are query-owned so the query
+// module does not import the store. Re-export them here to keep the existing
+// `store/index.js` and package entry-point paths unchanged.
+export type {
+  HistoricalRouteInspection,
+  SpatialMemoryCapability,
+  SpatialMemoryCapabilities,
+  SpatialMemoryCapabilityName,
+  SpatialMemoryStoreSnapshot,
+} from '../query/types.js';
 
 /** Caller-supplied read-only projection over a search it already ran. */
 export type WalkSearchSnapshotProvider = (
@@ -125,62 +135,17 @@ export interface SpatialMemoryStoreOptions {
   query?: SpatialQueryOptions;
 }
 
-/** One method's honesty report. */
-export interface SpatialMemoryCapability {
-  available: boolean;
-  /** Why it is unavailable, or the honest limitation when it is available. */
-  reason?: string;
-}
-
-export type SpatialMemoryCapabilityName = keyof SpatialMemoryStore;
-export type SpatialMemoryCapabilities = Record<
-  SpatialMemoryCapabilityName,
-  SpatialMemoryCapability
+// Compile-time guard: the query-owned capability key list must mirror exactly
+// the store surface (`spatial-memory-store.ts` may not edit query types).
+type ExpectTrue<T extends true> = T;
+type _CapabilityNamesMatchStoreSurface = ExpectTrue<
+  Exclude<
+    SpatialMemoryCapabilityName | keyof SpatialMemoryStore,
+    SpatialMemoryCapabilityName & keyof SpatialMemoryStore
+  > extends never
+    ? true
+    : false
 >;
-
-/** Read-only runtime summary. Never refreshes evidence or changes a revision. */
-export interface SpatialMemoryStoreSnapshot {
-  worldId: string;
-  voxel: {
-    saveRevision: number;
-    residentSections: number;
-    residentBytes: number;
-    pinLeases: number;
-    pinnedSections: number;
-  };
-  fragments: { revision: number; total: number };
-  topology: { revision: number; nodes: number; edges: number };
-  capabilities: SpatialMemoryCapabilities;
-}
-
-/** Detailed historical-route read; explicitly not an executable route. */
-export interface HistoricalRouteInspection {
-  worldId: string;
-  dim: string;
-  from: Vec3Like;
-  to: Vec3Like;
-  /** Endpoint snapping radius around `from`/`to`. */
-  near: number;
-  status: RouteQueryStatus | 'ENDPOINT_NOT_RECORDED';
-  fromNodeId: string | null;
-  toNodeId: string | null;
-  /** Ordered recorded node positions for a FOUND route; empty otherwise. */
-  points: Vec3Like[];
-  nodeIds: string[];
-  edgeIds: string[];
-  segments: RouteSegment[];
-  gaps: SearchGapKind[];
-  stats: QueryStats | null;
-  diagnostics: SearchDiagnostic[];
-  exhausted?: QueryBudgetKey;
-  /** Recorded topology/geometry, not measured current terrain. */
-  historicalGeometry: true;
-  /** This query never starts movement or an executor. */
-  executable: false;
-  /** Current terrain passability is not established by this query. */
-  currentPassability: 'UNKNOWN';
-  message: string;
-}
 
 /** `unavailable` is a first-class outcome; callers never have to catch to see it. */
 export type FrontierInspection =
