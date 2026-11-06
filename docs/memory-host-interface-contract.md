@@ -498,7 +498,7 @@ export type SpatialQueryProblem =
 
 | 查询 | 返回 | 不得声称 |
 |---|---|---|
-| `cells` | 每格的 state/evidence/freshness/validUntil；未观察/未驻留原因（`not_resident`/`loading`/`load_failed` → `gap.reason:'unloaded'` + `status:'partial'`） | 未返回 = 空气；未驻留 = 从未观察；历史 gap 可重建 |
+| `cells` | 每格的 state/evidence/freshness/validUntil；未观察/未驻留原因（`not_resident`/`loading`/`load_failed` → `gap.reason:'unloaded'` + `status:'partial'`）；未观察格另带可选 `residency`（`SectionResidency`）与 `unobservedReason: 'no_record' \| 'resident'`，可细分 `no_record`、resident-unobserved、`not_resident`、`loading`、`load_failed` 五种内部驻留状态；旧消费者忽略新字段时仍只看到已观察、未观察（无 gap）、不可读（`gap.reason:'unloaded'`）三类 | 未返回 = 空气；未观察 = 空气；未驻留 = 从未观察；历史 gap 可重建 |
 | `fragments` | 历史几何、kind、geometrySource、polyline、端点、分页 | 历史 = 当前可走 |
 | `traversals` | 实际走过证据、方向、会话、时间 | 保存几何 = 实际走过 |
 | `nodes` | 地点/资源/基地/危险等锚点、精确/区域位置、来源 | 名字/标签 = 自动资源发现 |
@@ -1288,7 +1288,7 @@ export interface ChangeReport {
 | 统一 `SpatialQueryPort` | 已实现 | `src/query/*`；`SpatialMemoryStore.query(request)` 暴露；含 segments；未知字段/kind 拒绝、分页 100/1000、只读 |
 | `segments` 查询 | 已实现 | 包装 `TopologyStore.segments`；未知 fragment 返回 `not_found`；不删除/改写 fragment 历史 |
 | `MemoryHostCapabilities` / `CONTRACT_VERSION` | 已实现（M2/M3 部分） | `src/memory/capabilities.ts`；memory/query 按实际能力，M3 规划 walk search/history/auto 为 `true`；execute/persistence 与其余 plan 位待 M5.4 |
-| `cells` 未驻留/gap 语义 | 部分实现 | 可区分 `no_record`/resident-unobserved/`not_resident`/`loading`/`load_failed`；历史 `ObservationGap` 未持久化，只报告当前驻留 gap |
+| `cells` 未驻留/gap 语义 | 已实现 | 对外三类：已观察、未观察且无 gap、不可读（`gap.reason:'unloaded'` + `status:'partial'`）；未观察格另带可选 `residency`（`SectionResidency`）与 `unobservedReason: 'no_record' \| 'resident'`，可细分 `no_record`/resident-unobserved/`not_resident`/`loading`/`load_failed`，旧消费者忽略新字段后仍只见三类；历史 `ObservationGap` 未持久化，只报告当前驻留 gap |
 | `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts` |
 | `WalkRouteExecutor` + `bodyArrival` | 已实现 | `src/execution/*` |
 | `startKnownWalkRoute` | 已实现（启动执行，不是 plan-only） | `src/navigation/known-walk-route.ts` |
