@@ -199,6 +199,19 @@
   - `node --test acceptance/provenance.test.mjs acceptance/run.test.mjs acceptance/consumer-close.test.mjs`：**32/32 通过**。
 - 总计：**1000 项离线断言通过**。没有启动 Minecraft 服务器、mineflayer bot 或真实 Curio 宿主。
 
+### 5.7 历史几何的统一抽象边界
+
+**统一的是记录类型，不是把所有经历合并成同一种无差别事实。**
+
+- `PathFragment` 用 `kind: 'dug' | 'walked' | 'bridge' | 'built'` 和 `geometrySource: 'traversal' | 'observed_structure' | 'legacy'` 统一矿道、走过、桥和建造几何；`FragmentStore` 不再为每种来源建立独立存储。
+- `TraversalEvidence` 是单独的“实际走过”记录：保存 fragment 不等于走过，桥/建造几何也不会自动生成 traversal 证据。
+- `SpatialNode`/`SpatialEdge` 统一地点与连接；`SpatialEdge.type` 覆盖 `HORIZONTAL`、`STAIRCASE`、`VERTICAL_SHAFT`、`LADDER`、`BRIDGE`、`DROP`、`CLIMB`、`SWIM`、`CAVE_PASSAGE`、`PORTAL`。
+- 仍保留分层与来源：历史几何（fragment）、当前观测（`VoxelMap`）、派生通行性（traversability）分开，这是证据边界，不是重复存储。
+- `placed_blocks` 仍是独立账本；容器内容归宿主精确账本；旧 JSON 的 passages/placed/travel 正式迁移仍只有 dry-run。
+- 自动归纳“搭的桥”仍依赖宿主提供几何/动作证据；库不会仅凭放置记录生成亲历路线。
+
+**结论：** 模型层已经统一到同一套 `PathFragment`/拓扑抽象，并用 `kind`/`geometrySource`/`basis` 保留来源；摄入与旧数据迁移层尚未完全统一。
+
 ---
 
 ## 6. 缺口清单（纯记忆库）
@@ -397,7 +410,66 @@ flowchart LR
 
 ---
 
-## 11. 附录
+## 11. 复杂度与性能风险（仅记录，未优化）
+
+> 本节是静态只读审计结果：**本轮不修改代码，也不声称已做基准测试**。严重度按“渐进复杂度 × 调用频率 × 现有上限”综合判断；“高”表示在默认上限或常见规模下可能成为主线程/内存热点。实际优先级应以真实容量基准测试为准。
+
+### 11.1 高风险
+
+| # | 位置 | 问题与复杂度 | 触发与规模 | 现有缓解 | 后续优化候选（仅记录） |
+|---|---|---|---|---|---|
+| H1 | `src/voxel/voxel-map.ts` 的 `sectionAt`/`snapshotSection`；调用方 `step.ts`、`land-transition.ts`、`water/verify.ts`、`walk-search.ts` | 每次读取都深拷贝整个 Section（5 个位图、cells、palette、evidence Map）：O(4096 + 已观测格) | 每次 walk step 评估在 section cache miss 时调用；一次搜索最多 8192 条边，可能产生数万次全 Section 拷贝 | 单次评估内有 section cache | 为受信任评估器增加内部非拷贝 `sectionRef/readSection`；公共 `sectionAt` 保留防御性拷贝 |
+| H2 | `src/topology/topology-store.ts` 的 `nodes`/`edges`，`fragment-store.ts` 的 `fragments`/`traversals`；`spatial-memory-store.ts` 的 `drain*` | 每页都 `filter+sort` 全部记录，`total` 重新计数；内部分页 drain 变成 O(N² log N) | 2 万节点/边、每页 100 时，一次全量 drain 约 5.7e7 次字符串比较；`findNodeNear` 每次路线查询 O(N) | 有页大小和查询 budget 上限 | 按 dim/tag/label/from/to 建有序索引；提供一次物化的 `listAll`/迭代器；缓存 total |
+| H3 | `src/topology/topology-store.ts` 的 `components()`/`invalidateNodeComponent` | 每次重建全部邻接并排序；每次边写入失效扫描全部组件缓存，批量导入接近 O(E·V) | 2 万边批量加载 | 组件 BFS 有缓存，但邻接重建/失效仍全量 | 增量邻接表 + 按组件 ID 失效；按 `mutationRevision` 记忆化整个报告 |
+| H4 | `src/topology/topology-store.ts` 的 `fragmentation()` + `connectivity.ts` | 每次调用 drain 全部 fragments/traversals 并深拷贝，再跑 union-find；无 revision 缓存 | 默认上限 1000 fragments × 4096 点，理论可达数百万点 | 有 fragment/traversal 数量上限 | 按 `fragmentStore.revision` 记忆化；提供不克隆 polyline 的轻量迭代器 |
+| H5 | `src/traversability/route.ts`、`src/execution/walk-route-executor.ts`、`src/traversability/land-route.ts` | 每走一步都对整条路线做 snapshot/克隆/排序；O(n²) | 正常逐点执行；路线上限 1024 点 | 单步只验证本段 | 内部 `stepAt(i)` 访问器；紧凑状态；按 revision 记忆化；pending 游标代替每次排序 |
+| H6 | `src/storage/sqlite/spatial.ts`、`ledger.ts`、`worker.ts` | 仅体素增量；history/topology/ledger 每次 checkpoint 全量复制、解构、删表重插 | 20 万 chunk visits、5 万 placed、8 MB ledger | 有各域容量上限 | 按域 revision 只发送脏域；ledger 增量 upsert；字节统计放回 Worker |
+
+### 11.2 中风险
+
+| 位置 | 问题 | 触发与影响 |
+|---|---|---|
+| `voxel-map.ts` 的 `markStale`/`beginSession` | 遍历所有 Section/evidence，逐格生成 `CellChange` 和克隆位置，可能一次产生百万级对象 | 断线/换会话；同步 `onChange` |
+| `voxel-map.ts` 的 `observeBatch` | 没有 batch 大小/字节上限；大扫描一次性分配 | 宿主一次提交大量观测 |
+| `voxel-map.ts` 手动驻留字节估算 | 每批对每个触及 Section 扫描全部 evidence 和字符串长度 | 手动驻留 + 频繁小批次 |
+| `voxel/serialization.ts` | 每个已观测格重复 `sessionId/source/evidence` 等字段；全观测 Section 约 0.8–1.2 MB | 大世界持久化体积、JSON/structured clone 峰值 |
+| `voxel-map.ts` 的 `writePalette` | `palette.indexOf` 线性查找；palette 不压缩 | 方块类型多或频繁变化 |
+| `traversability/cache.ts` | `entries` 没有容量上限/过期清扫；长生命周期校验器持续累积 | 长时间/多会话运行 |
+| `navigation/navigate.ts` | `trace = trace.concat(copyTrace(...))` 每段复制前缀；O(段数²) | 多段委托；受 20s deadline 限制 |
+| `topology-store.ts` 的 `saveNode` | 每次插入扫描全部节点计数，批量 O(N²) | 2 万节点导入 |
+| `topology-store.ts` 锚点查询 | O(N) 扫描 + 两次 BFS；默认 1000 节点 budget，大组件可能直接返回 null | 大图/大组件 |
+| `topology-store.ts` 的 `segments()` | 每次扫描全部边，cut 去重是线性 `some` | 大量 blocked 边 |
+| `topology-store.ts` BFS | 先解析证据再查 visited，重复消耗 query budget | 大图查询 |
+| `voxel-map.ts` 的 `commitDirectory` | 每次 save ACK 展开整个 directory 求 max | 长期运行、目录条目多 |
+
+### 11.3 低风险
+
+- `src/observation/queue.ts`：`drain` 用 `splice(0, take)`，频繁小批量 drain 会搬移剩余队列；入队字节估算两次。
+- `src/voxel/lru.ts` 本身 O(1)，但 `WorkingSetManager.reconcile`/`residentSectionKeys` 在比较器里用 `JSON.stringify` 生成 key 并多次复制。
+- 增量体素保存仍会扫描全部驻留 Section/directory 计数；Worker 每次增量 checkpoint 跑全表 SQL 聚合。
+- `TraversabilityCache` 的 key 每步 `JSON.stringify`（并排序 `avoid`）。
+- `src/water/verify.ts` 的 box sweep 每次分配 `[min,max]` 数组，最多约 13 万次。
+- `src/store/spatial-memory-store.ts:583-676` 有一段私有的 O(P²) 两两 proximity 代码，当前未被调用；建议删除以免未来误接。
+- `portalEdges` 未分页，返回全部 portal 边和 traversal（有 1000×32 上限）。
+- `TransientOccupancy` 有 256 条上限，读取时惰性清扫，暂不需要优化。
+
+### 11.4 已检查、暂未发现明显问题
+
+- `WalkRouteSearch.advance/status`：使用增量游标，边预算有上限；没有整图克隆、`shift`/`splice` 或重复排序。
+- 水面路线验证有 `maxCandidateCells`/`maxReadCells`/`maxNeighborReads`/`maxShapeChecks` 上限，没有 O(volume²)。
+- `WalkRouteExecutor` 的样本处理是 O(1)，只保留最后样本/位置，没有逐样本 `filter/find`。
+- `WorkingSetManager` 淘汰使用一次 LRU 快照 + 游标，复杂度受驻留上限约束。
+- `VoxelMap.cellAt`/`historyAt` 只克隆单条证据或返回标志对象，适合在循环中调用。
+
+### 11.5 后续验证建议（不在本轮）
+
+- 用 1 万 Sections、2 万节点/边、1000 fragments、1024 点路线做基准测试。
+- 重点测量：walk 搜索耗时与 GC、路线执行每步耗时、checkpoint 时间、fragmentation 时间、分页查询延迟、手动驻留批次的内存峰值。
+- 先修 H1/H2/H5/H6（热路径），再根据实测决定 H3/H4 和中等项；不要在没有基准的情况下做大规模重构。
+
+---
+
+## 12. 附录
 
 ### A. 关键证据索引
 
@@ -443,7 +515,7 @@ node --test acceptance/provenance.test.mjs acceptance/run.test.mjs acceptance/co
 
 ---
 
-## 12. 结论
+## 13. 结论
 
 按“纯记忆库”定位，当前实现已经具备可用的核心：它能记录宿主提供的合法观测，保留历史路径和拓扑，按证据回答“这里观察到什么、哪些路线曾走过、锚点在哪里、当前证据是否支持通行”，并能通过 SQLite 持久化。
 
