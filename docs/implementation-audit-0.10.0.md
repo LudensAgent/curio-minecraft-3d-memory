@@ -1,16 +1,64 @@
-# 空间记忆与导航库实现审计（0.10.0 / HEAD `0737f30`）
+# 空间记忆库实现审计（纯记忆库定位，0.10.0 / HEAD `0737f30`）
 
 > 审计日期：2026-11-06
-> 代码基线：`0737f30`（2026-11-05，`feat(topology): store opaque metadata and durable nodes`），`package.json` 版本 `0.10.0`
-> 文档基线：`docs/spatial-memory-library-design.md` 工作区版本（v0.5，未提交改动）；`docs/design-progress-0.9.0.md` 仅作为历史进度记录
+> 代码基线：`0737f30`（2026-11-05），`package.json` 版本 `0.10.0`
+> 文档基线：`docs/spatial-memory-library-design.md` 工作区版本（v0.5，未提交改动）
 > 审计范围：本仓库源码、测试、文档和包入口；只读源码审计 + 基线命令验证
 > 非审计范围：Curio 宿主仓库源码、真实 Minecraft Java 1.20.1 / mineflayer 联机运行
+
+> **本版范围澄清（2026-11-06 第二稿）**
 >
-> 本文回答“现在实际有什么、还缺什么、下一步怎么排”，不修改设计文档，也不把计划中的能力写成已完成。文中的完成度是**实现证据等级**的估算，不是测试覆盖率、发布门槛或真实游戏验收结论。
+> 本库的目标定位是**纯记忆库**：只负责**记录**和**查询**空间事实，**不涉及任何身体操作、动作派发或路线执行**。
+> LLM 选择技能，宿主执行器负责查询、规划、控制和执行；空间记忆库只保存事实并回答查询。
+>
+> 上一版审计按设计文档的完整目标（含导航/执行）评分约 62%。本版把**导航/执行层单列**，不计入纯记忆库完成度；纯记忆库按“记录 + 查询”重新评分。
+>
+> 当前包仍然是“记忆核心 + 可选导航/执行层”的混合体。本文既评估纯记忆库的完成度，也指出为落实该定位需要做的入口/模块拆分。
 
 ---
 
-## 0. 证据等级与判定规则
+## 0. 范围与结论
+
+### 0.1 纯记忆库的职责边界
+
+| 属于纯记忆库 | 不属于纯记忆库 |
+|---|---|
+| 记录观测到的方块状态、证据、时间、会话 | 扫描世界、监听 `blockUpdate`、自动建图 |
+| 记录历史路径、拓扑节点/边、传送证据、占用 | 选择目标、选择技能、选择岸边或载具 |
+| 记录资源锚点、容器位置、可达证据 | 保存或推断容器内的物品数量 |
+| 查询坐标、标签、名称、历史路线、当前证据 | 规划新路线、搜索路线、启动移动 |
+| 持久化已记录事实，恢复原始时间和证据 | 控制身体、调用 `moveTo/swimTo/dig/place` |
+| 返回结构化事实、缺口和“不能声称什么” | 自动救援、堵水、造船、挖放搭柱 |
+
+三条硬边界：
+
+1. **库不持有身体。** 没有 bot、按键、寻路器或执行器；不消费 `MoveExecutor`。
+2. **库不派发动作。** 不调用 `navigateTo`/`WalkRouteExecutor` 这类动作编排入口，也不提供身体动作端口作为核心 API。
+3. **库不自行观察。** 只接收宿主通过合法感知边界提供的 `Observation`/`ObservationBatch`；原始世界事件、墙后数据、声音线索都不能直接写入记忆。
+
+### 0.2 纯记忆库完成度
+
+| 口径 | 估算 | 说明 |
+|---|---:|---|
+| **纯记忆库（记录 + 查询 + 宿主适配 + 迁移 + 验收）** | **约 75%** | 本文主口径；区间 72%–78% |
+| 记忆核心（不含宿主适配、迁移权威切换、真实验收） | 约 82% | 数据/证据、拓扑、记录、持久化、查询面 |
+| 可选导航/执行层（不计入纯记忆库） | 约 45% | 仅同高 walk 可编排；其余模式未执行 |
+| 若按完整设计（含导航/执行） | 约 62% | 上一版口径，保留用于对比 |
+
+**一句话：** 纯记忆库的核心已经基本可用；当前包多了一层导航/执行编排，需要拆分；真正把它当作“地图记忆库”接入时，最缺的是**感知适配层、统一查询面、宿主记录策略和迁移收口**。
+
+### 0.3 当前最小可用闭环
+
+- 宿主把合法观测写入 `VoxelMap`。
+- 宿主把走过的位置标记为 `traversed`，把历史路线保存为 `FragmentStore`。
+- 宿主/执行器查询坐标、标签、历史路线、当前证据。
+- 宿主显式 `checkpoint()` 写入 SQLite；重启后事实恢复为 `STALE`。
+
+这个闭环**不需要库控制身体**，也不需要库规划路线。
+
+---
+
+## 1. 证据等级与判定规则
 
 | 等级 | 含义 | 本文如何标注 |
 |---|---|---|
@@ -18,125 +66,98 @@
 | 已实现未验证 | 源码存在，逻辑可读，但没有真实游戏或宿主验收 | “已实现未验证” |
 | 仅类型或声明 | 只有类型、接口或能力表，没有运行时入口 | “仅类型/声明” |
 | 缺失 | 没有公开入口，也没有可替代的运行时路径 | “缺失” |
-| 阻塞外部 | 需要 Curio/游戏先满足前置条件，本库无法单独完成 | “阻塞外部” |
+| 阻塞外部 | 需要 Curio/游戏先满足前置条件 | “阻塞外部” |
 
-四条硬规则：
+判定规则：
 
-1. **源码存在 ≠ 可执行 ≠ 已联机验证。** 本文分开写“实现了什么”和“能实际做什么”。
-2. **`geometry_only` ≠ 可导航。** 陆地/水面验证器的结果携带 `assurance: 'geometry_only'`、`executable: false`，不能当成执行能力。
-3. **dry-run ≠ 迁移完成。** SQLite 的旧数据迁移目前只有离线演练，没有 JSON→SQLite 权威源切换。
-4. **单测通过 ≠ 真实世界通过。** 导航身体、感知、物理、碰撞和流体规则均由调用方注入；测试中的执行器是 Fake。
-
----
-
-## 1. 执行摘要
-
-**总体完成度约 62%（区间 60%–65%）。** 这是“按设计文档端到端目标”的估算。若只看数据、证据、拓扑、动态更新和持久化这些库内核心，完成度约 **84%**；把首版 walk 导航和结果接缝也算进来，约 **73%**。
-
-| 判断 | 结论 |
-|---|---|
-| 最强的部分 | 观测/证据模型、稀疏体素地图、拓扑历史、SQLite 单 Worker 持久化 |
-| 最弱的部分 | 真实宿主接入、非 walk 移动模式执行、完整导航参数面、迁移权威切换 |
-| 已经可用的最小闭环 | 内存地图 + 同高单格 walk 搜索/复验/执行 + SQLite 显式 checkpoint，全部由调用方提供感知、身体和搜索环境 |
-| 当前最大阻塞 | `src/adapter/` 只有类型契约，没有 mineflayer/Curio 运行时适配；真实联机验收为零 |
-| 外部硬门槛 | Curio 的基础移动元语（设计 §10.3 M0/M1）必须先修复并独立核验；在此之前不应开始 M2 真实 walk 接线和联机排查 |
-| 一句话 | **数据底座已相当完整，但“陆地 + 水面全模式导航”和“真实 Curio 接线”还没有闭环。** |
-
-现有 `docs/design-progress-0.9.0.md` 对 §3–§9 自评约 90%，但那是“0.9.0 已声明支持子集”的完成度，不是设计文档完整目标的完成度。例如 §7 只执行同高 walk，而设计范围还包括跳跃、台阶、梯子、下落、游泳和已乘船。
+1. **源码存在 ≠ 可查询。** 只有公开入口、作用域校验和返回结构完整，才算“可查询”。
+2. **`geometry_only` ≠ 可执行。** 陆地/水面验证器只回答几何事实，不控制身体。
+3. **dry-run ≠ 迁移完成。** SQLite 旧数据迁移目前只有离线演练。
+4. **查询不等于动作。** 纯函数验证、历史路线查询、锚点查询属于查询；搜索新路线、启动移动、驱动执行器属于导航/执行，不计入纯记忆库。
+5. **单测通过 ≠ 真实世界通过。** 测试中的感知、身体、物理和流体规则都是 Fake/调用方注入。
 
 ---
 
-## 2. 评分口径
-
-评分锚点：
-
-| 分数段 | 含义 |
-|---:|---|
-| 90–100 | 设计要求基本覆盖，离线验证充分，仍有真实环境未验 |
-| 75–89 | 主体实现，边界清晰，缺少部分模式或集成 |
-| 60–74 | 核心构件存在，但关键路径不完整或依赖外部 |
-| 40–59 | 只有部分入口/几何验证，不能声称完整能力 |
-| 20–39 | 类型、声明或局部工具，没有端到端路径 |
-| 0–19 | 缺失或仅有远期设计 |
+## 2. 评分口径与结果（纯记忆库）
 
 | 领域 | 权重 | 估算分 | 加权 | 置信度 | 主要依据 |
 |---|---:|---:|---:|---|---|
-| A 数据/证据（§3–§4） | 20 | 88 | 17.6 | 中 | Observation、CellEvidence、Palette、位图、revision、ChangeReport |
-| B 拓扑/历史（§5） | 12 | 85 | 10.2 | 中 | FragmentStore、边验证、portal、锚点、占用、合并拆分 |
-| C 动态更新（§6） | 10 | 78 | 7.8 | 中 | 差分、局部失效、在途撤销、TTL；宿主接线与队列未闭环 |
-| D 导航/执行（§7） | 20 | 45 | 9.0 | 高 | 仅同高单格 walk 可执行；其余模式是几何验证或显式拒绝 |
-| E 持久化/迁移（§9） | 13 | 80 | 10.4 | 中 | 真 SQLite Worker、checkpoint、增量、驻留；迁移仅 dry-run |
-| F 适配/宿主接入（§2） | 15 | 18 | 2.7 | 低 | 只有 `WorldAdapter` 类型；无运行时桥 |
-| G 心智接缝（§8） | 5 | 65 | 3.25 | 低–中 | NavResult/problem/ActionRecord 有；宿主映射和注册未接 |
-| H 验收（§10–§11） | 5 | 30 | 1.5 | 低 | 离线测试强；真实 Java/多人/流体验收为零 |
-| **合计** | **100** |  | **62.45 ≈ 62** |  |  |
+| A 数据/证据 | 25 | 88 | 22.0 | 中 | Observation、CellEvidence、Palette、位图、revision、ChangeReport |
+| B 拓扑/历史 | 15 | 85 | 12.75 | 中 | FragmentStore、边验证、portal、锚点、占用、合并拆分 |
+| C 动态更新/记录 | 10 | 78 | 7.8 | 中 | 差分、局部失效、在途撤销、TTL；宿主接线与队列未闭环 |
+| E 持久化/迁移 | 18 | 80 | 14.4 | 中 | 真 SQLite Worker、checkpoint、增量、驻留；迁移仅 dry-run |
+| F 感知适配 | 10 | 30 | 3.0 | 低 | 有 `ObservationBatch` 契约；没有运行时感知适配器 |
+| G 查询面/兼容 | 12 | 75 | 9.0 | 中 | 节点/图/历史路线/锚点可查；容器内容不在库内；查询入口分散 |
+| H 记忆验收 | 10 | 60 | 6.0 | 低 | 离线测试强；真实宿主感知、会话、持久化验收未做 |
+| **合计** | **100** |  | **74.95 ≈ 75** |  |  |
 
 派生结论：
 
-- **库内核心（A+B+C+E）**：46.0 / 55 ≈ **84%**。
-- **含导航与接缝（A+B+C+D+E+G）**：58.25 / 80 ≈ **73%**。
-- **端到端（A–H）**：**约 62%，报告为 60%–65% 区间**。
+- **记忆核心（A+B+C+E+G）**：65.95 / 80 ≈ **82%**。
+- **纯记忆库整体（A–H）**：**约 75%，报告为 72%–78% 区间**。
+- **可选导航/执行层**：不在上述分母内；当前约 45%。如果把它也算进来，整体约 62%（上一版口径）。
 
 评分的两个限制：
 
-1. 分数是“实现证据等级”，不是“测试覆盖率”，也不是“发布就绪度”。
-2. F/G/H 的置信度低，因为本库没有真实宿主；这三项应作为风险区间看，不应作为精确 KPI。
+1. 分数是“实现证据等级”，不是测试覆盖率或发布门槛。
+2. F/H 的置信度低，因为本库没有真实宿主感知和真实持久化生命周期验收。
 
 ---
 
-## 3. 设计章节完成度对照
+## 3. 按“纯记忆库”要求的能力矩阵
 
-| 设计章节 | 状态 | 已经落地 | 主要缺口 / 不能声称 |
+| 能力要求 | 纯记忆库应提供 | 当前状态 | 现有入口 / 证据 | 主要差距 |
+|---|---|---|---|---|
+| **查询资源** | 按标签/名字查资源锚点、精确位置、观测时间、可达/历史连接证据 | 部分可用 | `TopologyStore.nodes({ tag, label })`；`SpatialMemoryStore.recordNode`/`graph`/`displayNodes`；`SpatialNode.tag` 含 `resource`/`base`/`danger` 等 | 没有自动资源发现；`SpatialMemoryStore` 没有专门的 `findResource`/`findByTag` 便捷方法 |
+| **查询容器** | 容器位置锚点、最后确认存在、精确坐标、可达证据 | 部分可用 | 可把容器记为 `SpatialNode`（`label`/`metadata` 不透明）；`recordNode`/`graph` 可查 | **不保存容器内容/数量/空槽**；容器内容按设计与 `CLAUDE.md` 归宿主精确账本；`src/compat/legacy.ts` 的 chest 结构只用于迁移读取 |
+| **查询可行路线** | 查历史路线、当前证据是否支持通行、路线是否被阻塞 | 部分可用 | `FragmentStore`、`TopologyStore.route`、`routeInspection`、`segments`、`components`、`edgeRuntime`；`evaluateWalkStep`/`TraversabilityCache` 作为派生查询 | 只覆盖同高 walk 的当前证据；历史 `route()` 不证明现在可走；没有通用三维/水陆路径查询 |
+| **走过的地方存地图** | 宿主写入实际观测；库记录遍历历史、路径片段和持久化 | 机制有，未自动接线 | `observe`/`observeBatch`、`markTraversed`/`markModified`、`saveFragment`、`checkpoint` | 库不扫描、不跟随 bot；`navigateTo` 不自动写库；宿主必须在感知循环和实际走过后显式调用 |
+| **不涉及动作** | 核心 API 不持有身体、不派发动作、不启动移动 | 当前包不满足 | 核心记忆 API 本身可独立使用；但包入口同时导出 `navigateTo`、`WalkRouteExecutor`、`MoveExecutor`、`WorldAdapter.moveTo/swimTo/dig/placeBlockAt` | 需要把导航/执行层拆到可选入口或独立包 |
+
+---
+
+## 4. 设计章节对照（按纯记忆库重新定界）
+
+| 设计章节 | 对纯记忆库的意义 | 状态 | 说明 |
 |---|---|---|---|
-| §1 原则与边界 | 已落实到模块边界 | 库不选目标、不自动施工、不接管救援；`nav` 只消费调用方环境 | 宿主是否遵守同一授权链，需 Curio 侧核验 |
-| §2.1 `WorldAdapter` | 仅类型/声明 | `state`、`observeBatch`、`capabilities`、`moveTo`、`swimTo`、`dig`、`placeBlockAt`、`subscribe` 类型齐备（`src/adapter/types.ts`） | 没有任何运行时实现；类型存在不等于已接 mineflayer |
-| §2.2 Curio 接口对照 | 阻塞外部 | 设计记录了旧入口、`SkillResult`、仲裁链与参数映射 | 本仓库没有 Curio 桥；`data.nav` 映射、动作注册、嵌套、恢复均未接 |
-| §2.3 当前快照 | 文档落后于代码 | 设计头部仍称 SQLite 未完成，实际已有 SQLite Worker | 以本文和当前源码为准；不要据旧头部判断实现缺失 |
-| §3.1 历史几何 | 已验证离线 | `FragmentStore`、`PathFragment`、traversal evidence、links、bridge 来源 | 自动发现、旧记录迁移仍由宿主/后续批次负责 |
-| §3.2 当前观测状态 | 已验证离线 | `Observation` 的来源/证据/完整性/时间/会话/gap、`CellEvidence` 新鲜度与 `validUntil`、严格校验（`src/observation/`） | `sequence` 已校验但未用于写入排序；`risk` 位从不写入 |
-| §3.3 通行性 | 已实现未验证 | 四态、方向/模式/身体上下文、跨 Section 依赖、支撑/净空、hazard、TTL（`src/traversability/`） | 执行器只支持同高 walk；step/drop/jump/ladder 只是几何验证 |
-| §3.4 水与岩浆 | 已实现未验证 | 水面游泳与已乘船几何验证、流体/含水/气泡柱证据、`geometry_only`（`src/water/`） | 没有游泳/船执行器；不能把“几何可通过”写成“能游过去” |
-| §4 稀疏存储 | 已验证离线 | Section/Palette/位打包、负坐标、`explored/traversed/stale/modified`、逐格 revision、LRU/Pin（`src/voxel/`） | `risk` 位图是空转索引；自动 TTL 清扫器由调用方负责 |
-| §5 拓扑与垂直连接 | 已验证离线 | 节点/边、方向×模式验证、portal 独立图、占用 TTL、锚点、碎片合并/拆分（`src/topology/`） | `SpatialEdge` 是 `TopologyEdge` 的有损投影；容器内容仍归宿主精确账本 |
-| §6 动态更新 | 已实现未验证 | 观测差分、局部失效、执行器在途撤销、ChangeReport（`src/voxel/`、`src/execution/`） | `ObservationQueue` 未接入 `VoxelMap`；`TransientOccupancy` 未组合进 store；宿主必须手动转发 ChangeReport |
-| §7 导航接口 | 部分实现 | `navigateTo`、`followKnownPath`、`inspectRoute`/`inspectKnownRoute`、`frontierCandidates`（`src/navigation/`） | 只执行同高单格 walk；`near`/`reach_block`、挖/放/搭柱/材料/`avoid`/frontier 全部拒绝；`recall_route` 缺失 |
-| §8 心智接缝 | 部分实现 | `NavResult`、结构化 `NavProblem`、语义 `message`、`ActionRecord`、能力表（`src/navigation/`） | 宿主 `SkillResult.data.nav` 映射、动作注册、仲裁/嵌套/恢复未接；`ActionRecord` 不自动落库 |
-| §9 持久化 | 大部分实现 | 单 Worker、WAL、事务、checkpoint ACK、增量 Section、WorkingSet、journal/账本、schema v7（`src/storage/sqlite/`） | JSON→SQLite 仅 dry-run；无权威源切换；无 Minecraft 游戏版本列；无自动保存（当前策略是显式 checkpoint） |
-| §10 阶段 1–6 | 部分完成 | 阶段 2 库内完成；阶段 3 首版 walk；阶段 4 大部分；阶段 5 部分 | 阶段 1 感知接入、阶段 6 学习/真实联机验收未完成 |
-| §11 必测场景 | 部分覆盖 | 负坐标、局部失效、墙体对照、会话、持久化等大量离线用例 | 真实 Java 1.20.1、多人、流体、断线重连、取消仲裁为零 |
-| §12 范围取舍 | 遵守 | 不包含飞行/鞘翅/水下三维导航；没有把水/岩浆写成永久禁止 | 真实游戏行为仍需联机验收 |
+| §1 原则与边界 | 核心约束 | 已落实 | 库不选目标、不自动施工、不接管救援 |
+| §2.1 `WorldAdapter` | 只应保留感知输入；身体/动作端口属于宿主 | 需拆分 | 当前 `WorldAdapter` 混合 `observeBatch/subscribe` 与 `moveTo/swimTo/dig/placeBlockAt`；纯记忆库只需前者 |
+| §2.2 Curio 接口对照 | 宿主适配，不是库核心 | 阻塞外部 | 没有 Curio 桥；`SkillResult.data.nav`、动作注册、仲裁链不属于纯记忆库 |
+| §3.1 历史几何 | 记录历史路径与遍历证据 | 已验证离线 | `FragmentStore`、`PathFragment`、traversal evidence |
+| §3.2 当前观测状态 | 记录观测与证据 | 已验证离线 | `Observation`、`CellEvidence`、`ObservationGap`、严格校验 |
+| §3.3 通行性 | 派生查询：当前证据是否支持一步通行 | 部分实现 | 四态、依赖、支撑/净空、hazard；只覆盖同高 walk |
+| §3.4 水与岩浆 | 记录流体/含水/气泡柱事实；派生几何查询 | 部分实现 | `src/water/` 是几何验证，`geometry_only`、不可执行 |
+| §4 稀疏存储 | 核心存储 | 已验证离线 | Section/Palette/位图/revision/LRU/Pin |
+| §5 拓扑与垂直连接 | 核心记录/查询 | 已验证离线 | 节点/边/portal/占用/锚点/合并拆分；容器内容仍归宿主 |
+| §6 动态更新 | 记录差分与局部失效 | 已实现未验证 | 差分、ChangeReport、在途撤销；`ObservationQueue` 未接入，宿主需手动转发 |
+| §7 导航接口 | **不属于纯记忆库** | 可选/排除 | `navigateTo`、`WalkRouteSearch`、`WalkRouteExecutor` 属于可选导航层；`recall_route` 缺失 |
+| §8 心智接缝 | 只读查询/稳定引用属于记忆库；动作结果映射属于宿主 | 部分实现 | `NavResult`/`ActionRecord` 存在，但动作注册与 `SkillResult` 映射不在纯记忆库 |
+| §9 持久化 | 核心持久化 | 大部分实现 | SQLite Worker、checkpoint、增量、驻留；迁移仅 dry-run |
+| §10 阶段 1–6 | 阶段 1–2、5 属于记忆库；阶段 3/6 的动作部分不属于 | 部分完成 | 感知接入未做；库内地图/持久化已做；导航/执行未闭环 |
+| §11 必测场景 | 记忆相关场景属于本库；导航/联机执行属于宿主/可选层 | 部分覆盖 | 离线记忆测试较强；真实感知/宿主验收为零 |
+| §12 范围取舍 | 纯记忆库进一步收窄 | 需修订 | 设计中的 L2 导航原语应标注为可选层或宿主职责 |
 
 ---
 
-## 4. 已落地能力
+## 5. 已落地能力（纯记忆库核心）
 
-### 4.1 观测与证据
+### 5.1 观测与证据
 
-`src/observation/` 已实现设计 §3.2 的核心字段：`source`（`vision/agent_action/local_rescan`）、`evidence`（`seen/contact/confirmed_effect`）、`stateComplete`、`observedAt`、`worldId/dim/sessionId`、`originObservationId`、`sequence`、可选 `actionId`，以及 `ObservationGap` 的未观察原因。边界校验要求 `agent_action` 必须配 `confirmed_effect` 和 `actionId`，不能凭时间接近归因。
+`src/observation/` 已实现 `Observation` 的 `source`、`evidence`、`stateComplete`、`observedAt`、`worldId/dim/sessionId`、`originObservationId`、`sequence`、可选 `actionId`，以及 `ObservationGap` 的未观察原因。边界校验要求 `agent_action` 必须配 `confirmed_effect` 和 `actionId`。
 
 已验证离线：来源/证据约束、gap、批次原子性、队列容量与字节上限、恢复后 STALE。
 
-未闭环：`ObservationQueue` 是独立有界工具，未被 `VoxelMap` 消费；顺序仍按 `observedAt`，`sequence` 未参与写入排序。
+未闭环：`ObservationQueue` 未被 `VoxelMap` 消费；顺序按 `observedAt`，`sequence` 未参与写入排序。
 
-### 4.2 稀疏体素地图
+### 5.2 稀疏体素地图
 
 `src/voxel/voxel-map.ts` 已实现 Section/Palette/位打包、负坐标、`explored/traversed/stale/modified/risk` 位图、逐格 `CellEvidence`、内容 revision、局部 `ChangeReport`、会话隔离、过期判断、手动驻留、LRU/Pin。
 
 已验证离线：负坐标、位宽扩容、已知空气与未知区分、重复确认只刷新时间、同名属性变化、历史位不推进内容 revision、恢复为 STALE。
 
-未闭环：`risk` 位从未被写入；`markStale` 是整维度粒度；没有自动 TTL 清扫器（评估器在读取时检查 `validUntil`）。
+未闭环：`risk` 位从未写入；`markStale` 是整维度粒度；没有自动 TTL 清扫器（查询时检查 `validUntil`）。
 
-### 4.3 通行性、陆地与水面验证
-
-- `src/traversability/step.ts`：四态、连续支撑、身体 AABB 扫掠、头部净空、证据会话/完整性/过期、跨 Section 依赖、`HazardFact`、`contextKey`。**只支持 `walk`，同高、±1 沿 X 或 Z。**
-- `src/traversability/land-transition.ts` / `land-route.ts`：`step/drop/jump/ladder` 的几何验证，支持注入版本化 `LandMotionModel` / `ClimbRegionProvider`；结果固定 `assurance: 'geometry_only'`、`executable: false`。
-- `src/water/verify.ts`：`surface_swim` 与 `mounted_boat` 两套几何验证，检查碰撞、净空、呼吸空间、水面带、证据新鲜度；同样不可执行。
-
-已验证离线：碰撞/支撑/净空边界、跨 Section 依赖、版本失效、预算、流体/含水/气泡柱、船体与乘员几何。
-
-未闭环：没有 step/drop/jump/ladder/swim/boat 的执行器；`navigateTo` 会拒绝这些模式。
-
-### 4.4 拓扑与历史
+### 5.3 拓扑与历史
 
 `src/topology/` 已实现 `FragmentStore`、`TopologyStore`、方向/模式分别验证的边、独立 portal 图、`TransientOccupancy`、碎片连通分量/合并、可达分量内的 surface/deepest 锚点、`recordNode`/`markGone`/`goneNear`。
 
@@ -144,32 +165,32 @@
 
 未闭环：`SpatialEdge` 是 `TopologyEdge` 的有损投影；容器内容、床/熔炉/农田语义仍归宿主精确账本；自动锚点发现由宿主观察驱动。
 
-### 4.5 导航与受控执行
+### 5.4 查询面
 
-- `navigateTo`：校验原请求 → 读取实测起点 → 有界 `WalkRouteSearch` → `WalkRouteExecutor` 逐段复验 → 实测到达。`ARRIVED` 要求 `confirmed: true`、实测 `lastPosition` 精确满足原目标、存在对应 `lastObservation`。
-- `followKnownPath`：按 `pathId`/`fragmentId` 选择单个历史 fragment，只有 `drive: true` 才驱动执行器；同高、单轴、精确到达。
-- `inspectRoute` / `inspectKnownRoute` / `frontierCandidates`：只读投影，不移动、不观察、不 pin、不保存。
-- `WalkRouteExecutor`：每段要求当前 `OPEN` 证据，接受实测样本并校验 executionId/sequence，依据变化时撤销在途段，取消只清理本执行。
-- `MoveExecutor`：只有 `move` / `stop`，没有挖、放、搭柱、游泳、船。
+当前可查询：
 
-已验证离线：实测到达、无假到达、预算耗尽、取消/超时保留位置、PARTIAL 分段、执行关联、在途失效、旧回调隔离。
+- `sectionAt` / `graph` / `displayNodes` / `fragments` / `edgesDetailed` / `edgeRuntime` / `portalEdges`。
+- `TopologyStore.nodes({ dim, source, tag, label, after, limit })`，支持按资源/基地/危险等标签和名字分页过滤。
+- `SpatialMemoryStore.route` / `routeInspection` / `segments` / `components` / `surfaceAnchor` / `deepestAnchor` / `fragmentation`。
+- `evaluateWalkStep`/`TraversabilityCache` 作为当前通行证据的派生查询。
+- `inspectRoute`/`inspectKnownRoute` 只读投影（如果保留可选导航层）。
 
-未闭环：`recall_route` 没有公开入口；`near`/`reach_block` 不支持；授权挖/放/搭柱/材料/`avoid` 只拒绝不执行；真实身体仍是 Fake。
+未闭环：没有统一的 `findResource`/`findContainer`/`queryRoute` 便捷 API；容器内容不保存；查询入口分散在 `SpatialMemoryStore`、`TopologyStore` 和可选导航模块。
 
-### 4.6 SQLite 持久化
+### 5.5 SQLite 持久化
 
 - 单个 `better-sqlite3` Worker 独占连接，WAL、事务、短批量；`checkpoint()` 是唯一显式保存触发。
 - 表覆盖 `spatial_sections`、`path_fragments`、`spatial_nodes`、`spatial_edges`、`spatial_events`、`action_records`、`placed_blocks`、`chunk_visits`、`portal_traversals`，并有 schema v1→v7 迁移。
 - 体素载荷是 Palette + 位打包 + 位图 + 紧凑逐格元数据；增量 checkpoint 只写脏 Section；缺失 key 不会被当作删除。
 - 恢复时保留原始观测时间，FRESH 证据恢复为 STALE；加载旧快照不能覆盖新观测。
 - `WorkingSetManager` 支持按需加载、临时 pin 租约、只淘汰已提交/干净/未 pin 的 Section。
-- 旧数据迁移只做离线 dry-run：保留 ID、字段、计数、顺序、原始时间和 LRU 序号；不做权威切换，也不宣称真实用户数据已迁移。
+- 旧数据迁移只做离线 dry-run：保留 ID、字段、计数、顺序、原始时间和 LRU 序号；不做权威切换。
 
 已验证离线：真实 SQLite Worker、checkpoint ACK、重启恢复、增量保存、驻留/淘汰、WorkingSet、ledger/journal、迁移演练。
 
 未闭环：JSON→SQLite 权威切换、旧写入路径移除、landmark/travel endpoint 的正式迁移、Minecraft 游戏版本列、自动保存/宿主生命周期接线（当前策略是显式 checkpoint）。
 
-### 4.7 打包与测试
+### 5.6 打包与测试
 
 - 包入口：`.`、`./storage/sqlite`、`./water`；ESM + 声明；`better-sqlite3` 为可选 peer。
 - 本轮实际执行（2026-11-06）：
@@ -180,149 +201,181 @@
 
 ---
 
-## 5. 缺口清单
+## 6. 缺口清单（纯记忆库）
 
-### P0：影响“能否实际使用”的阻塞项
+### 6.1 P0：影响“作为记忆库可用”的阻塞项
 
 | # | 缺口 | 现状证据 | 影响 | 不能声称 |
 |---|---|---|---|---|
-| P0-1 | 没有运行时 `WorldAdapter` / Curio 桥 | `src/adapter/` 只有 `types.ts`/`index.ts`；没有 mineflayer 导入或适配实现 | 库无法自行获取感知、无法驱动真实身体 | “已接入 mineflayer/Curio” |
-| P0-2 | 只执行同高、单轴、单格 walk | `src/traversability/step.ts` 只接受 `mode: 'walk'`；`navigate.ts` 拒绝其他模式 | 设计范围内的跳跃、台阶、梯子、下落、游泳、船都不可执行 | “陆地+水面导航已实现” |
-| P0-3 | 导航参数面不完整 | `navigateTo` 显式拒绝 `near`/`reach_block`、挖/放/搭柱/材料/`avoid`/frontier；“`recall_route`”无公开函数 | 只能完成“同高精确脚格 walk”，不能覆盖设计 §7 的完整委托 | “`navigate_to` 全契约已实现” |
-| P0-4 | 迁移只有 dry-run | `src/compat/migration-dry-run.ts` 明确不切权威源、不删旧写入路径 | 旧 JSON 数据不能正式迁入 SQLite | “SQLite 迁移完成” |
+| P0-1 | 没有运行时感知适配器 | `src/adapter/types.ts` 有 `observeBatch`/`subscribe` 契约；没有 mineflayer/Curio 实现 | 库无法自行获得观测；宿主必须自己写适配 | “已接入 mineflayer/Curio” |
+| P0-2 | 核心入口混合了动作 API | `src/index.ts` 同时导出记忆、拓扑、`navigateTo`、`WalkRouteExecutor`、`MoveExecutor`、`WorldAdapter.moveTo/swimTo/dig/placeBlockAt` | 纯记忆库的边界不清晰，消费者容易误用动作编排 | “这是纯记忆库” |
+| P0-3 | 没有统一的资源/容器/路线查询面 | 资源可用 `TopologyStore.nodes({tag,label})`，路线可用 `route`/`fragments`，但没有统一的记忆查询入口；容器内容不在库内 | 查询需要了解多个模块；容器内容无法从库获得 | “库能查询容器内容” |
+| P0-4 | 迁移只有 dry-run | `src/compat/migration-dry-run.ts` 明确不切权威源、不删旧写入路径 | 旧 JSON 记忆不能正式迁入 SQLite | “SQLite 迁移完成” |
+| P0-5 | “走过即存图”没有自动接线 | `observe`/`markTraversed`/`saveFragment` 都是显式调用；`navigateTo` 不自动写库 | 宿主必须自己接感知和遍历记录；否则地图不会自动增长 | “接入后自动建图” |
 
-### P1：影响正确性、可观测性或集成调试的缺口
+### 6.2 P1：影响记录正确性、查询可观测性或持久化的缺口
 
 | # | 缺口 | 现状证据 | 影响 | 不能声称 |
 |---|---|---|---|---|
 | P1-1 | `ObservationQueue` 未接入 `VoxelMap` | 队列只被导出，没有运行时消费方 | 感知批次背压、字节预算和单次处理量没有形成闭环 | “有界感知管线已接通” |
 | P1-2 | `risk` 位图从不写入 | `VoxelMap` 初始化/读取/持久化 `risk`，但没有写入路径 | 风险索引是空转位图；实际风险只走 `HazardFact` | “风险索引已生效” |
-| P1-3 | `TransientOccupancy` 未组合进 store | 占用模块独立，search/executor 不查询 | `NavProblem.kind: 'occupied'` 声明存在但不会产生 | “玩家/实体占位已参与导航” |
-| P1-4 | 导航细节契约不完整 | `cancellationOrigin` 在执行路径被硬编码为 `agent`；非法环境配置抛异常而非结构化 `NavProblem`；`navigateTo` 不暴露 `bodyArrival` | 取消来源、稳定到达和错误分型在真实宿主中可能失真 | “取消/到达/错误契约已全部贯通” |
-| P1-5 | `ActionRecord` 不自动持久化 | `navigateTo` 返回 `record`，但 journal 落库由宿主调用 | 导航经历需要宿主额外接线才能保存 | “每次导航已自动落库” |
-| P1-6 | 持久化载荷没有游戏版本列 | 载荷有 `v:2`，DB 有 schema 版本；没有 Minecraft 游戏版本 | 跨版本恢复/解释缺少显式标记 | “版本化载荷已覆盖游戏版本” |
+| P1-3 | `TransientOccupancy` 未组合进 store | 占用模块独立，查询不经过 store | 临时占位查询需要单独接线 | “玩家/实体占位已作为记忆查询的一部分” |
+| P1-4 | `sequence` 未用于写入排序 | 校验存在，写入顺序按 `observedAt` | 同一时间戳的批次顺序语义不完整 | “接收顺序已严格保证” |
+| P1-5 | 持久化载荷没有游戏版本列 | 载荷有 `v:2`，DB 有 schema 版本；没有 Minecraft 游戏版本 | 跨版本恢复/解释缺少显式标记 | “版本化载荷已覆盖游戏版本” |
+| P1-6 | `markStale` 是整维度粒度 | `markStale(dim, reason)` 按维度失效 | 不能只让某个 Section/区域过期 | “支持逐 Section 会话失效” |
 
-### P2：文档、打包与次要语义问题
+### 6.3 P2：文档、打包与次要语义问题
 
 | # | 缺口 | 现状证据 | 影响 |
 |---|---|---|---|
 | P2-1 | 文档/版本漂移 | 设计头部仍说 SQLite 未完成；README 写 0.9.0，`package.json` 是 0.10.0；仓库内 tgz 是 0.7.4；acceptance runner 仍写 0.7.6 | 读者容易误判当前状态 |
 | P2-2 | `compat` 未从包入口导出 | `package.json` exports 只有 `.`、`./storage/sqlite`、`./water`；`src/index.ts` 不导出 `src/compat/*` | README 宣称的迁移 dry-run 对包消费者不可达 |
-| P2-3 | 打包验收可能受 LICENSE 影响 | `acceptance/run.mjs` 预期非 dist 入包项为 `package.json` + `README.md`；根目录已新增 `LICENSE`，npm 通常总是收录 | 需要实际跑一次 pack 验收确认；本文未执行 |
-| P2-4 | 源码注释过期 | 例如 `topology-store.ts` 仍称 PORTAL/cross-dimension 在本阶段被拒绝（实际是步行边 API 拒绝，独立 portal API 已支持）；`spatial-memory-store.ts` 仍称 `portalEdges` 不支持，但该方法已实现 | 维护者容易被误导 |
+| P2-3 | 打包验收可能受 LICENSE 影响 | `acceptance/run.mjs` 预期非 dist 入包项为 `package.json` + `README.md`；根目录已新增 `LICENSE` | 需要实际跑一次 pack 验收确认；本文未执行 |
+| P2-4 | 源码注释过期 | `topology-store.ts` 仍称 PORTAL/cross-dimension 在本阶段被拒绝（实际是步行边 API 拒绝，独立 portal API 已支持）；`spatial-memory-store.ts` 仍称 `portalEdges` 不支持，但方法已实现 | 维护者容易被误导 |
 | P2-5 | 水面预算语义与陆地不一致 | 水验证预算耗尽报 `UNSUPPORTED/budget_exceeded`，陆地为 `INCOMPLETE` | 调用方需要分别处理；不是世界事实 |
+| P2-6 | 容器内容/资源语义没有明确的宿主接口 | 库只存锚点；宿主精确账本没有在本仓库定义查询契约 | 若 Agent 要查“箱子里有什么”，需要宿主提供单独接口 |
 
-**关于“自动保存”的说明：** 设计 §9.2 要求的是有界队列、保存确认、正常关闭 flush/close；当前选择“显式 `checkpoint()`”是策略，不是核心缺陷。问题在于宿主生命周期必须明确调用，且当前审计没有验证杀进程/异常退出场景。
+### 6.4 不属于纯记忆库的缺口（可选导航/执行层）
 
----
+以下问题不计入纯记忆库完成度，只影响可选的导航/执行能力：
 
-## 6. Curio 前置门槛：为什么先修基础移动，再接线
-
-设计 §2.6 已明确：不能把现有 `moveTo`（Pathfinder 自行寻路、可能清树叶、可能隐藏绕路）直接当作库的段执行器。设计 §10.3 也把 M0/M1 放在 M2 之前。当前项目判断与此一致：**Curio 的基础移动元语仍需完整修复；在它稳定完成基本移动前，真实接线和联机调试会把宿主问题与库问题混在一起。**
-
-本文**不审计 Curio 源码**，以下状态统一标为“待 Curio 仓库独立核验”，不能据本库审计判定已通过。
-
-### 6.1 M0：委托、目标与结果
-
-- [ ] 原请求、解析后的目标、完成条件、父期限一起保存；后续转头/补块/重试不能重新解释相对目标。
-- [ ] 取消/超时保留最后实测位置、已确认的部分效果和原作用域。
-- [ ] 父任务取消与单段取消能组合；`stop(executionId)` 只清理所属动作。
-- [ ] 新 `taskId`/`planVersion` 不重置已走高度、耗材、累计进展和剩余时限。
-- [ ] 失败/取消结果能区分“真实障碍、未知/过期、搜索预算、能力缺口、授权不足”。
-
-### 6.2 M1：基础身体与地形操作
-
-- [ ] 绝对/相对目标语义统一；纯 `step` 不默认补坑、不隐式耗材。
-- [ ] 支撑顶面与脚格分开；半砖、床、耕地等不被取整成整格；头部/侧上方净空按实际形状检查。
-- [ ] 绝对 `dig` 不被重解释；错物放置不再成功；未授权时零耗材、不清树叶、不挖头顶。
-- [ ] 平走、上/下一级台阶、指定下降、梯子等基本转换在真实服务器上可稳定完成。
-- [ ] 显式挖/放/搭柱仍可自由组合，且授权、材料额度、取消和部分效果贯穿执行链。
-- [ ] 动作归属（action epoch/所有权）稳定，旧回调不能清掉新动作。
-
-### 6.3 接线门禁
-
-| 门禁 | 必须满足 | 证据 | 当前状态 |
-|---|---|---|---|
-| G0 | Curio M0/M1 通过 | Curio 仓库的离线测试 + 真实服务器动作轨迹 | 待外部核验 |
-| G1 | 库侧 Fake 适配契约通过 | `WorldAdapter`/`MoveExecutor` conformance 测试 | 未开始 |
-| G2 | M2 首个真实同高 walk 闭环 | 真实 Java 1.20.1 短路线、实测到达、在途失效 | 阻塞于 G0/G1 |
-| G3 | 多人/流体/重连/取消场景 | 设计 §11 相关组 | 阻塞于 G2 |
-
-**规则：** G0 未通过前，不启动 G2 的联机排查；库侧 B0–B5 可按依赖并行推进。G0 通过后，也不要直接接完整 `navigateTo`，先用调用方给定的短同高路线验证 M2。
+- 只执行同高、单轴、单格 walk；`jump/step/drop/ladder` 只有几何验证。
+- `swim/boat` 只有几何验证，没有规划器/执行器。
+- `near`/`reach_block`、`recall_route`、授权挖/放/搭柱/材料/`avoid`/frontier 未实现或显式拒绝。
+- `navigateTo`/`WalkRouteExecutor`/`MoveExecutor` 会编排/驱动宿主动作；在纯记忆库中应移到可选层。
+- 真实 mineflayer/Curio 身体接入与联机验收。
 
 ---
 
-## 7. 下一步路线图
+## 7. 纯记忆库的保证与不保证
 
-### 7.1 依赖关系
+### 7.1 可以保证
+
+- **只记录有证据的格。** 未观察、遮挡、太暗、未加载、预算跳过都是缺口，不会写成空气。
+- **历史与当前分开。** `traversed`/历史路径不因当前堵塞删除；历史经过不证明现在可走。
+- **未知/过期不等于可通行。** `UNKNOWN`/`STALE` 不会被查询成 `OPEN`。
+- **查询无副作用。** 只读查询不移动、不转头、不扫描、不刷新观测时间、不改变持久化。
+- **作用域隔离。** `worldId`/`dim`/`sessionId` 在边界校验；旧会话证据不会污染新会话。
+- **持久化语义明确。** 显式 `checkpoint()` 后才算保存；恢复的 FRESH 证据变为 STALE；加载旧快照不会覆盖新观测。
+- **稳定 ID 与分页。** 节点/路径/边保留稳定 ID、坐标口径、分页和删除语义。
+
+### 7.2 不能保证
+
+- **完整世界覆盖。** 库只记录宿主给的观测，不保证知道没看见的区域。
+- **容器内容/库存。** 容器内容按设计归宿主精确账本，库只存位置锚点和可达证据。
+- **自动建图。** 库不扫描世界、不跟随 bot；需要宿主在感知循环中调用 `observe`。
+- **自动记录遍历。** 库不会因为身体移动自动 `markTraversed`/`saveFragment`；宿主必须显式调用。
+- **通用寻路。** 库不规划路线；可选导航层目前也只支持同高 walk。
+- **真实游戏验收。** 没有在真实 Java 1.20.1/mineflayer 环境中验证感知、持久化和访问。
+
+### 7.3 记录策略：`explored` 与 `traversed`
+
+- `explored`：本轮实际观察到的格，带方块状态和证据。
+- `traversed`：Agent 实际走过的格，只证明“经过”，不证明“那里是什么方块”。
+- `markModified`：只来自已确认的自身动作，且必须带 `actionId`。
+- 走过一个地方但没有观察到方块状态，不能据此重建地图；必须由宿主补充观测。
+- 记录“走过”的函数本身不是世界动作，但它的输入必须由宿主确认；库不会根据时间接近或位置变化猜归属。
+
+---
+
+## 8. Curio 依赖（按纯记忆库重新定位）
+
+### 8.1 纯记忆库需要 Curio 提供什么
+
+纯记忆库**不需要**身体控制、游泳/划船控制器、挖放授权或动作仲裁。它需要宿主提供：
+
+- 合法观测批次：`observeBatch` 只包含实际看见/接触的格和明确的未观察原因。
+- 会话与作用域：`worldId`、`dim`、`sessionId`、真实观测时间。
+- 实测位置/遍历事件：宿主确认走过哪些脚格，用于 `markTraversed`；不能用计划坐标或时间接近代替实测。
+- 生命周期：连接、断开、暂停、死亡、换维、重连；库据此隔离会话和标记 STALE。
+- 持久化调用：在合适时机调用 `checkpoint()`/`flush()`/`close()`。
+
+**结论：** 纯记忆库可以先于完整移动能力接入；但“走过路径”的记录必须等到 Curio 能稳定报告实测位置和动作归属，否则会写入错误的 traversed 证据。
+
+### 8.2 可选导航/执行层需要什么
+
+如果以后还要使用库内的 `navigateTo`/`WalkRouteExecutor`，则需要设计 §10.3 的门槛：
+
+- **M0**：原请求/解析目标/完成条件/父期限；取消/超时保留最后位置和部分效果；父/段取消组合；新 taskId 不重置进展、耗材和时间。
+- **M1**：绝对/相对目标语义；支撑顶面与净空；绝对 dig 不被重解释；错物放置修正；纯 step 不默认耗材；上下台阶/下降正确；无授权零耗材；显式挖放仍可组合。
+- **M2**：经仲裁的窄 `MoveExecutor`、实测采样、动作归属、单段范围、取消/限时；不转调无约束旧寻路。
+
+这些是**可选导航层**的门槛，不是纯记忆库的 P0。
+
+---
+
+## 9. 下一步路线图（memory-first）
+
+### 9.1 依赖关系
 
 ```mermaid
 flowchart LR
-    B0[B0 基线固化] --> B1[B1 契约 + Fake 驱动]
-    B1 --> B2[B2 感知/更新闭环]
-    B1 --> B3[B3 导航面补全]
-    B2 --> B4[B4 持久化收口]
-    B3 --> B4
-    B1 --> B5[B5 Curio 契约准备]
-    CURIO[Curio M0/M1 通过] --> B6[B6 首个真实 walk 闭环]
-    B2 --> B6
-    B3 --> B6
-    B5 --> B6
-    B6 --> B7[B7 模式与迁移扩展]
+    N0[N0 基线固化] --> N1[N1 范围冻结 + 入口拆分]
+    N1 --> N2[N2 感知适配 + 观测队列]
+    N1 --> N3[N3 统一查询面]
+    N2 --> N4[N4 记录策略 + 宿主生命周期]
+    N3 --> N4
+    N4 --> N5[N5 持久化与迁移收口]
+    N5 --> N6[N6 真实宿主记忆接入验收]
+    N6 --> N7[N7 可选导航层：walk 闭环]
+    CURIO[Curio M0/M1 通过] --> N7
+    N7 --> N8[N8 可选导航层：模式扩展与联机验收]
 ```
 
-### 7.2 批次表
+### 9.2 批次表
 
 | 批次 | 目标 | 依赖 | 主要交付 | 退出条件 |
 |---|---|---|---|---|
-| B0 | 固化基线 | 无 | 记录 HEAD/版本、真实测试结果、已知环境噪声 | 本文已记录；后续变更沿用同一口径 |
-| B1 | 契约与 Fake 驱动 | B0 | 能力矩阵、Fake `WorldAdapter`/`MoveExecutor` harness、`NavResult`/`bodyArrival` 契约测试 | 未实现模式/目标返回结构化原因；Fake 能驱动与 `WalkRouteExecutor` 相同路径 |
-| B2 | 感知/更新闭环 | B1 | `ObservationQueue`→`VoxelMap`、risk 位或删除决策、occupancy 组合、ChangeReport 失效链路 | 只刷新被观察格；UNKNOWN/STALE 永不变成 OPEN；跨 Section 局部失效有测试 |
-| B3 | 导航面补全 | B1 | 初始化错误结构化、`bodyArrival`、`cancellationOrigin`、拒绝矩阵、`recall_route` 决策 | 每个不支持/非法参数都有结构化结果；不静默接受 |
-| B4 | 持久化收口 | B2/B3 | ActionRecord 持久化钩子、游戏版本列、checkpoint/重启/杀进程测试、权威切换门禁 | 已观测与已保存可区分；重启不复用 OPEN；dry-run 对等后才允许切换 |
-| B5 | Curio 契约准备 | B1 | 锁定 Curio 版本、`BodySample/ExecutableMove/NavResult` 映射、仲裁内 `MoveExecutor` 骨架、M0/M1 核对清单 | M0/M1 证据收集完毕；所有联机声明仍标“未验证” |
-| B6 | 首个真实 walk 闭环 | Curio M0/M1 + B2/B3/B5 | 真实服务器短同高路线、实测样本、精确到达、在途失效、旧回调隔离 | 设计 §10.3 M2 退出条件全部满足 |
-| B7 | 模式与迁移扩展 | B6 | `pathId`/near/reach_block、step/drop/jump/ladder，再 swim/boat；正式迁移 | 每个模式有几何 + 真实身体双验收；旧 ID/字段/计数不变 |
+| N0 | 固化基线 | 无 | 记录 HEAD/版本、真实测试结果、已知环境噪声 | 本文已记录；后续沿用同一口径 |
+| N1 | 范围冻结 + 入口拆分 | N0 | 明确纯记忆库 API；拆分 `memory` 核心与可选 `navigation` 入口；拆分 `ObservationSource` 与 `BodyAdapter` | 核心入口不导出动作 API；可选层通过独立入口导出；类型/测试通过 |
+| N2 | 感知适配 + 观测队列 | N1 | `ObservationSource` 运行时适配；`ObservationQueue`→`VoxelMap`；ChangeReport 失效链路 | 只写入实际观测；墙后变化不污染；缺口/空气证据完整 |
+| N3 | 统一查询面 | N1 | 资源按 tag/label、容器位置、历史路线、当前证据、锚点查询；稳定 ID/分页/只读 | 查询不扫描、不移动、不改状态；资源/容器位置可查；容器内容明确不在本库 |
+| N4 | 记录策略 + 宿主生命周期 | N2/N3 | `observe` + `markTraversed` + `saveFragment` + `checkpoint` 的宿主接线；explored/traversed 测试 | 走过路径可保存；未观察不伪造；保存/关闭有界；旧会话隔离 |
+| N5 | 持久化与迁移收口 | N4 | 权威源切换门禁、游戏版本列、重启/杀进程测试、迁移 dry-run 对等 | 已观测与已保存可区分；重启不复用 OPEN；旧 ID/字段/计数不变 |
+| N6 | 真实宿主记忆接入验收 | N5 | Curio 感知/会话/遍历事件接入；真实服务器观测、重连、持久化 | 真实环境只记录合法观测；遍历由实测确认；重启后证据 STALE |
+| N7 | 可选导航层：walk 闭环 | N6 + Curio M0/M1 | `WalkRouteSearch`/`navigateTo`/`WalkRouteExecutor` 独立入口 | 短同高 walk 闭环；实测到达；在途失效；旧回调隔离 |
+| N8 | 可选导航层：模式扩展与联机验收 | N7 | step/drop/jump/ladder，再 swim/boat；真实联机 | 每个模式有几何 + 真实身体双验收 |
 
-### 7.3 顺序建议
+### 9.3 顺序建议
 
-1. **现在就能做：B1 → B2/B3（可并行）→ B4。** 这些不依赖 Curio，能先把契约、Fake 宿主、失效链路和持久化边界补齐。
-2. **B5 与 B1 并行：** 只做契约映射和核对清单，不碰真实身体。
-3. **B6 必须等 Curio M0/M1：** 先用短路线验证“库编排段、Curio 驱动身体”，不要直接上完整 `navigateTo` 或历史拓扑。
-4. **B7 在 B6 之后：** 先 step/drop/jump/ladder，再水面/船；挖放搭柱必须同时有几何验证和真实身体验收。
+1. **N1 先做**：不拆入口，纯记忆库和动作 API 会一直混在一起。
+2. **N2/N3 可并行**：一个是“怎么把观测写进来”，一个是“怎么把事实查出来”。
+3. **N4/N5 随后**：记录策略和持久化必须一起验收，否则“走过就保存”不可靠。
+4. **N6 是纯记忆库的真实接入验收**：不需要等完整移动能力，但需要 Curio 提供合法观测和实测位置。
+5. **N7/N8 是可选导航层**：必须等 Curio M0/M1；不计入纯记忆库完成度。
 
-### 7.4 每批的共同完成定义
+### 9.4 每批完成定义
 
 - 代码通过 `npm run typecheck` 和 `npm test`；不接受“测试文件加载噪声”被当成通过。
-- 新增/修改的行为有对应离线用例；涉及真实宿主的行为另有联机验收或明确标“未验证”。
-- 结果同时有语义 `message` 和结构化 `problem`；不把 `geometry_only` 写成可执行。
-- 不新增隐式施工、隐式观察、隐式救援或超出委托的目标改写。
+- 新增/修改行为有对应离线用例；真实宿主行为另做联机验收或明确标“未验证”。
+- 查询只读、无副作用；记录只接受有证据的输入。
+- 不新增隐式扫描、隐式动作、隐式救援或超出委托的目标改写。
 
 ---
 
-## 8. 风险与过度声称陷阱
+## 10. 风险与过度声称
 
-### 8.1 必须避免的表述
+### 10.1 必须避免的表述
 
 - 把 `src/adapter/types.ts` 的类型存在写成“已接入 mineflayer”。
-- 把 `evaluateLandTransition` / `evaluateWaterRoute` 的几何结果写成“可执行导航”。
-- 把 `navigateTo` 的 walk 首版写成设计 §7 的完整 `navigate_to`。
-- 把 `recall_route` 的能力表条目写成已有函数。
-- 把 SQLite 表、Worker、checkpoint 的存在写成“迁移完成”。
+- 把 `TopologyStore.nodes` 的锚点查询写成“自动发现资源”。
+- 把容器位置锚点写成“能查询容器内容/库存”。
+- 把历史 `route()` 写成“当前可走路线”。
+- 把 `evaluateWalkStep`/`evaluateWaterRoute` 的几何结果写成“可执行”。
+- 把 `navigateTo`/`WalkRouteExecutor` 写成纯记忆库功能。
+- 把 SQLite 表/Worker/checkpoint 的存在写成“迁移完成”。
 - 把离线 1000 项断言写成“真实游戏验收通过”。
-- 把 Curio M0/M1 写成已通过；本仓库无法核验。
 
-### 8.2 当前未验证项
+### 10.2 当前未验证项
 
-- 真实 Java 1.20.1 / mineflayer 的身体执行、落脚、支撑、头部净空和服务器位置纠正。
-- 真实玩家/生物占位、流体传播、门/活塞/含水方块变化。
-- 真实多人环境下的墙后改动、区块卸载/加载、重连和换维。
-- 宿主仲裁器中的取消/超时/嵌套/恢复，以及 `SkillResult.data.nav` 的传播。
+- 真实 Java 1.20.1 / mineflayer 的感知输入、位置采样和会话生命周期。
+- 真实多人环境的墙后改动、区块卸载/加载、重连和换维。
 - 杀进程、写满磁盘、SQLite 失败/超时后的恢复边界。
-- 扫描延迟、队列积压、单批工作预算和主线程阻塞。
+- 真实容器账本与空间锚点的联合查询（本库不保存容器内容）。
 - 迁移权威切换后的旧查询/旧技能回归。
+- 可选导航层的真实身体执行、落脚、支撑、头部净空和服务器位置纠正。
 
-### 8.3 文档/制品漂移
+### 10.3 文档/制品漂移
 
 | 位置 | 当前内容 | 与代码/制品的关系 |
 |---|---|---|
@@ -333,9 +386,18 @@ flowchart LR
 | `acceptance/run.mjs` | 版本 0.7.6、非 dist 入包项预期 | 新增 `LICENSE` 后需实际跑一次 pack 验收确认 |
 | 源码注释 | 部分 portal/迁移注释已过期 | 以当前导出与测试为准 |
 
+### 10.4 设计文档需要同步的范围修订
+
+本文不改设计文档工作区改动。若确认“纯记忆库”定位，设计文档至少需要：
+
+1. 把 §7 的 `navigate_to`/`follow_known_path`/`inspect_route`/`frontier_candidates` 标注为**可选导航层或宿主职责**，不列入纯记忆库核心。
+2. 把 §2.1 的 `WorldAdapter` 拆成**感知输入**（记忆库）和**身体动作**（宿主/可选层）。
+3. 把 §10.3 的 M2–M5 明确为可选导航层的门槛。
+4. 在 §9/§11 中把“容器内容、自动建图、自动记录遍历”写成宿主职责或明确的非目标。
+
 ---
 
-## 9. 附录
+## 11. 附录
 
 ### A. 关键证据索引
 
@@ -343,12 +405,12 @@ flowchart LR
 |---|---|
 | 观测/证据 | `src/observation/types.ts`、`src/observation/validate.ts`、`src/observation/queue.ts` |
 | 体素地图 | `src/voxel/voxel-map.ts`、`src/voxel/section.ts`、`src/voxel/palette.ts`、`src/voxel/serialization.ts`、`src/voxel/snapshot.ts` |
-| 通行/陆地/水面 | `src/traversability/step.ts`、`src/traversability/cache.ts`、`src/traversability/route.ts`、`src/traversability/land-transition.ts`、`src/traversability/land-route.ts`、`src/water/verify.ts` |
-| 拓扑 | `src/topology/fragment-store.ts`、`src/topology/topology-store.ts`、`src/topology/edge-runtime.ts`、`src/topology/portal.ts`、`src/topology/occupancy.ts` |
-| 导航/执行 | `src/navigation/navigate.ts`、`src/navigation/walk-search.ts`、`src/navigation/known-walk-route.ts`、`src/navigation/route-inspection.ts`、`src/execution/walk-route-executor.ts`、`src/execution/types.ts` |
-| 适配契约 | `src/adapter/types.ts` |
+| 拓扑/历史 | `src/topology/fragment-store.ts`、`src/topology/topology-store.ts`、`src/topology/edge-runtime.ts`、`src/topology/portal.ts`、`src/topology/occupancy.ts` |
+| 查询/store | `src/store/spatial-memory-store.ts` |
+| 派生通行查询 | `src/traversability/step.ts`、`src/traversability/cache.ts`、`src/water/verify.ts` |
 | 持久化 | `src/storage/sqlite/worker.ts`、`src/storage/sqlite/spatial.ts`、`src/storage/sqlite/working-set.ts`、`src/storage/sqlite/journal.ts`、`src/storage/sqlite/ledger.ts` |
 | 迁移/兼容 | `src/compat/legacy.ts`、`src/compat/migration-dry-run.ts` |
+| 可选导航/执行（不在纯记忆库核心） | `src/navigation/*`、`src/execution/*`、`src/adapter/types.ts` |
 | 公开入口 | `src/index.ts`、`package.json` |
 
 ### B. 本轮验证命令与结果
@@ -381,8 +443,16 @@ node --test acceptance/provenance.test.mjs acceptance/run.test.mjs acceptance/co
 
 ---
 
-## 10. 结论
+## 12. 结论
 
-本库已经具备一个可测试、可持久化、证据边界清晰的空间记忆核心：它能记录“最近观察到什么”、保留“曾经怎么经过”、按方向/模式/身体条件推导“现在证据是否支持通行”，并能编排调用方给定的同高 walk 路线。
+按“纯记忆库”定位，当前实现已经具备可用的核心：它能记录宿主提供的合法观测，保留历史路径和拓扑，按证据回答“这里观察到什么、哪些路线曾走过、锚点在哪里、当前证据是否支持通行”，并能通过 SQLite 持久化。
 
-但它还不是设计文档所描述的完整“陆地 + 水面导航库”：真实宿主适配、非 walk 模式执行、完整导航参数面、迁移权威切换和真实联机验收都未完成。**当前最合理的顺序不是继续堆库内功能，而是先把 Curio 的 M0/M1 基础移动元语修到可独立验收，同时并行完成库侧的 B1–B5 契约、Fake 驱动、失效链路和持久化收口；M0/M1 通过后再进入 B6 的真实 walk 闭环。**
+但它还不是一个边界清晰的纯记忆库产品：
+
+- 公开入口同时包含记忆和动作编排；
+- 没有运行时感知适配器；
+- 资源/容器/路线的查询面分散，容器内容不在库内；
+- “走过即存图”需要宿主显式接线；
+- 迁移权威切换和真实宿主验收未完成。
+
+**下一步应先把“memory core”和“optional navigation”拆开，优先完成感知适配、统一查询面、宿主记录策略和持久化收口；导航/执行层作为独立可选层，等 Curio 基础移动修复后再接。**
