@@ -180,6 +180,10 @@ a Section, refreshes evidence, saves, pins, or executes. Results carry
   `1..1000`, use a stable exclusive `after` cursor, and return the true match
   `total`. The query layer joins store pages when the requested limit exceeds
   the store's `maxQueryBatch`; it does not silently truncate.
+- `resourceAnchors`/`containerAnchors` select by `dim`/`tag`/`label` and return
+  each node's `location`; M2 does not accept position or neighborhood filters.
+  A host that needs nearby anchors pages the list and filters on `location.pos`,
+  or waits for a later minor contract extension.
 - `historyRoute`/`anchor`/`components`/`segments` are historical projections.
   They are never executable and never prove current passability. An unknown
   `segments.fragmentId` returns `not_found`, not an empty segment list.

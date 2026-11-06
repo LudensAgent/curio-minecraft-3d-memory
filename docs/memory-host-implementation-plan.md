@@ -294,11 +294,11 @@ flowchart LR
 
 #### M2.5 资源/容器位置查询
 
-- 目标：`resourceAnchors`/`containerAnchors` 按 tag/label/位置返回锚点和可达证据；容器内容返回 `host_ledger`。
+- 目标：`resourceAnchors`/`containerAnchors` 按 tag/label 返回锚点及其位置字段（`SpatialNode.location`）；**不做位置/邻域过滤**（请求不接受 `near`/`radius`/`pos`）；可达证据不在 M2 范围；容器内容返回 `host_ledger`。
 - 依赖：M2.3。
 - 修改文件：`src/query/anchors.ts`（新建）、`src/query/index.ts`、`tests/query-anchors.test.ts`。
-- 测试：按 tag/label 过滤；精确/区域；容器内容 unsupported；不返回空箱。
-- 退出条件：资源/容器位置可查；内容明确不支持。
+- 测试：按 tag/label 过滤；返回位置/精度/观测时间；位置/邻域参数被拒绝；容器内容 unsupported；不返回空箱。
+- 退出条件：资源/容器位置可查；内容明确不支持；位置/邻域过滤明确不在 M2，宿主需要附近过滤时自行分页按 `location.pos` 过滤或走后续 minor 变更。
 - 审计证据：容器内容查询返回 `host_ledger`；不推断物品数量。
 
 #### M2.6 能力报告与边界

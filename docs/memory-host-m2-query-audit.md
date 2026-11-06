@@ -47,7 +47,7 @@
 | M2.2 `cells` 查询 | 完成 | `src/query/cells.ts`；已观察/未观察/未驻留区分；`not_resident`/`loading`/`load_failed` → `gap.reason:'unloaded'` + `status:'partial'`；负坐标、副本隔离、不加载 Section 有测试。历史 `ObservationGap` 未持久化，契约 §15 已标为部分实现 |
 | M2.3 碎片/traversal/nodes/edges 分页 | 完成 | `src/query/topology.ts`、`src/query/paging.ts`；默认 100、上限 1000、合并底层 100 条页、稳定 `after`、`total` 为完整匹配数；250 条跨页与末页无重复测试通过 |
 | M2.4 历史路线/锚点/分量/portal | 完成 | `src/query/history.ts`；`historyRoute` 带 `historicalGeometry:true`/`executable:false`/`currentPassability:'UNKNOWN'`；未知 fragment 返回 `not_found`；`anchor` 为 `null` 时保持 `ok`；portal 与 walk graph 独立 |
-| M2.5 资源/容器位置查询 | **有条件完成** | `src/query/anchors.ts` 支持 `dim/tag/label`、只返回 exact 节点、`containerAnchors` 需宿主 `isContainer`、`containerContents` 固定 `host_ledger`；但“可达证据”未实现，且无按位置/邻域过滤参数（见 M2-A1/M2-A6） |
+| M2.5 资源/容器位置查询 | **有条件完成** | `src/query/anchors.ts` 支持 `dim/tag/label`、只返回 exact 节点、`containerAnchors` 需宿主 `isContainer`、`containerContents` 固定 `host_ledger`；但“可达证据”未实现；“按位置”已决策为只返回位置字段、不做邻域过滤（M2-A6） |
 | M2.6 能力报告与边界 | 完成 | `src/memory/capabilities.ts`、`src/query/capabilities.ts`；memory/query 按实际能力，plan/execute/persistence 保守为 `false`；`containerContents` 恒为 `false`；无分类器时 `containerAnchors` 返回 `unsupported` |
 | G1 契约冻结 | 通过 | 类型、运行时校验、契约 §5/§15 与测试一致；新增项已记录在契约 §12.5 |
 
@@ -117,11 +117,11 @@
 ### M2-A6｜M2.5 的“位置”过滤未实现
 
 - **严重度**：低（需求澄清）
-- **状态**：待澄清（可与 M2-A1 合并）
+- **状态**：已决策（2026-11-06）
 - **证据**：`SpatialQueryRequest` 的 `resourceAnchors`/`containerAnchors` 只有 `dim/tag/label/after/limit`，没有位置/邻域参数；`src/query/anchors.ts:48-71` 也未做空间过滤。契约 §5.2 与实现一致。
-- **影响**：如果计划中的“位置”指按位置过滤，则该项未落地；如果仅指返回位置字段，则已满足。
-- **处理建议**：在计划中澄清；若需要空间过滤，按新增可选字段（minor）或新增查询 kind 的流程处理。
-- **验收标准**：计划/契约/代码对“位置”的语义一致。
+- **决策**：M2 的“按位置”只表示返回 `SpatialNode.location` 的位置字段，**不做位置/邻域过滤**；请求 union 不增加 `near`/`radius`/`pos`。宿主需要“附近资源/容器”时，先按 tag/label 分页拉取后按 `location.pos` 自行过滤；若后续确需库侧过滤，另走 minor 契约变更（复用 `anchor` 的 `near` 语义，明确半径边界、过滤后 `total`/游标，且不声明可达性）。
+- **影响**：资源/容器锚点可查位置，但“附近”筛选由宿主负责；库不会隐式扫描或过滤。
+- **验收标准**：计划 M2.5、契约 §5.4/§5.6、代码与测试对“位置”的语义一致；请求中的位置过滤参数必须被拒绝。
 
 ---
 
@@ -145,7 +145,7 @@
 - [ ] **M2-A3**：M9 发布前决定契约版本（minor/major）并同步宿主。
 - [ ] **M2-A4**：在契约性能章节标注 `portals` 的有界全量排序；M8 评估优化。
 - [ ] **M2-A5**：补强只读测试对 `observedAt` 与 fragment 使用记录的断言（可选）。
-- [ ] **M2-A6**：澄清“按位置”的含义；如需要空间过滤，走契约变更流程。
+- [x] **M2-A6**（2026-11-06）：已决策 M2 只返回位置字段，不做邻域过滤；宿主自行按 `location.pos` 过滤，库侧过滤另走 minor 契约变更。
 
 ---
 
