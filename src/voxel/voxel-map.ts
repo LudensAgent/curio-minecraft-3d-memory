@@ -298,6 +298,15 @@ export class VoxelMap {
   }
 
   /**
+   * Currently active observation session, or `null` before the first
+   * observation / `beginSession`. Read-only; it never begins or switches a
+   * session and never refreshes evidence.
+   */
+  get sessionId(): string | null {
+    return this.currentSessionId;
+  }
+
+  /**
    * Subscribe to accepted-change reports from observations, batch observations,
    * session changes and stale marking.
    *

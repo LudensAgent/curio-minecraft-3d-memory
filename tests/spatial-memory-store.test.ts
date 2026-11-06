@@ -784,6 +784,21 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
     store.frontierCandidates(DIM, { x: 0.5, y: 0, z: 0.5 });
     store.frontierInspection(DIM, { x: 0.5, y: 0, z: 0.5 });
     store.inspectRoute(snapshot);
+    store.query({ kind: 'cells', dim: DIM, positions: [A, B] });
+    store.query({ kind: 'fragments', dim: DIM });
+    store.query({ kind: 'traversals', dim: DIM });
+    store.query({ kind: 'nodes', dim: DIM });
+    store.query({ kind: 'edges', dim: DIM });
+    store.query({ kind: 'portals' });
+    store.query({ kind: 'historyRoute', dim: DIM, from: A, to: B });
+    store.query({ kind: 'anchor', dim: DIM, here: A, order: 'surface' });
+    store.query({ kind: 'components', dim: DIM });
+    store.query({ kind: 'segments', fragmentId: 'missing' });
+    store.query({ kind: 'resourceAnchors', dim: DIM });
+    store.query({ kind: 'containerAnchors', dim: DIM });
+    store.query({ kind: 'containerContents', dim: DIM });
+    store.query({ kind: 'snapshot' });
+    store.query({ kind: 'capabilities' });
 
     expect(capture()).toEqual(before);
   });
@@ -793,6 +808,7 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
     expect(store.describeCapabilities().markTraversed.available).toBe(true);
     expect(store.describeCapabilities().markModified.available).toBe(true);
     expect(store.describeCapabilities().portalEdges.available).toBe(true);
+    expect(store.describeCapabilities().query.available).toBe(true);
     expect(store.portalEdges()).toEqual([]);
 
     const cell = { x: 0, y: 64, z: 0 };
@@ -837,6 +853,7 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
       'observe',
       'observeBatch',
       'portalEdges',
+      'query',
       'recordNode',
       'route',
       'saveFragment',

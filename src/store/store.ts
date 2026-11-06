@@ -11,6 +11,7 @@
 import type { ChangeReportSource } from '../memory/change-reports.js';
 import type { Frontier } from '../navigation/types.js';
 import type { Observation, ObservationBatch } from '../observation/types.js';
+import type { SpatialQueryRequest, SpatialQueryResult } from '../query/types.js';
 import type {
   AnchorQueryOptions,
   AnchorResult,
@@ -106,6 +107,13 @@ export interface SpatialMemoryStore extends ChangeReportSource {
   segments(fragmentId: string): FragmentSegmentsResult;
   /** Only evidence that actually connects the two fragments; never proximity. */
   mergeFragments(aId: string, bId: string, evidenceId: string): void;
+
+  // --- Read-only query projection (contract §5)
+  /**
+   * Project the composed stores for a host query. Never moves, turns, scans,
+   * loads a Section, refreshes evidence, saves, pins, or executes.
+   */
+  query(request: SpatialQueryRequest): SpatialQueryResult;
 
   // --- Frontier (candidates only — never selects a target)
   frontierCandidates(dim: string, here: Vec3Like): Frontier[];

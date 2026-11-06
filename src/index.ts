@@ -277,11 +277,27 @@ export type {
 } from './topology/index.js';
 
 // Memory write/change ports (pure memory core)
+export { CONTRACT_VERSION } from './memory/index.js';
 export type {
   ChangeReportSink,
   ChangeReportSource,
+  ContractVersion,
+  MemoryHostCapabilities,
   MemoryIngest,
 } from './memory/index.js';
+
+// Query — read-only projection (contract §5, plan M2)
+export type {
+  CellQueryView,
+  SpatialQueryData,
+  SpatialQueryKind,
+  SpatialQueryOptions,
+  SpatialQueryPort,
+  SpatialQueryProblem,
+  SpatialQueryRequest,
+  SpatialQueryResult,
+  SpatialQueryStatus,
+} from './query/index.js';
 
 // Adapter
 export type {

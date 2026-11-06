@@ -52,7 +52,7 @@
 1. **不持有身体。** 没有 bot、按键、寻路器或 `MoveExecutor` 依赖。
 2. **不派发动作。** 核心入口不导出 `moveTo`/`dig`/`place`/`navigateTo`/`walkPath` 等动作编排。
 3. **不自行观察。** 只接受宿主通过合法感知边界提交的 `Observation`/`ObservationBatch`。
-4. **不保存容器内容。** 只保存容器位置锚点、存在性与可达证据；物品数量归宿主精确账本。
+4. **不保存容器内容。** 只保存容器位置锚点与存在性证据；M2 查询不计算新的可达性。物品数量归宿主精确账本。
 5. **不生成策略。** 不自动挖、放、搭柱、堵水、造船、救援、探索或改目标。
 6. **不伪造证据。** 未观察、遮挡、太暗、未加载、预算跳过不得写成空气；历史经过不得写成当前可走。
 
@@ -140,7 +140,11 @@ export interface MemoryHostCapabilities {
     historyRoute: boolean;
     anchors: boolean;
     components: boolean;
+    /** 增量：§5.2 暴露了 segments kind。 */
+    segments: boolean;
     portals: boolean;
+    /** 增量：§5.2 暴露了独立 kind，宿主需要能协商。 */
+    resourceAnchors: boolean;
     containerAnchors: boolean;
     containerContents: false; // 永远为 false：宿主账本职责
   };
@@ -408,9 +412,12 @@ export type SpatialQueryRequest =
   | { kind: 'historyRoute'; dim: string; from: Vec3Like; to: Vec3Like; near?: number }
   | { kind: 'anchor'; dim: string; here: Vec3Like; order: 'surface' | 'deepest'; near?: number }
   | { kind: 'components'; dim: string }
+  | { kind: 'segments'; fragmentId: string }
   | { kind: 'portals'; after?: string; limit?: number }
   | { kind: 'resourceAnchors'; dim?: string; tag?: LandmarkTag; label?: string; after?: string; limit?: number }
   | { kind: 'containerAnchors'; dim?: string; after?: string; limit?: number }
+  // 增量（M2）：内容永远转交宿主账本；该 kind 不产生 data。
+  | { kind: 'containerContents'; dim?: string; nodeId?: string }
   | { kind: 'snapshot' }
   | { kind: 'capabilities' };
 ```
@@ -418,7 +425,13 @@ export type SpatialQueryRequest =
 ### 5.3 结果信封
 
 ```ts
-export type SpatialQueryStatus = 'ok' | 'partial' | 'unsupported' | 'scope_mismatch' | 'invalid_request';
+export type SpatialQueryStatus =
+  | 'ok'
+  | 'partial'
+  | 'not_found'
+  | 'unsupported'
+  | 'scope_mismatch'
+  | 'invalid_request';
 
 /** One cell's read-only projection; `observed:false` never means air. */
 export interface CellQueryView {
@@ -443,11 +456,15 @@ export type SpatialQueryData =
   | { kind: 'historyRoute'; inspection: HistoricalRouteInspection }
   | { kind: 'anchor'; anchor: AnchorResult | null }
   | { kind: 'components'; report: ComponentReport }
+  | { kind: 'segments'; segments: FragmentSegmentsResult }
   | { kind: 'portals'; items: PortalEdgeView[]; total: number; nextAfter?: string }
   | { kind: 'resourceAnchors'; items: SpatialNode[]; total: number; nextAfter?: string }
   | { kind: 'containerAnchors'; items: SpatialNode[]; total: number; nextAfter?: string }
   | { kind: 'snapshot'; snapshot: SpatialMemoryStoreSnapshot }
   | { kind: 'capabilities'; capabilities: MemoryHostCapabilities };
+
+// `containerContents` 没有 data 变体：其成功形态就是结构化 `host_ledger`
+// problem（见 §5.5）。不得返回 `items: []`。
 
 export interface SpatialQueryResult {
   status: SpatialQueryStatus;
@@ -481,7 +498,7 @@ export type SpatialQueryProblem =
 
 | 查询 | 返回 | 不得声称 |
 |---|---|---|
-| `cells` | 每格的 state/evidence/freshness/validUntil；未观察/未驻留原因 | 未返回 = 空气；未驻留 = 从未观察 |
+| `cells` | 每格的 state/evidence/freshness/validUntil；未观察/未驻留原因（`not_resident`/`loading`/`load_failed` → `gap.reason:'unloaded'` + `status:'partial'`） | 未返回 = 空气；未驻留 = 从未观察；历史 gap 可重建 |
 | `fragments` | 历史几何、kind、geometrySource、polyline、端点、分页 | 历史 = 当前可走 |
 | `traversals` | 实际走过证据、方向、会话、时间 | 保存几何 = 实际走过 |
 | `nodes` | 地点/资源/基地/危险等锚点、精确/区域位置、来源 | 名字/标签 = 自动资源发现 |
@@ -489,15 +506,17 @@ export type SpatialQueryProblem =
 | `historyRoute` | 有序历史路点、分段、缺口；`historicalGeometry:true`、`executable:false`、`currentPassability:'UNKNOWN'` | 历史路线可直接执行 |
 | `anchor` | 可达连通分量内的 surface/deepest 锚点 | 任意全网锚点；区域中心 = 精确交互目标 |
 | `components` | 连通分量/碎片统计 | 当前可走 |
+| `segments` | 由已记录 edge verification 推导的分段、cuts、blocked edge ids；未验证连接不会被切割，因此分段不等于当前可通行；未知 fragment 返回 `not_found` | 分段 = 已授权执行；分段 = 当前已确认可通行的全量证明；历史 fragment 被删除 |
 | `portals` | 独立 portal 边与原始穿越证据 | 接近门 = 已穿越 |
-| `resourceAnchors` | `tag`/`label` 过滤后的锚点位置、精度、观测时间、可达证据 | 资源数量/价值/自动采集 |
-| `containerAnchors` | 容器位置、存在性、精确坐标、可达证据 | **容器内容/数量/空槽** |
+| `resourceAnchors` | `tag`/`label` 过滤后的 `SpatialNode` 位置、精度、观测时间、来源 | 资源数量/价值/自动采集；M2 不计算可达性 |
+| `containerAnchors` | 容器位置、存在性、精确坐标、观测时间；需要宿主注入 `isContainer` 分类器；只返回 exact 节点 | **容器内容/数量/空槽**；区域中心 = 精确容器目标 |
+| `containerContents` | 固定 `status:'unsupported'` + `problem.kind:'host_ledger'`，无 `data` | 空箱；`items:[]`；任何内容/数量 |
 | `snapshot` | 只读计数/版本/能力 | 当前通行结论 |
 | `capabilities` | 能力报告 | 未实现能力已可用 |
 
 ### 5.5 容器查询的硬边界
 
-- 本库只回答：“这个容器位置是否被记录、最后确认存在、是否可达、证据时间”。
+- 本库只回答：“这个容器位置是否被记录、最后确认存在、最后记录的证据时间”。M2 的 `containerAnchors` 不计算新的可达性；可达性必须由宿主的路由/感知证据判断，不能从位置记录推断。
 - 本库**不回答**：“箱子里有什么、有多少、还能放多少”。
 - 请求容器内容时 MUST 返回：
 
@@ -516,19 +535,24 @@ export type SpatialQueryProblem =
 
 ### 5.6 分页与边界
 
-- 所有列表查询默认 `limit = 100`，最大 `limit = 1000`；超过必须拒绝或截断并明确 `truncated`。
+- 所有列表查询默认 `limit = 100`，最大 `limit = 1000`；M2 对越界值返回 `invalid_request`，不做静默截断。
+- 当请求 `limit` 大于底层 store 的单页上限（默认 100）时，查询层合并在途页直到满足请求值；`total` 仍取过滤后匹配总数。
 - `after` 是稳定 ID 游标；同一作用域内可重复查询。
 - `total` 是匹配总数；不得用整页长度代替。
-- `cells` 查询必须有位置数量上限（建议 4096）；超过返回 `invalid_request`。
+- `cells` 查询位置数量上限为 4096；超过返回 `invalid_request`。
+- `containerAnchors` 的分类器没有索引，因此会分页扫描节点直到耗尽；扫描范围由 `TopologyStore` 的节点容量上限约束，`total` 是完整匹配数。大节点集上的频繁调用列为 M8 基准候选，不得用固定前缀预算牺牲游标正确性。
 - 查询 MUST 只读：不移动、不转头、不扫描、不刷新观测时间、不写库、不 pin/保存。
-- 查询不得隐式重试或回退到全图扫描。
+- 查询不得隐式重试或回退到世界/区块扫描。`containerAnchors` 的宿主分类器没有索引，会对**内存节点索引**做一次只读遍历以获得精确 `total`；该 O(nodes) 工作是 M8 基准候选，不是世界扫描。
+- M2 的请求不带 `worldId`：store 绑定单一不可变世界，`scope_mismatch` 保留给未来的世界寻址适配器，当前没有产生者。
 
 ### 5.7 当前实现映射
 
 - `[已实现]` `SpatialMemoryStore.sectionAt`、`fragments`、`graph`、`displayNodes`、`edgeRuntime`、`portalEdges`、`route`、`routeInspection`、`surfaceAnchor`、`deepestAnchor`、`components`、`segments`、`fragmentation`。
 - `[已实现]` `TopologyStore.nodes({ dim, source, tag, label, after, limit })`。
 - `[已实现]` `FragmentStore.fragments/traversals`。
-- `[待实现]` 统一的 `SpatialQueryPort` 投影；当前入口分散，且 `SpatialMemoryStore` 没有专门的 `findResource`/`findContainer`。
+- `[已实现]` 统一 `SpatialQueryPort` 投影（`src/query/*`，通过 `SpatialMemoryStore.query(request)` 暴露）：cells、fragments、traversals、nodes、edges、historyRoute、anchor、components、segments、portals、resourceAnchors、containerAnchors、containerContents、snapshot、capabilities；未知字段/未知 kind 拒绝；列表分页 100/1000；查询只读。
+- `[增量]` `containerContents` 与 `segments` 是 M2 新增请求 kind；`containerContents` 固定返回 `host_ledger`，无 `data`；`MemoryHostCapabilities.query.segments`/`resourceAnchors` 是 §2.3 的增量能力位。`not_found` 也作为新增状态用于未知 fragment。
+- `[已实现，需宿主配置]` `containerAnchors` 依赖宿主注入 `isContainer` 分类器；未配置时返回 `unsupported` 且能力为 `false`。库不解释 label/metadata；扫描受节点容量约束并返回完整 `total`。
 - `[宿主职责]` 容器内容、库存、玩家/生物实时占位语义（库可存位置/可达证据，但不复制账本）。
 
 ---
@@ -1038,7 +1062,7 @@ export interface ChangeReport {
 2. **库不自动救援。** 溺水、岩浆、卡死、坠落只返回事实和缺口；不自动堵水、垫方块、换装备或切换目标。
 3. **库不自动探索。** 只走 `known_only`；不自动 frontier。
 4. **库不接收墙后数据。** 原始 `blockUpdate`、区块事件、客户端已加载世界不能独立改变记忆、新鲜度、通行结论或路线。
-5. **库不保存容器内容。** 只保存位置/存在/可达证据。
+5. **库不保存容器内容。** 只保存位置/存在证据；M2 查询不计算新的可达性。
 6. **库不伪造归因。** 动作效果必须有 `actionId`/`EffectEvidence.verified`；不得按时间接近归因。
 7. **库不把 `OPEN` 当授权。** `OPEN` 只表示当前证据支持该物理动作；不表示已授权、无风险或执行器支持。
 8. **库不把历史当事实现状。** 历史路线、遍历、桥、建造几何都要重新验证当前通行性。
@@ -1099,6 +1123,15 @@ export interface ChangeReport {
 - `SpatialMemoryStore.observeBatch` 新增到接口并返回 `BatchChangeReport`；`addTraversal` 返回 `SaveResult`。忽略返回值的调用不受影响。
 - `VoxelMap` 的订阅者（以及 `onChange`）异常不再原样冒泡，而是继续通知其余订阅者后聚合为 `ChangeReportDeliveryError`（`committed:true`）。
 - 包版本仍为 `0.10.0`；正式发布时按 §12.3 决定 minor/major，并同步宿主与能力报告。
+
+### 12.5 M2 兼容性记录
+
+- `SpatialMemoryStore` 新增必选 `query(request)`。通过 `SpatialMemoryStore` 类型使用库的调用方源码兼容；**自行实现该接口的外部实现者必须补齐**（这是接口新增，不是可选方法）。
+- `SpatialMemoryStoreOptions` 新增可选 `query: { now?, isContainer? }`；不提供时使用 `Date.now`、`containerAnchors` 为 `unsupported`。
+- `VoxelMap` 新增只读 `sessionId` getter；不改变会话行为。
+- `MemoryHostCapabilities`、`CONTRACT_VERSION` 与查询类型从根入口导出；`query.segments`、`query.resourceAnchors`、`containerContents`/`segments` kind 与 `not_found` 状态是增量。
+- 查询结果新增可选 `sessionId`（当前观察会话）与 `problem` 分类；未改变既有写入/路由接口。
+- 按 §12.3，新增枚举值/收窄必填属于契约变更。预发布仍标记 `memory-host-contract/1` 并依赖能力协商；正式发布时由 M9 决定 minor/major 并同步宿主。包版本仍为 `0.10.0`（未发布）。
 
 ---
 
@@ -1221,7 +1254,10 @@ export interface ChangeReport {
 | `contact` 证据的方块名 | 部分实现 | `Observation.state.name` 必填，模型无法表达“名称未知”；`validateObservation` 要求 contact 必须 `stateComplete:false`，未看见的名称不得由宿主提交；可表达未知名称的 state 模型列为后续任务 |
 | 旧 `sequence` 拒绝 | 部分实现 | 新旧由 `observedAt` 判定；`sequence` 是接收顺序，不用于覆盖判断。契约 §4.2 规则 6 的措辞待与实现对齐 |
 | `SpatialMemoryStore` 查询方法 | 已实现（分散） | `src/store/store.ts` |
-| 统一 `SpatialQueryPort` | 待实现 | 需要只读投影层 |
+| 统一 `SpatialQueryPort` | 已实现 | `src/query/*`；`SpatialMemoryStore.query(request)` 暴露；含 segments；未知字段/kind 拒绝、分页 100/1000、只读 |
+| `segments` 查询 | 已实现 | 包装 `TopologyStore.segments`；未知 fragment 返回 `not_found`；不删除/改写 fragment 历史 |
+| `MemoryHostCapabilities` / `CONTRACT_VERSION` | 已实现（M2 部分） | `src/memory/capabilities.ts`；memory/query 按实际能力，plan/execute/persistence 保守 `false` |
+| `cells` 未驻留/gap 语义 | 部分实现 | 可区分 `no_record`/resident-unobserved/`not_resident`/`loading`/`load_failed`；历史 `ObservationGap` 未持久化，只报告当前驻留 gap |
 | `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts` |
 | `WalkRouteExecutor` + `bodyArrival` | 已实现 | `src/execution/*` |
 | `startKnownWalkRoute` | 已实现（启动执行，不是 plan-only） | `src/navigation/known-walk-route.ts` |
@@ -1229,8 +1265,8 @@ export interface ChangeReport {
 | `walkPath`/`WalkPathResult` | 待实现 | 本契约 §7；可先用 `WalkRouteExecutor` 由宿主实现 |
 | `INVALIDATED` outcome | 待实现 | 当前 `NavOutcome` 无此值，使用 `route_invalidated` problem |
 | `PerceptionSource`/`BodyAdapter` 拆分 | 已实现 | 计划中的感知端口命名为 `PerceptionSource`，避免与既有证据来源联合类型 `ObservationSource` 冲突；`WorldAdapter` 保留为兼容交叉类型 |
-| 容器位置锚点查询 | 部分实现 | 可用 `nodes({tag,label})`/`graph`；无专用入口 |
-| 容器内容查询 | 不适用 | 宿主精确账本；库返回 `host_ledger` |
+| 容器位置锚点查询 | 已实现（需宿主分类器） | `SpatialMemoryStore.query({kind:'containerAnchors'})`；只返回 exact 节点；未注入 `isContainer` 时为 `unsupported` |
+| 容器内容查询 | 不适用 | `SpatialMemoryStore.query({kind:'containerContents'})` 固定返回 `host_ledger`；不返回 `items`/空箱 |
 | 水面/船几何验证 | 已实现（仅几何） | `assurance:'geometry_only'`、`executable:false` |
 | 水面/船执行 | 未实现 | 不属于 v1 `walkPath` |
 | SQLite Worker/checkpoint/WorkingSet | 已实现 | `src/storage/sqlite/*` |

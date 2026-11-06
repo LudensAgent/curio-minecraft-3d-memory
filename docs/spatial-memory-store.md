@@ -162,12 +162,43 @@ available method. `snapshot()` returns read-only counts and revisions:
 Counts and revisions are runtime state, not persistence confirmation; a higher
 `saveRevision` does not mean the data is on disk.
 
+### Read-only query port
+
+`query(request)` is the contract §5 projection over the same composed stores.
+It is synchronous and read-only: it never moves, turns, scans the world, loads
+a Section, refreshes evidence, saves, pins, or executes. Results carry
+`contract: 'memory-host-contract/1'`, `worldId`, the active observation session
+(when one exists), `computedAt`, `readOnly: true` and `executable: false`.
+
+- `cells` reads `VoxelMap.cellAt` plus section residency. `observed: false`
+  never means air; `no_record`/resident-but-unobserved return no gap, while
+  `not_resident`/`loading`/`load_failed` return `gap.reason: 'unloaded'` and
+  `status: 'partial'`. Historical `ObservationGap`s are not persisted, so the
+  projection can only report current residency gaps.
+- List kinds (`fragments`, `traversals`, `nodes`, `edges`, `portals`,
+  `resourceAnchors`, `containerAnchors`) default to 100 items, accept
+  `1..1000`, use a stable exclusive `after` cursor, and return the true match
+  `total`. The query layer joins store pages when the requested limit exceeds
+  the store's `maxQueryBatch`; it does not silently truncate.
+- `historyRoute`/`anchor`/`components`/`segments` are historical projections.
+  They are never executable and never prove current passability. An unknown
+  `segments.fragmentId` returns `not_found`, not an empty segment list.
+- `containerAnchors` requires a host-injected `isContainer` classifier; without
+  it the query is `unsupported` and the capability is `false`. It pages through
+  the node store (bounded by the store's node capacity) so the exclusive cursor
+  and `total` stay correct; only exact node locations are returned.
+  `containerContents` always returns a structured `host_ledger` problem and
+  never an empty list: inventory belongs to the host ledger.
+- The capability query reports the same nested booleans as
+  `MemoryHostCapabilities` (contract §2.3); domains not implemented at this
+  milestone stay `false`.
+
 ## Read-only guarantee
 
 `sectionAt`, `fragments`, `graph`, `edgesDetailed`, `route`, `routeInspection`,
 `surfaceAnchor`, `deepestAnchor`, `fragmentation`, `frontierCandidates`,
-`frontierInspection`, `inspectRoute`, `describeCapabilities` and `snapshot`
-are read-only with respect to the composed stores. The test suite captures the
+`frontierInspection`, `inspectRoute`, `query`, `describeCapabilities` and
+`snapshot` are read-only with respect to the composed stores. The test suite captures the
 voxel `saveRevision`, pin state and residency, fragment/topology revisions,
 cell evidence and anchor results before and after all of them and requires an
 exact match.

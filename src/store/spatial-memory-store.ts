@@ -36,6 +36,14 @@ import type {
 import type { MemoryIngest, SpatialEdgeRecord } from '../memory/ingest.js';
 import type { Observation, ObservationBatch } from '../observation/types.js';
 import type { Frontier } from '../navigation/types.js';
+import { createSpatialQueryPort } from '../query/index.js';
+import type {
+  SpatialQueryOptions,
+  SpatialQueryPort,
+  SpatialQueryRequest,
+  SpatialQueryResult,
+  SpatialQuerySources,
+} from '../query/types.js';
 import {
   frontierCandidates as projectFrontierCandidates,
   inspectRoute as projectRouteInspection,
@@ -82,6 +90,7 @@ import type {
 } from '../topology/index.js';
 import { FragmentStore, TopologyStore } from '../topology/index.js';
 import type { Vec3Like } from '../types.js';
+import { blockToSection } from '../voxel/coordinates.js';
 import type { Section } from '../voxel/section.js';
 import type { BatchChangeReport, ChangeReport, StaleReason } from '../voxel/voxel-map.js';
 import { VoxelMap } from '../voxel/voxel-map.js';
@@ -109,6 +118,11 @@ export interface SpatialMemoryStoreOptions {
    * `frontierCandidates`; when absent that method reports `unavailable`.
    */
   frontierSource?: WalkSearchSnapshotProvider;
+  /**
+   * Read-only query-port behavior: envelope clock and the host-owned container
+   * classifier. Without `isContainer`, `containerAnchors` is unsupported.
+   */
+  query?: SpatialQueryOptions;
 }
 
 /** One method's honesty report. */
@@ -222,13 +236,14 @@ const DEFAULT_ENDPOINT_NEAR = 5;
 const DEFAULT_ANCHOR_NEAR = 6;
 const ANCHOR_QUERY_LIMIT = 20;
 
-export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest {
+export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest, SpatialQueryPort {
   readonly worldId: string;
 
   private readonly voxel: VoxelMap;
   private readonly fragmentStore: FragmentStore;
   private readonly topologyStore: TopologyStore;
   private readonly frontierSource: WalkSearchSnapshotProvider | undefined;
+  private readonly queryPort: SpatialQueryPort;
 
   constructor(options: SpatialMemoryStoreOptions) {
     const worldId = options.worldId;
@@ -248,6 +263,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest 
     this.fragmentStore = fragments;
     this.topologyStore = topology;
     this.frontierSource = options.frontierSource;
+    this.queryPort = createSpatialQueryPort(this.buildQuerySources(), options.query);
   }
 
   // --- Voxel (current world state) ---
@@ -773,6 +789,46 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest 
     return projectRouteInspection(snapshot);
   }
 
+  // --- Read-only query projection (contract §5) ---
+
+  /** Read-only projection over the composed stores; never loads, refreshes, or writes. */
+  query(request: SpatialQueryRequest): SpatialQueryResult {
+    return this.queryPort.query(request);
+  }
+
+  /** The narrow, mutation-free view the query port is allowed to see. */
+  private buildQuerySources(): SpatialQuerySources {
+    return {
+      worldId: this.worldId,
+      currentSessionId: () => this.voxel.sessionId,
+      cellAt: (dim, x, y, z) => this.voxel.cellAt(dim, x, y, z),
+      residencyAt: (dim, x, y, z) => {
+        const { cx, cz, sy } = blockToSection(x, y, z);
+        return this.voxel.sectionResidency({ worldId: this.worldId, dim, cx, cz, sy }).residency;
+      },
+      fragments: {
+        fragments: (query) => this.fragmentStore.fragments(query),
+        traversals: (query) => this.fragmentStore.traversals(query),
+        getFragment: (id) => this.fragmentStore.getFragment(id),
+      },
+      topology: {
+        nodes: (query) => this.topologyStore.nodes(query),
+        edges: (query) => this.topologyStore.edges(query),
+        portalEdges: () => this.topologyStore.portalEdges(),
+      },
+      history: {
+        routeInspection: (dim, from, to, options) =>
+          this.routeInspection(dim, from, to, options),
+        surfaceAnchor: (dim, here, options) => this.surfaceAnchor(dim, here, options),
+        deepestAnchor: (dim, here, options) => this.deepestAnchor(dim, here, options),
+        components: (dim) => this.components(dim),
+        segments: (fragmentId) => this.segments(fragmentId),
+      },
+      snapshot: () => this.snapshot(),
+      memoryCapabilities: () => this.describeCapabilities(),
+    };
+  }
+
   // --- Capability and snapshot reports ---
 
   describeCapabilities(): SpatialMemoryCapabilities {
@@ -802,6 +858,11 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest 
       sectionAt: {
         available: true,
         reason: 'null means the Section is not resident or was never allocated; it is not empty air.',
+      },
+      query: {
+        available: true,
+        reason:
+          'Read-only projection over the composed stores. containerAnchors requires a host-injected isContainer classifier; containerContents always returns host_ledger/unsupported.',
       },
       markTraversed: {
         available: true,

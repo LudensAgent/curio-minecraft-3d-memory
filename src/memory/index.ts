@@ -6,6 +6,11 @@
  * module exists now so the write/change ports have a navigation-free home.
  */
 
+export { CONTRACT_VERSION } from './capabilities.js';
+export type {
+  ContractVersion,
+  MemoryHostCapabilities,
+} from './capabilities.js';
 export type {
   ChangeReportErrorHandler,
   ChangeReportSink,
