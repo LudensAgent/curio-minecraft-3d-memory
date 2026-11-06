@@ -15,6 +15,7 @@ import {
 } from '../src/index.js';
 import type { SpatialNode, Vec3Like } from '../src/index.js';
 import { runSpatialQuery } from '../src/query/index.js';
+import { MAX_QUERY_LIMIT } from '../src/query/paging.js';
 import type {
   SpatialQueryOptions,
   SpatialQueryResult,
@@ -111,6 +112,40 @@ export function makeNode(
   };
 }
 
+function collectPages<T>(
+  fetch: (
+    after: string | undefined,
+    limit: number,
+  ) => { items: T[]; total: number; nextAfter?: string },
+): T[] {
+  const items: T[] = [];
+  let after: string | undefined;
+  let pageBudget = 1;
+  for (let pageIndex = 0; pageIndex < pageBudget; pageIndex += 1) {
+    const page = fetch(after, MAX_QUERY_LIMIT);
+    if (pageIndex === 0) pageBudget = Math.max(1, page.total);
+    items.push(...page.items);
+    if (page.nextAfter === undefined) return items;
+    after = page.nextAfter;
+  }
+  return items;
+}
+
+/**
+ * `componentCache`/`componentNext` are TypeScript-private; reading them is the
+ * only direct proof that a query path never creates cache or counter entries.
+ */
+export function captureComponentCache(parts: QueryParts) {
+  const state = parts.topology as unknown as {
+    componentCache: Map<string, Map<string, number>>;
+    componentNext: Map<string, number>;
+  };
+  return {
+    cached: [...state.componentCache].map(([dim, cache]) => [dim, [...cache]] as const),
+    counters: [...state.componentNext],
+  };
+}
+
 /** Read-only snapshot used by tests to prove a query did not mutate anything. */
 export function captureStoreState(parts: QueryParts): unknown {
   return {
@@ -121,5 +156,32 @@ export function captureStoreState(parts: QueryParts): unknown {
     topologyRevision: parts.topology.revision,
     cell: parts.map.cellAt(DIM, 0, 0, 0),
     section: parts.map.sectionAt(DIM, 0, 0, 0),
+    // Evidence times and use counters must survive a query untouched.
+    nodes: collectPages((after, limit) => parts.topology.nodes({ after, limit })).map((node) => ({
+      id: node.id,
+      observedAt: node.observedAt,
+    })),
+    fragments: collectPages((after, limit) => parts.fragments.fragments({ after, limit })).map(
+      (fragment) => ({
+        id: fragment.id,
+        lastUsedAt: fragment.lastUsedAt,
+        uses: fragment.uses,
+      }),
+    ),
+    traversals: collectPages((after, limit) =>
+      parts.fragments.traversals({ after, limit }),
+    ).map((traversal) => ({
+      id: traversal.id,
+      observedAt: traversal.observedAt,
+    })),
+    edges: collectPages((after, limit) => parts.topology.edges({ after, limit })).map((edge) => ({
+      id: edge.id,
+      from: edge.from,
+      to: edge.to,
+      basis: edge.basis,
+    })),
+    // The component cache and its id counters are write-side derivation state;
+    // a read-only query must leave both untouched.
+    components: captureComponentCache(parts),
   };
 }

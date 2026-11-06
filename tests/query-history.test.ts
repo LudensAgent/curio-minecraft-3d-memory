@@ -8,13 +8,14 @@ import type {
   Vec3Like,
 } from '../src/index.js';
 import type { SpatialQueryResult } from '../src/query/types.js';
-import { pathFragment, traversalEvidence } from './fakes.js';
+import { AIR, obs, pathFragment, traversalEvidence } from './fakes.js';
 import {
   A,
   B,
   C,
   DIM,
   WORLD,
+  captureComponentCache,
   captureStoreState,
   makeNode,
   makeQueryParts,
@@ -308,6 +309,107 @@ describe('queryHistory — components', () => {
     expect(report.groups).toEqual([['a', 'b', 'c'], ['d']]);
     expect(report.byNode.get('d')).not.toBe(report.byNode.get('a'));
   });
+
+  it('returns a deep-equal report for consecutive queries', () => {
+    // Insert out of order: component and group order must not depend on
+    // node insertion order.
+    const parts = makeQueryParts();
+    parts.topology.saveNode(makeNode('c', C));
+    parts.topology.saveNode(makeNode('a', A));
+    parts.topology.saveNode(makeNode('b', B));
+    seedResolvedEdge(parts, 'e-ab', 'a', 'b', 'ev-ab', 'frag-ab', A, B);
+    seedResolvedEdge(parts, 'e-bc', 'b', 'c', 'ev-bc', 'frag-bc', B, C);
+
+    const first = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+    const second = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+
+    expect(first.groups).toEqual([['a', 'b', 'c']]);
+    expect(second).toEqual(first);
+    expect([...second.byNode]).toEqual([...first.byNode]);
+    expect(second.recomputedNodes).toBe(first.recomputedNodes);
+  });
+
+  it('rebuilds identical reports across multiple source pages', () => {
+    const parts = makeQueryParts();
+    // More nodes than one store page (default maxQueryBatch is 100), so this
+    // exercises the cursor loop rather than a single page.
+    for (let i = 249; i >= 0; i -= 1) {
+      const id = `n${String(i).padStart(3, '0')}`;
+      parts.topology.saveNode(makeNode(id, { x: i + 0.5, y: 64, z: 0.5 }));
+    }
+
+    const first = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+    const second = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+
+    expect(first.components).toBe(250);
+    expect(first.groups).toHaveLength(250);
+    expect(first.groups[0]).toEqual(['n000']);
+    expect(first.groups[249]).toEqual(['n249']);
+    expect(first.recomputedNodes).toBe(250);
+    expect(second).toEqual(first);
+  });
+
+  it('orders groups with the store locale comparator', () => {
+    const parts = makeQueryParts();
+    parts.topology.saveNode(makeNode('B', A));
+    parts.topology.saveNode(makeNode('a', B));
+
+    const report = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+
+    // Code-unit order would put 'B' before 'a'; the store uses localeCompare.
+    expect(report.groups).toEqual([['a'], ['B']]);
+    expect([...report.byNode]).toEqual([
+      ['a', 0],
+      ['B', 1],
+    ]);
+    expect(report).toEqual(parts.topology.components(DIM));
+  });
+
+  it('does not populate the store component cache, including for an empty dimension', () => {
+    const parts = chainParts();
+
+    runQuery(parts, { kind: 'components', dim: DIM });
+    runQuery(parts, { kind: 'components', dim: 'the_nether' });
+
+    expect(captureComponentCache(parts)).toEqual({ cached: [], counters: [] });
+    // The store cache is still cold: its first call recomputes every node.
+    expect(parts.topology.components(DIM).recomputedNodes).toBe(3);
+  });
+
+  it('reports an empty dimension without inventing nodes or groups', () => {
+    const parts = chainParts();
+
+    const report = componentsOf(runQuery(parts, { kind: 'components', dim: 'the_nether' }));
+    expect(report.components).toBe(0);
+    expect(report.groups).toEqual([]);
+    expect(report.byNode.size).toBe(0);
+    expect(report.recomputedNodes).toBe(0);
+
+    const again = componentsOf(runQuery(parts, { kind: 'components', dim: 'the_nether' }));
+    expect(again).toEqual(report);
+  });
+
+  it('only groups nodes that belong to the requested dimension', () => {
+    const parts = chainParts();
+    parts.topology.saveNode(makeNode('nether-a', A, { dim: 'the_nether' }));
+
+    const report = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+
+    expect(report.groups).toEqual([['a', 'b', 'c']]);
+    expect(report.byNode.has('nether-a')).toBe(false);
+    expect(report.recomputedNodes).toBe(3);
+  });
+
+  it('matches the topology store component projection', () => {
+    const parts = chainParts();
+    const d: Vec3Like = { x: 3.5, y: 64, z: 0.5 };
+    parts.topology.saveNode(makeNode('d', d));
+
+    const queryReport = componentsOf(runQuery(parts, { kind: 'components', dim: DIM }));
+    const storeReport = parts.topology.components(DIM);
+
+    expect(queryReport).toEqual(storeReport);
+  });
 });
 
 describe('queryHistory — segments', () => {
@@ -341,6 +443,10 @@ describe('queryHistory — segments', () => {
 describe('queryHistory — read-only guarantees', () => {
   it('does not change store state, revisions, or evidence across all query kinds', () => {
     const parts = chainParts();
+    parts.map.observe(obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 4321 }));
+    parts.topology.saveNode(
+      makeNode('observed', { x: 9.5, y: 64, z: 0.5 }, { observedAt: 4242 }),
+    );
     const before = captureStoreState(parts);
     const fragmentRevision = parts.fragments.revision;
     const topologyRevision = parts.topology.revision;
@@ -356,6 +462,15 @@ describe('queryHistory — read-only guarantees', () => {
     expect(parts.topology.revision).toBe(topologyRevision);
     expect(parts.fragments.getTraversal('ev-ab')).toEqual(traversal);
     expect(parts.fragments.getFragment('frag-ab')).toEqual(fragment);
+    // Evidence time and fragment use records are never refreshed by a query.
+    expect(parts.map.cellAt(DIM, 0, 0, 0)).toMatchObject({
+      observed: true,
+      evidence: { observation: { observedAt: 4321 } },
+    });
+    expect(parts.topology.getNode('observed')?.observedAt).toBe(4242);
+    expect(parts.fragments.getTraversal('ev-ab')?.observedAt).toBe(1000);
+    expect(parts.fragments.getFragment('frag-ab')?.lastUsedAt).toBe(1000);
+    expect(parts.fragments.getFragment('frag-ab')?.uses).toBe(1);
     expect(captureStoreState(parts)).toEqual(before);
   });
 });

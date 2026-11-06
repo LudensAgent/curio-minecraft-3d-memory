@@ -6,7 +6,7 @@ import type {
   CellQueryView,
   SpatialQueryResult,
 } from '../src/query/index.js';
-import { AIR, STONE, obs } from './fakes.js';
+import { AIR, STONE, obs, pathFragment } from './fakes.js';
 import {
   captureStoreState,
   DIM,
@@ -317,8 +317,9 @@ describe('cells query — validation and isolation', () => {
 
   it('does not mutate store state across cell queries', () => {
     const parts = makeQueryParts();
-    parts.map.observe(obs(AIR, { x: 0, y: 64, z: 0 }));
+    parts.map.observe(obs(AIR, { x: 0, y: 64, z: 0 }, { observedAt: 4321 }));
     parts.map.observe(obs(STONE, { x: 1, y: 64, z: 0 }));
+    parts.fragments.saveFragment(pathFragment('frag-ab'));
     const before = captureStoreState(parts);
 
     runQuery(parts, {
@@ -332,6 +333,13 @@ describe('cells query — validation and isolation', () => {
     });
     runQuery(parts, { kind: 'cells', dim: DIM, positions: [{ x: 100, y: 0, z: 100 }] });
 
+    // Evidence time and fragment use records are never refreshed by a query.
+    expect(parts.map.cellAt(DIM, 0, 64, 0)).toMatchObject({
+      observed: true,
+      evidence: { observation: { observedAt: 4321 } },
+    });
+    expect(parts.fragments.getFragment('frag-ab')?.lastUsedAt).toBe(1000);
+    expect(parts.fragments.getFragment('frag-ab')?.uses).toBe(1);
     expect(captureStoreState(parts)).toEqual(before);
   });
 });
