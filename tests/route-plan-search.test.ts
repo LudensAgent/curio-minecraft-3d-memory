@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { planRoute, RouteVerifier } from '../src/index.js';
+import type { WalkSearchSnapshot } from '../src/index.js';
 import { bodyAt, fakeProvider, obs, STONE } from './fakes.js';
 import {
   capturePlanningState,
@@ -380,6 +381,144 @@ describe('planRoute — search source', () => {
     expect(plan.confidence).toBe('verified');
     expect(plan.points).toHaveLength(3);
     expect(parts.registry.size).toBe(1);
+  });
+});
+
+describe('planRoute — search scope and mid-plan deadlines', () => {
+  it('rejects an out-of-scope terminal snapshot after an in-scope PENDING first frame', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const found = runSearch(map, { x: 2.5, y: 0, z: 0.5 }, clock);
+    expect(found.state).toBe('FOUND');
+    // The first frame is in scope and PENDING, so the initial snapshot check
+    // passes; only the terminal check before interpreting the result can reject
+    // these foreign outcomes. Removing that check registers a plan (or a
+    // no_path) for another world's result.
+    const pending: WalkSearchSnapshot = {
+      ...found,
+      state: 'PENDING',
+      candidate: null,
+      counters: { ...found.counters, nodesReached: 1, edgesEvaluated: 0 },
+    };
+    const foreign: WalkSearchSnapshot[] = [
+      { ...found, worldId: 'other-world' },
+      { ...found, dim: 'the_nether' },
+      { ...found, sessionId: 's2' },
+      { ...found, mode: 'swim' },
+    ];
+
+    for (const snapshot of foreign) {
+      const parts = makePlanParts({ map, clock });
+      const before = capturePlanningState(parts);
+      const result = await planRoute(
+        planRequest(),
+        makePlanEnvironment(parts, { search: replayAdvancingSearchSource(pending, snapshot) }),
+      );
+
+      expect(result.plan).toBeUndefined();
+      expect(result.problem).toMatchObject({ kind: 'scope_changed' });
+      expect(parts.registry.size).toBe(0);
+      expect(capturePlanningState(parts)).toEqual(before);
+    }
+  });
+
+  it('reports an out-of-scope terminal search as scope_changed, never no_path', async () => {
+    const clock = new TestClock();
+    const map = openFloorMap([{ x: 0, z: 0 }], { now: clock.now });
+    wallOffSingleCell(map);
+    const terminal = runSearch(map, { x: 2.5, y: 0, z: 0.5 }, clock);
+    expect(terminal.state).not.toBe('FOUND');
+    // In-scope PENDING first frame, then a foreign session's terminal result:
+    // the initial scope check passes and only the terminal check can reject it.
+    const pending: WalkSearchSnapshot = { ...terminal, state: 'PENDING', candidate: null };
+    const parts = makePlanParts({ map, clock });
+    const before = capturePlanningState(parts);
+
+    const result = await planRoute(
+      planRequest(),
+      makePlanEnvironment(parts, {
+        search: replayAdvancingSearchSource(pending, { ...terminal, sessionId: 's2' }),
+      }),
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'scope_changed' });
+    expect(parts.registry.size).toBe(0);
+    expect(capturePlanningState(parts)).toEqual(before);
+  });
+
+  it('rejects a FOUND candidate whose target differs from request.to', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const found = runSearch(map, { x: 1.5, y: 0, z: 0.5 }, clock);
+    expect(found.state).toBe('FOUND');
+    const parts = makePlanParts({ map, clock });
+    const before = capturePlanningState(parts);
+
+    const result = await planRoute(
+      planRequest({ to: { x: 2.5, y: 0, z: 0.5 } }),
+      makePlanEnvironment(parts, { search: replaySearchSource(found) }),
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'invalid_request' });
+    expect(result.message).toContain('target');
+    expect(parts.registry.size).toBe(0);
+    expect(capturePlanningState(parts)).toEqual(before);
+  });
+
+  it('times out during the search phase without registering a plan or writing state', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(11, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const before = capturePlanningState(parts);
+    let waits = 0;
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      budgetPerSlice: 1,
+      wait: async () => {
+        waits += 1;
+        clock.advance(2000);
+      },
+    });
+
+    const result = await planRoute(
+      planRequest({ to: { x: 10.5, y: 0, z: 0.5 } }),
+      environment,
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toEqual({ kind: 'timeout' });
+    expect(waits).toBeGreaterThan(0);
+    expect(parts.registry.size).toBe(0);
+    expect(capturePlanningState(parts)).toEqual(before);
+  });
+
+  it('times out during verifier re-verification without registering a plan or writing state', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const found = runSearch(map, { x: 2.5, y: 0, z: 0.5 }, clock);
+    expect(found.state).toBe('FOUND');
+    const parts = makePlanParts({ map, clock });
+    const before = capturePlanningState(parts);
+    let waits = 0;
+    const environment = makePlanEnvironment(parts, {
+      search: replaySearchSource(found),
+      budgetPerSlice: 1,
+      wait: async () => {
+        waits += 1;
+        clock.advance(10_000);
+      },
+    });
+
+    const result = await planRoute(planRequest(), environment);
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toEqual({ kind: 'timeout' });
+    expect(waits).toBe(1);
+    expect(parts.registry.size).toBe(0);
+    expect(parts.verifier.status()).toBeNull();
+    expect(capturePlanningState(parts)).toEqual(before);
   });
 });
 
