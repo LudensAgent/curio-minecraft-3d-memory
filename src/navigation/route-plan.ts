@@ -31,6 +31,7 @@ import type {
   RouteUnsupported,
 } from './route-plan-types.js';
 import type { RouteSearchSource } from './route-search.js';
+import type { WalkSearchSnapshot } from './walk-search.js';
 import type { NavProblem } from './types.js';
 import { RoutePlanRegistryCapacityError } from './route-plan-registry.js';
 import { buildHistoryPlan } from './route-plan-history.js';
@@ -45,6 +46,7 @@ import {
   emptyVerification,
   isFinitePoint,
   planScope,
+  positionsEqual,
   problemFromSearch,
   readMeasuredStart,
   verifyRoutePoints,
@@ -231,6 +233,11 @@ async function planWithSearch(context: PlanContext): Promise<PlanOutcome> {
   });
 
   let snapshot = source.snapshot();
+  const initialScope = searchScopeProblem(snapshot, context);
+  if (initialScope !== null) {
+    void source.cancel('search snapshot scope does not match the planning scope');
+    return initialScope;
+  }
   const requestedMaxNodes = request.constraints?.maxNodes;
   const requestedMaxEdges = request.constraints?.maxEdges;
   if (requestedMaxNodes !== undefined && requestedMaxNodes > snapshot.limits.maxNodes) {
@@ -286,6 +293,12 @@ async function planWithSearch(context: PlanContext): Promise<PlanOutcome> {
     if (snapshot.state === 'PENDING') await context.wait();
   }
 
+  // Check the terminal snapshot's scope before interpreting its state: an
+  // out-of-scope result is not a fact about this world and must never be
+  // reported as `no_path`/`timeout` or turned into this scope's evidence.
+  const terminalScope = searchScopeProblem(snapshot, context);
+  if (terminalScope !== null) return terminalScope;
+
   if (environment.signal?.aborted === true) {
     return cancelledOutcome(context, abortReason(environment.signal));
   }
@@ -321,6 +334,18 @@ async function planWithSearch(context: PlanContext): Promise<PlanOutcome> {
         detail: 'the walk search reported a FOUND state without a usable candidate route',
       },
       message: 'the walk search returned an inconsistent candidate',
+    };
+  }
+  // A candidate is only about the target this planner asked for. Relying on
+  // `resolvedTarget` alone would turn another target's geometry into this
+  // request's evidence (as a non-executable candidate).
+  if (!positionsEqual(candidate.target, request.to)) {
+    return {
+      problem: {
+        kind: 'invalid_request',
+        detail: 'the walk search candidate target does not match request.to',
+      },
+      message: 'the walk search returned a candidate for a different target than requested',
     };
   }
   if (candidate.points.length > context.maxRoutePoints) {
@@ -618,6 +643,33 @@ function resolveConfig(environment: RoutePlanEnvironment):
 }
 
 // --- outcome helpers ------------------------------------------------------
+
+/**
+ * The search must describe the same world/dim/session/mode this planner was
+ * asked to plan in. A custom `RouteSearchSource` (or a mis-wired search
+ * instance) otherwise hands its candidate to this scope's evidence envelope.
+ */
+function searchScopeProblem(snapshot: WalkSearchSnapshot, context: PlanContext): PlanOutcome | null {
+  if (
+    snapshot.worldId === context.environment.worldId &&
+    snapshot.dim === context.environment.dim &&
+    snapshot.sessionId === context.environment.sessionId &&
+    snapshot.mode === context.request.mode
+  ) {
+    return null;
+  }
+  const snapshotScope = `${snapshot.worldId}/${snapshot.dim}/${snapshot.sessionId}/${snapshot.mode}`;
+  const planScopeLabel =
+    `${context.environment.worldId}/${context.environment.dim}/` +
+    `${context.environment.sessionId}/${context.request.mode}`;
+  return {
+    problem: {
+      kind: 'scope_changed',
+      detail: `the search snapshot scope ${snapshotScope} does not match the planning scope ${planScopeLabel}`,
+    },
+    message: 'the walk search result belongs to a different world, dimension, session or mode',
+  };
+}
 
 function invalid(detail: string): { problem: NavProblem; message: string } {
   return { problem: { kind: 'invalid_request', detail }, message: `the route plan request was rejected: ${detail}` };
