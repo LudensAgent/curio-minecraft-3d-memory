@@ -4,7 +4,7 @@
 > 契约版本：`memory-host-contract/1`
 > 库基线：`integration/memory-host-20261106`，代码 HEAD `df4be98`，包版本 `0.10.0`
 > 宿主参考：`E:\Repos\MinecraftLLM\docs\movement-primitives-refactor-plan-20261106.md`（源码基准 `8fa5a8e`）
-> 相关设计：[空间记忆与导航库设计](./spatial-memory-library-design.md)、[实现审计](./implementation-audit-0.10.0.md)
+> 相关设计：[空间记忆与导航库设计](./spatial-memory-library-design.md)、[实现审计](./implementation-audit-0.10.0.md)、[实现计划与代码审计要求](./memory-host-implementation-plan.md)
 
 > **这是目标契约，不是“全部已实现”的报告。** 每一节都标注 `[已实现]`、`[待实现]` 或 `[宿主职责]`。Agent 侧在接线前必须读取 §15 的实现状态表，并通过 §2 的能力协商确认实际可用能力；不得把目标类型当成已存在的运行时入口。
 
