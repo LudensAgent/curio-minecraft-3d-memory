@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CONTRACT_VERSION } from '../src/memory/capabilities.js';
+import { ROUTE_PLAN_CAPABILITIES } from '../src/index.js';
 import type { MemoryHostCapabilities } from '../src/memory/capabilities.js';
 import type { SpatialQueryResult } from '../src/query/types.js';
 import { captureStoreState, makeQueryParts, runQuery } from './query-fixtures.js';
@@ -67,11 +68,22 @@ describe('query capabilities', () => {
     expect(withClassifier.query.containerContents).toBe(false);
   });
 
-  it('keeps unimplemented plan, execute, and persistence domains false', () => {
+  it('reports implemented walk planning and keeps execute/persistence false', () => {
     const parts = makeQueryParts();
     const capabilities = capabilitiesOf(runQuery(parts, { kind: 'capabilities' }));
 
-    expect(Object.values(capabilities.plan).some(Boolean)).toBe(false);
+    expect(capabilities.plan).toEqual({
+      walkSearch: true,
+      walkHistory: true,
+      walkAuto: true,
+      nearArrival: false,
+      reachBlockArrival: false,
+      digPlaceTower: false,
+      swim: false,
+      boat: false,
+    });
+    // The canonical host report must not drift from the navigation-layer table.
+    expect(capabilities.plan).toEqual({ ...ROUTE_PLAN_CAPABILITIES });
     expect(Object.values(capabilities.execute).some(Boolean)).toBe(false);
     expect(Object.values(capabilities.persistence).some(Boolean)).toBe(false);
   });

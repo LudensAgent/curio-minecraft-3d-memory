@@ -234,3 +234,37 @@ export const NAVIGATION_CAPABILITIES = [
       'The nearest existing read-only primitives are historical queries. They neither select nor execute a route.',
   },
 ] as const satisfies readonly NavigationCapability[];
+
+/**
+ * Planning capability report for the optional `planRoute` entry (contract §2.3
+ * `plan`, plan M3.7).
+ *
+ * `false` is a contract fact: the host must not call or emulate that planning
+ * mode through `planRoute`. In particular near/reach_block arrival, digging,
+ * placing, towering, swimming and boating are not planned in v1; unsupported
+ * requests are rejected with structured problems rather than silently routed
+ * to a wider backend.
+ */
+export interface RoutePlanCapabilities {
+  walkSearch: boolean;
+  walkHistory: boolean;
+  walkAuto: boolean;
+  nearArrival: boolean;
+  reachBlockArrival: boolean;
+  digPlaceTower: boolean;
+  swim: boolean;
+  boat: boolean;
+}
+
+export type RoutePlanCapabilityName = keyof RoutePlanCapabilities;
+
+export const ROUTE_PLAN_CAPABILITIES = {
+  walkSearch: true,
+  walkHistory: true,
+  walkAuto: true,
+  nearArrival: false,
+  reachBlockArrival: false,
+  digPlaceTower: false,
+  swim: false,
+  boat: false,
+} as const satisfies RoutePlanCapabilities;

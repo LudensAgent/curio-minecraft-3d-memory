@@ -49,10 +49,12 @@ export function buildMemoryHostCapabilities(
       containerAnchors: context.isContainer !== undefined,
       containerContents: false,
     },
+    // M3 planning is present in this package. These are static capability
+    // facts, not optimistic placeholders; the wider planning modes remain false.
     plan: {
-      walkSearch: false,
-      walkHistory: false,
-      walkAuto: false,
+      walkSearch: true,
+      walkHistory: true,
+      walkAuto: true,
       nearArrival: false,
       reachBlockArrival: false,
       digPlaceTower: false,

@@ -623,9 +623,20 @@ export interface RoutePlanEnvironment {
   search?: RouteSearchSource;
   /** 历史来源；source:'history'/'auto' 必需。 */
   history?: FragmentStore;
+  /**
+   * 专用只读复验器，必须绑定同一个 `VoxelMap`。规划只通过它复验已经选出的
+   * 点列；不要与执行器共享同一个 `RouteVerifier` 实例。
+   */
+  verifier: RouteVerifier;
+  /** 发出易失 `routeId` 的注册表；规划只依赖 `register(draft): RoutePlan`。 */
+  registry: RoutePlanRegistrar;
   now?: () => number;
   /** 每次切片的最大边评估数；用于让出事件循环。 */
   budgetPerSlice?: number;
+  /** 计划有效期上限（ms），与证据有效期取较小值。 */
+  planTtlMs?: number;
+  /** 一条计划允许的最大点数；默认 1024。 */
+  maxRoutePoints?: number;
   /** 协作让出；必须在切片之间调用。 */
   wait?: () => Promise<void>;
   signal?: AbortSignal;
@@ -699,7 +710,7 @@ export type RouteUnsupported =
   | { kind: 'unsupported_constraint'; constraint: string; detail: string }
   | { kind: 'unsupported_geometry'; detail: string }
   | { kind: 'unobserved'; gap: ObservationGap }
-  | { kind: 'budget_exhausted'; limit: 'nodes' | 'edges' | 'time'; detail: string }
+  | { kind: 'budget_exhausted'; limit: 'nodes' | 'edges' | 'points' | 'time'; detail: string }
   | { kind: 'not_authorized'; detail: string }
   | { kind: 'scope_mismatch'; detail: string };
 
@@ -718,6 +729,8 @@ export interface RouteEvidence {
 export interface RoutePlanResult {
   plan?: RoutePlan;
   problem?: NavProblem | RouteUnsupported;
+  /** 与 `problem` 对应的可读说明；不是世界事实。 */
+  message?: string;
 }
 ```
 
@@ -750,24 +763,29 @@ export interface RoutePlanResult {
 - `routeId` 不持久化；不得跨进程恢复。
 
 ```ts
-// [待实现] optional navigation
+// [已实现] optional navigation
+export type RoutePlanDraft = Omit<RoutePlan, 'routeId'>;
+export type RoutePlanScope = WorldScope & { sessionId: string };
+
 export interface RoutePlanRegistry {
-  register(plan: RoutePlan): void;
+  /** `routeId` 由注册表发出并返回；宿主不能自造 id。 */
+  register(plan: RoutePlanDraft): RoutePlan;
   /**
    * Atomically consume a routeId. The first call consumes it, even if the
    * subsequent start/scope/expiry check fails; a new execution needs a new plan.
    */
-  consume(routeId: string, scope: WorldScope, now: number): RoutePlan | RoutePlanRegistryProblem;
+  consume(routeId: string, scope: RoutePlanScope, now: number): RoutePlan | RoutePlanRegistryProblem;
   /** Release an active execution's pin after terminal outcome. */
   release(routeId: string): void;
   readonly size: number;
 }
 
 export type RoutePlanRegistryProblem =
+  | { kind: 'invalid_request'; detail: string }
   | { kind: 'route_not_found'; routeId: string }
   | { kind: 'route_consumed'; routeId: string }
   | { kind: 'route_expired'; routeId: string; expiresAt: number }
-  | { kind: 'scope_mismatch'; routeId: string; expected: WorldScope; actual: WorldScope }
+  | { kind: 'scope_mismatch'; routeId: string; expected: RoutePlanScope; actual: RoutePlanScope }
   | { kind: 'route_not_executable'; routeId: string; reason: string };
 ```
 
@@ -1133,6 +1151,16 @@ export interface ChangeReport {
 - 查询结果新增可选 `sessionId`（当前观察会话）与 `problem` 分类；未改变既有写入/路由接口。
 - 按 §12.3，新增枚举值/收窄必填属于契约变更。预发布仍标记 `memory-host-contract/1` 并依赖能力协商；正式发布时由 M9 决定 minor/major 并同步宿主。包版本仍为 `0.10.0`（未发布）。
 
+### 12.6 M3 兼容性记录
+
+- 新增只读规划入口 `planRoute`、规划类型和 `RoutePlanRegistryImpl`；根入口与 `navigation` 子入口导出。`RoutePlanSegment` 是契约 §6.4 `RouteSegment` 的实现名（根入口已存在 topology 的 `RouteSegment`，不能重复导出）。
+- `RoutePlanEnvironment` 新增必选 `verifier`（专用只读 `RouteVerifier`）和 `registry`，以及可选 `planTtlMs`/`maxRoutePoints`。宿主实现者必须补齐；这是接口新增。
+- `RoutePlanRequest.mode` 类型收窄为 `'walk'`；非 walk 值只能在未类型化边界出现，运行时仍返回结构化 `unsupported_mode`。`RoutePlanResult` 新增可选 `message`（响应增量）；`budget_exhausted.limit` 新增 `'points'`（路线点数上限，不是搜索节点事实）。
+- `RoutePlanRegistry.register` 接受 `RoutePlanDraft` 并返回带 `routeId` 的 `RoutePlan`（比 §6.6 目标片段更强的“注册表发号”语义）；`consume` 的 scope **必须**提供 `sessionId`，并同时校验 world/dim/session。`now` 非有限时返回 `invalid_request` 且不消费句柄。消费时立即 pin，`release` 后仍保持已消费。起点复核属于 `walkPath` 预检（M4.2），不在注册表中伪造。
+- 新增 `ROUTE_PLAN_CAPABILITIES` 报告 walk search/history/auto 为 `true`，其余规划能力为 `false`；未实现能力不会被静默回退。`MemoryHostCapabilities.plan.walkSearch/walkHistory/walkAuto` 同步为 `true`（静态能力事实）；`plan` 其余位与 `execute`/`persistence` 仍由 M5.4 收口。
+- `source:'history'` 不接受 `maxNodes`/`maxEdges`（它们是搜索预算，历史路线不消费）；返回结构化 `unsupported_constraint`，不静默忽略。`maxRoutePoints` 仍是历史/搜索结果共同的点数上限。
+- 规划只读：不调用 `navigateTo`/执行器/pathfinder，不写地图、历史或容器；`executable:true` 只表示当前证据支持该 walk 几何，不表示授权。
+
 ---
 
 ## 13. 宿主接线步骤（Checklist）
@@ -1256,12 +1284,14 @@ export interface ChangeReport {
 | `SpatialMemoryStore` 查询方法 | 已实现（分散） | `src/store/store.ts` |
 | 统一 `SpatialQueryPort` | 已实现 | `src/query/*`；`SpatialMemoryStore.query(request)` 暴露；含 segments；未知字段/kind 拒绝、分页 100/1000、只读 |
 | `segments` 查询 | 已实现 | 包装 `TopologyStore.segments`；未知 fragment 返回 `not_found`；不删除/改写 fragment 历史 |
-| `MemoryHostCapabilities` / `CONTRACT_VERSION` | 已实现（M2 部分） | `src/memory/capabilities.ts`；memory/query 按实际能力，plan/execute/persistence 保守 `false` |
+| `MemoryHostCapabilities` / `CONTRACT_VERSION` | 已实现（M2/M3 部分） | `src/memory/capabilities.ts`；memory/query 按实际能力，M3 规划 walk search/history/auto 为 `true`；execute/persistence 与其余 plan 位待 M5.4 |
 | `cells` 未驻留/gap 语义 | 部分实现 | 可区分 `no_record`/resident-unobserved/`not_resident`/`loading`/`load_failed`；历史 `ObservationGap` 未持久化，只报告当前驻留 gap |
 | `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts` |
 | `WalkRouteExecutor` + `bodyArrival` | 已实现 | `src/execution/*` |
 | `startKnownWalkRoute` | 已实现（启动执行，不是 plan-only） | `src/navigation/known-walk-route.ts` |
-| `planRoute`/`RoutePlan`/`RoutePlanRegistry` | 待实现 | 本契约 §6 |
+| `planRoute`/`RoutePlan`/`RoutePlanRegistry` | 已实现（M3） | `src/navigation/route-plan*.ts`；search/history/auto、候选不可执行、边界、预算、routeId 单次使用 |
+| `RouteSearchSource` 适配 | 已实现（M3） | `src/navigation/route-search.ts`；包装 `WalkRouteSearch`，状态→规划结论显式映射 |
+| `ROUTE_PLAN_CAPABILITIES` | 已实现（M3） | `src/navigation/capabilities.ts`；walk search/history/auto true，其余 false |
 | `walkPath`/`WalkPathResult` | 待实现 | 本契约 §7；可先用 `WalkRouteExecutor` 由宿主实现 |
 | `INVALIDATED` outcome | 待实现 | 当前 `NavOutcome` 无此值，使用 `route_invalidated` problem |
 | `PerceptionSource`/`BodyAdapter` 拆分 | 已实现 | 计划中的感知端口命名为 `PerceptionSource`，避免与既有证据来源联合类型 `ObservationSource` 冲突；`WorldAdapter` 保留为兼容交叉类型 |

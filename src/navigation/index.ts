@@ -49,13 +49,47 @@ export type {
   KnownRouteTraversalView,
 } from './known-route-inspection.js';
 export { startKnownWalkRoute } from './known-walk-route.js';
-export { NAVIGATION_CAPABILITIES, NAVIGATION_CAPABILITY_STATUSES } from './capabilities.js';
+export {
+  NAVIGATION_CAPABILITIES,
+  NAVIGATION_CAPABILITY_STATUSES,
+  ROUTE_PLAN_CAPABILITIES,
+} from './capabilities.js';
 export type {
   NavigationCapability,
   NavigationCapabilityEffects,
   NavigationCapabilityName,
   NavigationCapabilityStatus,
+  RoutePlanCapabilities,
+  RoutePlanCapabilityName,
 } from './capabilities.js';
+export { planRoute } from './route-plan.js';
+export type {
+  CancellationOrigin,
+  RouteBoundary,
+  RouteEvidence,
+  RoutePlan,
+  RoutePlanConstraints,
+  RoutePlanDraft,
+  RoutePlanEnvironment,
+  RoutePlanRegistrar,
+  RoutePlanRequest,
+  RoutePlanResult,
+  RoutePlanScope,
+  RoutePlanSegment,
+  RoutePlanSource,
+  RouteUnsupported,
+} from './route-plan-types.js';
+export {
+  RoutePlanRegistryCapacityError,
+  RoutePlanRegistryImpl,
+} from './route-plan-registry.js';
+export type {
+  RoutePlanRegistry,
+  RoutePlanRegistryOptions,
+  RoutePlanRegistryProblem,
+} from './route-plan-registry.js';
+export { createWalkRouteSearchSource } from './route-search.js';
+export type { RouteSearchSource } from './route-search.js';
 export { frontierCandidates, inspectRoute } from './route-inspection.js';
 export type {
   FrontierCandidateView,

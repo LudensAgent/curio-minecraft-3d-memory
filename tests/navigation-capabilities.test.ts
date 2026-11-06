@@ -9,6 +9,8 @@ import {
   navigateTo,
   NAVIGATION_CAPABILITIES,
   NAVIGATION_CAPABILITY_STATUSES,
+  planRoute,
+  ROUTE_PLAN_CAPABILITIES,
   startKnownWalkRoute,
   WalkRouteSearch,
 } from '../src/navigation/index.js';
@@ -21,6 +23,15 @@ import type {
 } from '../src/index.js';
 import type { BlockState } from '../src/types.js';
 import { AIR, bodyAt, fakeProvider, obs, STONE } from './fakes.js';
+import {
+  loosePlanRequest,
+  makePlanEnvironment,
+  makePlanParts,
+  planRequest,
+  searchSource,
+  straightCorridor,
+  TestClock,
+} from './route-plan-fixtures.js';
 
 type Cell = [number, number, number];
 
@@ -368,5 +379,53 @@ describe('read-only queries preserve map and search state', () => {
     expect(search.status()).toEqual(before.snapshot);
     expect(search.status()!.state).toBe('PENDING');
     expect(search.status()!.counters.edgesEvaluated).toBe(pending.counters.edgesEvaluated);
+  });
+});
+
+describe('planRoute capability report (M3.7)', () => {
+  it('reports walk search/history/auto as implemented and the wider modes as false', () => {
+    expect(ROUTE_PLAN_CAPABILITIES).toEqual({
+      walkSearch: true,
+      walkHistory: true,
+      walkAuto: true,
+      nearArrival: false,
+      reachBlockArrival: false,
+      digPlaceTower: false,
+      swim: false,
+      boat: false,
+    });
+    expect(Object.keys(ROUTE_PLAN_CAPABILITIES).sort()).toEqual([
+      'boat',
+      'digPlaceTower',
+      'nearArrival',
+      'reachBlockArrival',
+      'swim',
+      'walkAuto',
+      'walkHistory',
+      'walkSearch',
+    ]);
+    expect(typeof navigation.planRoute).toBe('function');
+  });
+
+  it('returns structured unsupported problems for capabilities reported false', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(1, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const environment = makePlanEnvironment(parts, { search: searchSource(map, clock) });
+
+    const swim = await planRoute(loosePlanRequest({ mode: 'swim' }), environment);
+    expect(swim.plan).toBeUndefined();
+    expect(swim.problem).toMatchObject({ kind: 'unsupported_mode', mode: 'swim' });
+
+    const near = await planRoute(loosePlanRequest({ arrival: { kind: 'near', radius: 1 } }), environment);
+    expect(near.plan).toBeUndefined();
+    expect(near.problem).toMatchObject({ kind: 'unsupported_arrival' });
+
+    const avoid = await planRoute(
+      planRequest({ constraints: { avoid: [{ x: 1.5, y: 0, z: 0.5 }] } }),
+      environment,
+    );
+    expect(avoid.plan).toBeUndefined();
+    expect(avoid.problem).toMatchObject({ kind: 'unsupported_constraint' });
   });
 });
