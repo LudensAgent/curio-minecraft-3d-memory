@@ -120,6 +120,20 @@ export interface CellQueryView {
   staleReason?: string;
   /** Present only when this requested cell could not be observed now. */
   gap?: ObservationGap;
+  /**
+   * Residency of the owning Section at query time, present on unobserved cells.
+   * It separates `no_record`, `resident` (Section readable but this cell was
+   * never observed), `not_resident`, `loading`, and `load_failed`. Observed
+   * cells omit it: their own evidence already says the Section was readable.
+   */
+  residency?: SectionResidency;
+  /**
+   * Why an unobserved cell has no gap. `no_record` means the Section has no
+   * record at all; `resident` means the Section is resident but this cell was
+   * never observed. Absent for unreadable Sections, where `gap.reason` says
+   * `unloaded` and `residency` names the state.
+   */
+  unobservedReason?: 'no_record' | 'resident';
 }
 
 export type SpatialQueryData =

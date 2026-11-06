@@ -67,6 +67,9 @@ describe('cells query — observed evidence', () => {
       freshness: 'FRESH',
       validUntil: 61_000,
     });
+    // Residency fields are additive and only describe unobserved cells.
+    expect(cells[0]).not.toHaveProperty('residency');
+    expect(cells[0]).not.toHaveProperty('unobservedReason');
     expect(cells[1]).toEqual({
       pos: { x: 1, y: 64, z: 0 },
       observed: true,
@@ -169,7 +172,14 @@ describe('cells query — unobserved cells', () => {
 
     expect(result.status).toBe('ok');
     expect(gapsOf(result)).toEqual([]);
-    expect(cellsOf(result)).toEqual([{ pos: { x: 1, y: 64, z: 0 }, observed: false }]);
+    expect(cellsOf(result)).toEqual([
+      {
+        pos: { x: 1, y: 64, z: 0 },
+        observed: false,
+        residency: 'resident',
+        unobservedReason: 'resident',
+      },
+    ]);
   });
 
   it('reports a no-record section as unobserved without a gap (never observed is not unloaded)', () => {
@@ -183,7 +193,48 @@ describe('cells query — unobserved cells', () => {
 
     expect(result.status).toBe('ok');
     expect(gapsOf(result)).toEqual([]);
-    expect(cellsOf(result)).toEqual([{ pos: { x: 100, y: 64, z: 100 }, observed: false }]);
+    expect(cellsOf(result)).toEqual([
+      {
+        pos: { x: 100, y: 64, z: 100 },
+        observed: false,
+        residency: 'no_record',
+        unobservedReason: 'no_record',
+      },
+    ]);
+    // A read-only query never allocates a Section to answer `no_record`.
+    expect(parts.map.residentSize().sections).toBe(0);
+  });
+
+  it('distinguishes a no-record section from a resident section with an unobserved cell', () => {
+    const parts = makeQueryParts();
+    parts.map.observe(obs(STONE, { x: 0, y: 64, z: 0 })); // creates a resident Section
+
+    const result = runQuery(parts, {
+      kind: 'cells',
+      dim: DIM,
+      positions: [
+        { x: 1, y: 64, z: 0 }, // same Section, cell never observed
+        { x: 100, y: 64, z: 100 }, // no Section record at all
+      ],
+    });
+
+    expect(result.status).toBe('ok');
+    expect(gapsOf(result)).toEqual([]);
+    const [residentUnobserved, noRecord] = cellsOf(result);
+    expect(residentUnobserved).toEqual({
+      pos: { x: 1, y: 64, z: 0 },
+      observed: false,
+      residency: 'resident',
+      unobservedReason: 'resident',
+    });
+    expect(noRecord).toEqual({
+      pos: { x: 100, y: 64, z: 100 },
+      observed: false,
+      residency: 'no_record',
+      unobservedReason: 'no_record',
+    });
+    // Neither is air: the Section state differs, but both remain unobserved.
+    expect(residentUnobserved!.residency).not.toBe(noRecord!.residency);
   });
 });
 
@@ -204,7 +255,12 @@ describe('cells query — residency gaps', () => {
     expect(result.status).toBe('partial');
     expect(gapsOf(result)).toEqual([{ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' }]);
     expect(cellsOf(result)).toEqual([
-      { pos: { x: 0, y: 0, z: 0 }, observed: false, gap: { pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' } },
+      {
+        pos: { x: 0, y: 0, z: 0 },
+        observed: false,
+        residency: 'not_resident',
+        gap: { pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' },
+      },
     ]);
 
     // The query must not load, pin, or otherwise change residency.
@@ -227,6 +283,14 @@ describe('cells query — residency gaps', () => {
 
     expect(result.status).toBe('partial');
     expect(gapsOf(result)).toEqual([{ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' }]);
+    expect(cellsOf(result)).toEqual([
+      {
+        pos: { x: 0, y: 0, z: 0 },
+        observed: false,
+        residency: 'loading',
+        gap: { pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' },
+      },
+    ]);
     expect(map.sectionResidency(SECTION_ZERO).residency).toBe('loading');
   });
 
@@ -244,7 +308,57 @@ describe('cells query — residency gaps', () => {
 
     expect(result.status).toBe('partial');
     expect(gapsOf(result)).toEqual([{ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' }]);
+    expect(cellsOf(result)).toEqual([
+      {
+        pos: { x: 0, y: 0, z: 0 },
+        observed: false,
+        residency: 'load_failed',
+        gap: { pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' },
+      },
+    ]);
     expect(map.sectionResidency(SECTION_ZERO).residency).toBe('load_failed');
+  });
+
+  it('distinguishes not_resident, loading, and load_failed under the same unloaded gap', () => {
+    const viewFor = (prepare: (map: VoxelMap) => void): CellQueryView => {
+      const map = manualMap();
+      prepare(map);
+      const result = runQuery(makeQueryParts({ map }), {
+        kind: 'cells',
+        dim: DIM,
+        positions: [{ x: 0, y: 0, z: 0 }],
+      });
+      expect(result.status).toBe('partial');
+      expect(gapsOf(result)).toEqual([{ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' }]);
+      return cellsOf(result)[0]!;
+    };
+
+    const unloaded = viewFor((map) =>
+      map.installDirectory([
+        { key: SECTION_ZERO, seq: 1, bytes: 1, observedCells: 0, paletteEntries: 0, revision: 0 },
+      ]),
+    );
+    const loading = viewFor((map) => {
+      map.installDirectory([]);
+      map.markLoading([SECTION_ZERO]);
+    });
+    const loadFailed = viewFor((map) => {
+      map.installDirectory([]);
+      map.markLoadFailed([SECTION_ZERO]);
+    });
+
+    // The public gap stays `unloaded` for all three; only the additive field
+    // separates them.
+    for (const cell of [unloaded, loading, loadFailed]) {
+      expect(cell.observed).toBe(false);
+      expect(cell.gap).toEqual({ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' });
+      expect(cell.unobservedReason).toBeUndefined();
+    }
+    expect([unloaded.residency, loading.residency, loadFailed.residency]).toEqual([
+      'not_resident',
+      'loading',
+      'load_failed',
+    ]);
   });
 
   it('mixes observed cells with gaps, reporting only the unavailable one', () => {
@@ -270,6 +384,7 @@ describe('cells query — residency gaps', () => {
     expect(cells[0]!.observed).toBe(true);
     expect(cells[0]!.state).toEqual({ name: STONE.name, properties: {} });
     expect(cells[1]!.observed).toBe(false);
+    expect(cells[1]!.residency).toBe('not_resident');
     expect(cells[1]!.gap).toEqual({ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' });
 
     expect(gapsOf(result)).toEqual([{ pos: { x: 0, y: 0, z: 0 }, reason: 'unloaded' }]);

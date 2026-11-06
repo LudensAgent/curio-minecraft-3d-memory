@@ -59,13 +59,23 @@ export function queryCells(
 
     if (UNREADABLE_RESIDENCY.has(residency)) {
       // Separate objects so the view's gap and the collected gap are independent.
-      cells.push({ pos, observed: false, gap: { pos: { ...pos }, reason: 'unloaded' } });
+      cells.push({
+        pos,
+        observed: false,
+        residency,
+        gap: { pos: { ...pos }, reason: 'unloaded' },
+      });
       gaps.push({ pos: { ...pos }, reason: 'unloaded' });
       continue;
     }
 
     // `no_record`, or resident but this particular cell was never observed.
-    cells.push({ pos, observed: false });
+    cells.push({
+      pos,
+      observed: false,
+      residency,
+      unobservedReason: residency === 'no_record' ? 'no_record' : 'resident',
+    });
   }
 
   return makeQueryResult(context, {
