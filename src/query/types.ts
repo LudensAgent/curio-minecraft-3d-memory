@@ -28,19 +28,18 @@ import type {
   NodeSource,
   PathFragment,
   PortalEdgeView,
+  QueryBudgetKey,
+  QueryStats,
+  RouteQueryStatus,
+  RouteSegment,
+  SearchDiagnostic,
+  SearchGapKind,
   SpatialNode,
   TopologyStore,
   TraversalEvidence,
 } from '../topology/index.js';
 import type { BlockState, Vec3Like, WorldScope } from '../types.js';
 import type { CellView, SectionResidency } from '../voxel/index.js';
-// Type-only: these are erased under `verbatimModuleSyntax`. The query runtime
-// graph stays free of the store/navigation modules (checked against dist/*.js).
-import type {
-  HistoricalRouteInspection,
-  SpatialMemoryCapabilities,
-  SpatialMemoryStoreSnapshot,
-} from '../store/spatial-memory-store.js';
 
 export interface SpatialQueryPort {
   query(request: SpatialQueryRequest): SpatialQueryResult;
@@ -134,6 +133,107 @@ export interface CellQueryView {
    * `unloaded` and `residency` names the state.
    */
   unobservedReason?: 'no_record' | 'resident';
+}
+
+/** One store method's honesty report. */
+export interface SpatialMemoryCapability {
+  available: boolean;
+  /** Why it is unavailable, or the honest limitation when it is available. */
+  reason?: string;
+}
+
+/**
+ * Public store surface covered by the capability report.
+ *
+ * Owned by the query types so this module stays free of store imports;
+ * `spatial-memory-store.ts` asserts at compile time that the list still equals
+ * `keyof SpatialMemoryStore`.
+ */
+export type SpatialMemoryCapabilityName =
+  | 'observe'
+  | 'observeBatch'
+  | 'beginSession'
+  | 'markStale'
+  | 'sectionAt'
+  | 'markTraversed'
+  | 'markModified'
+  | 'saveFragment'
+  | 'addTraversal'
+  | 'forgetFragment'
+  | 'fragments'
+  | 'recordNode'
+  | 'upsertNode'
+  | 'upsertEdge'
+  | 'dropEdge'
+  | 'graph'
+  | 'displayNodes'
+  | 'markGone'
+  | 'goneNear'
+  | 'verifyEdge'
+  | 'blockEdge'
+  | 'clearEdgeBlock'
+  | 'edgeRuntime'
+  | 'savePortalEdge'
+  | 'addPortalTraversal'
+  | 'portalEdges'
+  | 'route'
+  | 'surfaceAnchor'
+  | 'deepestAnchor'
+  | 'fragmentation'
+  | 'components'
+  | 'segments'
+  | 'mergeFragments'
+  | 'query'
+  | 'frontierCandidates'
+  | 'subscribeChanges';
+
+export type SpatialMemoryCapabilities = Record<
+  SpatialMemoryCapabilityName,
+  SpatialMemoryCapability
+>;
+
+/** Read-only runtime summary. Never refreshes evidence or changes a revision. */
+export interface SpatialMemoryStoreSnapshot {
+  worldId: string;
+  voxel: {
+    saveRevision: number;
+    residentSections: number;
+    residentBytes: number;
+    pinLeases: number;
+    pinnedSections: number;
+  };
+  fragments: { revision: number; total: number };
+  topology: { revision: number; nodes: number; edges: number };
+  capabilities: SpatialMemoryCapabilities;
+}
+
+/** Detailed historical-route read; explicitly not an executable route. */
+export interface HistoricalRouteInspection {
+  worldId: string;
+  dim: string;
+  from: Vec3Like;
+  to: Vec3Like;
+  /** Endpoint snapping radius around `from`/`to`. */
+  near: number;
+  status: RouteQueryStatus | 'ENDPOINT_NOT_RECORDED';
+  fromNodeId: string | null;
+  toNodeId: string | null;
+  /** Ordered recorded node positions for a FOUND route; empty otherwise. */
+  points: Vec3Like[];
+  nodeIds: string[];
+  edgeIds: string[];
+  segments: RouteSegment[];
+  gaps: SearchGapKind[];
+  stats: QueryStats | null;
+  diagnostics: SearchDiagnostic[];
+  exhausted?: QueryBudgetKey;
+  /** Recorded topology/geometry, not measured current terrain. */
+  historicalGeometry: true;
+  /** This query never starts movement or an executor. */
+  executable: false;
+  /** Current terrain passability is not established by this query. */
+  currentPassability: 'UNKNOWN';
+  message: string;
 }
 
 export type SpatialQueryData =

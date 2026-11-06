@@ -44,9 +44,8 @@ function makeContext(
   sources: SpatialQuerySources,
   options: SpatialQueryOptions,
 ): SpatialQueryContext {
-  if (typeof sources.worldId !== 'string' || sources.worldId.length === 0) {
-    throw new Error('SpatialQuerySources.worldId must be a non-empty string');
-  }
+  // `worldId` is validated once at the store boundary that owns it
+  // (`SpatialMemoryStoreImpl`); the query port receives an already-typed value.
   return {
     sources,
     worldId: sources.worldId,
