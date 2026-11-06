@@ -11,6 +11,7 @@
  */
 
 import type { MemoryHostCapabilities } from '../memory/capabilities.js';
+import type { QueryPage } from './paging.js';
 import type {
   EvidenceKind,
   Freshness,
@@ -236,19 +237,20 @@ export interface HistoricalRouteInspection {
   message: string;
 }
 
+/** Every list kind carries the one bounded page window (`QueryPage`). */
 export type SpatialQueryData =
   | { kind: 'cells'; cells: CellQueryView[]; gaps: ObservationGap[] }
-  | { kind: 'fragments'; items: PathFragment[]; total: number; nextAfter?: string }
-  | { kind: 'traversals'; items: TraversalEvidence[]; total: number; nextAfter?: string }
-  | { kind: 'nodes'; items: SpatialNode[]; total: number; nextAfter?: string }
-  | { kind: 'edges'; items: EdgeView[]; total: number; nextAfter?: string }
+  | ({ kind: 'fragments' } & QueryPage<PathFragment>)
+  | ({ kind: 'traversals' } & QueryPage<TraversalEvidence>)
+  | ({ kind: 'nodes' } & QueryPage<SpatialNode>)
+  | ({ kind: 'edges' } & QueryPage<EdgeView>)
   | { kind: 'historyRoute'; inspection: HistoricalRouteInspection }
   | { kind: 'anchor'; anchor: AnchorResult | null }
   | { kind: 'components'; report: ComponentReport }
   | { kind: 'segments'; segments: FragmentSegmentsResult }
-  | { kind: 'portals'; items: PortalEdgeView[]; total: number; nextAfter?: string }
-  | { kind: 'resourceAnchors'; items: SpatialNode[]; total: number; nextAfter?: string }
-  | { kind: 'containerAnchors'; items: SpatialNode[]; total: number; nextAfter?: string }
+  | ({ kind: 'portals' } & QueryPage<PortalEdgeView>)
+  | ({ kind: 'resourceAnchors' } & QueryPage<SpatialNode>)
+  | ({ kind: 'containerAnchors' } & QueryPage<SpatialNode>)
   | { kind: 'snapshot'; snapshot: SpatialMemoryStoreSnapshot }
   | { kind: 'capabilities'; capabilities: MemoryHostCapabilities };
 

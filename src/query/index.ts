@@ -19,6 +19,7 @@ import { queryTopology } from './topology.js';
 import { validateSpatialQueryRequest } from './validate.js';
 import type {
   SpatialQueryContext,
+  SpatialQueryKind,
   SpatialQueryOptions,
   SpatialQueryPort,
   SpatialQueryRequest,
@@ -54,33 +55,45 @@ function makeContext(
   };
 }
 
+type QueryHandler<K extends SpatialQueryKind> = (
+  context: SpatialQueryContext,
+  request: Extract<SpatialQueryRequest, { kind: K }>,
+) => SpatialQueryResult;
+
+/**
+ * One exhaustive kind→handler table. The `Record` annotation makes a missing
+ * or misspelled kind a compile error instead of an implicit `undefined` return.
+ */
+const QUERY_HANDLERS: { [K in SpatialQueryKind]: QueryHandler<K> } = {
+  cells: queryCells,
+  fragments: queryTopology,
+  traversals: queryTopology,
+  nodes: queryTopology,
+  edges: queryTopology,
+  portals: queryTopology,
+  historyRoute: queryHistory,
+  anchor: queryHistory,
+  components: queryHistory,
+  segments: queryHistory,
+  resourceAnchors: queryAnchors,
+  containerAnchors: queryAnchors,
+  containerContents: queryAnchors,
+  snapshot: querySnapshot,
+  capabilities: queryCapabilities,
+};
+
 function dispatch(
   context: SpatialQueryContext,
   request: SpatialQueryRequest,
 ): SpatialQueryResult {
-  switch (request.kind) {
-    case 'cells':
-      return queryCells(context, request);
-    case 'fragments':
-    case 'traversals':
-    case 'nodes':
-    case 'edges':
-    case 'portals':
-      return queryTopology(context, request);
-    case 'historyRoute':
-    case 'anchor':
-    case 'components':
-    case 'segments':
-      return queryHistory(context, request);
-    case 'resourceAnchors':
-    case 'containerAnchors':
-    case 'containerContents':
-      return queryAnchors(context, request);
-    case 'snapshot':
-      return querySnapshot(context);
-    case 'capabilities':
-      return queryCapabilities(context);
-  }
+  // TypeScript cannot carry the kind→handler correlation through an indexed
+  // union lookup; the table is exhaustive, so widening the looked-up handler to
+  // the full request union is sound.
+  const handler = QUERY_HANDLERS[request.kind] as (
+    context: SpatialQueryContext,
+    request: SpatialQueryRequest,
+  ) => SpatialQueryResult;
+  return handler(context, request);
 }
 
 function executeQuery(

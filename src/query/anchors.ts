@@ -9,6 +9,7 @@
 import { makeQueryResult, unsupportedQueryResult } from './envelope.js';
 import { collectQueryPages, pageSortedById, resolveLimit } from './paging.js';
 import type { SpatialNode } from '../topology/index.js';
+import { pagedQueryResult } from './topology.js';
 import type { SpatialQueryContext, SpatialQueryRequest, SpatialQueryResult } from './types.js';
 
 export type AnchorQuery = Extract<
@@ -61,13 +62,7 @@ function queryResourceAnchors(
     request.after,
     resolveLimit(request.limit),
   );
-  return makeQueryResult(context, {
-    status: 'ok',
-    ...(request.dim === undefined ? {} : { dim: request.dim }),
-    data: { kind: 'resourceAnchors', ...page },
-    total: page.total,
-    ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
-  });
+  return pagedQueryResult(context, 'resourceAnchors', page, request.dim);
 }
 
 function queryContainerAnchors(
@@ -107,13 +102,7 @@ function queryContainerAnchors(
   // Matches are already id-ordered by the source pages; the request cursor and
   // limit page the collected result without reordering it.
   const page = pageSortedById(matches, request.after, resolveLimit(request.limit));
-  return makeQueryResult(context, {
-    status: 'ok',
-    ...(request.dim === undefined ? {} : { dim: request.dim }),
-    data: { kind: 'containerAnchors', ...page },
-    total: page.total,
-    ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
-  });
+  return pagedQueryResult(context, 'containerAnchors', page, request.dim);
 }
 
 function queryContainerContents(
