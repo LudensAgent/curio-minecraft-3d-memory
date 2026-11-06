@@ -20,14 +20,14 @@
 - 阶段门禁 **G2 通过**：`planRoute` 只读，不移动、不写地图/历史、不调用执行器；返回 `routeId`，`executable` 只对完整复验的 OPEN 路线为真。
 - 未发现计划 §4.12 的阻断项；没有伪造 OPEN/ARRIVED/保存确认，没有静默回退 pathfinder，没有容器内容进入空间库。
 - **Standards 轴**：0 个硬性违规；2 个边界判断、7 个可维护性气味（均为判断项，不参与阻断判断），详见 §2.1。
-- **Spec 轴**：4 项发现：`maxNodes` 预算越界、`maxRoutePoints` 异常边界、timeout 缺回归测试、能力报告提前落到 M5.4；最重为 `maxNodes`（§2.2）。
-- 发现 **1 个中等正确性问题（双轴审查独立复现）**：请求的 `maxNodes` 在单个搜索切片内未被强制，搜索在该切片内 FOUND 时会返回可执行计划，即使实际到达节点数已超过请求预算（见 M3-A1）。
-- 发现 **1 个中低问题（双轴审查独立复现）**：`environment.maxRoutePoints` 可以大于 `RouteVerifier` 的 `maxRouteLength`（默认 1024），长路线会让 `planRoute` 抛出普通异常而不是返回结构化预算错误（见 M3-A2）。
+- **Spec 轴**：4 项发现：`maxNodes` 预算越界、`maxRoutePoints` 异常边界、timeout 缺回归测试、能力报告提前落到 M5.4；前两项已修复（A1/A2），后两项分别见 A4 与 M5.4/A8。
+- 发现 **1 个中等正确性问题（双轴审查独立复现，已修复）**：请求的 `maxNodes` 在单个搜索切片内未被强制，搜索在该切片内 FOUND 时会返回可执行计划，即使实际到达节点数已超过请求预算（见 M3-A1）。
+- 发现 **1 个中低问题（双轴审查独立复现，已修复）**：`environment.maxRoutePoints` 可以大于 `RouteVerifier` 的 `maxRouteLength`（默认 1024），长路线会让 `planRoute` 抛出普通异常而不是返回结构化预算错误（见 M3-A2）。
 - 其余问题为边界校验、超时测试覆盖、能力报告批次归属和文档/提交卫生，不改变 M3 的主路径结论。
-- 功能完成度估计：**约 90%–95%**。所有 M3 功能项都有公开入口、测试和契约状态更新；剩余缺口集中在预算边界、异常边界与覆盖度。
+- 功能完成度估计：**约 90%–95%**。所有 M3 功能项都有公开入口、测试和契约状态更新；A1/A2 与提交卫生已修复，剩余缺口集中在超时测试覆盖与低风险边界（A3/A4）。
 - 真实游戏/宿主联调未执行，属于 M7；本审计只能证明库内规划逻辑与 Fake 场景。
 
-一句话：**M3 的主功能可交付、只读边界成立；在进入 M4 `walkPath` 前应先修复 `maxNodes` 预算越界和 `maxRoutePoints` 异常边界，否则执行层拿到的计划可能违反原委托预算或在配置边界崩溃。**
+一句话：**M3 的主功能可交付、只读边界成立；`maxNodes` 预算越界与 `maxRoutePoints` 异常边界（A1/A2）已修复；进入 M4 前建议补 A3（快照作用域/目标交叉校验）与 A4（timeout 回归测试）。**
 
 ---
 
@@ -101,12 +101,12 @@
 |---|---|---|
 | M3.1 定义规划类型 | 完成 | `src/navigation/route-plan-types.ts`；`RoutePlanRequest`/`RoutePlan`/`RoutePlanSegment`/`RouteBoundary`/`RouteUnsupported`/`RouteEvidence`/`RoutePlanResult`/`RoutePlanSource` 与契约 §6.2/§6.4 一致；未知请求字段、未知 arrival/constraint 字段在 `src/navigation/route-plan.ts:371-557` 拒绝。契约 §6.4 的 `RouteSegment` 实现名为 `RoutePlanSegment`，已在 §12.6 记录（命名问题见 M3-A6） |
 | M3.2 搜索源适配 | 完成 | `src/navigation/route-search.ts`；`start/advance/snapshot/cancel` 直接委托 `WalkRouteSearch`，不复制搜索状态；`concludeWalkSearch` 对 8 个状态做显式映射；`tests/route-search.test.ts` 覆盖委托、取消、全状态映射、只快照不推进 |
-| M3.3 `source:'search'` 规划 | **有条件完成** | `src/navigation/route-plan.ts:207-350`；起点来自 `environment.sample()` 实测样本（`route-plan-support.ts:62-126`），目标原样传入；FOUND 后统一通过专用 `RouteVerifier` 复验，`verified` 仅在全段 OPEN、起点/目标匹配、证据未过期时为真；`NO_VERIFIED_PATH`/`INSUFFICIENT_EVIDENCE`/`UNSUPPORTED`/`BUDGET_EXHAUSTED`/取消/失效分别映射为结构化问题。缺口：`maxNodes` 预算在切片内不严格（M3-A1） |
+| M3.3 `source:'search'` 规划 | 完成 | `src/navigation/route-plan.ts` 的 `planWithSearch`；起点来自 `environment.sample()` 实测样本（`route-plan-support.ts:62-126`），目标原样传入；FOUND 后统一通过专用 `RouteVerifier` 复验，`verified` 仅在全段 OPEN、起点/目标匹配、证据未过期时为真；`NO_VERIFIED_PATH`/`INSUFFICIENT_EVIDENCE`/`UNSUPPORTED`/`BUDGET_EXHAUSTED`/取消/失效分别映射为结构化问题。`maxNodes`/`maxEdges` 在切片内钳制并在接受 FOUND 前复核（M3-A1 已修复） |
 | M3.4 `source:'history'` 规划 | 完成 | `src/navigation/route-plan-history.ts`；只读 `getFragment`，不更新 `uses`/`lastUsedAt`/revision；当前阻塞保留几何并返回 candidate 边界；`requestedTarget`/`resolvedTarget` 分开；不调用 `startKnownWalkRoute`/执行器。测试覆盖不存在 pathId、跨维/跨世界、非法几何、近单位步、当前阻塞、端点略近、起点不符、单点历史、搜索预算拒绝 |
-| M3.5 `source:'auto'` | 完成 | `src/navigation/route-plan.ts:165-205`；有 `pathId` 时 history 优先，候选/失败回退 search，取消/超时不回退；无 `pathId` 直接 search；`RoutePlan.source` 报告实际来源；测试覆盖成功、阻塞回退、端点略近回退、无 pathId、无历史不写成无路、取消不启动搜索 |
+| M3.5 `source:'auto'` | 完成 | `src/navigation/route-plan.ts` 的 `planAuto`；有 `pathId` 时 history 优先，候选/失败回退 search，取消/超时不回退；无 `pathId` 直接 search；`RoutePlan.source` 报告实际来源；测试覆盖成功、阻塞回退、端点略近回退、无 pathId、无历史不写成无路、取消不启动搜索 |
 | M3.6 `RoutePlanRegistry` | 完成 | `src/navigation/route-plan-registry.ts`；`register(draft)` 发号并返回副本；`consume` 首次调用即消费，过期/作用域/不可执行分别返回；成功消费即 pin，`release` 后仍保持已消费；容量默认 128、TTL 默认 30 s，淘汰优先 tombstone、绝不淘汰 pinned；不持久化、不接受宿主自造 id。测试覆盖单次消费、并发重复消费、作用域、过期、容量、pin、release |
 | M3.7 规划能力报告 | 完成 | `src/navigation/capabilities.ts:238-270`、`src/query/capabilities.ts:52-60`；`ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan.walkSearch/walkHistory/walkAuto` 为 true，其余规划位保持 false；`planRoute` 对 swim/near/reach_block/avoid 返回结构化 unsupported；测试覆盖能力表与拒绝路径 |
-| G2 规划可审 | 通过（附 M3-A1） | `src/navigation/route-plan*.ts` 无 `navigateTo`/`MoveExecutor`/`WalkRouteExecutor` 运行时导入；规划后地图的 `saveRevision`/pin/residency/dirty 与历史 revision/`uses`/`lastUsedAt` 不变（`tests/route-plan-fixtures.ts:233-247`、搜索与历史只读断言）；`routeId` 只由注册表发出 |
+| G2 规划可审 | 通过 | `src/navigation/route-plan*.ts` 无 `navigateTo`/`MoveExecutor`/`WalkRouteExecutor` 运行时导入；规划后地图的 `saveRevision`/pin/residency/dirty 与历史 revision/`uses`/`lastUsedAt` 不变（`tests/route-plan-fixtures.ts:233-247`、搜索与历史只读断言）；`routeId` 只由注册表发出 |
 
 ---
 
@@ -117,7 +117,8 @@
 ### M3-A1｜请求的 `maxNodes` 在搜索切片内未被强制，超出预算仍可能返回可执行计划
 
 - **严重度**：中
-- **状态**：待修复（建议进入 M4 前处理）
+- **状态**：已修复（2026-11-07）
+- **修复**：`planWithSearch` 的每个切片同时按剩余 `maxNodes`/`maxEdges` 裁剪；循环结束后、接受 `FOUND` 前复核 `nodesReached`/`edgesEvaluated`，超限返回 `budget_exhausted` 且不注册计划。新增切片内超预算、长走廊、精确预算边界与 maxEdges 边界回归测试。
 - **证据**：
   - 契约要求 `maxNodes`/`maxEdges` “映射到 `WalkSearchLimits`”：`docs/memory-host-interface-contract.md:587-592`、`607`。
   - 实现只在每次 `advance()` **之前**检查 `snapshot.counters.nodesReached >= requestedMaxNodes`：`src/navigation/route-plan.ts:266-273`；`advance` 的切片只按 `maxEdges` 余量裁剪，不按节点余量裁剪：`src/navigation/route-plan.ts:275-283`。
@@ -134,7 +135,8 @@
 ### M3-A2｜`maxRoutePoints` 未与 `RouteVerifier` 的点数上限对齐，长路线会抛异常
 
 - **严重度**：中低
-- **状态**：待修复（建议进入 M4 前处理）
+- **状态**：已修复（2026-11-07）
+- **修复**：`RouteVerifier.maxRouteLength` 改为公开只读；`resolveConfig` 校验宿主上限，显式 `maxRoutePoints` 超过验证器上限返回 `invalid_request`，默认取 `min(1024, maxRouteLength)`；`verifyRoutePoints` 在 `register` 前再检查点数并返回 `budget_exhausted(limit:'points')`。搜索与历史共用该配置校验，并补低上限、长路线、精确边界测试。
 - **证据**：
   - `environment.maxRoutePoints` 只校验为正整数，没有上限：`src/navigation/route-plan.ts:576-580`；默认 1024：`src/navigation/route-plan-support.ts:45`。
   - 搜索结果与历史结果都直接交给 `verifyRoutePoints`，后者调用 `verifier.register`：`src/navigation/route-plan-support.ts:161-171`；历史路径同样先只按 `maxRoutePoints` 检查：`src/navigation/route-plan-history.ts:111-120`。
@@ -173,7 +175,7 @@
 ### M3-A5｜提交卫生：文件末尾多余空行
 
 - **严重度**：低（提交卫生）
-- **状态**：待修正
+- **状态**：已修复（2026-11-07）
 - **证据**：`git show --check 5b65ca1` exit 2，报告 `src/navigation/route-plan-support.ts:612: new blank line at EOF.`。文件以空行结束。
 - **影响**：不影响运行；但会持续让 `git show --check` 失败，降低后续提交检查的信噪比。
 - **处理建议**：删除末尾多余空行；后续提交前运行 `git show --check`。
@@ -246,11 +248,11 @@
 
 ## 6. 后续处理清单
 
-- [ ] **M3-A1**：修复 `maxNodes` 切片内越界；补“切片内 FOUND 超预算”回归测试。建议在 M4 开始前完成。
-- [ ] **M3-A2**：对齐 `maxRoutePoints` 与 `RouteVerifier.maxRouteLength`；超限返回结构化问题。建议在 M4 开始前完成。
+- [x] **M3-A1**：修复 `maxNodes` 切片内越界；补“切片内 FOUND 超预算”回归测试。建议在 M4 开始前完成。
+- [x] **M3-A2**：对齐 `maxRoutePoints` 与 `RouteVerifier.maxRouteLength`；超限返回结构化问题。建议在 M4 开始前完成。
 - [ ] **M3-A3**：校验搜索快照的作用域/目标；补 replay-source 负例。
 - [ ] **M3-A4**：补搜索阶段与复验阶段的 deadline/timeout 回归测试。
-- [ ] **M3-A5**：删除 `src/navigation/route-plan-support.ts` 文件末尾空行。
+- [x] **M3-A5**：删除 `src/navigation/route-plan-support.ts` 文件末尾空行。
 - [ ] **M3-A6**：在契约 §6.4 标注 `RoutePlanSegment` 实现名；M9 统一决定契约版本并与 M2-A3 合并处理。
 - [ ] **M3-A7**（可选）：确认 `source:'search'` 的 `pathId` 与嵌套额外字段语义，并在契约/实现中保持一致。
 - [ ] **M3-A8**：确认能力报告提前落地是否接受；无论接受与否，在 M5.4 收敛 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan` 的单一来源。

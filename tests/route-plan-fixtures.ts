@@ -184,6 +184,19 @@ export function replaySearchSource(snapshot: WalkSearchSnapshot): RouteSearchSou
   };
 }
 
+/** First read returns `initial`; the first advance returns `advanced`. */
+export function replayAdvancingSearchSource(
+  initial: WalkSearchSnapshot,
+  advanced: WalkSearchSnapshot,
+): RouteSearchSource {
+  return {
+    start: () => {},
+    advance: () => advanced,
+    snapshot: () => initial,
+    cancel: () => {},
+  };
+}
+
 /** Run a real search to a terminal snapshot (fixture helper, not part of planning). */
 export function runSearch(
   map: VoxelMap,

@@ -74,6 +74,12 @@ function applyStatus(verifier: RouteVerifier, report: Parameters<RouteVerifier['
 }
 
 describe('RouteVerifier — decomposition and bounded verification', () => {
+  it('exposes its configured point limit read-only', () => {
+    const map = new VoxelMap('world');
+    expect(new RouteVerifier(map).maxRouteLength).toBe(1024);
+    expect(new RouteVerifier(map, { maxRouteLength: 3 }).maxRouteLength).toBe(3);
+  });
+
   it('verifies a multi-step route all OPEN only after full advance', () => {
     const map = new VoxelMap('world');
     const points = openRouteMap(map, 4); // 3 steps

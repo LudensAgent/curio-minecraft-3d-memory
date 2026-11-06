@@ -165,7 +165,7 @@ export interface RoutePlanEnvironment {
   budgetPerSlice?: number;
   /** Plan lifetime cap in ms from the planning clock; defaults to 30 000. */
   planTtlMs?: number;
-  /** Maximum ordered points a plan may carry; defaults to 1024. */
+  /** Maximum ordered points a plan may carry; defaults to min(1024, verifier.maxRouteLength). */
   maxRoutePoints?: number;
   /** Cooperative yield between slices; defaults to a macrotask. */
   wait?: () => Promise<void>;

@@ -635,7 +635,10 @@ export interface RoutePlanEnvironment {
   budgetPerSlice?: number;
   /** 计划有效期上限（ms），与证据有效期取较小值。 */
   planTtlMs?: number;
-  /** 一条计划允许的最大点数；默认 1024。 */
+  /**
+   * 一条计划允许的最大点数；不得超过 `verifier.maxRouteLength`。
+   * 默认取 `min(1024, verifier.maxRouteLength)`。
+   */
   maxRoutePoints?: number;
   /** 协作让出；必须在切片之间调用。 */
   wait?: () => Promise<void>;
@@ -1158,7 +1161,7 @@ export interface ChangeReport {
 - `RoutePlanRequest.mode` 类型收窄为 `'walk'`；非 walk 值只能在未类型化边界出现，运行时仍返回结构化 `unsupported_mode`。`RoutePlanResult` 新增可选 `message`（响应增量）；`budget_exhausted.limit` 新增 `'points'`（路线点数上限，不是搜索节点事实）。
 - `RoutePlanRegistry.register` 接受 `RoutePlanDraft` 并返回带 `routeId` 的 `RoutePlan`（比 §6.6 目标片段更强的“注册表发号”语义）；`consume` 的 scope **必须**提供 `sessionId`，并同时校验 world/dim/session。`now` 非有限时返回 `invalid_request` 且不消费句柄。消费时立即 pin，`release` 后仍保持已消费。起点复核属于 `walkPath` 预检（M4.2），不在注册表中伪造。
 - 新增 `ROUTE_PLAN_CAPABILITIES` 报告 walk search/history/auto 为 `true`，其余规划能力为 `false`；未实现能力不会被静默回退。`MemoryHostCapabilities.plan.walkSearch/walkHistory/walkAuto` 同步为 `true`（静态能力事实）；`plan` 其余位与 `execute`/`persistence` 仍由 M5.4 收口。
-- `source:'history'` 不接受 `maxNodes`/`maxEdges`（它们是搜索预算，历史路线不消费）；返回结构化 `unsupported_constraint`，不静默忽略。`maxRoutePoints` 仍是历史/搜索结果共同的点数上限。
+- `source:'history'` 不接受 `maxNodes`/`maxEdges`（它们是搜索预算，历史路线不消费）；返回结构化 `unsupported_constraint`，不静默忽略。`maxRoutePoints` 仍是历史/搜索结果共同的点数上限，并受 `verifier.maxRouteLength` 约束：显式配置超过验证器上限返回 `invalid_request`；实际路线超过解析后的上限返回 `budget_exhausted(limit:'points')`。复验前还有一次防御检查，保证不会把 `register` 的点数异常抛进控制循环。
 - 规划只读：不调用 `navigateTo`/执行器/pathfinder，不写地图、历史或容器；`executable:true` 只表示当前证据支持该 walk 几何，不表示授权。
 
 ---

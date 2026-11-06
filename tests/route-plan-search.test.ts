@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { planRoute } from '../src/index.js';
-import { bodyAt, obs, STONE } from './fakes.js';
+import { planRoute, RouteVerifier } from '../src/index.js';
+import { bodyAt, fakeProvider, obs, STONE } from './fakes.js';
 import {
   capturePlanningState,
   loosePlanRequest,
@@ -12,6 +12,7 @@ import {
   openFloorMap,
   planOf,
   planRequest,
+  replayAdvancingSearchSource,
   replaySearchSource,
   runSearch,
   searchSource,
@@ -19,6 +20,7 @@ import {
   TestClock,
   wallOffSingleCell,
 } from './route-plan-fixtures.js';
+import { verifyRoutePoints } from '../src/navigation/route-plan-support.js';
 
 function switchState(
   map: ReturnType<typeof openFloorMap>,
@@ -238,6 +240,147 @@ describe('planRoute — search source', () => {
     expect(result.plan).toBeUndefined();
     expect(result.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'nodes' });
   });
+
+  it('caps a large slice by the remaining node budget', async () => {
+    const clock = new TestClock();
+    // Two edges are needed (three nodes) but only two nodes are allowed.
+    const map = straightCorridor(3, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      budgetPerSlice: 64,
+    });
+
+    const result = await planRoute(
+      planRequest({ constraints: { maxNodes: 2 } }),
+      environment,
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'nodes' });
+    expect(parts.registry.size).toBe(0);
+  });
+
+  it('does not exceed maxNodes on a long corridor even with a large slice', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(11, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      budgetPerSlice: 256,
+    });
+
+    const result = await planRoute(
+      planRequest({ to: { x: 10.5, y: 0, z: 0.5 }, constraints: { maxNodes: 2 } }),
+      environment,
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'nodes' });
+    expect(parts.registry.size).toBe(0);
+  });
+
+  it('rejects an over-budget terminal snapshot returned by advance before registering', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const found = runSearch(map, { x: 2.5, y: 0, z: 0.5 }, clock);
+    const overBudget = {
+      ...found,
+      counters: { ...found.counters, nodesReached: 5 },
+    };
+    const pending = {
+      ...found,
+      state: 'PENDING' as const,
+      candidate: null,
+      counters: { ...found.counters, nodesReached: 1, edgesEvaluated: 0 },
+    };
+    const parts = makePlanParts({ map, clock });
+    const environment = makePlanEnvironment(parts, {
+      search: replayAdvancingSearchSource(pending, overBudget),
+      budgetPerSlice: 64,
+    });
+
+    const result = await planRoute(
+      planRequest({ constraints: { maxNodes: 2 } }),
+      environment,
+    );
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'nodes' });
+    expect(parts.registry.size).toBe(0);
+  });
+
+  it('accepts a one-edge target with maxNodes 2 and a zero-edge target with maxNodes 1', async () => {
+    const clock = new TestClock();
+    const oneEdgeMap = straightCorridor(2, { now: clock.now });
+    const oneEdgeParts = makePlanParts({ map: oneEdgeMap, clock });
+    const oneEdge = await planRoute(
+      planRequest({ to: { x: 1.5, y: 0, z: 0.5 }, constraints: { maxNodes: 2 } }),
+      makePlanEnvironment(oneEdgeParts, {
+        search: searchSource(oneEdgeMap, clock),
+        budgetPerSlice: 64,
+      }),
+    );
+    expect(planOf(oneEdge).points).toHaveLength(2);
+
+    const zeroEdgeMap = straightCorridor(1, { now: clock.now });
+    const zeroEdgeParts = makePlanParts({ map: zeroEdgeMap, clock });
+    const zeroEdge = await planRoute(
+      planRequest({ to: { x: 0.5, y: 0, z: 0.5 }, constraints: { maxNodes: 1 } }),
+      makePlanEnvironment(zeroEdgeParts, {
+        search: searchSource(zeroEdgeMap, clock),
+        budgetPerSlice: 64,
+      }),
+    );
+    expect(planOf(zeroEdge).points).toHaveLength(1);
+  });
+
+  it('accepts exactly maxEdges evaluations and rejects one fewer', async () => {
+    const clock = new TestClock();
+    const acceptedMap = straightCorridor(3, { now: clock.now });
+    const acceptedParts = makePlanParts({ map: acceptedMap, clock });
+    const accepted = await planRoute(
+      planRequest({ constraints: { maxEdges: 5 } }),
+      makePlanEnvironment(acceptedParts, {
+        search: searchSource(acceptedMap, clock),
+        budgetPerSlice: 64,
+      }),
+    );
+    expect(planOf(accepted).confidence).toBe('verified');
+
+    const rejectedMap = straightCorridor(3, { now: clock.now });
+    const rejectedParts = makePlanParts({ map: rejectedMap, clock });
+    const rejected = await planRoute(
+      planRequest({ constraints: { maxEdges: 4 } }),
+      makePlanEnvironment(rejectedParts, {
+        search: searchSource(rejectedMap, clock),
+        budgetPerSlice: 64,
+      }),
+    );
+    expect(rejected.plan).toBeUndefined();
+    expect(rejected.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'edges' });
+    expect(rejectedParts.registry.size).toBe(0);
+  });
+
+  it('accepts a plan that uses exactly the requested node budget', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      budgetPerSlice: 64,
+    });
+
+    const result = await planRoute(
+      planRequest({ constraints: { maxNodes: 3 } }),
+      environment,
+    );
+    const plan = planOf(result);
+
+    expect(plan.confidence).toBe('verified');
+    expect(plan.points).toHaveLength(3);
+    expect(parts.registry.size).toBe(1);
+  });
 });
 
 describe('planRoute — request and environment boundaries', () => {
@@ -348,6 +491,126 @@ describe('planRoute — request and environment boundaries', () => {
       }),
     );
     expect(result.problem).toMatchObject({ kind: 'invalid_request' });
+  });
+
+  it('rejects a host verifier without a usable point limit', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      verifier: {} as RouteVerifier,
+    });
+
+    const result = await planRoute(planRequest(), environment);
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'invalid_request' });
+  });
+
+  it('returns a points budget before register when a route exceeds the verifier limit', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const verifier = new RouteVerifier(map, { now: clock.now, maxRouteLength: 2 });
+    // Pre-register a valid route so the post-call clear assertion is meaningful.
+    verifier.register({
+      worldId: 'world',
+      dim: 'overworld',
+      sessionId: 's1',
+      mode: 'walk',
+      body: bodyAt(0.5, 0, 0.5),
+      shapeProvider: fakeProvider,
+      points: [{ x: 0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }],
+    });
+    expect(verifier.status()).not.toBeNull();
+    const outcome = await verifyRoutePoints({
+      verifier,
+      scope: { worldId: 'world', dim: 'overworld', sessionId: 's1' },
+      body: bodyAt(0.5, 0, 0.5),
+      shapeProvider: fakeProvider,
+      points: [
+        { x: 0.5, y: 0, z: 0.5 },
+        { x: 1.5, y: 0, z: 0.5 },
+        { x: 2.5, y: 0, z: 0.5 },
+      ],
+      now: clock.now,
+      deadlineMs: NOW + 10_000,
+      budget: 8,
+      wait: async () => {},
+      cancellationOrigin: 'unknown',
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) throw new Error('expected a verifier point-limit failure');
+    expect(outcome.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'points' });
+    expect(verifier.status()).toBeNull();
+  });
+
+  it('rejects maxRoutePoints above the verifier limit as invalid_request', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const limitedVerifier = new RouteVerifier(map, { now: clock.now, maxRouteLength: 2 });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      verifier: limitedVerifier,
+      maxRoutePoints: 2000,
+    });
+
+    const result = await planRoute(planRequest(), environment);
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'invalid_request' });
+    expect(parts.registry.size).toBe(0);
+  });
+
+  it('defaults maxRoutePoints to the verifier limit and returns a points budget', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const limitedVerifier = new RouteVerifier(map, { now: clock.now, maxRouteLength: 2 });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      verifier: limitedVerifier,
+    });
+
+    const result = await planRoute(planRequest(), environment);
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'points' });
+    expect(parts.registry.size).toBe(0);
+  });
+
+  it('accepts a route exactly at the verifier point limit', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(2, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const limitedVerifier = new RouteVerifier(map, { now: clock.now, maxRouteLength: 2 });
+    const environment = makePlanEnvironment(parts, {
+      search: searchSource(map, clock),
+      verifier: limitedVerifier,
+    });
+
+    const result = await planRoute(
+      planRequest({ to: { x: 1.5, y: 0, z: 0.5 } }),
+      environment,
+    );
+    const plan = planOf(result);
+
+    expect(plan.confidence).toBe('verified');
+    expect(plan.points).toHaveLength(2);
+
+    const zeroMap = straightCorridor(1, { now: clock.now });
+    const zeroParts = makePlanParts({ map: zeroMap, clock });
+    const zeroVerifier = new RouteVerifier(zeroMap, { now: clock.now, maxRouteLength: 2 });
+    const zero = await planRoute(
+      planRequest({ to: { x: 0.5, y: 0, z: 0.5 } }),
+      makePlanEnvironment(zeroParts, {
+        search: searchSource(zeroMap, clock),
+        verifier: zeroVerifier,
+      }),
+    );
+    expect(planOf(zero).points).toHaveLength(1);
   });
 
   it('reports cancellation before reading a search', async () => {

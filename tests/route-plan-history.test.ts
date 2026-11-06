@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { FragmentStore, planRoute } from '../src/index.js';
+import { FragmentStore, planRoute, RouteVerifier } from '../src/index.js';
 
 import { obs, STONE } from './fakes.js';
 import {
@@ -258,6 +258,23 @@ describe('planRoute — history source', () => {
     );
     expect(edgeResult.plan).toBeUndefined();
     expect(edgeResult.problem).toMatchObject({ kind: 'unsupported_constraint', constraint: 'search_budget' });
+  });
+
+  it('returns a points budget instead of throwing when history exceeds the verifier limit', async () => {
+    const clock = new TestClock();
+    const map = straightCorridor(3, { now: clock.now });
+    const parts = makePlanParts({ map, clock });
+    const limitedVerifier = new RouteVerifier(map, { now: clock.now, maxRouteLength: 2 });
+    const environment = makePlanEnvironment(parts, {
+      history: historyWith([straightFragment('frag', 3)]),
+      verifier: limitedVerifier,
+    });
+
+    const result = await planRoute(historyRequest('frag'), environment);
+
+    expect(result.plan).toBeUndefined();
+    expect(result.problem).toMatchObject({ kind: 'budget_exhausted', limit: 'points' });
+    expect(parts.registry.size).toBe(0);
   });
 
   it('reports history as unavailable when no history store was supplied', async () => {

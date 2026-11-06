@@ -169,7 +169,12 @@ export class RouteVerifier {
   private readonly map: VoxelMap;
   private readonly cache: TraversabilityCache;
   private readonly now: () => number;
-  private readonly maxRouteLength: number;
+  /**
+   * Maximum number of points this verifier accepts; `register` rejects longer
+   * routes. Exposed read-only so a planner can align its own point budget and
+   * return a structured budget problem instead of hitting the register error.
+   */
+  readonly maxRouteLength: number;
 
   private route: RegisteredRoute | null = null;
   /** Verified step index → cloned evaluation (the "processed" range). */

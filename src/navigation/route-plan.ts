@@ -272,14 +272,16 @@ async function planWithSearch(context: PlanContext): Promise<PlanOutcome> {
       return budgetOutcome('nodes', `the requested maxNodes budget of ${requestedMaxNodes} was exhausted`);
     }
 
-    let slice = context.budget;
-    if (requestedMaxEdges !== undefined) {
-      slice = Math.min(slice, requestedMaxEdges - snapshot.counters.edgesEvaluated);
-    }
-    if (slice <= 0) {
-      source.cancel('requested maxEdges exhausted');
-      return budgetOutcome('edges', `the requested maxEdges budget of ${requestedMaxEdges} was exhausted`);
-    }
+    // Every evaluated edge can add at most one node, so capping the slice by
+    // both remaining budgets prevents a single advance() from overshooting
+    // either request limit before the loop can check it.
+    const nodesRemaining = requestedMaxNodes === undefined
+      ? Number.POSITIVE_INFINITY
+      : requestedMaxNodes - snapshot.counters.nodesReached;
+    const edgesRemaining = requestedMaxEdges === undefined
+      ? Number.POSITIVE_INFINITY
+      : requestedMaxEdges - snapshot.counters.edgesEvaluated;
+    const slice = Math.min(context.budget, nodesRemaining, edgesRemaining);
     snapshot = source.advance(slice);
     if (snapshot.state === 'PENDING') await context.wait();
   }
@@ -288,6 +290,23 @@ async function planWithSearch(context: PlanContext): Promise<PlanOutcome> {
     return cancelledOutcome(context, abortReason(environment.signal));
   }
   if (context.now() >= context.deadlineMs) return timeoutOutcome();
+
+  // Never accept or report a terminal snapshot from an over-budget search.
+  // The slice cap already prevents this for the bundled WalkRouteSearch; this
+  // O(1) check also covers a caller-supplied RouteSearchSource that returns a
+  // terminal snapshot from start()/advance() without honoring the slice bound.
+  if (requestedMaxNodes !== undefined && snapshot.counters.nodesReached > requestedMaxNodes) {
+    return budgetOutcome(
+      'nodes',
+      `the search reached ${snapshot.counters.nodesReached} nodes, exceeding requested maxNodes ${requestedMaxNodes}`,
+    );
+  }
+  if (requestedMaxEdges !== undefined && snapshot.counters.edgesEvaluated > requestedMaxEdges) {
+    return budgetOutcome(
+      'edges',
+      `the search evaluated ${snapshot.counters.edgesEvaluated} edges, exceeding requested maxEdges ${requestedMaxEdges}`,
+    );
+  }
 
   if (snapshot.state !== 'FOUND') {
     const mapped = problemFromSearch(snapshot, context.cancellationOrigin);
@@ -573,10 +592,28 @@ function resolveConfig(environment: RoutePlanEnvironment):
   if (!Number.isFinite(planTtlMs) || planTtlMs <= 0) {
     return invalid(`environment.planTtlMs must be a positive finite number: ${planTtlMs}`);
   }
-  const maxRoutePoints = environment.maxRoutePoints ?? DEFAULT_MAX_ROUTE_POINTS;
-  if (!Number.isSafeInteger(maxRoutePoints) || maxRoutePoints < 1) {
-    return invalid(`environment.maxRoutePoints must be a positive safe integer: ${maxRoutePoints}`);
+  const verifierLimit = environment.verifier.maxRouteLength;
+  if (!Number.isSafeInteger(verifierLimit) || verifierLimit < 2) {
+    return invalid(
+      `environment.verifier.maxRouteLength must be a safe integer ≥ 2: ${verifierLimit}`,
+    );
   }
+  const requestedMaxRoutePoints = environment.maxRoutePoints;
+  if (requestedMaxRoutePoints !== undefined) {
+    if (!Number.isSafeInteger(requestedMaxRoutePoints) || requestedMaxRoutePoints < 1) {
+      return invalid(
+        `environment.maxRoutePoints must be a positive safe integer: ${requestedMaxRoutePoints}`,
+      );
+    }
+    if (requestedMaxRoutePoints > verifierLimit) {
+      return invalid(
+        `environment.maxRoutePoints ${requestedMaxRoutePoints} exceeds the route verifier limit ${verifierLimit}`,
+      );
+    }
+  }
+  // Default to the smaller of the planner default and what the verifier can
+  // actually accept, so a candidate never reaches register() over its limit.
+  const maxRoutePoints = requestedMaxRoutePoints ?? Math.min(DEFAULT_MAX_ROUTE_POINTS, verifierLimit);
   return { budgetPerSlice, planTtlMs, maxRoutePoints };
 }
 

@@ -160,6 +160,20 @@ export interface VerifyRouteOptions {
  */
 export async function verifyRoutePoints(options: VerifyRouteOptions): Promise<VerificationOutcome> {
   const { verifier, points } = options;
+  // Defense in depth for a host-supplied verifier with a smaller limit than the
+  // planner budget: never let register() throw into the control loop.
+  if (points.length > verifier.maxRouteLength) {
+    verifier.clear();
+    return {
+      ok: false,
+      problem: {
+        kind: 'budget_exhausted',
+        limit: 'points',
+        detail: `route has ${points.length} points, exceeding the route verifier limit ${verifier.maxRouteLength}`,
+      },
+      message: 'the selected route exceeds the route verifier point limit',
+    };
+  }
   verifier.register({
     worldId: options.scope.worldId,
     dim: options.scope.dim,
@@ -609,4 +623,3 @@ export function cloneArrival(arrival: ArrivalSpec): ArrivalSpec {
   if (arrival.kind === 'reach_block') return { kind: 'reach_block' };
   return { kind: 'exact' };
 }
-
