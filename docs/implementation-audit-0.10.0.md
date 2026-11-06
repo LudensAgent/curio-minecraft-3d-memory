@@ -505,6 +505,7 @@ node --test acceptance/provenance.test.mjs acceptance/run.test.mjs acceptance/co
 ### C. 相关文档
 
 - [设计文档](./spatial-memory-library-design.md)
+- [Agent/宿主接口契约](./memory-host-interface-contract.md)
 - [0.9.0 实现进度（历史）](./design-progress-0.9.0.md)
 - [导航 API 状态](./navigation-api-status.md)
 - [运行时 store 组合](./spatial-memory-store.md)
