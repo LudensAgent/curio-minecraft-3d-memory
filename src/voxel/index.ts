@@ -53,6 +53,7 @@ export type {
   CellHistoryView,
   CellView,
   ChangeReport,
+  ChangeReportListener,
   SectionChange,
   StaleReason,
   VoxelMapOptions,

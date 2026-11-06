@@ -1,13 +1,17 @@
 export type {
   ActionResult,
   AgentState,
+  BodyAdapter,
   EffectEvidence,
   EventContext,
   MaterialAllowance,
   MoveOpts,
   MoveRejection,
   MoveTarget,
+  PerceptionCapabilities,
   PerceptionEvent,
+  PerceptionSource,
+  PerceptionState,
   SwimOptions,
   WorldAdapter,
 } from './types.js';

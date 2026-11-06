@@ -64,6 +64,7 @@ export type {
   CellChangeKind,
   CellView,
   ChangeReport,
+  ChangeReportListener,
   CommittedSectionInfo,
   PinLease,
   ResidencyLimits,
@@ -271,17 +272,28 @@ export type {
   RuntimeQueryOptions,
 } from './topology/index.js';
 
+// Memory write/change ports (pure memory core)
+export type {
+  ChangeReportSink,
+  ChangeReportSource,
+  MemoryIngest,
+} from './memory/index.js';
+
 // Adapter
 export type {
   ActionResult,
   AgentState,
+  BodyAdapter,
   EffectEvidence,
   EventContext,
   MaterialAllowance,
   MoveOpts,
   MoveRejection,
   MoveTarget,
+  PerceptionCapabilities,
   PerceptionEvent,
+  PerceptionSource,
+  PerceptionState,
   SwimOptions,
   WorldAdapter,
 } from './adapter/index.js';

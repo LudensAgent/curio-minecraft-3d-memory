@@ -7,9 +7,9 @@ import {
   WalkRouteSearch,
 } from '../src/index.js';
 import type {
-  PathFragment,
+  ObservationBatch,
+  ObservationGap,
   SpatialNode,
-  TraversalEvidence,
   Vec3Like,
   WalkSearchRequest,
   WalkSearchSnapshot,
@@ -19,7 +19,15 @@ import {
   SpatialMemoryStoreImpl,
   SpatialMemoryUnsupportedError,
 } from '../src/store/index.js';
-import { AIR, bodyAt, fakeProvider, obs, STONE } from './fakes.js';
+import {
+  AIR,
+  bodyAt,
+  fakeProvider,
+  obs,
+  pathFragment as makeFragment,
+  STONE,
+  traversalEvidence as makeEvidence,
+} from './fakes.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -30,23 +38,6 @@ const C: Vec3Like = { x: 2.5, y: 64, z: 0.5 };
 const FAR: Vec3Like = { x: 50.5, y: 64, z: 50.5 };
 const FAR_NEXT: Vec3Like = { x: 51.5, y: 64, z: 50.5 };
 
-function makeFragment(id: string, overrides: Partial<PathFragment> = {}): PathFragment {
-  return {
-    id,
-    worldId: WORLD,
-    dim: DIM,
-    kind: 'walked',
-    entrances: [{ ...A }],
-    polyline: [{ ...A }, { ...B }],
-    geometrySource: 'traversal',
-    deepestY: 64,
-    createdAt: 1000,
-    lastUsedAt: 1000,
-    uses: 1,
-    ...overrides,
-  };
-}
-
 function makeNode(id: string, pos: Vec3Like, overrides: Partial<SpatialNode> = {}): SpatialNode {
   return {
     id,
@@ -56,25 +47,6 @@ function makeNode(id: string, pos: Vec3Like, overrides: Partial<SpatialNode> = {
     dim: DIM,
     location: { kind: 'exact', pos: { ...pos } },
     ...overrides,
-  };
-}
-
-function makeEvidence(
-  id: string,
-  fragmentId: string,
-  from: Vec3Like,
-  to: Vec3Like,
-): TraversalEvidence {
-  return {
-    id,
-    fragmentId,
-    from: { ...from },
-    to: { ...to },
-    worldId: WORLD,
-    dim: DIM,
-    sessionId: 's1',
-    observedAt: 1000,
-    source: 'confirmed_walk',
   };
 }
 
@@ -237,6 +209,230 @@ describe('SpatialMemoryStoreImpl — voxel state', () => {
     expect(map.cellAt(DIM, 1, 0, 0)).toEqual({ observed: false });
     // Reading through the store never refreshes the evidence.
     expect(map.cellAt(DIM, 0, 0, 0)).toEqual(stale);
+  });
+});
+
+describe('SpatialMemoryStoreImpl — batch and lifecycle write ports', () => {
+  it('returns the batch change report and the requested gaps', () => {
+    const { store, map } = makeStore();
+    const batch: ObservationBatch = {
+      observations: [
+        obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 2000, sequence: 1 }),
+        obs(AIR, { x: 1, y: 0, z: 0 }, { observedAt: 2000, sequence: 2 }),
+      ],
+      unobserved: [{ pos: { x: 2, y: 0, z: 0 }, reason: 'occluded' }],
+    };
+
+    const report = store.observeBatch(batch);
+
+    expect(report.sections).toHaveLength(1);
+    expect(report.sections[0]?.key).toEqual({
+      worldId: WORLD,
+      dim: DIM,
+      cx: 0,
+      cz: 0,
+      sy: 0,
+    });
+    expect(report.sections[0]?.invalidated).toBe(true);
+    expect(report.sections[0]?.cells.map((cell) => cell.kind)).toEqual([
+      'inserted',
+      'inserted',
+    ]);
+    expect(report.gaps).toEqual(batch.unobserved);
+    // A gap is a diagnostic: it never becomes a cell or air.
+    expect(map.cellAt(DIM, 2, 0, 0)).toEqual({ observed: false });
+    expect(map.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
+  });
+
+  it('rejects an invalid batch before a single cell is written', () => {
+    const { store, map, fragments } = makeStore();
+    const revision = map.saveRevision;
+
+    expect(() =>
+      store.observeBatch({
+        observations: [
+          obs(STONE, { x: 0, y: 0, z: 0 }),
+          obs(STONE, { x: 1, y: 0, z: 0 }, { worldId: 'other' }),
+        ],
+        unobserved: [],
+      }),
+    ).toThrow(SpatialMemoryScopeError);
+    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
+    expect(map.cellAt(DIM, 1, 0, 0)).toEqual({ observed: false });
+    expect(map.saveRevision).toBe(revision);
+
+    expect(() =>
+      store.observeBatch({
+        observations: [
+          obs(STONE, { x: 0, y: 0, z: 0 }),
+          obs(STONE, { x: 1, y: 0, z: 0 }, { pos: { x: Number.NaN, y: 0, z: 0 } }),
+        ],
+        unobserved: [],
+      }),
+    ).toThrow(/integer grid coordinates/);
+    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
+    expect(map.cellAt(DIM, 1, 0, 0)).toEqual({ observed: false });
+    expect(map.saveRevision).toBe(revision);
+
+    expect(() =>
+      store.observeBatch({
+        observations: [obs(STONE, { x: 0, y: 0, z: 0 })],
+        unobserved: [{ pos: { x: 2, y: 0, z: 0 }, reason: 'bogus' } as unknown as ObservationGap],
+      }),
+    ).toThrow(/gap reason is not known/);
+    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
+
+    expect(() =>
+      store.observeBatch({ observations: [] } as unknown as ObservationBatch),
+    ).toThrow(/observations and unobserved arrays/);
+    expect(fragments.revision).toBe(0);
+  });
+
+  it('switches sessions, reports stale evidence and rejects late old-session writes', () => {
+    const { store, map, fragments } = makeStore();
+    store.beginSession('s1');
+    store.observeBatch({
+      observations: [
+        obs(STONE, { x: 0, y: 0, z: 0 }, { sessionId: 's1', observedAt: 2000, sequence: 1 }),
+      ],
+      unobserved: [],
+    });
+    store.saveFragment(makeFragment('f1'));
+    const history = store.snapshot();
+
+    const report = store.beginSession('s2');
+    expect(report.sections).toHaveLength(1);
+    expect(report.sections[0]?.invalidated).toBe(true);
+    expect(report.sections[0]?.cells).toEqual([
+      { pos: { x: 0, y: 0, z: 0 }, kind: 'staled' },
+    ]);
+
+    const stale = map.cellAt(DIM, 0, 0, 0);
+    expect(stale.observed).toBe(true);
+    if (!stale.observed) throw new Error('expected observed evidence');
+    expect(stale.evidence.freshness).toBe('STALE');
+    expect(stale.evidence.staleReason).toBe('observation_gap');
+    expect(stale.evidence.observation.observedAt).toBe(2000);
+
+    // A late old-session write is rejected even with a newer observedAt and sequence.
+    const late = store.observeBatch({
+      observations: [
+        obs(STONE, { x: 0, y: 0, z: 0 }, { sessionId: 's1', observedAt: 9000, sequence: 99 }),
+      ],
+      unobserved: [],
+    });
+    expect(late.sections).toEqual([]);
+    const afterLate = map.cellAt(DIM, 0, 0, 0);
+    expect(afterLate.observed).toBe(true);
+    if (!afterLate.observed) throw new Error('expected observed evidence');
+    expect(afterLate.evidence.observation.sessionId).toBe('s1');
+    expect(afterLate.evidence.observation.observedAt).toBe(2000);
+    expect(afterLate.evidence.freshness).toBe('STALE');
+
+    // A current-session write re-establishes current evidence.
+    const fresh = store.observeBatch({
+      observations: [
+        obs(AIR, { x: 0, y: 0, z: 0 }, { sessionId: 's2', observedAt: 3000, sequence: 1 }),
+      ],
+      unobserved: [],
+    });
+    expect(fresh.sections).toHaveLength(1);
+    const current = map.cellAt(DIM, 0, 0, 0);
+    expect(current.observed).toBe(true);
+    if (!current.observed) throw new Error('expected observed evidence');
+    expect(current.evidence.freshness).toBe('FRESH');
+    expect(current.evidence.observation.sessionId).toBe('s2');
+
+    // Session changes never delete historical geometry or traversal history.
+    expect(store.fragments(DIM).map((fragment) => fragment.id)).toEqual(['f1']);
+    expect(fragments.revision).toBe(history.fragments.revision);
+    expect(store.snapshot().fragments.total).toBe(1);
+
+    // Same-session beginSession is an idempotent no-op.
+    expect(store.beginSession('s2').sections).toEqual([]);
+    expect(() => store.beginSession('')).toThrow(/sessionId/);
+  });
+
+  it('marks evidence stale without deleting history and validates the reason', () => {
+    const { store, map, fragments } = makeStore();
+    store.observeBatch({
+      observations: [obs(STONE, { x: 0, y: 0, z: 0 }, { observedAt: 2000 })],
+      unobserved: [],
+    });
+    store.saveFragment(makeFragment('f1'));
+    fragments.addTraversal(makeEvidence('t1', 'f1', A, B));
+
+    const report = store.markStale(DIM, 'observation_gap');
+    expect(report.sections[0]?.cells).toEqual([
+      { pos: { x: 0, y: 0, z: 0 }, kind: 'staled' },
+    ]);
+    const stale = map.cellAt(DIM, 0, 0, 0);
+    expect(stale.observed).toBe(true);
+    if (!stale.observed) throw new Error('expected observed evidence');
+    expect(stale.evidence.freshness).toBe('STALE');
+    expect(stale.evidence.staleReason).toBe('observation_gap');
+    expect(stale.evidence.observation.observedAt).toBe(2000);
+
+    // Evidence acquired at or before the interruption boundary is rejected.
+    const late = store.observeBatch({
+      observations: [obs(AIR, { x: 0, y: 0, z: 0 }, { observedAt: 5000, sequence: 2 })],
+      unobserved: [],
+    });
+    expect(late.sections).toEqual([]);
+
+    expect(store.fragments(DIM)).toHaveLength(1);
+    expect(fragments.getTraversal('t1')).not.toBeNull();
+    expect(store.markStale('the_nether', 'unloaded').sections).toEqual([]);
+    expect(() => store.markStale('', 'unloaded')).toThrow(/dim/);
+    expect(() =>
+      store.markStale(DIM, 'made_up' as unknown as Parameters<typeof store.markStale>[1]),
+    ).toThrow(/stale reason is not known/);
+  });
+
+  it('adds traversal evidence with fragment, scope, idempotence, conflict and capacity rules', () => {
+    const fragments = new FragmentStore(WORLD, { maxTraversals: 2 });
+    const { store } = makeStore({ fragments });
+    store.saveFragment(makeFragment('f1'));
+
+    const evidence = makeEvidence('t1', 'f1', A, B);
+    expect(store.addTraversal(evidence)).toEqual({ status: 'inserted' });
+    expect(store.addTraversal(makeEvidence('t1', 'f1', A, B))).toEqual({
+      status: 'unchanged',
+    });
+    expect(store.fragments(DIM)[0]).toMatchObject({ uses: 1, lastUsedAt: 1000 });
+
+    // Same id, different content conflicts and leaves the original intact.
+    expect(() => store.addTraversal(makeEvidence('t1', 'f1', A, C))).toThrow(
+      /already exists with different content/,
+    );
+    expect(fragments.getTraversal('t1')?.to).toEqual(B);
+
+    // Unknown fragment, cross-world and cross-dimension writes are rejected.
+    expect(() => store.addTraversal(makeEvidence('t2', 'missing', A, B))).toThrow(
+      /unknown fragment/,
+    );
+    expect(() =>
+      store.addTraversal({ ...makeEvidence('t2', 'f1', A, B), worldId: 'other' }),
+    ).toThrow(SpatialMemoryScopeError);
+    expect(() =>
+      store.addTraversal({ ...makeEvidence('t2', 'f1', A, B), dim: 'the_nether' }),
+    ).toThrow(SpatialMemoryScopeError);
+    expect(() =>
+      store.addTraversal({ ...makeEvidence('t2', 'f1', A, B), fragmentId: '' }),
+    ).toThrow(/fragmentId/);
+    expect(fragments.getTraversal('t2')).toBeNull();
+
+    // Capacity is a rejection, never a silent drop.
+    expect(store.addTraversal(makeEvidence('t2', 'f1', B, C))).toEqual({
+      status: 'inserted',
+    });
+    expect(() => store.addTraversal(makeEvidence('t3', 'f1', A, C))).toThrow(
+      /capacity .* reached/,
+    );
+    expect(fragments.getTraversal('t3')).toBeNull();
+    // Adding traversal evidence never creates a fragment or an edge.
+    expect(store.fragments(DIM)).toHaveLength(1);
+    expect(store.graph(DIM).edges).toHaveLength(0);
   });
 });
 
@@ -606,6 +802,8 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
     const capabilities = store.describeCapabilities();
     expect(Object.keys(capabilities).sort()).toEqual([
       'addPortalTraversal',
+      'addTraversal',
+      'beginSession',
       'blockEdge',
       'clearEdgeBlock',
       'components',
@@ -621,9 +819,11 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
       'graph',
       'markGone',
       'markModified',
+      'markStale',
       'markTraversed',
       'mergeFragments',
       'observe',
+      'observeBatch',
       'portalEdges',
       'recordNode',
       'route',
@@ -631,6 +831,7 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
       'savePortalEdge',
       'sectionAt',
       'segments',
+      'subscribeChanges',
       'surfaceAnchor',
       'upsertEdge',
       'upsertNode',

@@ -29,6 +29,8 @@
  * executable routes. See `docs/spatial-memory-store.md` for the full mapping.
  */
 
+import type { ChangeReportSink } from '../memory/change-reports.js';
+import type { MemoryIngest, SpatialEdgeRecord } from '../memory/ingest.js';
 import type { Observation, ObservationBatch } from '../observation/types.js';
 import type { Frontier } from '../navigation/types.js';
 import {
@@ -67,17 +69,22 @@ import type {
   RouteQueryStatus,
   RouteSegment,
   RuntimeQueryOptions,
+  SaveResult,
   SearchDiagnostic,
   SearchGapKind,
   SpatialEdge,
   SpatialNode,
   TopologyEdge,
+  TraversalEvidence,
 } from '../topology/index.js';
 import { FragmentStore, TopologyStore } from '../topology/index.js';
 import type { Vec3Like } from '../types.js';
 import type { Section } from '../voxel/section.js';
+import type { BatchChangeReport, ChangeReport, StaleReason } from '../voxel/voxel-map.js';
 import { VoxelMap } from '../voxel/voxel-map.js';
 import type { SpatialMemoryStore } from './store.js';
+
+export type { SpatialEdgeRecord } from '../memory/ingest.js';
 
 /** Caller-supplied read-only projection over a search it already ran. */
 export type WalkSearchSnapshotProvider = (
@@ -100,18 +107,6 @@ export interface SpatialMemoryStoreOptions {
    */
   frontierSource?: WalkSearchSnapshotProvider;
 }
-
-/**
- * `SpatialEdge` as accepted by this store, with the optional fields
- * `TopologyStore` needs to record a *traversed* connection.
- *
- * `evidenceIds` may only belong to a traversed edge, so when `basis` is omitted
- * and evidence ids are present the basis is `traversed`; otherwise it is
- * `candidate`. `directed`, `modes` and `verifications` are accepted for source
- * compatibility but are not stored by `TopologyStore` (see `docs/`).
- */
-export type SpatialEdgeRecord = SpatialEdge &
-  Partial<Pick<TopologyEdge, 'basis' | 'evidenceIds' | 'source'>>;
 
 /** One method's honesty report. */
 export interface SpatialMemoryCapability {
@@ -224,7 +219,7 @@ const DEFAULT_ENDPOINT_NEAR = 5;
 const DEFAULT_ANCHOR_NEAR = 6;
 const ANCHOR_QUERY_LIMIT = 20;
 
-export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
+export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest {
   readonly worldId: string;
 
   private readonly voxel: VoxelMap;
@@ -260,13 +255,37 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
     this.voxel.observe(observation);
   }
 
-  /** Validates every observation's scope before a single cell is written. */
-  observeBatch(batch: ObservationBatch): void {
+  /**
+   * Validate the batch's world scope before a single cell is written, then
+   * return the `VoxelMap` change report unchanged. Schema/gap validation stays
+   * in `VoxelMap.observeBatch` (the boundary that owns `Observation`), which
+   * also keeps the whole batch atomic. The report covers only the sections this
+   * batch touched; gaps are diagnostics and never become cells.
+   */
+  observeBatch(batch: ObservationBatch): BatchChangeReport {
     for (const observation of batch.observations) {
       this.assertWorld(observation.worldId, 'observeBatch');
-      this.assertDim(observation.dim, 'observeBatch');
     }
-    this.voxel.observeBatch(batch);
+    return this.voxel.observeBatch(batch);
+  }
+
+  /**
+   * Begin/switch the observation session. Evidence last confirmed by another
+   * session becomes STALE and is reported; history and original evidence times
+   * are kept. A late old-session write is rejected by `VoxelMap`.
+   */
+  beginSession(sessionId: string): ChangeReport {
+    return this.voxel.beginSession(sessionId);
+  }
+
+  /** Mark observable evidence STALE after an interruption; history is never deleted. */
+  markStale(dim: string, reason: StaleReason): ChangeReport {
+    return this.voxel.markStale(dim, reason);
+  }
+
+  /** Forward accepted-change reports to an active verifier/executor. */
+  subscribeChanges(sink: ChangeReportSink): () => void {
+    return this.voxel.subscribeChanges(sink);
   }
 
   /** `null` means the Section is not resident/allocated — it is never empty air. */
@@ -296,6 +315,27 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
     this.assertWorld(fragment.worldId, 'saveFragment');
     this.assertDim(fragment.dim, 'saveFragment');
     this.fragmentStore.saveFragment(fragment);
+  }
+
+  /**
+   * Record measured continuous traversal evidence. The fragment must already
+   * exist in this world/dimension; the same id with the same content is
+   * idempotent, the same id with different content conflicts, and a full store
+   * rejects the whole record. Saving evidence never marks the route as
+   * currently passable, creates a fragment, or creates a topology edge.
+   */
+  addTraversal(evidence: TraversalEvidence): SaveResult {
+    this.assertWorld(evidence.worldId, 'addTraversal');
+    // The store owns its world/dim scope contract, so a cross-dimension record
+    // is reported as `SpatialMemoryScopeError` here. Record shape, fragment
+    // existence, idempotence, conflict and capacity stay in `FragmentStore`.
+    const fragmentScope = this.fragmentStore.getFragmentScope(evidence.fragmentId);
+    if (fragmentScope !== null && fragmentScope.dim !== evidence.dim) {
+      throw new SpatialMemoryScopeError(
+        `addTraversal: dim "${evidence.dim}" does not match fragment "${evidence.fragmentId}" dim "${fragmentScope.dim}"`,
+      );
+    }
+    return this.fragmentStore.addTraversal(evidence);
   }
 
   forgetFragment(id: string): void {
@@ -726,7 +766,27 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
   describeCapabilities(): SpatialMemoryCapabilities {
     const hasFrontierSource = this.frontierSource !== undefined;
     return {
-      observe: { available: true },
+      observe: { available: true, reason: 'Use subscribeChanges for its report; observe() itself returns void.' },
+      observeBatch: {
+        available: true,
+        reason:
+          'Whole batch is scope-validated before any write; returns the localized BatchChangeReport. Gaps are diagnostics, never cells or air.',
+      },
+      beginSession: {
+        available: true,
+        reason:
+          'Prior-session evidence becomes STALE and is reported; original evidence times and history are kept.',
+      },
+      markStale: {
+        available: true,
+        reason:
+          'Freshness only: affected cells become STALE and are reported; fragments and traversal history are not deleted.',
+      },
+      subscribeChanges: {
+        available: true,
+        reason:
+          'Synchronous report forwarding from the same VoxelMap that accepted the write; empty reports are not delivered.',
+      },
       sectionAt: {
         available: true,
         reason: 'null means the Section is not resident or was never allocated; it is not empty air.',
@@ -740,6 +800,11 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore {
         reason: 'Requires a confirmed actionId; block-content revision is not advanced.',
       },
       saveFragment: { available: true },
+      addTraversal: {
+        available: true,
+        reason:
+          'Requires an existing same-world/same-dim fragment; idempotent for identical ids, conflicts on different content, and rejects a full store. History evidence only, never current passability.',
+      },
       forgetFragment: { available: true },
       fragments: { available: true },
       recordNode: {

@@ -35,6 +35,7 @@ import {
   estimateVoxelSectionSnapshotBytes,
   restoreVoxelSection,
   snapshotVoxelSection,
+  STALE_REASONS,
   voxelSectionLowerBound,
 } from './snapshot.js';
 import { resolveResidencyLimits, VoxelResidencyError } from './residency.js';
@@ -96,6 +97,9 @@ export interface BatchChangeReport extends ChangeReport {
   gaps: ObservationGap[];
 }
 
+/** Synchronous subscriber for accepted-change reports. */
+export type ChangeReportListener = (report: ChangeReport) => void;
+
 /** Read-only history/validity flags for one cell. Never mutates or refreshes. */
 export interface CellHistoryView {
   /** A precise observation (including confirmed air) exists. */
@@ -148,7 +152,7 @@ export interface VoxelMapOptions {
    * synchronously and must not be used to perform hidden world reads; errors
    * propagate to the caller. Restore (the initialization path) never fires it.
    */
-  onChange?: (report: ChangeReport) => void;
+  onChange?: ChangeReportListener;
 }
 
 /** Read-only view of one cell. `observed: false` means never observed (UNKNOWN). */
@@ -172,6 +176,7 @@ export class VoxelMap {
   private readonly manualResidency: boolean;
   private readonly residentLimits: ResolvedResidencyLimits;
   private readonly onChange: ((report: ChangeReport) => void) | undefined;
+  private readonly changeListeners = new Set<ChangeReportListener>();
   /**
    * Committed section directory (manual mode only), keyed by a dim|coords key.
    * Read once at open from the worker without decoding any payload.
@@ -246,6 +251,26 @@ export class VoxelMap {
   }
 
   /**
+   * Subscribe to accepted-change reports from observations, batch observations,
+   * session changes and stale marking.
+   *
+   * Delivery is synchronous: the callback runs after the local evidence and
+   * revision have been updated but before the write call returns, so the host
+   * can hand the report to an active verifier/executor in the same control step.
+   * Empty reports are not delivered, and restore (the initialization path) never
+   * fires. The returned function unsubscribes; it is safe to call more than once.
+   */
+  subscribeChanges(listener: ChangeReportListener): () => void {
+    if (typeof listener !== 'function') {
+      throw new Error('change listener must be a function');
+    }
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  /**
    * Begin (or switch to) an observation session. Cells last confirmed by a
    * different session become STALE (validity change → revision bump + stale bit)
    * and are reported. Idempotent for the already-active session.
@@ -278,6 +303,10 @@ export class VoxelMap {
    * deferred; this round invalidates at dimension scope.
    */
   markStale(dim: string, reason: StaleReason): ChangeReport {
+    assertNonEmptyString(dim, 'dim');
+    if (!STALE_REASONS.includes(reason)) {
+      throw new Error(`stale reason is not known: ${String(reason)}`);
+    }
     const boundary = this.now();
     if (!Number.isFinite(boundary)) {
       throw new Error(`now() must return a finite number: ${boundary}`);
@@ -1044,9 +1073,15 @@ export class VoxelMap {
     }
   }
 
-  /** Fire the synchronous change hook once per non-empty report. */
+  /**
+   * Fire the synchronous change hook and subscribers once per non-empty report.
+   * The listener set is copied so subscribing/unsubscribing from inside a
+   * callback cannot skip or repeat another listener.
+   */
   private emit<T extends ChangeReport>(report: T): T {
-    if (this.onChange !== undefined && report.sections.length > 0) this.onChange(report);
+    if (report.sections.length === 0) return report;
+    if (this.onChange !== undefined) this.onChange(report);
+    for (const listener of [...this.changeListeners]) listener(report);
     return report;
   }
 

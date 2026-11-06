@@ -11,8 +11,12 @@
 import type { ObservationBatch } from '../observation/types.js';
 import type { MoveMode, Vec3Like, WorldScope } from '../types.js';
 
-/** Body/world state subset the library depends on. */
-export interface AgentState {
+/**
+ * Perception-relevant subset of the body/world state. The memory core only
+ * needs this much to scope and interpret evidence; it never reads inventory,
+ * health or survival state.
+ */
+export interface PerceptionState {
   pos: Vec3Like;
   dim: string;
   worldId: string;
@@ -25,10 +29,14 @@ export interface AgentState {
   observationReady: boolean;
   onGround: boolean;
   inWater: boolean;
+  riding: string | null;
+}
+
+/** Full body/world state subset the host exposes to body actions. */
+export interface AgentState extends PerceptionState {
   inLava: boolean;
   oxygen: number;
   effects: readonly string[];
-  riding: string | null;
   worldAgeTicks: number;
 }
 
@@ -137,19 +145,44 @@ export type PerceptionEvent = EventContext &
       }
   );
 
+export interface PerceptionCapabilities {
+  fullBlockState: boolean;
+  movementModes: MoveMode[];
+}
+
 /**
- * The library's dependency face: perception evidence + execution + observation
- * lifecycle. `observeBatch` must only return cells truly seen/contacted; cells
- * not returned are not air.
+ * Perception input the *memory core* depends on (implementation plan M1.5).
+ *
+ * `observeBatch` must only return cells truly seen/contacted; cells not returned
+ * are not air. The perception loop pushes lifecycle events through `subscribe`;
+ * it must never subscribe to raw `blockUpdate` data as a memory entry.
+ *
+ * Naming note: the implementation plan calls this port `ObservationSource`, but
+ * that name is already the public evidence-origin union
+ * (`'vision' | 'agent_action' | 'local_rescan'`, design §3.2). The two are
+ * different concepts, so the adapter input face is named `PerceptionSource` and
+ * the existing union type stays source-compatible.
  */
-export interface WorldAdapter {
-  state(): AgentState;
+export interface PerceptionSource {
+  /** Perception-relevant state only; body/survival fields stay with the body face. */
+  state(): PerceptionState;
 
   /** New bridged entry; does not change the legacy `observeBlocks` return type. */
   observeBatch(positions: Vec3Like[]): ObservationBatch;
-  capabilities(): { fullBlockState: boolean; movementModes: MoveMode[] };
+  capabilities(): PerceptionCapabilities;
 
-  /** L1 body — stably executes a destination the agent already chose. Rejects with a `MoveRejection` when a constraint in `opts` cannot be honored. */
+  /** Perception-loop push; returns an unsubscribe fn, never subscribes to raw blockUpdate. */
+  subscribe(cb: (event: PerceptionEvent) => void): () => void;
+}
+
+/**
+ * L1 body actions owned by the host/navigation layer. The memory core never
+ * imports this interface and never dispatches these actions itself.
+ *
+ * `moveTo` stably executes a destination the agent already chose and rejects
+ * with a `MoveRejection` when a constraint in `opts` cannot be honored.
+ */
+export interface BodyAdapter {
   moveTo(target: MoveTarget, opts: MoveOpts): Promise<void>;
   swimTo?(
     target: Vec3Like | null,
@@ -163,7 +196,13 @@ export interface WorldAdapter {
   /** Existing action-history hints; lack scope/full post-state/actionId, so not turned into Observations. */
   recentDug?(since: number): { pos: Vec3Like; name: string; ts: number }[];
   recentPlaced?(since: number): { pos: Vec3Like; name: string; ts: number }[];
-
-  /** Perception-loop push; returns an unsubscribe fn, never subscribes to raw blockUpdate. */
-  subscribe(cb: (event: PerceptionEvent) => void): () => void;
 }
+
+/**
+ * Compatibility composition of both faces. Existing hosts may keep passing a
+ * `WorldAdapter`; the memory core should type against `PerceptionSource` only.
+ * The explicit `state()` intersection preserves the legacy `AgentState` return
+ * for existing `WorldAdapter` consumers.
+ */
+export type WorldAdapter = Omit<PerceptionSource, 'state'> &
+  BodyAdapter & { state(): AgentState };

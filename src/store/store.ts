@@ -8,8 +8,9 @@
  * is added in phase 5 (§9.2).
  */
 
+import type { ChangeReportSource } from '../memory/change-reports.js';
 import type { Frontier } from '../navigation/types.js';
-import type { Observation } from '../observation/types.js';
+import type { Observation, ObservationBatch } from '../observation/types.js';
 import type {
   AnchorQueryOptions,
   AnchorResult,
@@ -29,15 +30,24 @@ import type {
   PortalTraversalEvidence,
   RecordNodeOptions,
   RuntimeQueryOptions,
+  SaveResult,
   SpatialEdge,
   SpatialNode,
+  TraversalEvidence,
 } from '../topology/index.js';
 import type { MoveMode, Vec3Like } from '../types.js';
 import type { Section } from '../voxel/section.js';
+import type { BatchChangeReport, ChangeReport, StaleReason } from '../voxel/voxel-map.js';
 
-export interface SpatialMemoryStore {
+export interface SpatialMemoryStore extends ChangeReportSource {
   // --- Voxel (current world state)
   observe(o: Observation): void;
+  /** Atomically accept one batch; returns the localized change report plus gaps. */
+  observeBatch(batch: ObservationBatch): BatchChangeReport;
+  /** Begin/switch the observation session; returns the local invalidation report. */
+  beginSession(sessionId: string): ChangeReport;
+  /** Mark observation interrupted/unloaded; freshness only, history is kept. */
+  markStale(dim: string, reason: StaleReason): ChangeReport;
   sectionAt(dim: string, x: number, y: number, z: number): Section | null;
   markTraversed(dim: string, pos: Vec3Like): void;
   /** Only from a confirmed own action. */
@@ -45,6 +55,8 @@ export interface SpatialMemoryStore {
 
   // --- Paths (historical geometry)
   saveFragment(f: PathFragment): void;
+  /** Record measured continuous traversal; the fragment must already exist. */
+  addTraversal(evidence: TraversalEvidence): SaveResult;
   forgetFragment(id: string): void;
   fragments(dim?: string): PathFragment[];
 

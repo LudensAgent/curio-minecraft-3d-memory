@@ -92,6 +92,13 @@ export function validateObservation(worldId: string, observation: Observation): 
   if (observation.source === 'agent_action' && observation.evidence !== 'confirmed_effect') {
     throw new Error(`agent_action observation must be a confirmed_effect, got "${observation.evidence}"`);
   }
+  // Contact proves contact/blockage, not the full state of an unseen block.
+  // The host must acknowledge that the submitted state is incomplete.
+  if (observation.evidence === 'contact' && observation.stateComplete) {
+    throw new Error(
+      'contact observation must be stateComplete=false: contact proves contact/blockage, not an unseen block state',
+    );
+  }
 }
 
 /** Validate one bounded gap. Gaps are diagnostics only — they never become cells. */

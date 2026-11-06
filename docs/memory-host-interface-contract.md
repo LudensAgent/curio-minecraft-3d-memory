@@ -244,8 +244,8 @@ export interface MemoryIngest {
   /** 保存历史几何；不生成 traversal，不证明当前可走。 */
   saveFragment(fragment: PathFragment): void;
 
-  /** 保存实际连续走过的证据；fragment 必须已存在。 */
-  addTraversal(evidence: TraversalEvidence): void;
+  /** 保存实际连续走过的证据；fragment 必须已存在。返回写入结果（inserted/unchanged）。 */
+  addTraversal(evidence: TraversalEvidence): SaveResult;
 
   /** 记录命名锚点；label/tag/metadata 对库不透明。 */
   recordNode(
@@ -270,9 +270,11 @@ export interface MemoryIngest {
 **当前状态：**
 
 - `[已实现]` `observeBatch`、`markTraversed`、`markModified`、`saveFragment`、`recordNode`、`upsertEdge`、`savePortalEdge`、`addPortalTraversal`、`beginSession`/`markStale`（在 `VoxelMap` 上）。
-- `[待实现]` `MemoryIngest.observeBatch` 返回 `BatchChangeReport`（当前 `SpatialMemoryStoreImpl.observeBatch` 返回 `void`，会丢失报告；宿主应直接使用 `session.voxel.observeBatch` 或等待 store 包装补齐）。
-- `[待实现]` `SpatialMemoryStore.addTraversal`（底层 `FragmentStore.addTraversal` 已存在，但 store 未暴露）。
-- `[待实现]` 统一的 `MemoryIngest` 端口；当前方法分散在 `SpatialMemoryStore`、`VoxelMap`、`FragmentStore`、`TopologyStore`。
+- `[已实现]` `SpatialMemoryStore.observeBatch` 返回 `BatchChangeReport`；store 先做世界作用域校验并抛 `SpatialMemoryScopeError`，再由 `VoxelMap.observeBatch` 完成整批形状/缺口校验与原子写入。
+- `[已实现]` `SpatialMemoryStore.beginSession`/`markStale` 委托 `VoxelMap` 并返回 `ChangeReport`；旧会话写入由 `VoxelMap` 拒绝，历史与原始证据时间保留。
+- `[已实现]` `SpatialMemoryStore.addTraversal` 与 `MemoryIngest.addTraversal` 委托 `FragmentStore.addTraversal`，保留 fragment 必须存在、同世界/同维、幂等/冲突/容量语义，并返回 `SaveResult`（响应字段增加；调用方可忽略）。
+- `[已实现]` 统一 `MemoryIngest` 端口（`src/memory/ingest.ts`）；`SpatialMemoryStoreImpl` 实现该端口，写入方法不再要求宿主直接接触 `VoxelMap`/`FragmentStore`。
+- `[已实现]` `ChangeReport` 订阅：`VoxelMap.subscribeChanges` 与 store 的 `ChangeReportSource`（`subscribeChanges`）在证据更新后同步转发；空报告不投递。
 
 ### 4.2 Observation 必填语义
 
@@ -1200,11 +1202,16 @@ export interface ChangeReport {
 |---|---|---|
 | `Observation`/`ObservationBatch`/`ObservationGap` | 已实现 | `src/observation/types.ts` |
 | `VoxelMap.observeBatch` → `BatchChangeReport` | 已实现 | `src/voxel/voxel-map.ts` |
-| `SpatialMemoryStore.observeBatch` 返回报告 | 待实现 | 当前 store wrapper 返回 `void`，会丢报告；暂时直接用 `session.voxel` |
+| `SpatialMemoryStore.observeBatch` 返回报告 | 已实现 | `src/store/spatial-memory-store.ts`；返回 `BatchChangeReport` |
 | `VoxelMap.beginSession`/`markStale` | 已实现 | 返回 `ChangeReport` |
+| `SpatialMemoryStore.beginSession`/`markStale` | 已实现 | store 委托 `VoxelMap` 并返回 `ChangeReport` |
 | `markTraversed`/`markModified` | 已实现 | `VoxelMap`/`SpatialMemoryStore` |
 | `FragmentStore.addTraversal` | 已实现 | `src/topology/fragment-store.ts` |
-| `SpatialMemoryStore.addTraversal` | 待实现 | 底层已有，store 未暴露 |
+| `SpatialMemoryStore.addTraversal` | 已实现 | store 作用域检查后委托；返回 `SaveResult` |
+| 统一 `MemoryIngest` | 已实现 | `src/memory/ingest.ts`；`SpatialMemoryStoreImpl` 实现 |
+| `ChangeReport` 订阅/转发 | 已实现 | `VoxelMap.subscribeChanges`、store `ChangeReportSource` |
+| `contact` 证据的方块名 | 部分实现 | `Observation.state.name` 必填，模型无法表达“名称未知”；`validateObservation` 要求 contact 必须 `stateComplete:false`，未看见的名称不得由宿主提交 |
+| 旧 `sequence` 拒绝 | 部分实现 | 新旧由 `observedAt` 判定；`sequence` 是接收顺序，不用于覆盖判断。契约 §4.2 规则 6 的措辞待与实现对齐 |
 | `SpatialMemoryStore` 查询方法 | 已实现（分散） | `src/store/store.ts` |
 | 统一 `SpatialQueryPort` | 待实现 | 需要只读投影层 |
 | `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts` |
@@ -1213,7 +1220,7 @@ export interface ChangeReport {
 | `planRoute`/`RoutePlan`/`RoutePlanRegistry` | 待实现 | 本契约 §6 |
 | `walkPath`/`WalkPathResult` | 待实现 | 本契约 §7；可先用 `WalkRouteExecutor` 由宿主实现 |
 | `INVALIDATED` outcome | 待实现 | 当前 `NavOutcome` 无此值，使用 `route_invalidated` problem |
-| `ObservationSource`/`BodyAdapter` 拆分 | 待实现 | 当前 `WorldAdapter` 混合两者 |
+| `PerceptionSource`/`BodyAdapter` 拆分 | 已实现 | 计划中的感知端口命名为 `PerceptionSource`，避免与既有证据来源联合类型 `ObservationSource` 冲突；`WorldAdapter` 保留为兼容交叉类型 |
 | 容器位置锚点查询 | 部分实现 | 可用 `nodes({tag,label})`/`graph`；无专用入口 |
 | 容器内容查询 | 不适用 | 宿主精确账本；库返回 `host_ledger` |
 | 水面/船几何验证 | 已实现（仅几何） | `assurance:'geometry_only'`、`executable:false` |

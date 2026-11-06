@@ -154,7 +154,14 @@ export function snapshotVoxelSection(section: Section): VoxelSectionSnapshot {
 
 // --- restore: validation + reconstruction --------------------------------------
 
-const STALE_REASONS = ['unloaded', 'observation_gap', 'expired', 'pending_effect', 'conflict'] as const;
+/** The single runtime list of known stale reasons, shared with `VoxelMap.markStale`. */
+export const STALE_REASONS = [
+  'unloaded',
+  'observation_gap',
+  'expired',
+  'pending_effect',
+  'conflict',
+] as const;
 /** Longest known stale reason, used to bill the worst-case resident footprint. */
 const WORST_CASE_STALE_REASON = 'observation_gap';
 

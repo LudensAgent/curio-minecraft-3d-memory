@@ -230,7 +230,7 @@ flowchart LR
   - `src/index.ts`
   - `tests/adapter-contract.test.ts`（新建或扩展）
 - 变更：
-  - `ObservationSource`：`state` 的感知子集、`observeBatch`、`capabilities`、`subscribe`；
+  - `ObservationSource`：`state` 的感知子集、`observeBatch`、`capabilities`、`subscribe`；实现中命名为 `PerceptionSource`，避免与既有证据来源联合类型 `ObservationSource` 冲突（见契约 §15）；
   - `BodyAdapter`：`moveTo`、`swimTo`、`stopAll`、`dig`、`placeBlockAt`、`recentDug`/`recentPlaced`；
   - `WorldAdapter` 保留为兼容交叉类型（或组合），但 memory 核心只导入 `ObservationSource`；
   - `PerceptionEvent`/`EventContext` 保持在感知侧。
