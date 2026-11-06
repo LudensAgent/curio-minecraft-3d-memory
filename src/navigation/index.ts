@@ -28,6 +28,14 @@ export type {
   NavProblem,
   NavResult,
 } from './types.js';
+export type {
+  ChangeReportSource,
+  WalkBodyPort,
+  WalkPathEnvironment,
+  WalkPathOutcome,
+  WalkPathRequest,
+  WalkPathResult,
+} from './walk-path-types.js';
 export { followKnownPath, navigateTo } from './navigate.js';
 export type {
   FollowKnownPathEnvironment,

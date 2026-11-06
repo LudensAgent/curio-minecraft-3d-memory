@@ -368,6 +368,9 @@ export type {
   NavigationCapabilityStatus,
   NavOutcome,
   CancellationOrigin,
+  // The walk-path port has its own `subscribe` shape; alias it so the memory
+  // write port's existing `ChangeReportSource` export stays unchanged.
+  ChangeReportSource as WalkPathChangeReportSource,
   NavProblem,
   NavResult,
   RouteBoundary,
@@ -391,6 +394,11 @@ export type {
   RoutePlanSource,
   RouteSearchSource,
   RouteUnsupported,
+  WalkBodyPort,
+  WalkPathEnvironment,
+  WalkPathOutcome,
+  WalkPathRequest,
+  WalkPathResult,
   WalkSearchArrival,
   WalkSearchCandidate,
   WalkSearchCounters,
