@@ -15,15 +15,15 @@
 
 ## 0. 结论
 
-**M2 有条件通过（2026-11-07 复核：实现、测试与只读边界已收口；范围决策待人工复核）。**
+**M2 有条件通过（2026-11-07 复核：实现、测试与只读边界已收口；D-001 已按保守策略记录，最终人工复核项保留）。**
 
 - M2.1、M2.2、M2.3、M2.4、M2.6 完成；阶段门禁 G1 通过。
-- M2.5 的核心查询（资源/容器位置、`host_ledger` 边界）可用；“可达证据”按 D-001 接受降级为“M2 不计算可达性”，计划 M2.5 已同步（`f9b827b`），仍需人工复核。
+- M2.5 的核心查询（资源/容器位置、`host_ledger` 边界）可用；“可达证据”按 D-001 接受降级为“M2 不计算可达性”，计划 M2.5 已同步（`f9b827b`）并在审计证据行记录 D-001 后续跟踪（`docs/memory-host-implementation-plan.md:302`），最终人工复核项保留。
 - 前序批次已修复：M2-A2（`3ae4fd8`）、M2-A5 / M2-L1（`f09b92e`）、M2-L3（`4321fda`）、M2-L5（`883fe22`；契约 §5.2 的 `nodeId` 文档同步仍挂 L-M2-03d/M9）。
-- 仍未收口：M2-A3（D-003，目标 M9）、M2-A4（D-004，目标 L-M2-03d/M8）。
+- 仍未收口：M2-A3（D-003，目标 M9）、M2-A4 的 M8 性能基准（文档落点已在 L-M2-03d 完成）。
 - 未发现计划 §4.12 的阻断项；真实联机/宿主验收未执行，属于 M7，本文件不据此声称已通过。
 
-一句话：**查询端口可交付，测试与只读边界成立；剩余问题为 D-001 人工复核、契约版本收口（M9）、`portals` 扫描文档与基准（L-M2-03d/M8），不是查询实现缺陷。**
+一句话：**查询端口可交付，测试与只读边界成立；剩余问题为 D-001 人工复核、契约版本收口（M9）、`portals` 的 M8 基准（文档已落契约 §5.6），不是查询实现缺陷。**
 
 ---
 
@@ -59,7 +59,7 @@
 | M2.2 `cells` 查询 | 完成 | `src/query/cells.ts`；已观察/未观察/未驻留区分；`not_resident`/`loading`/`load_failed` → `gap.reason:'unloaded'` + `status:'partial'`；未观察格另带可选 `residency`/`unobservedReason`，五态可区分（D-002，`3ae4fd8`）；负坐标、副本隔离、不加载 Section、五态区分有测试。历史 `ObservationGap` 未持久化，契约 §15 已标为部分实现 |
 | M2.3 碎片/traversal/nodes/edges 分页 | 完成 | `src/query/topology.ts`、`src/query/paging.ts`；默认 100、上限 1000、合并底层 100 条页、稳定 `after`、`total` 为完整匹配数；250 条跨页与末页无重复测试通过 |
 | M2.4 历史路线/锚点/分量/portal | 完成 | `src/query/history.ts`；`historyRoute` 带 `historicalGeometry:true`/`executable:false`/`currentPassability:'UNKNOWN'`；未知 fragment 返回 `not_found`；`anchor` 为 `null` 时保持 `ok`；portal 与 walk graph 独立 |
-| M2.5 资源/容器位置查询 | **完成（范围按 D-001/D-006 收窄；D-001 待人工复核）** | `src/query/anchors.ts` 支持 `dim/tag/label`、只返回 exact 节点、`containerAnchors` 需宿主 `isContainer`、`containerContents` 固定 `host_ledger`；“可达证据”按 D-001 明确不在 M2；“按位置”按 D-006 只返回位置字段、不做邻域过滤，`near`/`radius`/`pos` 由 validator 拒绝（回归见 M2-A6） |
+| M2.5 资源/容器位置查询 | **完成（范围按 D-001/D-006 收窄；D-001 已接受降级，待人工复核）** | `src/query/anchors.ts` 支持 `dim/tag/label`、只返回 exact 节点、`containerAnchors` 需宿主 `isContainer`、`containerContents` 固定 `host_ledger`；“可达证据”按 D-001 明确不在 M2；“按位置”按 D-006 只返回位置字段、不做邻域过滤，`near`/`radius`/`pos` 由 validator 拒绝（回归见 M2-A6） |
 | M2.6 能力报告与边界 | 完成 | `src/memory/capabilities.ts`、`src/query/capabilities.ts`；memory/query 按实际能力，plan/execute/persistence 保守为 `false`；`containerContents` 恒为 `false`；无分类器时 `containerAnchors` 返回 `unsupported` |
 | G1 契约冻结 | 通过 | 类型、运行时校验、契约 §5/§15 与测试一致；新增项已记录在契约 §12.5 |
 
@@ -70,13 +70,14 @@
 ### M2-A1｜M2.5 的“可达证据”被契约降级
 
 - **严重度**：中
-- **状态**：已决策（D-001，2026-11-07；`requires_user_review: true`，待人工复核）
+- **状态**：已决策（D-001：接受降级；`requires_user_review: true`，待人工复核）
 - **证据**：
   - 计划 M2.5 已改为“可达证据不在 M2 范围；宿主结合路由/感知自行判断可达”：`docs/memory-host-implementation-plan.md:297`（决策落文档 `f9b827b`）。
+  - 计划 M2.5 已在审计证据行记录 D-001 后续跟踪（`requires_user_review: true`，待人工复核）：`docs/memory-host-implementation-plan.md:302`（宿主结合自身路由/感知证据判断可达；未来库侧只读可达性投影须另走契约变更并同步字段/测试/能力位）。
   - 契约 §1.2、§5.4、§5.5 一致写明“M2 查询不计算新的可达性”：`docs/memory-host-interface-contract.md:55`、`:511`、`:519`。
   - 代码只返回原始 `SpatialNode`（位置、精度、观测时间、来源）：`src/query/anchors.ts:49-66`。
 - **影响**：宿主无法从查询直接获得资源/容器锚点的可达关系，必须自行结合路由/感知证据判断。该方向与“位置记录不能推断可达”一致，但它是实现批次内对既有契约基线的范围缩减。
-- **后续**：人工复核 D-001；若接受，M2.5 范围即此为止，不为查询层补可达投影。L-M2-03d 只负责剩余文档/Curio 计划对齐（若有）。
+- **后续**：最终人工复核 D-001；决策落点已写入计划 M2.5（范围 + 后续跟踪项）并与契约一致。若人工复核后需要库侧只读可达性投影，另走契约变更并同步字段/测试/能力位，不直接扩展 M2。
 - **验收标准**：计划、契约与代码对 M2.5 范围表述一致；若补实现，有正例/负例测试且能力报告同步。
 
 ### M2-A2｜§15 对 `cells` 状态区分过度声称
@@ -106,14 +107,15 @@
 ### M2-A4｜`portals` 查询每次复制并排序全部 portal 边
 
 - **严重度**：低（性能/文档）
-- **状态**：延期（D-004；文档目标 L-M2-03d，性能评估 M8）
+- **状态**：已文档化（D-004；契约 §5.6；M8 基准决定是否优化）
 - **证据**：
   - `src/query/topology.ts:127-131` 调用 `pagePortalEdges`。
   - `src/query/paging.ts:111-118` 每次查询克隆并按 id 排序完整列表。
   - 数量受 `maxPortalEdges`（默认 1000）约束：`src/topology/topology-store.ts:690`、`:1280-1281`。
-  - 契约 §5.6 已记录 `containerAnchors` 的节点索引扫描（`:543-545`），但尚未单独记录 `portals` 的有界全量排序；§11 只有泛化的“拓扑分页全量扫描/排序”行（`:1113`）。
-- **影响**：与其他列表查询相比，`portals` 不是按底层游标分页；当前规模下风险有限，但未在契约 §5.6 标注为扫描型查询。
-- **处理建议**：在 §5.6 或 §11 记录该有界全量排序（L-M2-03d 落文档）；M8 基准时评估是否需要底层游标。
+  - 契约 §5.6 已记录 `portals` 的有界全量排序：`docs/memory-host-interface-contract.md:543`（克隆完整边集 + 按 id 排序 + `after` 非底层游标 + 受 `maxPortalEdges` 默认 1000 约束 + M8 决定是否改游标）。
+  - 契约 §5.6 另记录 `containerAnchors` 的节点索引扫描（`:543`、`:545`）；§11 的泛化“拓扑分页全量扫描/排序”行在 `:1113`。
+- **影响**：与其他列表查询相比，`portals` 不是按底层游标分页；当前规模下风险有限，文档已标注为有界全量排序。
+- **处理建议**：文档落点已完成（L-M2-03d，契约 §5.6）；M8 基准时评估是否需要底层游标。
 - **验收标准**：文档说明与实现一致；如有优化，附前后对比。
 
 ### M2-A5｜只读测试未直接断言证据时间/fragment 使用记录
@@ -164,10 +166,10 @@
 
 ## 5. 后续处理清单
 
-- [ ] **M2-A1**（D-001，2026-11-07；目标 L-M2-03d + 人工复核）：已接受“M2 不计算可达性”，计划 M2.5（`f9b827b`）与契约 §5.4/§5.5 已对齐。`requires_user_review: true`，人工复核与剩余文档/Curio 计划对齐未完成；无需补查询层可达投影。
+- [ ] **M2-A1**（D-001，2026-11-07；人工复核未完成）：已决策接受“M2 不计算可达性”（`requires_user_review: true`）；计划 M2.5（`f9b827b`）已记录后续跟踪（`docs/memory-host-implementation-plan.md:302`），契约 §1.2/§5.4/§5.5 已对齐。无需补查询层可达投影。
 - [x] **M2-A2**（D-002，`3ae4fd8`）：已加可选 `residency`/`unobservedReason`，§5.4/§15 与测试三处一致；残留 §5.3 形状块/`SectionResidency` 定义按 D-026 交 L-M2-03d/M9。
 - [ ] **M2-A3**（D-003，目标 M9）：M9 发布前决定契约版本（minor/major）并同步宿主；当前保持 `memory-host-contract/1` + 能力协商。
-- [ ] **M2-A4**（D-004，目标 L-M2-03d/M8）：在契约 §5.6 或 §11 标注 `portals` 的有界全量排序；M8 基准后评估优化。当前 §5.6 只记录 `containerAnchors` 扫描，尚未单独记录 `portals`。
+- [ ] **M2-A4**（D-004，文档目标 L-M2-03d 已完成，M8 基准未开始）：契约 §5.6 已标注 `portals` 的有界全量排序（`docs/memory-host-interface-contract.md:543`）；M8 基准后评估是否需要底层游标。
 - [x] **M2-A5**（D-005，`f09b92e`）：只读测试已直接断言 `observedAt`、fragment `uses`/`lastUsedAt` 不变。
 - [x] **M2-A6**（D-006，2026-11-06；回归 L-M2-04）：M2 只返回位置字段，不做邻域过滤；`tests/query-port.test.ts:55-75` 断言 `near`/`radius`/`pos` 被拒绝。
 - [x] **M2-L1 / M2-L3 / M2-L5**：分别由 `f09b92e` / `4321fda` / `883fe22` 修复；证据见 §3.1。M2-L5 的契约 §5.2 文档同步仍挂 L-M2-03d/M9。
