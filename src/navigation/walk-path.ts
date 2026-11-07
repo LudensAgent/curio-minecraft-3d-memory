@@ -22,7 +22,7 @@ import type { BodySample, GroundedArrival, WalkRouteRequest, WalkRouteStatus } f
 import { GROUNDED_ARRIVAL_DEFAULTS } from '../execution/types.js';
 import { WalkRouteExecutor } from '../execution/walk-route-executor.js';
 import type { Vec3Like } from '../types.js';
-import type { VoxelMap } from '../voxel/voxel-map.js';
+import type { ChangeReport, VoxelMap } from '../voxel/voxel-map.js';
 import type { RoutePlanRegistry, RoutePlanRegistryProblem } from './route-plan-registry.js';
 import {
   DEFAULT_BUDGET_PER_SLICE,
@@ -311,9 +311,26 @@ export function createWalkPathExecution(options: WalkPathExecutionOptions): Walk
       sequence: sample.sequence,
     });
     let terminal = status.result;
+    // The accepted-change report forwarded to the executor immediately before
+    // the execution became terminal as a `route_invalidated`/`scope_changed`
+    // invalidation. Kept by reference (contract §7.4/§8.1) so `invalidation.changes`
+    // names that report under consideration; it is not necessarily the sole
+    // cause, since the executor can also stop on TTL, rule-version or residency
+    // changes it does not expose. A report delivered after the execution already
+    // terminated is ignored below and cannot replace it.
+    let invalidationReport: ChangeReport | undefined;
 
     const unsubscribe = environment.changes?.subscribe((report) => {
-      if (status.result === null) status = executor.observe(report, budget);
+      if (status.result !== null) return;
+      status = executor.observe(report, budget);
+      const result = status.result;
+      if (
+        invalidationReport === undefined
+        && result !== null
+        && (result.problem?.kind === 'route_invalidated' || result.problem?.kind === 'scope_changed')
+      ) {
+        invalidationReport = report;
+      }
     });
 
     try {
@@ -364,7 +381,7 @@ export function createWalkPathExecution(options: WalkPathExecutionOptions): Walk
       unsubscribe?.();
     }
 
-    return toWalkPathResult(plan, executionId, status, terminal);
+    return toWalkPathResult(plan, executionId, status, terminal, invalidationReport);
   };
 }
 
@@ -420,6 +437,7 @@ function toWalkPathResult(
   executionId: string,
   status: WalkRouteStatus,
   result: NavResult,
+  invalidationReport?: ChangeReport,
 ): WalkPathResult {
   const confirmedSegments = Math.max(0, status.nextPointIndex - 1);
   const evidence =
@@ -457,7 +475,11 @@ function toWalkPathResult(
     return {
       ...base,
       outcome: 'INVALIDATED',
-      invalidation: { segment: confirmedSegments, reason: kind },
+      invalidation: {
+        segment: confirmedSegments,
+        reason: kind,
+        ...(invalidationReport === undefined ? {} : { changes: invalidationReport }),
+      },
       ...(result.problem === undefined ? {} : { problem: result.problem }),
       confirmed: false,
     };

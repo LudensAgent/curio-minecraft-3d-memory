@@ -99,6 +99,14 @@ export interface WalkPathResult {
   invalidation?: {
     segment: number;
     reason: string;
+    /**
+     * The accepted-change report forwarded to the executor immediately before
+     * the invalidation became terminal (contract §7.4, §8.1), kept verbatim.
+     * It names the report under consideration, not necessarily the sole cause:
+     * the executor can also stop on TTL expiry, a rule-version change or a
+     * section-residency change, which no report exposes. Absent when no report
+     * was forwarded during this execution.
+     */
     changes?: ChangeReport;
   };
   problem?: NavProblem;
