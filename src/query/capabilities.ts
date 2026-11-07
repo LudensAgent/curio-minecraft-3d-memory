@@ -7,7 +7,10 @@
  */
 
 import type { MemoryHostCapabilities } from '../memory/capabilities.js';
-import { CONTRACT_VERSION } from '../memory/capabilities.js';
+import {
+  CONTRACT_VERSION,
+  ROUTE_PLAN_CAPABILITIES,
+} from '../memory/capabilities.js';
 import { makeQueryResult } from './envelope.js';
 import type { SpatialQueryContext, SpatialQueryResult } from './types.js';
 
@@ -49,18 +52,10 @@ export function buildMemoryHostCapabilities(
       containerAnchors: context.isContainer !== undefined,
       containerContents: false,
     },
-    // M3 planning is present in this package. These are static capability
-    // facts, not optimistic placeholders; the wider planning modes remain false.
-    plan: {
-      walkSearch: true,
-      walkHistory: true,
-      walkAuto: true,
-      nearArrival: false,
-      reachBlockArrival: false,
-      digPlaceTower: false,
-      swim: false,
-      boat: false,
-    },
+    // M3 planning is present in this package. Reference the single source in
+    // `src/memory/capabilities.ts` directly (D-010) so the report and the
+    // constant cannot drift; the constant is frozen against host mutation.
+    plan: ROUTE_PLAN_CAPABILITIES,
     execute: {
       walk: false,
       groundedArrival: false,

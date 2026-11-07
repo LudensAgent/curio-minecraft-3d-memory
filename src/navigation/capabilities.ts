@@ -239,32 +239,15 @@ export const NAVIGATION_CAPABILITIES = [
  * Planning capability report for the optional `planRoute` entry (contract §2.3
  * `plan`, plan M3.7).
  *
- * `false` is a contract fact: the host must not call or emulate that planning
- * mode through `planRoute`. In particular near/reach_block arrival, digging,
- * placing, towering, swimming and boating are not planned in v1; unsupported
- * requests are rejected with structured problems rather than silently routed
- * to a wider backend.
+ * Single source (D-010): the type and constant now live in the dependency-free
+ * memory core (`src/memory/capabilities.ts`) so the query capability report and
+ * pure-memory consumers see the same values. This module re-exports them so the
+ * navigation entry keeps its existing public names.
  */
-export interface RoutePlanCapabilities {
-  walkSearch: boolean;
-  walkHistory: boolean;
-  walkAuto: boolean;
-  nearArrival: boolean;
-  reachBlockArrival: boolean;
-  digPlaceTower: boolean;
-  swim: boolean;
-  boat: boolean;
-}
-
-export type RoutePlanCapabilityName = keyof RoutePlanCapabilities;
-
-export const ROUTE_PLAN_CAPABILITIES = {
-  walkSearch: true,
-  walkHistory: true,
-  walkAuto: true,
-  nearArrival: false,
-  reachBlockArrival: false,
-  digPlaceTower: false,
-  swim: false,
-  boat: false,
-} as const satisfies RoutePlanCapabilities;
+export {
+  ROUTE_PLAN_CAPABILITIES,
+} from '../memory/capabilities.js';
+export type {
+  RoutePlanCapabilities,
+  RoutePlanCapabilityName,
+} from '../memory/capabilities.js';

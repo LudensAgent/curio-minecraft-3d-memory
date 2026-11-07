@@ -10,6 +10,14 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./memory": {
+      "types": "./dist/memory/index.d.ts",
+      "import": "./dist/memory/index.js"
+    },
+    "./navigation": {
+      "types": "./dist/navigation/index.d.ts",
+      "import": "./dist/navigation/index.js"
+    },
     "./storage/sqlite": {
       "types": "./dist/storage/sqlite/index.d.ts",
       "import": "./dist/storage/sqlite/index.js"
