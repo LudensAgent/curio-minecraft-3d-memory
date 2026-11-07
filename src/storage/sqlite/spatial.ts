@@ -71,6 +71,7 @@ import type {
   WorkerResponse,
 } from './types.js';
 import { LedgerStore } from './ledger.js';
+import type { LedgerDelta, LedgerDeltaCapture } from './ledger.js';
 import type { ActionRecord } from '../../navigation/types.js';
 import { JournalQueue } from './journal.js';
 import type { JournalCapture } from './journal.js';
@@ -94,8 +95,12 @@ interface PendingRequest {
   voxelSections?: VoxelSectionSnapshot[];
   /** The captured journal batch, for the ACK-time pending clear. */
   journalCapture?: JournalCapture;
-  /** Ledger revision captured by this checkpoint. */
-  ledgerRevision?: number;
+  /**
+   * The ledger delta captured by this checkpoint. Its presence means this
+   * checkpoint wrote ledger rows; its tokens make the ACK clear exactly what the
+   * worker committed and keep rows re-dirtied afterwards pending.
+   */
+  ledgerCapture?: LedgerDeltaCapture;
 }
 
 interface InFlightCheckpoint {
@@ -370,10 +375,24 @@ class SpatialSessionImpl implements SpatialSession {
       throw new PersistenceError('capacity', `worldId alone exceeds maxBytes (${maxBytes})`);
     }
 
+    // Only domains whose revision leads their confirmed revision are sent and
+    // rewritten. A clean domain contributes an empty snapshot and its measure is
+    // zero; the worker leaves its committed rows and baseline untouched.
+    const historyMode: 'full' | 'none' =
+      this.history.revision !== this.confirmedFragmentRevision ? 'full' : 'none';
+    const topologyMode: 'full' | 'none' =
+      this.topology.revision !== this.confirmedTopologyRevision ? 'full' : 'none';
+
     const shared = maxBytes - historyEnvelope - voxelEnvelope;
-    const historyMeasure = this.history.checkpointMeasure(shared);
+    const historyMeasure =
+      historyMode === 'full'
+        ? this.history.checkpointMeasure(shared)
+        : { fragments: 0, traversals: 0, polylinePoints: 0, entrancePoints: 0, linkPairs: 0, bytes: 0 };
     const afterHistory = shared - historyMeasure.bytes;
-    const topologyMeasure = this.topology.checkpointMeasure(Math.max(0, afterHistory));
+    const topologyMeasure =
+      topologyMode === 'full'
+        ? this.topology.checkpointMeasure(Math.max(0, afterHistory))
+        : { nodes: 0, edges: 0, edgeEvidenceRefs: 0, bytes: 0 };
     const afterTopology = afterHistory - topologyMeasure.bytes;
 
     const historyCommas = interRecordCommas(
@@ -442,16 +461,18 @@ class SpatialSessionImpl implements SpatialSession {
       },
     );
 
-    const historySnapshot = this.history.checkpointSnapshot();
-    const topologySnapshot = this.topology.checkpointSnapshot();
+    // Copy only dirty domains after the bounded pre-flight passed. A clean domain
+    // is sent as empty arrays under its `none` mode, never as a stale full copy.
+    const historySnapshot = historyMode === 'full' ? this.history.checkpointSnapshot() : null;
+    const topologySnapshot = topologyMode === 'full' ? this.topology.checkpointSnapshot() : null;
     const snapshot: HistorySnapshot = {
       worldId: this.worldId,
-      fragments: historySnapshot.fragments,
-      traversals: historySnapshot.traversals,
-      nodes: topologySnapshot.nodes,
-      edges: topologySnapshot.edges,
-      portalEdges: topologySnapshot.portalEdges ?? [],
-      fragmentMerges: topologySnapshot.fragmentMerges ?? [],
+      fragments: historySnapshot?.fragments ?? [],
+      traversals: historySnapshot?.traversals ?? [],
+      nodes: topologySnapshot?.nodes ?? [],
+      edges: topologySnapshot?.edges ?? [],
+      portalEdges: topologySnapshot?.portalEdges ?? [],
+      fragmentMerges: topologySnapshot?.fragmentMerges ?? [],
     };
     // Deep copy only after the bounded pre-flight passed (before copy/postMessage).
     const voxelSnapshot: VoxelCheckpointSnapshot =
@@ -466,27 +487,50 @@ class SpatialSessionImpl implements SpatialSession {
       this.journalLimitsField.maxBatchBytes,
     );
 
-    // Capture the complete ledger for this world. The ledger is bounded separately
-    // from the history/voxel envelope; its exact serialized size is checked before
-    // any copy or message pass.
-    const ledgerRevision = this.ledger.revision;
-    const ledgerSnapshot = this.ledger.snapshot();
-    if (ledgerSnapshot.placed.length > this.ledgerLimitsField.maxPlacedBlocks) {
-      throw new PersistenceError('capacity', `ledger exceeds maxPlacedBlocks (${ledgerSnapshot.placed.length})`);
+    // Ledger: the first save in this session is a full replacement (so an omitted
+    // row can never be read as a deletion); later saves send only the rows changed
+    // since the previous confirmed capture. The worker re-reads the committed set
+    // inside the transaction and enforces the full-set capacity/byte bounds there,
+    // so a delta is never the authority for what stays on disk.
+    let ledgerMode: 'none' | 'full' | 'delta' = 'none';
+    let ledgerSnapshot: LedgerSnapshot | undefined;
+    let ledgerDelta: LedgerDelta | undefined;
+    let ledgerCapture: LedgerDeltaCapture | undefined;
+    if (this.ledger.revision !== this.confirmedLedgerRevision) {
+      const capture = this.ledger.captureDelta();
+      ledgerCapture = capture;
+      if (this.ledgerBaselineCheckpointId === null) {
+        ledgerMode = 'full';
+        ledgerSnapshot = this.ledger.snapshot();
+        if (ledgerSnapshot.placed.length > this.ledgerLimitsField.maxPlacedBlocks) {
+          throw new PersistenceError('capacity', `ledger exceeds maxPlacedBlocks (${ledgerSnapshot.placed.length})`);
+        }
+        if (ledgerSnapshot.visits.length > this.ledgerLimitsField.maxChunkVisits) {
+          throw new PersistenceError('capacity', `ledger exceeds maxChunkVisits (${ledgerSnapshot.visits.length})`);
+        }
+        if (ledgerSnapshot.traversals.length > this.ledgerLimitsField.maxPortalTraversals) {
+          throw new PersistenceError(
+            'capacity',
+            `ledger exceeds maxPortalTraversals (${ledgerSnapshot.traversals.length})`,
+          );
+        }
+        const ledgerBytes = Buffer.byteLength(JSON.stringify(ledgerSnapshot), 'utf8');
+        if (ledgerBytes > this.ledgerLimitsField.maxBytes) {
+          throw new PersistenceError('capacity', `ledger exceeds maxBytes (${ledgerBytes})`);
+        }
+      } else {
+        ledgerMode = 'delta';
+        ledgerDelta = {
+          worldId: capture.worldId,
+          placedUpserts: capture.placedUpserts,
+          placedRemovals: capture.placedRemovals,
+          visitUpserts: capture.visitUpserts,
+          visitRemovals: capture.visitRemovals,
+          traversals: capture.traversals,
+        };
+      }
     }
-    if (ledgerSnapshot.visits.length > this.ledgerLimitsField.maxChunkVisits) {
-      throw new PersistenceError('capacity', `ledger exceeds maxChunkVisits (${ledgerSnapshot.visits.length})`);
-    }
-    if (ledgerSnapshot.traversals.length > this.ledgerLimitsField.maxPortalTraversals) {
-      throw new PersistenceError(
-        'capacity',
-        `ledger exceeds maxPortalTraversals (${ledgerSnapshot.traversals.length})`,
-      );
-    }
-    const ledgerBytes = Buffer.byteLength(JSON.stringify(ledgerSnapshot), 'utf8');
-    if (ledgerBytes > this.ledgerLimitsField.maxBytes) {
-      throw new PersistenceError('capacity', `ledger exceeds maxBytes (${ledgerBytes})`);
-    }
+    const ledgerRevision = ledgerCapture?.revision ?? this.confirmedLedgerRevision;
 
     const checkpointId = randomUUID();
     const promise = new Promise<SpatialCheckpointResult>((resolve, reject) => {
@@ -501,7 +545,7 @@ class SpatialSessionImpl implements SpatialSession {
         voxelMode,
         voxelSections: voxelSnapshot.sections,
         journalCapture,
-        ledgerRevision,
+        ledgerCapture,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -520,9 +564,12 @@ class SpatialSessionImpl implements SpatialSession {
         journalMode: 'append',
         journalRevision: journalCapture.revision,
         journalBatch: { actions: journalCapture.actions, events: journalCapture.events },
-        ledgerMode: 'full',
+        historyMode,
+        topologyMode,
+        ledgerMode,
         ledgerRevision,
-        ledgerSnapshot,
+        ...(ledgerSnapshot === undefined ? {} : { ledgerSnapshot }),
+        ...(ledgerDelta === undefined ? {} : { ledgerDelta }),
         gameVersion: this.gameVersionField,
       } satisfies WorkerRequest);
     });
@@ -1118,8 +1165,11 @@ class SpatialSessionImpl implements SpatialSession {
       this.confirmedVoxelRevision = entry.voxelRevision!;
       this.confirmedFragmentRevision = entry.fragmentRevision!;
       this.confirmedTopologyRevision = entry.topologyRevision!;
-      if (entry.ledgerRevision !== undefined) {
-        this.confirmedLedgerRevision = entry.ledgerRevision;
+      if (entry.ledgerCapture !== undefined) {
+        // Clear exactly the captured rows; a key re-dirtied after capture keeps
+        // its newer pending entry and is re-sent by the next checkpoint.
+        this.ledger.confirmDelta(entry.ledgerCapture);
+        this.confirmedLedgerRevision = entry.ledgerCapture.revision;
         this.ledgerBaselineCheckpointId = okMsg.checkpointId;
       }
       // Clear only the captured journal entries; newer acceptances stay pending.
@@ -1140,7 +1190,7 @@ class SpatialSessionImpl implements SpatialSession {
         // Exact captured (and now ACK-confirmed) revision, not the latest queue
         // revision. A truncated capture reports only its confirmed prefix.
         journalRevision: entry.journalCapture?.revision ?? this.confirmedJournalRevision,
-        ledgerRevision: entry.ledgerRevision ?? this.confirmedLedgerRevision,
+        ledgerRevision: entry.ledgerCapture?.revision ?? this.confirmedLedgerRevision,
       });
     } else {
       entry.resolve(true);

@@ -32,6 +32,7 @@ import {
   UNKNOWN_GAME_VERSION,
 } from '../../voxel/serialization.js';
 import { chunkVisitKey, placedBlockKey, portalTraversalIdentity } from './ledger.js';
+import type { LedgerDelta } from './ledger.js';
 import { DEFAULT_LEDGER_LIMITS } from './types.js';
 import type {
   ChunkVisitRecord,
@@ -1201,41 +1202,46 @@ function writeCheckpoint(
   fragmentRevision: number,
   topologyRevision: number,
   gameVersion: string,
+  domain: { history: 'full' | 'none'; topology: 'full' | 'none' },
   prepared: PreparedSnapshot,
   voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
-  ledger: { mode: 'none' | 'full'; revision: number; prepared: PreparedLedger | null },
+  ledger: { mode: 'none' | 'full' | 'delta'; revision: number; prepared: PreparedLedgerWrite | null },
   resolved: ResolvedSnapshotLimits,
   resolvedJournal: ResolvedJournalLimits,
-): void {
-  const tx = connection.transaction(() => {
+): LedgerStats | null {
+  const tx = connection.transaction((): LedgerStats | null => {
     const nextSeqRow = connection
       .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM checkpoints WHERE world_id = ?')
       .get(wId) as { n: number };
     const nextSeq = nextSeqRow.n;
 
-    connection.prepare('DELETE FROM path_fragments WHERE world_id = ?').run(wId);
-    connection.prepare('DELETE FROM traversal_evidence WHERE world_id = ?').run(wId);
-    connection.prepare('DELETE FROM spatial_nodes WHERE world_id = ?').run(wId);
-    connection.prepare('DELETE FROM spatial_edges WHERE world_id = ?').run(wId);
-
-    const insertFragment = connection.prepare(
-      'INSERT INTO path_fragments (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-    );
-    const insertTraversal = connection.prepare(
-      'INSERT INTO traversal_evidence (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-    );
-    const insertNode = connection.prepare(
-      'INSERT INTO spatial_nodes (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-    );
-    const insertEdge = connection.prepare(
-      'INSERT INTO spatial_edges (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-    );
-
-    prepared.fragments.forEach((f, i) => insertFragment.run(wId, i, f.id, f.payload));
-    prepared.traversals.forEach((t, i) => insertTraversal.run(wId, i, t.id, t.payload));
-    prepared.nodes.forEach((n, i) => insertNode.run(wId, i, n.id, n.payload));
-    prepared.edges.forEach((e, i) => insertEdge.run(wId, i, e.id, e.payload));
+    // Each domain is independent: `none` keeps that domain's committed rows and
+    // baseline untouched, so an omitted (empty) array is never read as a clear.
+    if (domain.history === 'full') {
+      connection.prepare('DELETE FROM path_fragments WHERE world_id = ?').run(wId);
+      connection.prepare('DELETE FROM traversal_evidence WHERE world_id = ?').run(wId);
+      const insertFragment = connection.prepare(
+        'INSERT INTO path_fragments (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
+      );
+      const insertTraversal = connection.prepare(
+        'INSERT INTO traversal_evidence (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
+      );
+      prepared.fragments.forEach((f, i) => insertFragment.run(wId, i, f.id, f.payload));
+      prepared.traversals.forEach((t, i) => insertTraversal.run(wId, i, t.id, t.payload));
+    }
+    if (domain.topology === 'full') {
+      connection.prepare('DELETE FROM spatial_nodes WHERE world_id = ?').run(wId);
+      connection.prepare('DELETE FROM spatial_edges WHERE world_id = ?').run(wId);
+      const insertNode = connection.prepare(
+        'INSERT INTO spatial_nodes (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
+      );
+      const insertEdge = connection.prepare(
+        'INSERT INTO spatial_edges (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
+      );
+      prepared.nodes.forEach((n, i) => insertNode.run(wId, i, n.id, n.payload));
+      prepared.edges.forEach((e, i) => insertEdge.run(wId, i, e.id, e.payload));
+    }
 
     // `none` never touches spatial_sections, so an existing voxel baseline
     // survives. `full` replaces the whole set (first save baseline). `incremental`
@@ -1301,11 +1307,37 @@ function writeCheckpoint(
       appendJournal(connection, wId, journal.prepared, resolvedJournal);
     }
 
-    // The ledger is a full replacement of this world's ledger rows; unattributed
-    // legacy rows (world_id IS NULL) are not this world's facts and are untouched.
-    if (ledger.mode === 'full') {
-      writeLedger(connection, wId, ledger.prepared ?? { placed: [], visits: [], traversals: [], bytes: 0 });
+    // `none` never touches ledger rows; `full` replaces this world's ledger rows
+    // (unattributed `world_id IS NULL` legacy rows are not this world's facts);
+    // `delta` upserts/removes only the changed keys and then checks the resulting
+    // full set. A delta never writes `world_id IS NULL` rows either.
+    let ledgerStats: LedgerStats | null = null;
+    if (ledger.mode !== 'none') {
+      // Fail closed: a `full`/`delta` save without its prepared set must never
+      // fall back to an empty `full`, which would read as "delete every row".
+      if (ledger.prepared === null) throw new Error('ledger save mode requires a prepared ledger set');
+      const preparedLedger = ledger.prepared;
+      writeLedger(connection, wId, preparedLedger);
+      ledgerStats =
+        ledger.mode === 'delta'
+          ? assertLedgerFullSetWithinLimits(connection, wId, ledgerLimits)
+          : {
+              placed: preparedLedger.placed.length,
+              visits: preparedLedger.visits.length,
+              traversals: preparedLedger.traversals.length,
+              bytes: preparedLedger.bytes,
+            };
     }
+
+    // A `none` topology write leaves the committed extras untouched, so the new
+    // checkpoint row must carry the previous row's extras forward: the opener reads
+    // portal edges/merges from the latest checkpoint only.
+    const topologyExtras =
+      domain.topology === 'full'
+        ? prepared.extras
+        : ((connection
+            .prepare('SELECT topology_extras FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
+            .get(wId) as { topology_extras: string } | undefined)?.topology_extras ?? prepared.extras);
 
     connection
       .prepare(
@@ -1322,12 +1354,13 @@ function writeCheckpoint(
         journal.mode === 'none' ? 0 : 1,
         ledger.mode === 'none' ? 0 : ledger.revision,
         ledger.mode === 'none' ? 0 : 1,
-        prepared.extras,
+        topologyExtras,
         gameVersion,
         nextSeq,
       );
+    return ledgerStats;
   });
-  tx();
+  return tx();
 }
 
 /**
@@ -1499,6 +1532,26 @@ interface PreparedLedger {
   bytes: number;
 }
 
+/** A fully validated ledger set to write: a complete replacement or a delta. */
+interface PreparedLedgerWrite {
+  mode: 'full' | 'delta';
+  placed: PlacedBlockRecord[];
+  visits: ChunkVisitRecord[];
+  traversals: PreparedTraversal[];
+  placedRemovals: string[];
+  visitRemovals: string[];
+  /** Serialized size of the sent set; for `full` this is the full-set figure. */
+  bytes: number;
+}
+
+/** Committed ledger row counts and full-set serialized size, reported in the ACK. */
+interface LedgerStats {
+  placed: number;
+  visits: number;
+  traversals: number;
+  bytes: number;
+}
+
 function ledgerInvalid(message: string): Error {
   return new Error(message);
 }
@@ -1628,17 +1681,31 @@ function prepareLedger(snapshot: LedgerSnapshot, wId: string, resolved: Resolved
   return { placed, visits, traversals, bytes };
 }
 
-/** Replace this world's ledger rows inside the checkpoint transaction. */
-function writeLedger(connection: Database.Database, wId: string, prepared: PreparedLedger): void {
-  connection.prepare('DELETE FROM placed_blocks WHERE world_id = ?').run(wId);
-  connection.prepare('DELETE FROM chunk_visits WHERE world_id = ?').run(wId);
-  connection.prepare('DELETE FROM portal_traversals WHERE world_id = ?').run(wId);
+/**
+ * Apply this world's ledger rows inside the checkpoint transaction. `full`
+ * replaces the whole set; `delta` replaces/removes only the changed keys and
+ * appends crossings. A crossing is never deleted, so a `delta` never describes
+ * a portal row removal.
+ */
+function writeLedger(connection: Database.Database, wId: string, ledger: PreparedLedgerWrite): void {
+  if (ledger.mode === 'full') {
+    connection.prepare('DELETE FROM placed_blocks WHERE world_id = ?').run(wId);
+    connection.prepare('DELETE FROM chunk_visits WHERE world_id = ?').run(wId);
+    connection.prepare('DELETE FROM portal_traversals WHERE world_id = ?').run(wId);
+  } else {
+    const deletePlaced = connection.prepare('DELETE FROM placed_blocks WHERE world_id = ? AND key = ?');
+    for (const key of ledger.placedRemovals) deletePlaced.run(wId, key);
+    const deleteVisit = connection.prepare('DELETE FROM chunk_visits WHERE world_id = ? AND key = ?');
+    for (const key of ledger.visitRemovals) deleteVisit.run(wId, key);
+  }
 
-  const insertPlaced = connection.prepare(
-    'INSERT INTO placed_blocks (key, world_id, dim, x, y, z, name, lru_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  const upsertPlaced = connection.prepare(
+    'INSERT INTO placed_blocks (key, world_id, dim, x, y, z, name, lru_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+      'ON CONFLICT(key) DO UPDATE SET dim = excluded.dim, x = excluded.x, y = excluded.y, z = excluded.z, ' +
+      'name = excluded.name, lru_at = excluded.lru_at, source = excluded.source',
   );
-  for (const record of prepared.placed) {
-    insertPlaced.run(
+  for (const record of ledger.placed) {
+    upsertPlaced.run(
       record.key,
       wId,
       record.dim,
@@ -1651,18 +1718,25 @@ function writeLedger(connection: Database.Database, wId: string, prepared: Prepa
     );
   }
 
-  const insertVisit = connection.prepare(
-    'INSERT INTO chunk_visits (key, world_id, dim, cx, cz, count, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  const upsertVisit = connection.prepare(
+    'INSERT INTO chunk_visits (key, world_id, dim, cx, cz, count, source) VALUES (?, ?, ?, ?, ?, ?, ?) ' +
+      'ON CONFLICT(key) DO UPDATE SET dim = excluded.dim, cx = excluded.cx, cz = excluded.cz, ' +
+      'count = excluded.count, source = excluded.source',
   );
-  for (const record of prepared.visits) {
-    insertVisit.run(record.key, wId, record.dim, record.cx, record.cz, record.count, record.source);
+  for (const record of ledger.visits) {
+    upsertVisit.run(record.key, wId, record.dim, record.cx, record.cz, record.count, record.source);
   }
 
-  const insertTraversal = connection.prepare(
-    'INSERT INTO portal_traversals (id, world_id, kind, direction, from_id, to_id, ts, from_session, to_session, from_observation, to_observation, from_endpoint, to_endpoint, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  const upsertTraversal = connection.prepare(
+    'INSERT INTO portal_traversals (id, world_id, kind, direction, from_id, to_id, ts, from_session, to_session, from_observation, to_observation, from_endpoint, to_endpoint, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+      'ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, direction = excluded.direction, ' +
+      'from_id = excluded.from_id, to_id = excluded.to_id, ts = excluded.ts, ' +
+      'from_session = excluded.from_session, to_session = excluded.to_session, ' +
+      'from_observation = excluded.from_observation, to_observation = excluded.to_observation, ' +
+      'from_endpoint = excluded.from_endpoint, to_endpoint = excluded.to_endpoint, source = excluded.source',
   );
-  for (const record of prepared.traversals) {
-    insertTraversal.run(
+  for (const record of ledger.traversals) {
+    upsertTraversal.run(
       record.id,
       wId,
       record.kind,
@@ -1681,44 +1755,45 @@ function writeLedger(connection: Database.Database, wId: string, prepared: Prepa
   }
 }
 
-function parseStoredEndpoint(raw: string | null, what: string): PortalEndpointEvidence | null {
-  if (raw === null) return null;
-  const parsed = JSON.parse(raw) as unknown;
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw ledgerInvalid(`corrupt ${what} payload`);
-  }
-  return parsed as PortalEndpointEvidence;
-}
-
 /**
- * Read this world's committed ledger. Payloads are bounded by count before decode;
- * a world with ledger rows but no ledger baseline is corruption, never an empty
- * ledger (a later full checkpoint would otherwise erase real rows).
+ * Enforce the post-write ledger row capacities and byte bound by reading the
+ * committed set back inside the checkpoint transaction, so an incremental
+ * sequence cannot accumulate past the limits. This checks counts and the
+ * canonical serialized size only; per-record and endpoint validation happened
+ * when each row was first prepared. Throws (rolling the transaction back) on
+ * overflow; the committed figures are also returned for the ACK.
  */
-function loadLedger(
+function assertLedgerFullSetWithinLimits(
   connection: Database.Database,
   wId: string,
   resolved: ResolvedLedgerLimits,
-): { baselineCheckpointId: string | null; snapshot: LedgerSnapshot | null; bytes: number } {
-  const cp = connection
-    .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_ledger = 1 ORDER BY seq DESC LIMIT 1')
-    .get(wId) as { checkpoint_id: string } | undefined;
-
-  const placedRows = countRows(connection, 'placed_blocks', wId);
-  const visitRows = countRows(connection, 'chunk_visits', wId);
-  const traversalRows = countRows(connection, 'portal_traversals', wId);
-  if (cp === undefined) {
-    if (placedRows + visitRows + traversalRows > 0) {
-      throw new Error('world has ledger rows but no ledger checkpoint metadata');
-    }
-    return { baselineCheckpointId: null, snapshot: null, bytes: 0 };
+): LedgerStats {
+  const snapshot = readLedgerRows(connection, wId);
+  if (snapshot.placed.length > resolved.maxPlacedBlocks) {
+    throw new Error(`ledger exceeds maxPlacedBlocks (${snapshot.placed.length})`);
   }
-  if (placedRows > resolved.maxPlacedBlocks) throw new Error(`ledger exceeds maxPlacedBlocks (${placedRows})`);
-  if (visitRows > resolved.maxChunkVisits) throw new Error(`ledger exceeds maxChunkVisits (${visitRows})`);
-  if (traversalRows > resolved.maxPortalTraversals) {
-    throw new Error(`ledger exceeds maxPortalTraversals (${traversalRows})`);
+  if (snapshot.visits.length > resolved.maxChunkVisits) {
+    throw new Error(`ledger exceeds maxChunkVisits (${snapshot.visits.length})`);
   }
+  if (snapshot.traversals.length > resolved.maxPortalTraversals) {
+    throw new Error(`ledger exceeds maxPortalTraversals (${snapshot.traversals.length})`);
+  }
+  const bytes = Buffer.byteLength(JSON.stringify(snapshot), 'utf8');
+  if (bytes > resolved.maxBytes) throw new Error(`ledger exceeds maxBytes (${bytes})`);
+  return {
+    placed: snapshot.placed.length,
+    visits: snapshot.visits.length,
+    traversals: snapshot.traversals.length,
+    bytes,
+  };
+}
 
+/**
+ * Read this world's committed ledger rows into the same canonical snapshot shape
+ * a checkpoint sends. Every recorded field is a stored column, so this is a
+ * plain reconstruction, not an opaque decode.
+ */
+function readLedgerRows(connection: Database.Database, wId: string): LedgerSnapshot {
   const placed = (connection
     .prepare('SELECT key, world_id, dim, x, y, z, name, lru_at, source FROM placed_blocks WHERE world_id = ? ORDER BY lru_at, key')
     .all(wId) as {
@@ -1797,7 +1872,98 @@ function loadLedger(
       source: row.source,
     }));
 
-  const snapshot: LedgerSnapshot = { worldId: wId, placed, visits, traversals };
+  return { worldId: wId, placed, visits, traversals };
+}
+
+/**
+ * Encode and validate one captured ledger delta. The delta's shape and world
+ * scope are checked here, then each sent row goes through `prepareLedger`; its
+ * upserts are keyed and cannot repeat a key that is also removed, so a delta
+ * never describes a deletion of something it also writes. The post-merge full
+ * set is checked inside the transaction from the committed rows, never from
+ * the delta alone.
+ */
+function prepareLedgerDelta(delta: LedgerDelta, wId: string, resolved: ResolvedLedgerLimits): PreparedLedgerWrite {
+  if (delta === null || typeof delta !== 'object' || Array.isArray(delta)) {
+    throw ledgerInvalid('ledger delta must be an object');
+  }
+  if (delta.worldId !== wId) throw ledgerInvalid('ledger delta worldId does not match session worldId');
+  if (
+    !Array.isArray(delta.placedUpserts) ||
+    !Array.isArray(delta.placedRemovals) ||
+    !Array.isArray(delta.visitUpserts) ||
+    !Array.isArray(delta.visitRemovals) ||
+    !Array.isArray(delta.traversals)
+  ) {
+    throw ledgerInvalid('ledger delta arrays are malformed');
+  }
+  // Shape/world validation above; per-record validation and the byte bound for
+  // the sent rows happen in `prepareLedger`. The authoritative full-set
+  // capacity/byte check runs inside the transaction after the merge.
+  const prepared = prepareLedger(
+    {
+      worldId: wId,
+      placed: delta.placedUpserts,
+      visits: delta.visitUpserts,
+      traversals: delta.traversals,
+    },
+    wId,
+    resolved,
+  );
+  const placedUpsertKeys = new Set(prepared.placed.map((record) => record.key));
+  const visitUpsertKeys = new Set(prepared.visits.map((record) => record.key));
+  const placedRemovals = delta.placedRemovals.map((key) => {
+    requireLedgerString(key, 'placed removal key');
+    if (placedUpsertKeys.has(key)) throw ledgerInvalid(`ledger placed key "${key}" is both written and removed`);
+    return key;
+  });
+  const visitRemovals = delta.visitRemovals.map((key) => {
+    requireLedgerString(key, 'visit removal key');
+    if (visitUpsertKeys.has(key)) throw ledgerInvalid(`ledger visit key "${key}" is both written and removed`);
+    return key;
+  });
+  return { mode: 'delta', ...prepared, placedRemovals, visitRemovals };
+}
+
+function parseStoredEndpoint(raw: string | null, what: string): PortalEndpointEvidence | null {
+  if (raw === null) return null;
+  const parsed = JSON.parse(raw) as unknown;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw ledgerInvalid(`corrupt ${what} payload`);
+  }
+  return parsed as PortalEndpointEvidence;
+}
+
+/**
+ * Read this world's committed ledger. Payloads are bounded by count before decode;
+ * a world with ledger rows but no ledger baseline is corruption, never an empty
+ * ledger (a later full checkpoint would otherwise erase real rows).
+ */
+function loadLedger(
+  connection: Database.Database,
+  wId: string,
+  resolved: ResolvedLedgerLimits,
+): { baselineCheckpointId: string | null; snapshot: LedgerSnapshot | null; bytes: number } {
+  const cp = connection
+    .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_ledger = 1 ORDER BY seq DESC LIMIT 1')
+    .get(wId) as { checkpoint_id: string } | undefined;
+
+  const placedRows = countRows(connection, 'placed_blocks', wId);
+  const visitRows = countRows(connection, 'chunk_visits', wId);
+  const traversalRows = countRows(connection, 'portal_traversals', wId);
+  if (cp === undefined) {
+    if (placedRows + visitRows + traversalRows > 0) {
+      throw new Error('world has ledger rows but no ledger checkpoint metadata');
+    }
+    return { baselineCheckpointId: null, snapshot: null, bytes: 0 };
+  }
+  if (placedRows > resolved.maxPlacedBlocks) throw new Error(`ledger exceeds maxPlacedBlocks (${placedRows})`);
+  if (visitRows > resolved.maxChunkVisits) throw new Error(`ledger exceeds maxChunkVisits (${visitRows})`);
+  if (traversalRows > resolved.maxPortalTraversals) {
+    throw new Error(`ledger exceeds maxPortalTraversals (${traversalRows})`);
+  }
+
+  const snapshot = readLedgerRows(connection, wId);
   // Re-validate everything read from disk through the same boundary as a write.
   const prepared = prepareLedger(snapshot, wId, resolved);
   return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes: prepared.bytes };
@@ -2233,6 +2399,32 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'data', message: 'snapshot worldId does not match session worldId' });
     return;
   }
+  const historyMode = msg.historyMode ?? 'full';
+  if (historyMode !== 'full' && historyMode !== 'none') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid history save mode' });
+    return;
+  }
+  const topologyMode = msg.topologyMode ?? 'full';
+  if (topologyMode !== 'full' && topologyMode !== 'none') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid topology save mode' });
+    return;
+  }
+  // A domain declared `none` must not smuggle rows in the snapshot: silently
+  // dropping them would turn "unchanged" into data loss.
+  if (historyMode === 'none' && (msg.snapshot.fragments.length > 0 || msg.snapshot.traversals.length > 0)) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'history mode none must not carry fragments or traversals' });
+    return;
+  }
+  if (
+    topologyMode === 'none' &&
+    (msg.snapshot.nodes.length > 0 ||
+      msg.snapshot.edges.length > 0 ||
+      (msg.snapshot.portalEdges?.length ?? 0) > 0 ||
+      (msg.snapshot.fragmentMerges?.length ?? 0) > 0)
+  ) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'topology mode none must not carry nodes, edges or topology extras' });
+    return;
+  }
   if (msg.journalMode !== 'none' && msg.journalMode !== 'append') {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid journal save mode' });
     return;
@@ -2246,7 +2438,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     return;
   }
   const ledgerMode = msg.ledgerMode ?? 'none';
-  if (ledgerMode !== 'none' && ledgerMode !== 'full') {
+  if (ledgerMode !== 'none' && ledgerMode !== 'full' && ledgerMode !== 'delta') {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid ledger save mode' });
     return;
   }
@@ -2255,12 +2447,16 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger revision must be a non-negative safe integer' });
     return;
   }
-  if (ledgerMode === 'none' && msg.ledgerSnapshot !== undefined) {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode none must not carry a snapshot' });
+  if (ledgerMode === 'none' && (msg.ledgerSnapshot !== undefined || msg.ledgerDelta !== undefined)) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode none must not carry a snapshot or delta' });
     return;
   }
   if (ledgerMode === 'full' && msg.ledgerSnapshot === undefined) {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode full requires a snapshot' });
+    return;
+  }
+  if (ledgerMode === 'delta' && msg.ledgerDelta === undefined) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode delta requires a delta' });
     return;
   }
   const gameVersion = msg.gameVersion === undefined ? UNKNOWN_GAME_VERSION : msg.gameVersion;
@@ -2271,7 +2467,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   let prepared: PreparedSnapshot;
   let preparedVoxel: PreparedVoxelSnapshot | null = null;
   let preparedJournal: PreparedJournal;
-  let preparedLedger: PreparedLedger | null = null;
+  let preparedLedger: PreparedLedgerWrite | null = null;
   try {
     prepared = prepareSnapshot(msg.snapshot);
     assertWithinLimits(prepared, limits);
@@ -2293,7 +2489,14 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
         ? { actions: [], events: [], bytes: 0 }
         : prepareJournalBatch(msg.journalBatch, worldId, journalLimits);
     if (ledgerMode === 'full') {
-      preparedLedger = prepareLedger(msg.ledgerSnapshot!, worldId, ledgerLimits);
+      preparedLedger = {
+        mode: 'full',
+        ...prepareLedger(msg.ledgerSnapshot!, worldId, ledgerLimits),
+        placedRemovals: [],
+        visitRemovals: [],
+      };
+    } else if (ledgerMode === 'delta') {
+      preparedLedger = prepareLedgerDelta(msg.ledgerDelta!, worldId, ledgerLimits);
     }
   } catch (err) {
     respond({
@@ -2304,8 +2507,12 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     });
     return;
   }
+  let committedLedger: LedgerStats | null = null;
   try {
-    writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, prepared, {
+    committedLedger = writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, {
+      history: historyMode,
+      topology: topologyMode,
+    }, prepared, {
       mode: msg.voxelMode,
       voxelRevision: msg.voxelRevision,
       sections: preparedVoxel?.sections ?? [],
@@ -2338,6 +2545,12 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     voxelBytes,
     journalRecordCount: countRows(db, 'action_records', worldId) + countRows(db, 'spatial_events', worldId),
     journalRecordBytes: sumPayloadBytes(db, 'action_records', worldId) + sumPayloadBytes(db, 'spatial_events', worldId),
+    ...(committedLedger === null
+      ? {}
+      : {
+          ledgerRecordCount: committedLedger.placed + committedLedger.visits + committedLedger.traversals,
+          ledgerRecordBytes: committedLedger.bytes,
+        }),
   });
 }
 
