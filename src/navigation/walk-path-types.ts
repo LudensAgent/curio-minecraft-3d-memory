@@ -50,7 +50,11 @@ export interface WalkPathEnvironment {
   sessionId: string;
   body: BodyContext;
   shapeProvider: CollisionShapeProvider;
-  /** Latest measured body sample; null, an old session or a disconnect means failure. */
+  /**
+   * Latest measured body sample. It must carry the stable external identity
+   * `exec_<routeId>` for the active walkPath; null, an old session or a
+   * disconnect means failure (never a reason to wait for TIMEOUT).
+   */
   sample(): BodySample | null;
   /** Single-step body port; executes one authorized move and never re-plans. */
   bodyPort: WalkBodyPort;

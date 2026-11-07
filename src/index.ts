@@ -320,7 +320,10 @@ export type {
 
 // Navigation
 export {
+  createWalkPath,
+  createWalkPathExecution,
   createWalkRouteSearchSource,
+  DEFAULT_START_TOLERANCE,
   followKnownPath,
   frontierCandidates,
   inspectKnownRoute,
@@ -395,10 +398,17 @@ export type {
   RouteSearchSource,
   RouteUnsupported,
   WalkBodyPort,
+  WalkPath,
   WalkPathEnvironment,
+  WalkPathExecute,
+  WalkPathExecutionOptions,
+  WalkPathInvalidationReason,
+  WalkPathOptions,
   WalkPathOutcome,
+  WalkPathRegistry,
   WalkPathRequest,
   WalkPathResult,
+  WalkPathStartContext,
   WalkSearchArrival,
   WalkSearchCandidate,
   WalkSearchCounters,

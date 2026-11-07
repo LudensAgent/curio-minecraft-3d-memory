@@ -36,6 +36,20 @@ export type {
   WalkPathRequest,
   WalkPathResult,
 } from './walk-path-types.js';
+export {
+  createWalkPath,
+  createWalkPathExecution,
+  DEFAULT_START_TOLERANCE,
+} from './walk-path.js';
+export type {
+  WalkPath,
+  WalkPathExecute,
+  WalkPathExecutionOptions,
+  WalkPathInvalidationReason,
+  WalkPathOptions,
+  WalkPathRegistry,
+  WalkPathStartContext,
+} from './walk-path.js';
 export { followKnownPath, navigateTo } from './navigate.js';
 export type {
   FollowKnownPathEnvironment,

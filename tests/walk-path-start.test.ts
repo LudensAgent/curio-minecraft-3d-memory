@@ -86,13 +86,20 @@ function arrived(start: WalkPathStartContext): WalkPathResult {
  * exposes only world scope, body facts, a sample read and the body port. This
  * harness proves the port is untouched; there is no writable memory seam.
  */
-function harness(overrides: Partial<WalkPathEnvironment> = {}) {
+function harness(overrides: Partial<WalkPathEnvironment> = {}, routeId?: string) {
   const bodyCalls = { move: 0, stop: 0 };
+  const executionId = routeId === undefined ? 'host-execution' : `exec_${routeId}`;
+  const { sample: sampleOverride, ...rest } = overrides;
   const environment: WalkPathEnvironment = {
     ...SCOPE,
     body: bodyAt(START.x, START.y, START.z),
     shapeProvider: fakeProvider,
-    sample: () => sampleAt(START),
+    sample: sampleOverride === undefined
+      ? () => sampleAt(START, { executionId })
+      : () => {
+          const sample = sampleOverride();
+          return sample === null ? null : { ...sample, executionId };
+        },
     bodyPort: {
       move: async () => {
         bodyCalls.move += 1;
@@ -103,7 +110,7 @@ function harness(overrides: Partial<WalkPathEnvironment> = {}) {
       },
     },
     now: () => NOW,
-    ...overrides,
+    ...rest,
   };
   return { environment, bodyCalls };
 }
@@ -123,7 +130,7 @@ function entry(reg: RoutePlanRegistryImpl) {
 describe('walkPath start precheck — handle lifecycle', () => {
   it('reports route_not_found for an id the registry never issued', async () => {
     const { walkPath, starts } = entry(registry());
-    const { environment, bodyCalls } = harness();
+    const { environment, bodyCalls } = harness({}, 'rt_missing');
 
     const result = await walkPath({ routeId: 'rt_missing', deadlineMs: 10_000 }, environment);
 
@@ -147,7 +154,7 @@ describe('walkPath start precheck — handle lifecycle', () => {
     const reg = registry();
     const plan = reg.register(draft());
     const { walkPath, starts } = entry(reg);
-    const { environment, bodyCalls } = harness();
+    const { environment, bodyCalls } = harness({}, plan.routeId);
     const request = { routeId: plan.routeId, deadlineMs: 10_000 };
 
     const first = await walkPath(request, environment);
@@ -174,7 +181,7 @@ describe('walkPath start precheck — handle lifecycle', () => {
     const reg = registry();
     const plan = reg.register(draft({ expiresAt: NOW - 1 }));
     const { walkPath, starts } = entry(reg);
-    const { environment, bodyCalls } = harness();
+    const { environment, bodyCalls } = harness({}, plan.routeId);
 
     const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, environment);
 
@@ -187,7 +194,7 @@ describe('walkPath start precheck — handle lifecycle', () => {
     const reg = registry();
     const plan = reg.register(draft({ executable: false, confidence: 'candidate' }));
     const { walkPath, starts } = entry(reg);
-    const { environment, bodyCalls } = harness();
+    const { environment, bodyCalls } = harness({}, plan.routeId);
 
     const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, environment);
 
@@ -202,7 +209,7 @@ describe('walkPath start precheck — handle lifecycle', () => {
     const plan = reg.register(draft());
     const { walkPath, starts } = entry(reg);
     const moved = { x: START.x + 0.06, y: START.y, z: START.z };
-    const { environment, bodyCalls } = harness({ sample: () => sampleAt(moved) });
+    const { environment, bodyCalls } = harness({ sample: () => sampleAt(moved) }, plan.routeId);
     const request = { routeId: plan.routeId, deadlineMs: 10_000 };
 
     const result = await walkPath(request, environment);
@@ -227,7 +234,7 @@ describe('walkPath start precheck — handle lifecycle', () => {
     const plan = reg.register(draft());
     const { walkPath, starts } = entry(reg);
     const close = { x: START.x + 0.049, y: START.y, z: START.z };
-    const { environment, bodyCalls } = harness({ sample: () => sampleAt(close) });
+    const { environment, bodyCalls } = harness({ sample: () => sampleAt(close) }, plan.routeId);
     const request = { routeId: plan.routeId, deadlineMs: 10_000 };
 
     const result = await walkPath(request, environment);
@@ -258,7 +265,7 @@ describe('walkPath start precheck — handle lifecycle', () => {
       },
     });
 
-    const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, harness().environment);
+    const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, harness({}, plan.routeId).environment);
 
     expect(result.outcome).toBe('ARRIVED');
     expect(registrationWhileExecuting).toBeInstanceOf(RoutePlanRegistryCapacityError);
@@ -280,7 +287,7 @@ describe('walkPath start precheck — scope, session and body gates', () => {
       const reg = registry();
       const plan = reg.register(draft());
       const { walkPath, starts } = entry(reg);
-      const { environment, bodyCalls } = harness(override);
+      const { environment, bodyCalls } = harness(override, plan.routeId);
 
       const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, environment);
 
@@ -295,7 +302,7 @@ describe('walkPath start precheck — scope, session and body gates', () => {
     const reg = registry();
     const plan = reg.register(draft());
     const { walkPath, starts } = entry(reg);
-    const { environment, bodyCalls } = harness({ sample: () => null });
+    const { environment, bodyCalls } = harness({ sample: () => null }, plan.routeId);
     const request = { routeId: plan.routeId, deadlineMs: 10_000 };
 
     const result = await walkPath(request, environment);
@@ -311,13 +318,40 @@ describe('walkPath start precheck — scope, session and body gates', () => {
     expect(retry.invalidation).toMatchObject({ reason: 'route_consumed' });
   });
 
+  it('rejects a start sample from another execution identity', async () => {
+    const reg = registry();
+    const plan = reg.register(draft());
+    const { walkPath, starts } = entry(reg);
+    const environment: WalkPathEnvironment = {
+      ...SCOPE,
+      body: bodyAt(START.x, START.y, START.z),
+      shapeProvider: fakeProvider,
+      sample: () => sampleAt(START, { executionId: 'walk-1' }),
+      bodyPort: {
+        move: async () => {
+          throw new Error('precheck must not call bodyPort.move');
+        },
+        stop: () => {},
+      },
+      now: () => NOW,
+    };
+
+    const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, environment);
+
+    expect(result.outcome).toBe('INVALIDATED');
+    expect(result.invalidation).toMatchObject({ reason: 'route_start_unmeasured' });
+    expect(result.problem).toMatchObject({ kind: 'unavailable' });
+    expect(result.lastPosition).toBeUndefined();
+    expect(starts).toHaveLength(0);
+  });
+
   it('fails closed when the sample belongs to an old session', async () => {
     const reg = registry();
     const plan = reg.register(draft());
     const { walkPath, starts } = entry(reg);
     const { environment, bodyCalls } = harness({
       sample: () => sampleAt(START, { sessionId: 'old-session' }),
-    });
+    }, plan.routeId);
 
     const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, environment);
 
@@ -334,7 +368,7 @@ describe('walkPath start precheck — scope, session and body gates', () => {
     const { walkPath, starts } = entry(reg);
     const { environment, bodyCalls } = harness({
       sample: () => sampleAt(START, { connected: false }),
-    });
+    }, plan.routeId);
 
     const result = await walkPath({ routeId: plan.routeId, deadlineMs: 10_000 }, environment);
 
