@@ -238,8 +238,8 @@ export class WalkRouteExecutor {
     if (this.releasing > 0) return this.snapshot(); // releasing control: defer step advancement
     if (this.guard()) return this.snapshot();
 
-    // Bounded re-verify.
-    this.verifier.advance(budget);
+    // Bounded re-verify (no throwaway full-route snapshot).
+    this.verifier.advanceVerification(budget);
 
     // Re-check the deadline and in-flight basis after verification: the clock may
     // have crossed the deadline or a TTL/rule boundary during re-verification.
@@ -317,7 +317,7 @@ export class WalkRouteExecutor {
     }
 
     // Re-verify (bounded) after the affected action has been revoked.
-    this.verifier.advance(budget);
+    this.verifier.advanceVerification(budget);
     this.guard();
 
     return this.snapshot();
@@ -520,7 +520,7 @@ export class WalkRouteExecutor {
     if (startedAt !== null && now - startedAt >= this.request!.timeoutMs) {
       return { outcome: 'TIMEOUT', message: 'move timed out', problem: { kind: 'timeout' } };
     }
-    if (ruleVersion !== null && this.verifierStatus().ruleVersion !== ruleVersion) {
+    if (ruleVersion !== null && this.verifier.currentRuleVersion() !== ruleVersion) {
       return {
         outcome: 'FAILED',
         message: 'the in-flight segment lost its OPEN verification basis',
@@ -544,9 +544,11 @@ export class WalkRouteExecutor {
       if (corridor.status !== 'OPEN') return this.failForStep(stepIndex, corridor);
       return null;
     }
-    const step = this.verifierStatus().steps[stepIndex];
-    if (step !== undefined && step.kind === 'verified') {
-      return step.result.status === 'OPEN' ? null : this.failForStep(stepIndex, step.result);
+    // `stepAt` re-runs the verifier's expiry and residency checks first, so a
+    // result queued for re-verification reads as pending here, exactly like `status()`.
+    const result = this.verifier.stepAt(stepIndex);
+    if (result !== undefined) {
+      return result.status === 'OPEN' ? null : this.failForStep(stepIndex, result);
     }
     return this.buildFailure('FAILED', 'the in-flight segment was invalidated before arrival', {
       kind: 'route_invalidated',
@@ -612,15 +614,15 @@ export class WalkRouteExecutor {
 
   /** Re-read the latest step status and start the move only if it is still OPEN. */
   private startMove(stepIndex: number): void {
-    const route = this.verifierStatus();
-    const step = route.steps[stepIndex];
-    if (step === undefined || step.kind !== 'verified') return; // pending: stay running, do not start
-    if (step.result.status !== 'OPEN') {
-      this.result = this.failForStep(stepIndex, step.result);
+    const ruleVersion = this.verifier.currentRuleVersion();
+    const step = this.verifier.stepAt(stepIndex);
+    if (step === undefined) return; // pending: stay running, do not start
+    if (step.status !== 'OPEN') {
+      this.result = this.failForStep(stepIndex, step);
       return;
     }
 
-    let evaluation = step.result;
+    let evaluation = step;
     if (this.request!.bodyArrival !== undefined) {
       evaluation = this.evaluateMeasured(this.lastPosition!, this.points[stepIndex + 1]!);
       if (evaluation.status !== 'OPEN') {
@@ -652,7 +654,7 @@ export class WalkRouteExecutor {
     this.activeExecutionId = executionId;
     this.activeAbort = abort;
     this.updateMeasuredBasis(evaluation);
-    this.activeRuleVersion = route.ruleVersion;
+    this.activeRuleVersion = ruleVersion;
     this.activeStartedAt = startedAt;
 
     const generation = this.generation;
