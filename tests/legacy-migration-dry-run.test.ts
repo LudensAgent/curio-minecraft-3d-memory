@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,7 @@ import {
   classifyLegacyRecordKeys,
   createLegacyReadBackend,
   createSwitchedLegacyView,
+  evaluateMigrationGate,
   importLegacyPassages,
   legacyBlockKey,
   passageRoute,
@@ -17,6 +18,7 @@ import {
   verifyLegacyPassageImport,
 } from '../src/compat/index.js';
 import type {
+  LegacyBatchName,
   LegacyDeletionSet,
   LegacyFurnaceRecord,
   LegacySpatialSnapshot,
@@ -767,5 +769,259 @@ describe('passage snapshot import, verification and temporary switch rehearsal',
     } finally {
       await reopened.close();
     }
+  });
+});
+
+// =============================================================================
+// Authority gate (M6.3): structured, decidable, never enabled
+// =============================================================================
+
+function gateSnapshot(): LegacySpatialSnapshot {
+  // Only migrated collections with proven scope, so every gate condition can hold.
+  const snapshot = makeSnapshot();
+  return {
+    worldId: WORLD,
+    passages: [snapshot.passages![0]!, snapshot.passages![1]!],
+    placed: {},
+    visitedChunks: {},
+    travel: { endpoints: [], traversals: [], gateways: [] },
+  };
+}
+
+function gateQuery(snapshot: LegacySpatialSnapshot) {
+  const path = snapshot.passages![0]!.path;
+  return { dim: DIM, pos: path[5]!, from: path[0]!, to: path[path.length - 1]! };
+}
+
+function runGate(
+  snapshot: LegacySpatialSnapshot,
+  deletions: LegacyDeletionSet = {},
+  migrationGate?: { operatorOptIn?: boolean; declaredMigratedBatches?: LegacyBatchName[] },
+) {
+  return runLegacyMigrationDryRun({
+    databasePath: makeDbPath(),
+    snapshot,
+    query: gateQuery(snapshot),
+    openSession: openSpatialSession,
+    deletions,
+    migrationGate,
+  });
+}
+
+function gateConditions(report: Awaited<ReturnType<typeof runLegacyMigrationDryRun>>) {
+  return Object.fromEntries(report.gate.conditions.map((condition) => [condition.condition, condition.ok]));
+}
+
+describe('JSON→SQLite authority gate (advisory, never auto-enabled)', () => {
+  it('reports not_satisfied with structured reasons when the rehearsal is incomplete', async () => {
+    const report = await runGate(makeSnapshot(), makeDeletions());
+
+    // Conditions are named + observed facts, not a single boolean.
+    expect(report.gate.conditions.map((condition) => condition.condition)).toEqual([
+      'stages_all_passed',
+      'verification_all_verified',
+      'no_unattributed_records',
+      'no_cross_world_records',
+      'no_invalid_records',
+      'deleted_not_resurrected',
+      'planned_destinations_declared',
+      'stage_d_trusted',
+    ]);
+    expect(gateConditions(report).stages_all_passed).toBe(true);
+    expect(report.gate.status).toBe('not_satisfied');
+    expect(report.gate.satisfied).toBe(false);
+
+    // Reasons are typed codes carrying the offending records/batches.
+    const codes = report.gate.reasons.map((reason) => reason.code);
+    expect(report.gate.conditions.find((condition) => condition.condition === 'verification_all_verified')!.ok).toBe(true);
+    expect(codes).toContain('unattributed_records');
+    expect(codes).toContain('cross_world_records');
+    expect(codes).toContain('batch_planned_only');
+    expect(codes).not.toContain('deleted_resurrected');
+    const unattributed = report.gate.conditions.find(
+      (condition) => condition.condition === 'no_unattributed_records',
+    )!;
+    expect(unattributed.observed.unattributedRecords).toBeGreaterThan(0);
+    const crossWorld = report.gate.conditions.find(
+      (condition) => condition.condition === 'no_cross_world_records',
+    )!;
+    expect(crossWorld.observed.crossWorldRecords).toBeGreaterThan(0);
+    // Deletion facts used by the gate are carried explicitly, not just implied.
+    const deletedFacts = report.gate.conditions.find(
+      (condition) => condition.condition === 'deleted_not_resurrected',
+    )!;
+    expect(deletedFacts.ok).toBe(true);
+    expect(deletedFacts.observed.deletedIdsChecked).toEqual(['psg_deleted']);
+    expect(deletedFacts.observed.resurrectedIds).toEqual([]);
+
+    // The gate never changes the dry-run guarantees.
+    expect(report.gate.guarantees).toEqual({
+      realAuthoritySwitch: false,
+      legacyWritePathRemoved: false,
+      dualWrite: false,
+      jsonReadFallbackForMissingRecords: false,
+    });
+    expect(report.gate.rollback).toBe('drop_temp_database_and_reopen_legacy');
+  });
+
+  it('stays not_satisfied while plan-only batches are undeclared, and never switches', async () => {
+    const report = await runGate(gateSnapshot(), {}, { operatorOptIn: true });
+
+    expect(report.stages.a.status).toBe('passed');
+    expect(report.stages.b.status).toBe('passed');
+    expect(report.stages.c.status).toBe('passed');
+    expect(report.stages.d.status).toBe('passed');
+    // Landmarks / portal endpoints are still plan-only, so the gate names that
+    // fact explicitly instead of hiding it in the aggregate.
+    expect(report.gate.reasons.map((reason) => reason.code)).toEqual(['batch_planned_only']);
+    const declared = report.gate.conditions.find(
+      (condition) => condition.condition === 'planned_destinations_declared',
+    )!;
+    expect(declared.ok).toBe(false);
+    expect(declared.observed.plannedBatches).toEqual(
+      expect.arrayContaining(['landmarks', 'travelEndpoints']),
+    );
+    expect(report.gate.status).toBe('not_satisfied');
+    expect(report.gate.satisfied).toBe(false);
+    // The opt-in is recorded, not acted on.
+    expect(report.gate.operatorOptIn).toBe(true);
+    expect(report.gate.requiresManualEnable).toBe(true);
+    expect(report.gate.autoSwitchImplemented).toBe(false);
+    expect(report.gate.guarantees).toEqual({
+      realAuthoritySwitch: false,
+      legacyWritePathRemoved: false,
+      dualWrite: false,
+      jsonReadFallbackForMissingRecords: false,
+    });
+    expect(report.realAuthoritySwitch).toBe(false);
+    expect(report.realMigrationPerformed).toBe(false);
+    expect(report.legacyWritePathRemoved).toBe(false);
+  });
+
+  it('reaches satisfied_but_disabled through runLegacyMigrationDryRun when plan-only batches are declared', async () => {
+    const report = await runGate(gateSnapshot(), {}, {
+      operatorOptIn: true,
+      declaredMigratedBatches: ['landmarks', 'travelEndpoints'],
+    });
+
+    // Discriminative wiring: a gate hard-wired to not_satisfied fails here.
+    expect(report.gate.status).toBe('satisfied_but_disabled');
+    expect(report.gate.satisfied).toBe(true);
+    expect(report.gate.reasons).toEqual([]);
+    expect(report.gate.conditions.every((condition) => condition.ok)).toBe(true);
+    // The declaration is recorded in the condition facts, not acted on.
+    const declared = report.gate.conditions.find(
+      (condition) => condition.condition === 'planned_destinations_declared',
+    )!;
+    expect(declared.observed.declaredMigratedBatches).toEqual(
+      expect.arrayContaining(['landmarks', 'travelEndpoints']),
+    );
+    expect(report.gate.autoSwitchImplemented).toBe(false);
+    expect(report.gate.requiresManualEnable).toBe(true);
+    expect(report.gate.guarantees).toEqual({
+      realAuthoritySwitch: false,
+      legacyWritePathRemoved: false,
+      dualWrite: false,
+      jsonReadFallbackForMissingRecords: false,
+    });
+    // Satisfied still means disabled at the report level.
+    expect(report.realMigrationPerformed).toBe(false);
+    expect(report.realAuthoritySwitch).toBe(false);
+    expect(report.legacyWritePathRemoved).toBe(false);
+  });
+
+  it('keeps a tombstoned passage absent and records it in the gate conditions', async () => {
+    const snapshot = gateSnapshot();
+    const deletions: LegacyDeletionSet = { passageIds: ['psg_walk'] };
+    const report = await runGate(snapshot, deletions, { operatorOptIn: true });
+
+    expect(report.gate.conditions.find((condition) => condition.condition === 'deleted_not_resurrected')!.ok).toBe(true);
+    if (report.stages.c.status !== 'passed') throw new Error('stage C did not pass');
+    expect(report.stages.c.deletedIdsChecked).toEqual(['psg_walk']);
+    expect(report.stages.c.deletedNotResurrected).toBe(true);
+    // The raw JSON still holds the tombstoned record; nothing reads it back.
+    expect(
+      createLegacyReadBackend(snapshot).passages(DIM).some((rec) => rec.id === 'psg_walk'),
+    ).toBe(true);
+    expect(report.realAuthoritySwitch).toBe(false);
+  });
+
+  it('does not fall back to JSON for a record missing from the migrated store', () => {
+    // Behavioural M6.3 evidence: the gate's "no JSON read fallback" claim is
+    // exercised on the switched read view itself, not inferred from source text.
+    const snapshot = gateSnapshot();
+    const store = new FragmentStore(WORLD);
+    importLegacyPassages(store, snapshot);
+    const view = createSwitchedLegacyView(store, snapshot);
+    const context = { worldId: WORLD, dim: DIM, pos: gateQuery(snapshot).pos };
+
+    store.forgetFragment('psg_walk');
+    // The raw JSON still contains the record...
+    expect(
+      createLegacyReadBackend(snapshot).passages(DIM).some((rec) => rec.id === 'psg_walk'),
+    ).toBe(true);
+    // ...and the switched view neither returns it nor reads it back from JSON.
+    expect(view.passages(DIM).map((rec) => rec.id)).not.toContain('psg_walk');
+    expect(parsePage(queryLegacyPassages(view, { id: 'psg_walk' }, context)).error).toBe(
+      '当前世界和维度没有这个矿道记录',
+    );
+    expect(view.passages().map((rec) => rec.id)).not.toContain('psg_walk');
+  });
+
+  it('withholds the gate when an importer resurrects a deleted record', () => {
+    const snapshot = gateSnapshot();
+    const deletions: LegacyDeletionSet = { passageIds: ['psg_walk'] };
+    const store = new FragmentStore(WORLD);
+    importLegacyPassages(store, snapshot); // no tombstones on purpose
+    const verification = verifyLegacyPassageImport(store, snapshot, deletions);
+
+    const gate = evaluateMigrationGate({
+      stages: {
+        a: { status: 'passed' },
+        b: { status: 'failed', problems: verification.problems },
+        c: {
+          status: 'failed',
+          deletedNotResurrected: false,
+          deletedIdsChecked: ['psg_walk'],
+          verification,
+        },
+        d: { status: 'passed', sessionsClosed: true, sourceSnapshotUnchanged: true },
+      },
+      verificationCounts: {
+        allVerified: false,
+        unattributedRecords: 0,
+        crossWorldRecords: 0,
+        invalidRecords: 0,
+      },
+      batchPlans: [{ batch: 'passages', status: 'failed', ok: false }],
+    });
+
+    expect(gate.status).toBe('not_satisfied');
+    const resurrected = gate.reasons.find((reason) => reason.code === 'deleted_resurrected')!;
+    expect(resurrected).toBeDefined();
+    const deletedCondition = gate.conditions.find((condition) => condition.condition === 'deleted_not_resurrected')!;
+    expect(deletedCondition.observed.resurrectedIds).toContain('psg_walk');
+    expect(gate.guarantees.realAuthoritySwitch).toBe(false);
+  });
+
+  it('regression guard: no dual-write or authority-switch branch in the module source', () => {
+    // Regression guard only. The behavioural evidence for "no JSON read
+    // fallback" is the switched-view test above; this scan catches a future
+    // edit that introduces an obvious dual-write/switch branch.
+    const source = readFileSync(
+      new URL('../src/compat/migration-dry-run.ts', import.meta.url),
+      'utf8',
+    );
+    const forbidden = [
+      /\bdualWrite\b(?!:\s*false)/,
+      /\bwriteBothStores\b|\bwriteJsonAndSqlite\b|\bmirrorToJson\b/,
+      /\bswitchAuthority\b\s*=\s*(?!false)/,
+      /\bbuildOutputDatabasePath\b|\bresolveUserDatabasePath\b/,
+    ];
+    for (const pattern of forbidden) expect(source).not.toMatch(pattern);
+    // The gate's guarantees are literal false facts in the shipped code.
+    expect(source).toMatch(/realAuthoritySwitch:\s*false\s+as\s+const/);
+    expect(source).toMatch(/legacyWritePathRemoved:\s*false\s+as\s+const/);
+    expect(source).toMatch(/jsonReadFallbackForMissingRecords:\s*false/);
   });
 });

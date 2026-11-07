@@ -11,7 +11,9 @@
  *   portal/gateway crossings into a caller-provided temporary SQLite database and
  *   checks IDs, counts, fields, order, coordinates, original times/lru serials
  *   and deletion semantics. Landmarks and portal endpoints are plan-only until
- *   their topology-node destination is wired.
+ *   their topology-node destination is wired. The report also carries an
+ *   advisory authority gate (structured conditions, `not_satisfied` /
+ *   `satisfied_but_disabled` only); see `docs/legacy-migration-gate.md`.
  *
  * Still not implemented: the live `JsonWorldMemoryBackend`, real migration
  * execution, persistence-authority switching, removal of the legacy write path,

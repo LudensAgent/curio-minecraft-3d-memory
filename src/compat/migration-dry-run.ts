@@ -10,6 +10,13 @@
  *
  * The persistence session is injected (`openSession`) so this module does not
  * construct a Worker or touch the filesystem on its own.
+ *
+ * The report also carries an advisory JSON→SQLite authority gate
+ * (`gate`). It is a structured, decidable condition list that can only report
+ * `not_satisfied` or `satisfied_but_disabled`: no branch in this module opens a
+ * real user database, writes both stores, falls back to JSON reads for missing
+ * rows, or switches the persistence authority. See
+ * `docs/legacy-migration-gate.md`.
  */
 
 import type { FragmentChanges } from '../topology/fragment-store.js';
@@ -125,6 +132,21 @@ export interface LegacyMigrationDryRunOptions {
   query: LegacyMigrationQuery;
   openSession: DryRunSessionOpener;
   deletions?: LegacyDeletionSet;
+  /**
+   * Manual operator acknowledgement for a future authority switch. It is only
+   * recorded in the gate report; this module never acts on it.
+   */
+  migrationGate?: LegacyMigrationGateRequest;
+}
+
+export interface LegacyMigrationGateRequest {
+  /** Explicit acknowledgement required by the gate; never a switch trigger. */
+  operatorOptIn?: boolean;
+  /**
+   * Plan-only batches (landmarks, portal endpoints) whose storage destination the
+   * caller separately declares wired. Recorded as a gate condition; never acted on.
+   */
+  declaredMigratedBatches?: LegacyBatchName[];
 }
 
 export interface LegacyImportProblem {
@@ -1025,6 +1047,225 @@ function passageBatchPlan(
   return finalizePlan(plan);
 }
 
+// ==============================================================================
+// Authority gate: structured, decidable conditions over the dry-run report
+// ==============================================================================
+
+/**
+ * Every condition the gate checks, evaluated from the dry-run facts. A condition
+ * with `ok: false` contributes a structured reason; nothing here writes, reads a
+ * user database, or changes an authority.
+ */
+export type LegacyMigrationGateConditionName =
+  | 'stages_all_passed'
+  | 'verification_all_verified'
+  | 'no_unattributed_records'
+  | 'no_cross_world_records'
+  | 'no_invalid_records'
+  | 'deleted_not_resurrected'
+  | 'planned_destinations_declared'
+  | 'stage_d_trusted';
+
+export interface LegacyMigrationGateCondition {
+  condition: LegacyMigrationGateConditionName;
+  ok: boolean;
+  /** Facts the decision was made from (counts, statuses, ids). */
+  observed: Record<string, unknown>;
+}
+
+/** Stable, machine-checkable reason codes for a failed condition. */
+export type LegacyMigrationGateReasonCode =
+  | 'stage_failed'
+  | 'batch_not_verified'
+  | 'unattributed_records'
+  | 'cross_world_records'
+  | 'invalid_records'
+  | 'deleted_resurrected'
+  | 'batch_planned_only'
+  | 'stage_d_not_passed';
+
+export interface LegacyMigrationGateReason {
+  code: LegacyMigrationGateReasonCode;
+  detail: string;
+  /** The failed condition's observed facts, for direct callers of the evaluator. */
+  observed: Record<string, unknown>;
+}
+
+export interface LegacyMigrationGate {
+  /** Advisory only. `satisfied_but_disabled` never means "switched". */
+  status: 'not_satisfied' | 'satisfied_but_disabled';
+  /** True only when every condition holds. */
+  satisfied: boolean;
+  conditions: LegacyMigrationGateCondition[];
+  /** Non-empty exactly when `satisfied` is false. */
+  reasons: LegacyMigrationGateReason[];
+  /** An automatic authority switch is intentionally absent from this module. */
+  autoSwitchImplemented: false;
+  /** Callers must enable a future switch explicitly; this module ignores the request. */
+  requiresManualEnable: true;
+  operatorOptIn: boolean;
+  rollback: 'drop_temp_database_and_reopen_legacy';
+  /** Facts that must stay true even when the conditions hold. */
+  guarantees: {
+    realAuthoritySwitch: false;
+    legacyWritePathRemoved: false;
+    dualWrite: false;
+    jsonReadFallbackForMissingRecords: false;
+  };
+}
+
+/**
+ * The report facts the gate decides from. Declared explicitly (not derived from
+ * the dry-run return type) so the decision is a pure function of the report and
+ * has no circular type dependency with `runLegacyMigrationDryRun`.
+ */
+export interface LegacyMigrationGateInput {
+  stages: {
+    a: { status: 'passed' | 'failed' };
+    b: { status: 'passed' | 'failed'; problems: readonly LegacyImportProblem[] };
+    c:
+      | {
+          status: 'passed' | 'failed';
+          deletedNotResurrected: boolean;
+          deletedIdsChecked: string[];
+          verification: { problems: readonly LegacyImportProblem[] };
+        }
+      | { status: 'not_run'; reason: string };
+    d: { status: 'passed' | 'failed'; sessionsClosed: boolean; sourceSnapshotUnchanged: boolean };
+  };
+  verificationCounts: {
+    allVerified: boolean;
+    unattributedRecords: number;
+    crossWorldRecords: number;
+    invalidRecords: number;
+  };
+  batchPlans: readonly Pick<LegacyBatchPlan, 'batch' | 'status' | 'ok'>[];
+}
+
+/**
+ * Evaluate the gate from an already-computed dry-run report. Pure function: it
+ * only derives a decision, never performs one.
+ */
+export function evaluateMigrationGate(
+  report: LegacyMigrationGateInput,
+  request: LegacyMigrationGateRequest = {},
+): LegacyMigrationGate {
+  const { stages, verificationCounts, batchPlans } = report;
+  const stageStatus = { a: stages.a.status, b: stages.b.status, c: stages.c.status, d: stages.d.status };
+  const resurrectedProblems = [
+    ...stages.b.problems,
+    ...(stages.c.status === 'not_run' ? [] : stages.c.verification.problems),
+  ].filter((problem) => problem.code === 'resurrected_deleted_passage');
+  const deletedNotResurrected =
+    stages.c.status !== 'not_run' &&
+    stages.c.deletedNotResurrected &&
+    resurrectedProblems.length === 0;
+  const failedPlans = batchPlans.filter((plan) => !plan.ok);
+  const plannedIds = batchPlans.filter((plan) => plan.status === 'planned').map((plan) => plan.batch);
+  const declared = new Set(request.declaredMigratedBatches ?? []);
+  const undeclaredPlannedIds = plannedIds.filter((batch) => !declared.has(batch));
+  // Base `allVerified` vetoes every planned batch. The gate evaluates the rows
+  // that actually have a storage destination; plan-only batches are a separate,
+  // explicit condition so callers can see what remains unwired.
+  const verifiedPlans = batchPlans.filter((plan) => plan.status !== 'planned');
+
+  const checks: (LegacyMigrationGateCondition & { code: LegacyMigrationGateReasonCode })[] = [
+    {
+      condition: 'stages_all_passed',
+      code: 'stage_failed',
+      ok: Object.values(stageStatus).every((status) => status === 'passed'),
+      observed: stageStatus,
+    },
+    {
+      condition: 'verification_all_verified',
+      code: 'batch_not_verified',
+      ok:
+        stages.b.status === 'passed' &&
+        stages.c.status === 'passed' &&
+        failedPlans.length === 0 &&
+        verifiedPlans.length > 0,
+      observed: {
+        allVerified: verificationCounts.allVerified,
+        failedBatches: failedPlans.map((plan) => plan.batch),
+        verifiedBatches: verifiedPlans.map((plan) => plan.batch),
+      },
+    },
+    // Three same-shaped count conditions share one row shape.
+    ...(
+      [
+        ['no_unattributed_records', 'unattributed_records', 'unattributedRecords'],
+        ['no_cross_world_records', 'cross_world_records', 'crossWorldRecords'],
+        ['no_invalid_records', 'invalid_records', 'invalidRecords'],
+      ] as const
+    ).map(([condition, code, field]) => ({
+      condition,
+      code,
+      ok: verificationCounts[field] === 0,
+      observed: { [field]: verificationCounts[field] },
+    })),
+    {
+      condition: 'deleted_not_resurrected',
+      code: 'deleted_resurrected',
+      ok: deletedNotResurrected,
+      observed: {
+        stageC: stages.c.status,
+        deletedIdsChecked: stages.c.status === 'not_run' ? [] : stages.c.deletedIdsChecked,
+        resurrectedIds: resurrectedProblems.flatMap((problem) => (problem.id === undefined ? [] : [problem.id])),
+      },
+    },
+    {
+      condition: 'planned_destinations_declared',
+      code: 'batch_planned_only',
+      ok: undeclaredPlannedIds.length === 0,
+      observed: { plannedBatches: plannedIds, declaredMigratedBatches: [...declared] },
+    },
+    {
+      // Stage D can fail because a session did not close or the JSON source
+      // changed; both mean the rehearsal cannot be trusted.
+      condition: 'stage_d_trusted',
+      code: 'stage_d_not_passed',
+      ok:
+        stages.d.status === 'passed' &&
+        stages.d.sessionsClosed === true &&
+        stages.d.sourceSnapshotUnchanged === true,
+      observed: {
+        stageD: stages.d.status,
+        sessionsClosed: stages.d.sessionsClosed,
+        sourceSnapshotUnchanged: stages.d.sourceSnapshotUnchanged,
+      },
+    },
+  ];
+
+  const conditions: LegacyMigrationGateCondition[] = checks.map(
+    ({ code: _code, ...condition }) => condition,
+  );
+  const reasons: LegacyMigrationGateReason[] = checks
+    .filter((check) => !check.ok)
+    .map((check) => ({
+      code: check.code,
+      detail: `${check.code}: ${JSON.stringify(check.observed)}`,
+      observed: check.observed,
+    }));
+
+  const satisfied = reasons.length === 0;
+  return {
+    status: satisfied ? 'satisfied_but_disabled' : 'not_satisfied',
+    satisfied,
+    conditions,
+    reasons,
+    autoSwitchImplemented: false,
+    requiresManualEnable: true,
+    operatorOptIn: request.operatorOptIn === true,
+    rollback: 'drop_temp_database_and_reopen_legacy',
+    guarantees: {
+      realAuthoritySwitch: false,
+      legacyWritePathRemoved: false,
+      dualWrite: false,
+      jsonReadFallbackForMissingRecords: false,
+    },
+  };
+}
+
 /**
  * Run the A → B → C → D rehearsal against a temporary database.
  *
@@ -1247,7 +1488,7 @@ export async function runLegacyMigrationDryRun(options: LegacyMigrationDryRunOpt
       batchPlans.every((plan) => plan.ok && plan.status !== 'planned'),
   };
 
-  return {
+  const report = {
     kind: 'legacy-migration-dry-run' as const,
     realMigrationPerformed: false as const,
     realAuthoritySwitch: false as const,
@@ -1276,4 +1517,8 @@ export async function runLegacyMigrationDryRun(options: LegacyMigrationDryRunOpt
       d: stageD,
     },
   };
+  // Advisory gate: reports whether the conditions for a future switch hold, but
+  // this module never acts on the answer (no switch, no dual write, no JSON
+  // read fallback). `satisfied_but_disabled` still leaves every guarantee false.
+  return { ...report, gate: evaluateMigrationGate(report, options.migrationGate) };
 }
