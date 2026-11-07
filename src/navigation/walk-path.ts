@@ -121,44 +121,65 @@ export type WalkPath = (
  */
 export function createWalkPath(registry: WalkPathRegistry, options: WalkPathOptions): WalkPath {
   return async (request, environment) => {
-    const executionId = `exec_${request.routeId}`;
-    const now = environment.now?.() ?? Date.now();
-    // Consume first: the handle is single-use even when every later check fails.
-    const consumed = registry.consume(
-      request.routeId,
-      { worldId: environment.worldId, dim: environment.dim, sessionId: environment.sessionId },
-      now,
-    );
-
-    if (!('points' in consumed)) {
-      return registryFailure(request.routeId, executionId, consumed, environment);
+    const result = await walkPathCore(registry, options, request, environment);
+    // Every terminal outcome — including registry rejections, start
+    // invalidations, cancellation, timeout and body unavailability — has already
+    // produced its final result here. The hook settles afterwards; its failure
+    // cannot change the result or the body port calls and is reported through
+    // `onPersistenceFailure`.
+    const persist = environment.persistAction;
+    if (persist !== undefined) {
+      void Promise.resolve()
+        .then(() => persist(environment.actionRecord ?? null))
+        .catch((error: unknown) => environment.onPersistenceFailure?.(error));
     }
-    const plan = consumed;
-    const sample = environment.sample();
-    if (sample === null) {
-      registry.release(plan.routeId);
-      return planInvalidated(plan, executionId, null, 'route_start_unmeasured', {
-        kind: 'unavailable',
-        detail: 'no measured body sample is available; the execution start is unconfirmed',
-      });
-    }
-
-    const startProblem = checkStart(plan, executionId, sample, environment);
-    if (startProblem !== null) {
-      registry.release(plan.routeId);
-      // A sample rejected for execution identity is not this execution's
-      // evidence; do not echo it back as lastPosition/lastObservation.
-      const evidence = sample.executionId === executionId ? sample : null;
-      return planInvalidated(plan, executionId, evidence, startProblem.reason, startProblem.problem);
-    }
-
-    // Every precheck passed. The executor owns the run; the handle stays pinned
-    // until it settles and is released even if the executor rejects.
-    const terminal = await options.execute({ plan, executionId, sample, request, environment }).finally(() => {
-      registry.release(plan.routeId);
-    });
-    return enforceTerminalContract(plan, executionId, request, environment, terminal);
+    return result;
   };
+}
+
+async function walkPathCore(
+  registry: WalkPathRegistry,
+  options: WalkPathOptions,
+  request: WalkPathRequest,
+  environment: WalkPathEnvironment,
+): Promise<WalkPathResult> {
+  const executionId = `exec_${request.routeId}`;
+  const now = environment.now?.() ?? Date.now();
+  // Consume first: the handle is single-use even when every later check fails.
+  const consumed = registry.consume(
+    request.routeId,
+    { worldId: environment.worldId, dim: environment.dim, sessionId: environment.sessionId },
+    now,
+  );
+
+  if (!('points' in consumed)) {
+    return registryFailure(request.routeId, executionId, consumed, environment);
+  }
+  const plan = consumed;
+  const sample = environment.sample();
+  if (sample === null) {
+    registry.release(plan.routeId);
+    return planInvalidated(plan, executionId, null, 'route_start_unmeasured', {
+      kind: 'unavailable',
+      detail: 'no measured body sample is available; the execution start is unconfirmed',
+    });
+  }
+
+  const startProblem = checkStart(plan, executionId, sample, environment);
+  if (startProblem !== null) {
+    registry.release(plan.routeId);
+    // A sample rejected for execution identity is not this execution's
+    // evidence; do not echo it back as lastPosition/lastObservation.
+    const evidence = sample.executionId === executionId ? sample : null;
+    return planInvalidated(plan, executionId, evidence, startProblem.reason, startProblem.problem);
+  }
+
+  // Every precheck passed. The executor owns the run; the handle stays pinned
+  // until it settles and is released even if the executor rejects.
+  const terminal = await options.execute({ plan, executionId, sample, request, environment }).finally(() => {
+    registry.release(plan.routeId);
+  });
+  return enforceTerminalContract(plan, executionId, request, environment, terminal);
 }
 
 /**

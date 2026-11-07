@@ -93,6 +93,23 @@ export async function planRoute(
   request: RoutePlanRequest,
   environment: RoutePlanEnvironment,
 ): Promise<RoutePlanResult> {
+  const result = await planRouteCore(request, environment);
+  // The result is final before the persistence hook is touched; the hook
+  // settles after the caller already has it and cannot change it. A failure is
+  // reported through `onPersistenceFailure`, never through the result.
+  const persist = environment.persistAction;
+  if (persist !== undefined) {
+    void Promise.resolve()
+      .then(() => persist(environment.actionRecord ?? null))
+      .catch((error: unknown) => environment.onPersistenceFailure?.(error));
+  }
+  return result;
+}
+
+async function planRouteCore(
+  request: RoutePlanRequest,
+  environment: RoutePlanEnvironment,
+): Promise<RoutePlanResult> {
   const now = environment.now ?? Date.now;
   const startedAt = now();
   if (!Number.isFinite(startedAt)) {
@@ -695,3 +712,4 @@ function budgetOutcome(limit: 'nodes' | 'edges' | 'points' | 'time', detail: str
     message: `route planning exhausted its ${limit} budget: ${detail}`,
   };
 }
+
