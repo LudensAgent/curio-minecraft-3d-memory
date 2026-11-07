@@ -195,24 +195,29 @@
 ### M3-A7｜请求边界的两处宽松行为（可选）
 
 - **严重度**：低（可选）
-- **状态**：待确认
+- **状态**：已解决（D-009，2026-11-07；仅文档）
+- **决议**：保留严格请求边界（D-009），并在契约 §6.2 按当前运行时记录两处语义：
+  1. 未知字段 MUST 拒绝（`invalid_request`）的规则不变，适用于请求顶层对象及 `arrival`/`constraints` 对象本身；`pathId` 只由 `history`（必需）与 `auto`（可选）消费，`source:'search'` 不消费且提供它无效果——运行时只校验其为非空字符串，不因 `search` 拒绝或应用，文档明确宿主不得依赖；
+  2. `to`/`avoid` 点只读取有限的 `x`/`y`/`z`，运行时**不拒绝**点对象上的额外键，文档声明宿主类型检查是这一层的边界。
+  本次仅更新契约 §6.2 与本审计，未改运行时行为，也未新增生产者或校验。
 - **证据**：
-  - `source:'search'` 时提供 `pathId` 会被接受并静默忽略：`src/navigation/route-plan.ts:405-414`；契约只规定 history/auto 使用 `pathId`。
-  - 未知字段只按顶层对象检查；`to`/`avoid` 内部的额外属性（如 `{x,y,z,w}`）通过 `isFinitePoint` 后被接受：`src/navigation/route-plan.ts:380-382`、`511-515`、`539-547`。
-- **影响**：不会造成错误路线，但会让宿主以为 `pathId` 生效或以为额外字段被校验。与契约“未知字段 MUST 拒绝”的严格措辞不完全一致。
-- **处理建议**：要么对 `source:'search'` 拒绝 `pathId`，要么在契约中明确“仅 auto/history 消费”；对 `to`/`avoid` 做对象键检查或在契约中声明只读取 `x/y/z`。若认为宿主类型系统已足够，也可明确记录为“运行时不拒绝嵌套额外键”。
-- **验收标准**：计划、契约、实现三者对这两个输入语义一致。
+  - `source:'search'` 时提供 `pathId` 会被接受并静默忽略：`src/navigation/route-plan.ts:449-458`、`209-394`；契约只规定 history/auto 使用 `pathId`。
+  - 未知字段在请求顶层（`src/navigation/route-plan.ts:420-422`）、`arrival`（`:508-510`）与 `constraints`（`:551-553`）对象上都会被拒绝；`to`（`:424`）与 `avoid`（`:555-571`）只校验有限 `x`/`y`/`z`，其点对象上的额外属性（如 `{x,y,z,w}`）通过 `isFinitePoint`（`src/navigation/route-plan-support.ts:553-561`）后被接受。
+- **影响（已由 D-009 收口）**：不会造成错误路线。严格顶层/`arrival`/`constraints` 字段拒绝的规则保持不变；`source:'search'` 下的 `pathId` 只做非空字符串校验、不被消费也无效果，`to`/`avoid` 点对象的额外键被忽略。这两点已作为 D-009 的决定写入契约 §6.2，并明确宿主不得依赖 `pathId` 在 `search` 下生效、嵌套点对象键由宿主类型检查负责；文档未声称运行时新增这些校验。
+- **处理建议**：无。D-009 已决定保留严格边界并如实记录上述两处宽容语义；本次仅改文档，不新增运行时校验。
+- **验收标准**：计划、契约、实现三者对这两个输入语义一致（D-009；L-M3-02 已同步契约 §6.2 与本审计）。
 
 ### M3-A8｜能力报告改动提前落到 M5.4（范围蔓延）
 
 - **严重度**：低（批次归属/流程）
-- **状态**：待确认（建议挂 M5.4 收口）
+- **状态**：已接受（D-010，2026-11-07；仅文档）
+- **决议**：接受 M3 提前落地的能力位为“已实现能力的提前静态报告”（D-010），不视为范围蔓延阻断项；当前值与实现一致。M5.4 负责把 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan` 收敛为单一来源，并记录这些能力位的批次归属（M3 提前落地、M5.4 收口）。本次仅更新本审计，未改运行时行为，也未新增能力生产者或校验。
 - **证据**：
   - 计划 M3.7 的修改文件只列 `src/navigation/capabilities.ts`、`tests/navigation-capabilities.test.ts`；`MemoryHostCapabilities` 归 M5.4（`docs/memory-host-implementation-plan.md:384-390`、`497-503`）。
   - 被审提交同时把 `src/query/capabilities.ts:54-57` 的 `plan.walkSearch/walkHistory/walkAuto` 改为 `true`，并改写 `tests/query-capabilities.test.ts`：`git diff 5b65ca1^ 5b65ca1 -- src/query/capabilities.ts`。
   - 该变更已在本提交新增的契约 §12.6 中记录（`docs/memory-host-interface-contract.md:1154-1164`）。
 - **影响**：M3 批次提前落地了 M5.4 的静态能力事实。当前值与实现一致，风险可控；但 M5.4 若调整能力协商口径，可能出现 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan` 两处真相。
-- **处理建议**：接受为“已实现能力的提前静态报告”，并在 M5.4 清单中合并核对；或在 M5.4 前回退该能力位。配合 §4.2 第 5 项，把能力表收敛为单一来源。
+- **处理建议**：无额外动作。D-010 已接受该提前静态报告；M5.4 只需合并核对 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan`（配合 §4.2 第 5 项收敛为单一来源），并记录批次归属。不回退能力位。
 - **验收标准**：M5.4 记录能力位的批次归属；测试断言两份能力报告来自同一来源。
 
 ### 4.2 Standards 轴（判断项）
@@ -254,8 +259,8 @@
 - [ ] **M3-A4**：补搜索阶段与复验阶段的 deadline/timeout 回归测试。
 - [x] **M3-A5**：删除 `src/navigation/route-plan-support.ts` 文件末尾空行。
 - [ ] **M3-A6**：在契约 §6.4 标注 `RoutePlanSegment` 实现名；M9 统一决定契约版本并与 M2-A3 合并处理。
-- [ ] **M3-A7**（可选）：确认 `source:'search'` 的 `pathId` 与嵌套额外字段语义，并在契约/实现中保持一致。
-- [ ] **M3-A8**：确认能力报告提前落地是否接受；无论接受与否，在 M5.4 收敛 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan` 的单一来源。
+- [x] **M3-A7**（可选）：由 D-009 解决（L-M3-02）。保留严格顶层字段拒绝；契约 §6.2 记录 `pathId` 仅 history/auto 消费、search 忽略且无效果，以及 `to`/`avoid` 只读 `x`/`y`/`z`、嵌套额外键由宿主类型检查。仅文档，未改运行时。
+- [x] **M3-A8**：由 D-010 接受（L-M3-02）。M3 提前落地的能力位视为已实现能力的提前静态报告；M5.4 收敛 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan` 的单一来源并记录批次归属。
 - [ ] **M3-S1–S7**（可选，判断项）：按 §4.2 逐项评估，优先第 1、2 项（上下文数据团、复验编排重复）；不阻断 M4。
 
 ---

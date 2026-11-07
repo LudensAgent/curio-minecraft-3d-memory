@@ -580,7 +580,7 @@ export interface RoutePlanRequest {
   mode: 'walk';
   /** auto | search | history */
   source: RoutePlanSource;
-  /** history 显式指定；v1 的 history 必须提供 pathId。 */
+  /** 仅 history（必需）与 auto（可选）消费；search 不消费。 */
   pathId?: string;
   /** v1 只接受 exact。 */
   arrival: { kind: 'exact' };
@@ -598,12 +598,14 @@ export interface RoutePlanRequest {
 
 校验规则：
 
-- 未知字段 MUST 拒绝（`invalid_request`）。
+- 未知字段 MUST 拒绝（`invalid_request`）：适用于请求顶层对象，以及 `arrival`、`constraints` 对象本身。
+- `to` 与 `constraints.avoid` 的点对象只读取有限的 `x`/`y`/`z`；运行时**不拒绝**点对象上的额外键（如 `w`），这些键会被忽略。对这类嵌套点对象的键校验属于宿主类型检查的边界，宿主不得依赖运行时的拒绝。
 - `to` 坐标必须有限；不得自动取整或改到附近/上方。
 - `mode !== 'walk'` → `unsupported_mode`。
 - `arrival.kind !== 'exact'` → `unsupported_arrival`。
 - 非空 `avoid` → `unsupported_constraint`（v1 的 walk evaluator 不消费）。
 - `source:'history'` 且缺少 `pathId` → `invalid_request`。
+- `pathId` 只由 `source:'history'`（必需）与 `source:'auto'`（可选）消费。`source:'search'` 不消费 `pathId`：提供它不会改变规划，也不会被拒绝（提供时仍须为非空字符串）；宿主不得依赖 `pathId` 在 `search` 下生效。
 - `maxNodes`/`maxEdges` 超过实现上限 → `invalid_request` 或明确截断（不得静默）。
 - `deadlineMs` 已过期 → `timeout`/`invalid_request`。
 
