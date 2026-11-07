@@ -87,8 +87,16 @@ export interface WalkPathStartContext {
 
 /**
  * Bound execution hook. M4.3 supplies a `WalkRouteExecutor` driver; the entry
- * only invokes it after every precheck passes and returns its terminal result
- * unchanged. The consumed handle stays pinned until this promise settles.
+ * only invokes it after every precheck passes, and the consumed handle stays
+ * pinned until the returned promise settles.
+ *
+ * The entry verifies the terminal result at the public boundary rather than
+ * forwarding it blindly: only `ARRIVED` may be `confirmed`, and an unbacked or
+ * foreign `ARRIVED` — missing/non-finite/out-of-scope/ungrounded evidence, an
+ * off-target measured position, mismatched route/execution identity, or bad
+ * `confirmedSegments` — is downgraded through the existing
+ * `unconfirmed_arrival` mapping (no confirmed segment → `INVALIDATED`,
+ * otherwise `PARTIAL`). No terminal state is synthesized.
  */
 export type WalkPathExecute = (start: WalkPathStartContext) => Promise<WalkPathResult>;
 
@@ -146,10 +154,152 @@ export function createWalkPath(registry: WalkPathRegistry, options: WalkPathOpti
 
     // Every precheck passed. The executor owns the run; the handle stays pinned
     // until it settles and is released even if the executor rejects.
-    return await options.execute({ plan, executionId, sample, request, environment }).finally(() => {
+    const terminal = await options.execute({ plan, executionId, sample, request, environment }).finally(() => {
       registry.release(plan.routeId);
     });
+    return enforceTerminalContract(plan, executionId, request, environment, terminal);
   };
+}
+
+/**
+ * Enforce the §7.4/§7.5.8/§7.5.11 terminal invariant at the public entry: only
+ * `ARRIVED` may be `confirmed`, and an `ARRIVED` claim is accepted only when it
+ * belongs to this route/execution and carries the measured feet position and
+ * observation that backed it — the position within the request's effective
+ * `bodyArrival` of the plan's final point, the observation measured in the
+ * execution scope and grounded/dry. The entry is the boundary for an injected
+ * executor hook; it cannot re-measure that executor's result, but it must not
+ * pass an unbacked arrival through as success. Measured evidence and confirmed
+ * progress that were supplied are preserved on the fail-closed result
+ * (`unconfirmed_arrival`'s normal mapping: no confirmed segment →
+ * `INVALIDATED`, otherwise `PARTIAL`).
+ */
+function enforceTerminalContract(
+  plan: RoutePlan,
+  executionId: string,
+  request: WalkPathRequest,
+  environment: WalkPathEnvironment,
+  result: WalkPathResult,
+): WalkPathResult {
+  // The injected executor must never make another route/execution's result
+  // visible to this delegation. Drop foreign identity, progress, evidence and
+  // side-effect facts instead of spreading them through the fail-closed branch.
+  if (result.routeId !== plan.routeId || result.executionId !== executionId) {
+    return {
+      outcome: 'INVALIDATED',
+      contract: CONTRACT,
+      routeId: plan.routeId,
+      executionId,
+      confirmedSegments: 0,
+      remainingPoints: plan.points.map(clonePoint),
+      invalidation: { segment: 0, reason: 'route_invalidated' },
+      problem: {
+        kind: 'route_invalidated',
+        detail: 'the executor result belongs to a different route/execution',
+      },
+      confirmed: false,
+      trace: [],
+    };
+  }
+
+  const bodyArrival = request.bodyArrival ?? GROUNDED_ARRIVAL_DEFAULTS;
+  if (!validGroundedArrival(bodyArrival)) {
+    return {
+      outcome: 'INVALIDATED',
+      contract: CONTRACT,
+      routeId: plan.routeId,
+      executionId,
+      confirmedSegments: 0,
+      remainingPoints: plan.points.map(clonePoint),
+      invalidation: { segment: 0, reason: 'invalid_request' },
+      problem: {
+        kind: 'invalid_request',
+        detail: 'bodyArrival requires finite nonnegative limits, horizontalTolerance in (0, 0.5), feetTolerance < 0.5, and positive stableMs',
+      },
+      confirmed: false,
+      trace: [],
+    };
+  }
+  const target = plan.points[plan.points.length - 1]!;
+  const maxSegments = plan.points.length - 1;
+  const validSegments =
+    Number.isSafeInteger(result.confirmedSegments)
+    && result.confirmedSegments >= 0
+    && result.confirmedSegments <= maxSegments;
+  const ownObservation = result.lastObservation !== undefined
+    && observationInScope(result.lastObservation, environment);
+
+  if (result.outcome !== 'ARRIVED') {
+    // The result is this execution's, but malformed numeric/evidence fields
+    // must still not escape the public envelope (contract §7.4).
+    const { lastPosition, lastObservation, ...rest } = result;
+    return {
+      ...rest,
+      routeId: plan.routeId,
+      executionId,
+      confirmed: false,
+      confirmedSegments: validSegments ? result.confirmedSegments : 0,
+      remainingPoints: validSegments ? result.remainingPoints : plan.points.map(clonePoint),
+      ...(lastPosition !== undefined && isFinitePoint(lastPosition)
+        ? { lastPosition: { ...lastPosition } }
+        : {}),
+      ...(lastObservation !== undefined && ownObservation
+        ? { lastObservation: { ...lastObservation } }
+        : {}),
+    };
+  }
+
+  const position = result.lastPosition;
+  const observation = result.lastObservation;
+  const backed =
+    result.confirmed === true
+    && result.routeId === plan.routeId
+    && result.executionId === executionId
+    && validSegments
+    && result.confirmedSegments === maxSegments
+    && result.remainingPoints.length === 0
+    && position !== undefined
+    && isFinitePoint(position)
+    && Math.hypot(position.x - target.x, position.z - target.z) <= bodyArrival.horizontalTolerance
+    && Math.abs(position.y - target.y) <= bodyArrival.feetTolerance
+    && observation !== undefined
+    && ownObservation
+    && observation.onGround
+    && observation.inWater === false;
+  if (backed) return result;
+
+  const confirmedSegments = validSegments ? result.confirmedSegments : 0;
+  const zero = confirmedSegments === 0;
+  const { lastPosition, lastObservation, invalidation: _invalidation, memoryWrite: _memoryWrite, ...rest } = result;
+  return {
+    ...rest,
+    routeId: plan.routeId,
+    executionId,
+    outcome: zero ? 'INVALIDATED' : 'PARTIAL',
+    confirmedSegments,
+    remainingPoints: zero
+      ? plan.points.map(clonePoint)
+      : plan.points.slice(confirmedSegments + 1).map(clonePoint),
+    ...(zero
+      ? { invalidation: { segment: confirmedSegments, reason: 'unconfirmed_arrival' } }
+      : {}),
+    problem: { kind: 'unconfirmed_arrival', expected: { ...target } },
+    confirmed: false,
+    ...(lastPosition !== undefined && isFinitePoint(lastPosition)
+      ? { lastPosition: { ...lastPosition } }
+      : {}),
+    ...(lastObservation !== undefined && ownObservation
+      ? { lastObservation: { ...lastObservation } }
+      : {}),
+  };
+}
+
+/** Finite observation time in this execution's scope. */
+function observationInScope(observation: LastObservation, environment: WalkPathEnvironment): boolean {
+  return Number.isFinite(observation.observedAt)
+    && observation.worldId === environment.worldId
+    && observation.dim === environment.dim
+    && observation.sessionId === environment.sessionId;
 }
 
 /** Configuration for the library's `WalkRouteExecutor` binding (implementation plan M4.3). */
