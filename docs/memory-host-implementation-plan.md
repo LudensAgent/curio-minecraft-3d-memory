@@ -299,7 +299,7 @@ flowchart LR
 - 修改文件：`src/query/anchors.ts`（新建）、`src/query/index.ts`、`tests/query-anchors.test.ts`。
 - 测试：按 tag/label 过滤；返回位置/精度/观测时间；位置/邻域参数被拒绝；容器内容 unsupported；不返回空箱。
 - 退出条件：资源/容器位置可查；内容明确不支持；位置/邻域过滤明确不在 M2，宿主需要附近过滤时自行分页按 `location.pos` 过滤或走后续 minor 变更。
-- 审计证据：容器内容查询返回 `host_ledger`；不推断物品数量。
+- 审计证据：容器内容查询返回 `host_ledger`；不推断物品数量。后续跟踪（D-001，`requires_user_review: true`，待人工复核）：接受 M2 不计算可达性；宿主须结合自身路由/感知证据判断资源/容器锚点是否可达，不能从位置记录推断。若未来需要库侧只读可达性投影，须另走契约变更，并同步字段、测试与能力位。
 
 #### M2.6 能力报告与边界
 

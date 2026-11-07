@@ -540,7 +540,7 @@ export type SpatialQueryProblem =
 - `after` 是稳定 ID 游标；同一作用域内可重复查询。
 - `total` 是匹配总数；不得用整页长度代替。
 - `cells` 查询位置数量上限为 4096；超过返回 `invalid_request`。
-- `containerAnchors` 的分类器没有索引，因此会分页扫描节点直到耗尽；扫描范围由 `TopologyStore` 的节点容量上限约束，`total` 是完整匹配数。大节点集上的频繁调用列为 M8 基准候选，不得用固定前缀预算牺牲游标正确性。
+- `containerAnchors` 的分类器没有索引，因此会分页扫描节点直到耗尽；扫描范围由 `TopologyStore` 的节点容量上限约束，`total` 是完整匹配数。大节点集上的频繁调用列为 M8 基准候选，不得用固定前缀预算牺牲游标正确性。`portals` 类似：每次查询克隆 `portalEdges()` 返回的完整边集合并按 `id` 排序后应用 `after`/`limit`（`after` 不是底层游标），规模受 `TopologyStore.maxPortalEdges`（默认 1000）约束；是否改为底层游标由 M8 基准决定。
 - 查询 MUST 只读：不移动、不转头、不扫描、不刷新观测时间、不写库、不 pin/保存。
 - 查询不得隐式重试或回退到世界/区块扫描。`containerAnchors` 的宿主分类器没有索引，会对**内存节点索引**做一次只读遍历以获得精确 `total`；该 O(nodes) 工作是 M8 基准候选，不是世界扫描。
 - M2 的请求不带 `worldId`：store 绑定单一不可变世界，`scope_mismatch` 保留给未来的世界寻址适配器，当前没有产生者。
