@@ -661,6 +661,35 @@ interface StoredEvidenceRef {
   snapshot: TraversalEvidence;
 }
 
+/**
+ * Lazily materialized, id-ascending read index for the paginated node listing.
+ * A derived view over `nodeMap`, never a second source of truth: every write
+ * that can change a listed node invalidates it, and it is rebuilt from the
+ * current map on the next read.
+ */
+interface NodeListingIndex {
+  /** Every node id, ascending (the unfiltered listing). */
+  readonly all: string[];
+  readonly byDim: Map<string, string[]>;
+  readonly bySource: Map<NodeSource, string[]>;
+  readonly byTag: Map<LandmarkTag, string[]>;
+  readonly byLabel: Map<string, string[]>;
+}
+
+/**
+ * Lazily materialized, id-ascending read index for the paginated edge listing.
+ * `byDim` keys on the `from` node's dimension, matching `edges({ dim })`'s
+ * endpoint rule (every stored edge's `from` node exists).
+ */
+interface EdgeListingIndex {
+  readonly all: string[];
+  readonly byDim: Map<string, string[]>;
+  readonly byFrom: Map<string, string[]>;
+  readonly byTo: Map<string, string[]>;
+  readonly byType: Map<ConnectionType, string[]>;
+  readonly byBasis: Map<EdgeBasis, string[]>;
+}
+
 interface ResolvedLimits {
   maxAgentNodes: number;
   maxProgramNodes: number;
@@ -738,6 +767,9 @@ export class TopologyStore {
    */
   private readonly componentCache = new Map<string, Map<string, number>>();
   private readonly componentNext = new Map<string, number>();
+  /** Materialized paging indexes; `null` after a listing-relevant write. */
+  private nodeListingIndex: NodeListingIndex | null = null;
+  private edgeListingIndex: EdgeListingIndex | null = null;
   private readonly clock: () => number;
   /** node id → edge ids that reference it (for location-update and delete guards). */
   private readonly nodeToEdgeIds = new Map<string, Set<string>>();
@@ -796,6 +828,7 @@ export class TopologyStore {
     }
     this.nodeMap.set(node.id, snapshot);
     if (snapshot.source === 'program') this.programNodeOrder.push(snapshot.id);
+    this.invalidateNodeListing();
     this.mutationRevision += 1;
     return { status: 'inserted' };
   }
@@ -824,6 +857,7 @@ export class TopologyStore {
     const snapshot = snapshotNode(this.worldId, merged, this.limits);
     if (nodesEqual(existing, snapshot)) return { status: 'unchanged' };
     this.nodeMap.set(id, snapshot);
+    this.invalidateNodeListing();
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -848,6 +882,7 @@ export class TopologyStore {
     this.nodeToEdgeIds.delete(id);
     if (existed) {
       this.invalidateNodeComponent(id);
+      this.invalidateNodeListing();
       this.mutationRevision += 1;
     }
   }
@@ -935,6 +970,7 @@ export class TopologyStore {
       },
     };
     this.nodeMap.set(nodeId, snapshotNode(this.worldId, merged, this.limits));
+    this.invalidateNodeListing();
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -965,24 +1001,60 @@ export class TopologyStore {
     return this.nodes({ ...rest, source: namespace });
   }
 
-  /** Paginated, read-only node listing (id-ordered, exclusive cursor, clamped limit). */
+  /**
+   * Paginated, read-only node listing (id-ordered, exclusive cursor, clamped
+   * limit). Pages come from the materialized `nodeListingIndex`; `total` is the
+   * bucket size for a single filter and the scanned match count otherwise.
+   */
   nodes(query: NodeQuery = {}): NodePage {
     const limit = clampLimit(query.limit, this.limits.maxQueryBatch);
-    const ids = [...this.nodeMap.keys()]
-      .filter((id) => {
-        const node = this.nodeMap.get(id)!;
-        if (query.dim !== undefined && node.dim !== query.dim) return false;
-        if (query.source !== undefined && node.source !== query.source) return false;
-        if (query.tag !== undefined && node.tag !== query.tag) return false;
-        if (query.label !== undefined && node.label !== query.label) return false;
-        return true;
-      })
-      .sort();
-    const { pageIds, nextAfter } = selectPage(ids, query.after, limit);
+    const index = this.getNodeListingIndex();
+    const filterCount =
+      (query.dim === undefined ? 0 : 1) +
+      (query.source === undefined ? 0 : 1) +
+      (query.tag === undefined ? 0 : 1) +
+      (query.label === undefined ? 0 : 1);
+    // First existing bucket by this fixed priority; its ids are already ascending.
+    const bucket =
+      query.label !== undefined
+        ? index.byLabel.get(query.label)
+        : query.tag !== undefined
+          ? index.byTag.get(query.tag)
+          : query.source !== undefined
+            ? index.bySource.get(query.source)
+            : query.dim !== undefined
+              ? index.byDim.get(query.dim)
+              : undefined;
+    if (filterCount === 0) {
+      const { pageIds, nextAfter } = selectPage(index.all, query.after, limit);
+      return {
+        items: pageIds.map((id) => cloneNode(this.nodeMap.get(id)!)),
+        total: index.all.length,
+        nextAfter,
+      };
+    }
+    if (filterCount === 1 && bucket !== undefined) {
+      // The single requested condition is exactly the bucket key: total is the
+      // materialized bucket size, and the page is a direct slice.
+      const { pageIds, nextAfter } = selectPage(bucket, query.after, limit);
+      return {
+        items: pageIds.map((id) => cloneNode(this.nodeMap.get(id)!)),
+        total: bucket.length,
+        nextAfter,
+      };
+    }
+    const page = selectFilteredPage(bucket ?? [], query.after, limit, (id) => {
+      const node = this.nodeMap.get(id)!;
+      if (query.dim !== undefined && node.dim !== query.dim) return false;
+      if (query.source !== undefined && node.source !== query.source) return false;
+      if (query.tag !== undefined && node.tag !== query.tag) return false;
+      if (query.label !== undefined && node.label !== query.label) return false;
+      return true;
+    });
     return {
-      items: pageIds.map((id) => cloneNode(this.nodeMap.get(id)!)),
-      total: ids.length,
-      nextAfter,
+      items: page.pageIds.map((id) => cloneNode(this.nodeMap.get(id)!)),
+      total: page.total,
+      nextAfter: page.nextAfter,
     };
   }
 
@@ -1023,6 +1095,7 @@ export class TopologyStore {
     this.edgeMap.set(edge.id, stored);
     this.indexEdge(stored);
     this.invalidateEdgeComponents(stored);
+    this.invalidateEdgeListing();
     this.mutationRevision += 1;
     return { status: 'inserted' };
   }
@@ -1053,6 +1126,7 @@ export class TopologyStore {
     if (storedEdgesEqual(existing, stored)) return { status: 'unchanged' };
     this.edgeMap.set(id, stored);
     this.invalidateEdgeComponents(stored);
+    this.invalidateEdgeListing();
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -1154,9 +1228,11 @@ export class TopologyStore {
     if (edgeVerificationsEqual(stored.verifications, verifications)) {
       return { status: 'unchanged' };
     }
+    // Verification is derived state and is not a listing key, so the paging
+    // index stays valid: `id`/`from`/`to`/`type`/`basis` are unchanged.
     this.edgeMap.set(id, { ...stored, verifications });
-    // Verification is derived state: it excludes routes but never rewrites
-    // historical connectivity/components or deletes fragments.
+    // Verification excludes routes but never rewrites historical
+    // connectivity/components or deletes fragments.
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -1179,6 +1255,7 @@ export class TopologyStore {
     this.edgeMap.delete(id);
     this.unindexEdge(stored);
     this.invalidateEdgeComponents(stored);
+    this.invalidateEdgeListing();
     this.mutationRevision += 1;
   }
 
@@ -1189,25 +1266,59 @@ export class TopologyStore {
    */
   edges(query: EdgeQuery = {}): EdgePage {
     const limit = clampLimit(query.limit, this.limits.maxQueryBatch);
-    const ids = [...this.edgeMap.keys()]
-      .filter((id) => {
-        const edge = this.edgeMap.get(id)!;
-        if (query.dim !== undefined) {
-          const from = this.nodeMap.get(edge.from);
-          if (from === undefined || from.dim !== query.dim) return false;
-        }
-        if (query.from !== undefined && edge.from !== query.from) return false;
-        if (query.to !== undefined && edge.to !== query.to) return false;
-        if (query.type !== undefined && edge.type !== query.type) return false;
-        if (query.basis !== undefined && edge.basis !== query.basis) return false;
-        return true;
-      })
-      .sort();
-    const { pageIds, nextAfter } = selectPage(ids, query.after, limit);
+    const matches = (id: string): boolean => {
+      const edge = this.edgeMap.get(id)!;
+      if (query.dim !== undefined) {
+        const from = this.nodeMap.get(edge.from);
+        if (from === undefined || from.dim !== query.dim) return false;
+      }
+      if (query.from !== undefined && edge.from !== query.from) return false;
+      if (query.to !== undefined && edge.to !== query.to) return false;
+      if (query.type !== undefined && edge.type !== query.type) return false;
+      if (query.basis !== undefined && edge.basis !== query.basis) return false;
+      return true;
+    };
+    const index = this.getEdgeListingIndex();
+    const filterCount =
+      (query.dim === undefined ? 0 : 1) +
+      (query.from === undefined ? 0 : 1) +
+      (query.to === undefined ? 0 : 1) +
+      (query.type === undefined ? 0 : 1) +
+      (query.basis === undefined ? 0 : 1);
+    // First existing bucket by this fixed priority; its ids are already ascending.
+    const bucket =
+      query.from !== undefined
+        ? index.byFrom.get(query.from)
+        : query.to !== undefined
+          ? index.byTo.get(query.to)
+          : query.type !== undefined
+            ? index.byType.get(query.type)
+            : query.basis !== undefined
+              ? index.byBasis.get(query.basis)
+              : query.dim !== undefined
+                ? index.byDim.get(query.dim)
+                : undefined;
+    if (filterCount === 0) {
+      const { pageIds, nextAfter } = selectPage(index.all, query.after, limit);
+      return {
+        items: pageIds.map((id) => this.toEdgeView(this.edgeMap.get(id)!)),
+        total: index.all.length,
+        nextAfter,
+      };
+    }
+    if (filterCount === 1 && bucket !== undefined) {
+      const { pageIds, nextAfter } = selectPage(bucket, query.after, limit);
+      return {
+        items: pageIds.map((id) => this.toEdgeView(this.edgeMap.get(id)!)),
+        total: bucket.length,
+        nextAfter,
+      };
+    }
+    const page = selectFilteredPage(bucket ?? [], query.after, limit, matches);
     return {
-      items: pageIds.map((id) => this.toEdgeView(this.edgeMap.get(id)!)),
-      total: ids.length,
-      nextAfter,
+      items: page.pageIds.map((id) => this.toEdgeView(this.edgeMap.get(id)!)),
+      total: page.total,
+      nextAfter: page.nextAfter,
     };
   }
 
@@ -1817,6 +1928,8 @@ export class TopologyStore {
       .map((node) => node.id);
     this.componentCache.clear();
     this.componentNext.clear();
+    this.nodeListingIndex = null;
+    this.edgeListingIndex = null;
     // Restore is a mutation: it replaces the store's facts, so it must mark the
     // store dirty. Only a session initializer (which then sets the confirmed
     // baseline to the post-restore revision) treats it as a clean baseline.
@@ -2238,6 +2351,7 @@ export class TopologyStore {
       this.nodeToEdgeIds.delete(id);
       this.programNodeOrder.splice(i, 1);
       this.invalidateNodeComponent(id);
+      this.invalidateNodeListing();
       return true;
     }
     return false;
@@ -2271,6 +2385,76 @@ export class TopologyStore {
     for (const [cachedId, cachedComponent] of [...cache]) {
       if (cachedComponent === component) cache.delete(cachedId);
     }
+  }
+
+  private invalidateNodeListing(): void {
+    this.nodeListingIndex = null;
+  }
+
+  private invalidateEdgeListing(): void {
+    this.edgeListingIndex = null;
+  }
+
+  /** The node listing index, rebuilt from `nodeMap` when a write invalidated it. */
+  private getNodeListingIndex(): NodeListingIndex {
+    const cached = this.nodeListingIndex;
+    if (cached !== null) return cached;
+    const byDim = new Map<string, string[]>();
+    const bySource = new Map<NodeSource, string[]>();
+    const byTag = new Map<LandmarkTag, string[]>();
+    const byLabel = new Map<string, string[]>();
+    const push = <K>(bucket: Map<K, string[]>, key: K, id: string): void => {
+      const list = bucket.get(key);
+      if (list === undefined) bucket.set(key, [id]);
+      else list.push(id);
+    };
+    // Map insertion order is not id order; sort once per bucket so a page is a
+    // slice, and keep each bucket in the same ascending order `selectPage` assumes.
+    for (const node of this.nodeMap.values()) {
+      push(byDim, node.dim, node.id);
+      push(bySource, node.source, node.id);
+      if (node.tag !== undefined) push(byTag, node.tag, node.id);
+      if (node.label !== undefined) push(byLabel, node.label, node.id);
+    }
+    const all = [...this.nodeMap.keys()].sort();
+    for (const bucket of [byDim, bySource, byTag, byLabel]) {
+      for (const list of bucket.values()) list.sort();
+    }
+    const index: NodeListingIndex = { all, byDim, bySource, byTag, byLabel };
+    this.nodeListingIndex = index;
+    return index;
+  }
+
+  /** The edge listing index, rebuilt from `edgeMap` when a write invalidated it. */
+  private getEdgeListingIndex(): EdgeListingIndex {
+    const cached = this.edgeListingIndex;
+    if (cached !== null) return cached;
+    const byDim = new Map<string, string[]>();
+    const byFrom = new Map<string, string[]>();
+    const byTo = new Map<string, string[]>();
+    const byType = new Map<ConnectionType, string[]>();
+    const byBasis = new Map<EdgeBasis, string[]>();
+    const push = <K>(bucket: Map<K, string[]>, key: K, id: string): void => {
+      const list = bucket.get(key);
+      if (list === undefined) bucket.set(key, [id]);
+      else list.push(id);
+    };
+    for (const edge of this.edgeMap.values()) {
+      // Every stored edge's `from` node exists: save/restore reject a missing
+      // endpoint, and a referenced node cannot be forgotten or evicted.
+      push(byDim, this.nodeMap.get(edge.from)!.dim, edge.id);
+      push(byFrom, edge.from, edge.id);
+      push(byTo, edge.to, edge.id);
+      push(byType, edge.type, edge.id);
+      push(byBasis, edge.basis, edge.id);
+    }
+    const all = [...this.edgeMap.keys()].sort();
+    for (const bucket of [byDim, byFrom, byTo, byType, byBasis]) {
+      for (const list of bucket.values()) list.sort();
+    }
+    const index: EdgeListingIndex = { all, byDim, byFrom, byTo, byType, byBasis };
+    this.edgeListingIndex = index;
+    return index;
   }
 
   private countNodes(source: NodeSource): number {
@@ -3063,9 +3247,46 @@ function selectPage(
 }
 
 function firstIndexAfter(sortedIds: string[], after: string): number {
-  let i = 0;
-  while (i < sortedIds.length && sortedIds[i]! <= after) i += 1;
-  return i;
+  // Upper bound: the first id strictly greater than the exclusive cursor.
+  let low = 0;
+  let high = sortedIds.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (sortedIds[mid]! <= after) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+/**
+ * Select one page of `candidates` (ascending ids) that pass `matches`, with the
+ * same `after`/`limit`/`nextAfter` semantics as `selectPage`. `total` is the
+ * number of matching ids, independent of the page. This is the general filter
+ * path for multi-condition queries; single-condition queries page their
+ * materialized bucket directly.
+ */
+function selectFilteredPage(
+  candidates: readonly string[],
+  after: string | undefined,
+  limit: number,
+  matches: (id: string) => boolean,
+): { pageIds: string[]; total: number; nextAfter: string | undefined } {
+  let total = 0;
+  let beforeCursor = 0;
+  const pageIds: string[] = [];
+  for (const id of candidates) {
+    if (!matches(id)) continue;
+    // `total` is the whole match count, independent of the cursor.
+    total += 1;
+    if (after !== undefined && id <= after) {
+      beforeCursor += 1;
+      continue;
+    }
+    if (pageIds.length < limit) pageIds.push(id);
+  }
+  const nextAfter =
+    beforeCursor + pageIds.length < total ? pageIds[pageIds.length - 1] : undefined;
+  return { pageIds, total, nextAfter };
 }
 
 // --- bounded query internals (phase 4C) ---
