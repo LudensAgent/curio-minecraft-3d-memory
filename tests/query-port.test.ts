@@ -45,6 +45,7 @@ describe('SpatialQueryPort — request boundary', () => {
       { kind: 'resourceAnchors', dim: DIM, order: 'surface' },
       { kind: 'containerAnchors', dim: DIM, tag: 'resource' },
       { kind: 'containerContents', dim: DIM, contents: true },
+      { kind: 'containerContents', dim: DIM, nodeId: 'chest-1' },
       { kind: 'snapshot', limit: 1 },
       { kind: 'capabilities', scope: 'all' },
     ];
@@ -112,6 +113,9 @@ describe('SpatialQueryPort — request boundary', () => {
     expect(detailOf({ kind: 'fragments', source: 'legacy' })).toBe(
       'unknown field "source" for query kind "fragments"',
     );
+    expect(detailOf({ kind: 'containerContents', dim: DIM, nodeId: 'chest-1' })).toBe(
+      'unknown field "nodeId" for query kind "containerContents"',
+    );
     expect(detailOf({ kind: 'components' })).toBe(
       'components.dim must be a non-empty string',
     );
@@ -168,7 +172,7 @@ describe('SpatialQueryPort — envelope and read-only boundary', () => {
 
   it('returns structured host_ledger for container contents, never an empty list', () => {
     const parts = makeQueryParts();
-    const result = parts.store.query({ kind: 'containerContents', dim: DIM, nodeId: 'chest-1' });
+    const result = parts.store.query({ kind: 'containerContents', dim: DIM });
     expect(result.status).toBe('unsupported');
     expect(result.problem).toEqual({
       kind: 'host_ledger',

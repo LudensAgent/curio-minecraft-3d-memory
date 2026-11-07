@@ -94,7 +94,7 @@ export type SpatialQueryRequest =
    * Additive to contract §5.2: a contents request is always answered by the
    * structured `host_ledger` boundary, never by an empty list.
    */
-  | { kind: 'containerContents'; dim?: string; nodeId?: string }
+  | { kind: 'containerContents'; dim?: string }
   | { kind: 'snapshot' }
   | { kind: 'capabilities' };
 
@@ -105,6 +105,7 @@ export type SpatialQueryStatus =
   | 'partial'
   | 'not_found'
   | 'unsupported'
+  /** Contract §5.6-reserved for future world-addressing adapters; no M2 producer. */
   | 'scope_mismatch'
   | 'invalid_request';
 
@@ -272,6 +273,7 @@ export interface SpatialQueryResult {
 
 export type SpatialQueryProblem =
   | { kind: 'invalid_request'; detail: string }
+  /** Contract §5.6-reserved for future world-addressing adapters; no M2 producer. */
   | { kind: 'scope_mismatch'; expected: WorldScope; actual: WorldScope }
   | { kind: 'unsupported'; query: SpatialQueryKind; detail: string }
   | { kind: 'host_ledger'; detail: string }
