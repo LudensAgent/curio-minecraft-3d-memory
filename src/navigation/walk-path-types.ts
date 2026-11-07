@@ -19,7 +19,7 @@ import type { BodyContext } from '../traversability/step.js';
 import type { Vec3Like } from '../types.js';
 import type { ChangeReport } from '../voxel/voxel-map.js';
 import type { CancellationOrigin } from './route-plan-types.js';
-import type { LastObservation, NavProblem } from './types.js';
+import type { ActionRecord, LastObservation, NavProblem } from './types.js';
 
 /** Input to `walkPath`; the route must come from `planRoute` and is single-use. */
 export interface WalkPathRequest {
@@ -62,6 +62,23 @@ export interface WalkPathEnvironment {
   changes?: ChangeReportSource;
   now?: () => number;
   cancellationOrigin?: CancellationOrigin;
+  /** The caller's own `ActionRecord` for this delegation; absent means `null`. */
+  actionRecord?: ActionRecord | null;
+  /**
+   * Optional host persistence seam (implementation plan M6.2). Called exactly
+   * once per `createWalkPath` call, after the walk settles for every terminal
+   * outcome, with the caller's `ActionRecord` or `null` (a direct
+   * `createWalkPathExecution` call never invokes it). The library never builds
+   * or amends that record; a throwing/rejecting hook cannot change the walk
+   * result or the body port calls. Absent means the library persists nothing.
+   */
+  persistAction?: (record: ActionRecord | null) => void | Promise<void>;
+  /**
+   * Observes a `persistAction` failure (thrown or rejected). Without it the
+   * failure still cannot change the walk result, but it would be silent; hosts
+   * that persist should supply this so a failed journal write stays visible.
+   */
+  onPersistenceFailure?: (error: unknown) => void;
 }
 
 /** Single-step body port; it only executes one authorized move. */

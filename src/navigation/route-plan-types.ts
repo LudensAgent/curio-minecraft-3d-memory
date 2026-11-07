@@ -23,7 +23,7 @@ import type { BodyContext } from '../traversability/step.js';
 import type { MoveMode, Vec3Like, WorldScope } from '../types.js';
 import type { SectionKey } from '../voxel/section.js';
 import type { RouteSearchSource } from './route-search.js';
-import type { ArrivalSpec, NavProblem } from './types.js';
+import type { ActionRecord, ArrivalSpec, NavProblem } from './types.js';
 
 /** Which planning backend `planRoute` should use. */
 export type RoutePlanSource = 'auto' | 'search' | 'history';
@@ -171,6 +171,26 @@ export interface RoutePlanEnvironment {
   wait?: () => Promise<void>;
   signal?: AbortSignal;
   cancellationOrigin?: CancellationOrigin;
+  /**
+   * The caller's own `ActionRecord` for this delegation, handed verbatim to
+   * `persistAction`. Absent means `null`; the library never synthesizes one.
+   */
+  actionRecord?: ActionRecord | null;
+  /**
+   * Optional host persistence seam (implementation plan M6.2). When supplied it
+   * is called exactly once after planning settles — success or problem — with
+   * the caller's `ActionRecord`, or `null` when the caller did not supply one.
+   * The library never builds or amends that record, and a throwing/rejecting
+   * hook cannot change the returned `RoutePlanResult`. Absent means the library
+   * persists nothing.
+   */
+  persistAction?: (record: ActionRecord | null) => void | Promise<void>;
+  /**
+   * Observes a `persistAction` failure (thrown or rejected). Without it the
+   * failure still cannot change the result, but it would be silent; hosts that
+   * persist should supply this so a failed journal write stays visible.
+   */
+  onPersistenceFailure?: (error: unknown) => void;
 }
 
 /** Provenance of a caller-initiated stop; never guessed from timing. */
