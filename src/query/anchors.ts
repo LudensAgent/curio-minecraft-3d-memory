@@ -110,7 +110,7 @@ function queryContainerContents(
   request: Extract<AnchorQuery, { kind: 'containerContents' }>,
 ): SpatialQueryResult {
   // Never an empty list: an empty inventory is a host ledger fact this library
-  // cannot verify. `dim`/`nodeId` scope the request but do not change the answer.
+  // cannot verify. `dim` is echoed into the result but does not change the answer.
   return makeQueryResult(context, {
     status: 'unsupported',
     ...(request.dim === undefined ? {} : { dim: request.dim }),

@@ -266,7 +266,6 @@ describe('containerContents', () => {
     const scoped = runQuery(parts, {
       kind: 'containerContents',
       dim: DIM,
-      nodeId: 'chest-1',
     });
     expect(scoped.status).toBe('unsupported');
     expect(scoped.problem?.kind).toBe('host_ledger');
@@ -298,7 +297,7 @@ describe('anchor query isolation', () => {
 
     runQuery(parts, { kind: 'resourceAnchors', tag: 'resource' });
     runQuery(parts, { kind: 'containerAnchors' }, { isContainer: (node) => node.label === 'chest' });
-    runQuery(parts, { kind: 'containerContents', nodeId: 'chest-1' });
+    runQuery(parts, { kind: 'containerContents' });
 
     expect(captureStoreState(parts)).toEqual(before);
   });
