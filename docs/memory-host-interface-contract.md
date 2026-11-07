@@ -416,8 +416,8 @@ export type SpatialQueryRequest =
   | { kind: 'portals'; after?: string; limit?: number }
   | { kind: 'resourceAnchors'; dim?: string; tag?: LandmarkTag; label?: string; after?: string; limit?: number }
   | { kind: 'containerAnchors'; dim?: string; after?: string; limit?: number }
-  // 增量（M2）：内容永远转交宿主账本；该 kind 不产生 data。
-  | { kind: 'containerContents'; dim?: string; nodeId?: string }
+  // 增量（M2）：内容永远转交宿主账本；该 kind 不产生 data。请求只接受 `dim`；`nodeId` 等未知字段失败关闭为 `invalid_request`（D-057，`src/query/validate.ts`）。
+  | { kind: 'containerContents'; dim?: string }
   | { kind: 'snapshot' }
   | { kind: 'capabilities' };
 ```
@@ -692,7 +692,7 @@ export interface RoutePlan {
   start: Vec3Like;
 }
 
-export interface RouteSegment {
+export interface RouteSegment { // 实现导出名：RoutePlanSegment（M3-A6；映射见 §12.6）
   index: number;
   mode: 'walk';
   points: Vec3Like[];
@@ -1290,25 +1290,25 @@ export interface ChangeReport {
 | `SpatialMemoryStore` 查询方法 | 已实现（分散） | `src/store/store.ts` |
 | 统一 `SpatialQueryPort` | 已实现 | `src/query/*`；`SpatialMemoryStore.query(request)` 暴露；含 segments；未知字段/kind 拒绝、分页 100/1000、只读 |
 | `segments` 查询 | 已实现 | 包装 `TopologyStore.segments`；未知 fragment 返回 `not_found`；不删除/改写 fragment 历史 |
-| `MemoryHostCapabilities` / `CONTRACT_VERSION` | 已实现（M2/M3 部分） | `src/memory/capabilities.ts`；memory/query 按实际能力，M3 规划 walk search/history/auto 为 `true`；execute/persistence 与其余 plan 位待 M5.4 |
+| `MemoryHostCapabilities` / `CONTRACT_VERSION` / 包入口 | 已实现（按域如实） | `src/memory/capabilities.ts`；memory/query 按实际能力，plan 的 walk search/history/auto 为 `true`；`execute.*`/`persistence.*` 仍全为 `false`（D-059，不因 M4/M6 已有运行时入口而翻真）；契约版本保持 `memory-host-contract/1`（H-02 未决）。M5 入口：`package.json` 的 `./memory`/`./navigation` 子路径与入口隔离由 `tests/entrypoints.test.ts` 锁定 |
 | `cells` 未驻留/gap 语义 | 已实现 | 对外三类：已观察、未观察且无 gap、不可读（`gap.reason:'unloaded'` + `status:'partial'`）；未观察格另带可选 `residency`（`SectionResidency`）与 `unobservedReason: 'no_record' \| 'resident'`，可细分 `no_record`/resident-unobserved/`not_resident`/`loading`/`load_failed`，旧消费者忽略新字段后仍只见三类；历史 `ObservationGap` 未持久化，只报告当前驻留 gap |
-| `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts` |
-| `WalkRouteExecutor` + `bodyArrival` | 已实现 | `src/execution/*` |
+| `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts`；M8.1 基准见 `benchmarks/walk-search.bench.ts`、`benchmarks/baseline.md`（Fake 碰撞规则，不是真实服务器） |
+| `WalkRouteExecutor` + `bodyArrival` | 已实现（含 M8.3b 单步访问器） | `src/execution/*`；`stepAt` 逐段验证不复制整条路线，见 `benchmarks/m8-3b.md` |
 | `startKnownWalkRoute` | 已实现（启动执行，不是 plan-only） | `src/navigation/known-walk-route.ts` |
-| `planRoute`/`RoutePlan`/`RoutePlanRegistry` | 已实现（M3） | `src/navigation/route-plan*.ts`；search/history/auto、候选不可执行、边界、预算、routeId 单次使用 |
+| `planRoute`/`RoutePlan`/`RoutePlanRegistry` | 已实现（M3） | `src/navigation/route-plan*.ts`；search/history/auto、候选不可执行、边界、预算、routeId 单次使用；`tests/route-plan-*.test.ts`；M8.1 基准 `benchmarks/route-plan.bench.ts`；实现类型名 `RoutePlanSegment`（§6.4 注释，映射见 §12.6） |
 | `RouteSearchSource` 适配 | 已实现（M3） | `src/navigation/route-search.ts`；包装 `WalkRouteSearch`，状态→规划结论显式映射 |
 | `ROUTE_PLAN_CAPABILITIES` | 已实现（M3） | `src/navigation/capabilities.ts`；walk search/history/auto true，其余 false |
-| `walkPath`/`WalkPathResult` | 待实现 | 本契约 §7；可先用 `WalkRouteExecutor` 由宿主实现 |
-| `INVALIDATED` outcome | 待实现 | 当前 `NavOutcome` 无此值，使用 `route_invalidated` problem |
+| `walkPath`/`WalkPathResult` | 已实现（M4；库自带绑定 + Fake） | `src/navigation/walk-path.ts` 的 `createWalkPath`/`createWalkPathExecution`；`WalkPathRequest`/`WalkPathResult` 见 `src/navigation/walk-path-types.ts`；`tests/walk-path-*.test.ts`。M6.2 可选 `persistAction` 钩子在结果确定后异步调用且失败不改结果（`tests/action-record-persistence-hook.test.ts`）；`memoryWrite` 仍只由宿主在 `navigateTo` 回调报告，库自带 `walkPath` 绑定从不写该字段；真实身体/H-01 未验证 |
+| `INVALIDATED` outcome | 已实现（执行期失效保留实际类别；起点门禁单独映射） | `WalkPathOutcome` 含 `INVALIDATED`（`src/navigation/walk-path-types.ts`）。**执行期失效**由 `toWalkPathResult` 映射（`src/navigation/walk-path.ts:643-728`）：`problem.kind` 与 `invalidation.reason` 保留实际类别 `route_invalidated`、`scope_changed`、`unobserved`、`stale`、`unloaded`；`problem.kind:'unavailable'` 是例外，此时 `invalidation.reason` 为 `route_body_unavailable`。**起点门禁**在 `checkStart`/`planInvalidated`（`:162-174`、`:920-990`、`:1038`）先于执行：样本缺失或非法 → `problem.kind:'unavailable'` + `invalidation.reason:'route_start_unmeasured'`（`tests/walk-path-start.test.ts:301-311`）；实测脚位偏离计划起点超过默认 0.05 → `problem.kind:'route_invalidated'` + `reason:'route_start_changed'`（`:986`；测试 `:206-218`）；起点作用域不匹配 → `kind:'scope_changed'` + `reason:'scope_mismatch'`，身体不可用 → `kind:'unavailable'` + `reason:'route_body_unavailable'`。执行结果另带段索引、最后实测位置与已确认段；测试见 `tests/walk-path-invalidation.test.ts`、`tests/walk-path-arrival.test.ts` |
 | `PerceptionSource`/`BodyAdapter` 拆分 | 已实现 | 计划中的感知端口命名为 `PerceptionSource`，避免与既有证据来源联合类型 `ObservationSource` 冲突；`WorldAdapter` 保留为兼容交叉类型 |
 | 容器位置锚点查询 | 已实现（需宿主分类器） | `SpatialMemoryStore.query({kind:'containerAnchors'})`；只返回 exact 节点；未注入 `isContainer` 时为 `unsupported` |
 | 容器内容查询 | 不适用 | `SpatialMemoryStore.query({kind:'containerContents'})` 固定返回 `host_ledger`；不返回 `items`/空箱 |
 | 水面/船几何验证 | 已实现（仅几何） | `assurance:'geometry_only'`、`executable:false` |
 | 水面/船执行 | 未实现 | 不属于 v1 `walkPath` |
-| SQLite Worker/checkpoint/WorkingSet | 已实现 | `src/storage/sqlite/*` |
+| SQLite Worker/checkpoint/WorkingSet | 已实现（含 M6.1/M6.4、M8.1/M8.3c） | `src/storage/sqlite/*`；`checkpoint()` 只返回确认后的 `CheckpointResult`（checkpointId + revisions），`flush()` 用 `completed` 表示已提交，“已观测 ≠ 已保存”；游戏版本列见 `tests/schema-v8.test.ts`，重启/checkpoint 见 `tests/spatial-checkpoint.test.ts` 的「M6.4 restart and checkpoint boundaries」；基准见 `benchmarks/baseline.md`、`benchmarks/m8-3c.md` |
 | JSON→SQLite 权威切换 | 未实现 | 只有 dry-run |
 | L1 元语 | 宿主职责 | 不属于本库 |
-| Curio M0/M1 | 外部前置 | 真实 `walkPath` 联调前必须先通过 |
+| 真实宿主联调（H-01） | 未验证 | 真实 Minecraft/mineflayer/Curio 联调未执行，本库仅有 Fake/单测；Curio M0/M1 仍是真实 `walkPath` 联调前置 |
 
 ---
 

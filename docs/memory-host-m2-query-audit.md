@@ -19,11 +19,11 @@
 
 - M2.1、M2.2、M2.3、M2.4、M2.6 完成；阶段门禁 G1 通过。
 - M2.5 的核心查询（资源/容器位置、`host_ledger` 边界）可用；“可达证据”按 D-001 接受降级为“M2 不计算可达性”，计划 M2.5 已同步（`f9b827b`）；D-001 后续跟踪项于 L-M2-03d 记录（`docs/memory-host-implementation-plan.md:302`），最终人工复核项保留。
-- 前序批次已修复：M2-A2（`3ae4fd8`）、M2-A5 / M2-L1（`f09b92e`）、M2-L3（`4321fda`）、M2-L5（`883fe22`；契约 §5.2 的 `nodeId` 文档同步仍挂 L-M2-03d/M9）。
-- 仍未收口：M2-A3（D-003，目标 M9）、M2-A4 的 M8 性能基准（文档落点已在 L-M2-03d 完成）。
+- 前序批次已修复：M2-A2（`3ae4fd8`）、M2-A5 / M2-L1（`f09b92e`）、M2-L3（`4321fda`）、M2-L5（`883fe22`；契约 §5.2 的 `nodeId` 文档已于 L-M9-1 同步）。
+- 仍未收口：M2-A3（D-003，H-02 版本未决）、M2-A4 的 portals 游标优化（M8.1 基准已落地，未改 portals）。
 - 未发现计划 §4.12 的阻断项；真实联机/宿主验收未执行，属于 M7，本文件不据此声称已通过。
 
-一句话：**查询端口可交付，测试与只读边界成立；剩余问题为 D-001 人工复核、契约版本收口（M9）、`portals` 的 M8 基准（文档已落契约 §5.6），不是查询实现缺陷。**
+一句话：**查询端口可交付，测试与只读边界成立；剩余问题为 D-001 人工复核、契约版本收口（M9，H-02 未决）、`portals` 游标优化评估（M8.1 基准已落地，未改 portals），不是查询实现缺陷。**
 
 ---
 
@@ -145,7 +145,7 @@
 |---|---|---|
 | M2-L1 components 查询写缓存 | 已修复（`f09b92e`，B02/L-M2-01） | `src/query/history.ts:46-99` 改为从只读 nodes/edges 分页重算，不再调用会写缓存的 `TopologyStore.components`；`captureStoreState` 纳入 `componentCache`/`componentNext`（`tests/query-fixtures.ts:138-147`、`:185`），`tests/query-history.test.ts:365`、`:371-376`、`:446-474` 断言结果与 store 报告一致、缓存/计数未生成、证据时间未刷新 |
 | M2-L3 worldId 双校验/query→store 类型耦合 | 已修复（`4321fda`，L-M2-03a） | `src/query/index.ts:48-52` 删除重复 `worldId` 校验（由 store 构造边界负责）；查询结果类型迁入 `src/query/types.ts`，query 模块无 store/navigation/execution 运行时导入；store 以编译期双向相等断言锁定 capability 名（`src/store/spatial-memory-store.ts:138-149`）。残留 D-030 为风格判断项 |
-| M2-L5 `containerContents.nodeId` 被静默忽略 | 已修复（`883fe22`，L-M2-03c；D-040） | `nodeId` 已从类型与 validator 删除，`{kind:'containerContents',nodeId}` 失败关闭为 `invalid_request`（`tests/query-port.test.ts:48`、`:138-140`）；合法 `containerContents`（±dim）仍固定 `unsupported` + `host_ledger`、无 data（`src/query/anchors.ts:108-119`）。残留：契约 §5.2:420 仍列 `nodeId`，文档同步按 D-040/B08-M2-03 延期到 L-M2-03d/M9；`scope_mismatch` 保留为预留状态（`src/query/types.ts:276`） |
+| M2-L5 `containerContents.nodeId` 被静默忽略 | 已修复（`883fe22`，L-M2-03c；D-040） | `nodeId` 已从类型与 validator 删除，`{kind:'containerContents',nodeId}` 失败关闭为 `invalid_request`（`tests/query-port.test.ts:48`、`:138-140`）；合法 `containerContents`（±dim）仍固定 `unsupported` + `host_ledger`、无 data（`src/query/anchors.ts:108-119`）。契约 §5.2:420 已由 L-M9-1 同步为只接受 `dim`，`nodeId` 失败关闭为 `invalid_request`（D-057）；`scope_mismatch` 保留为预留状态（`src/query/types.ts:276`） |
 
 ---
 
@@ -168,11 +168,11 @@
 
 - [ ] **M2-A1**（D-001，2026-11-07；人工复核未完成）：已决策接受“M2 不计算可达性”（`requires_user_review: true`）；计划 M2.5 已同步范围（`f9b827b`）；D-001 后续跟踪项于 L-M2-03d 记录（`docs/memory-host-implementation-plan.md:302`），契约 §1.2/§5.4/§5.5 已对齐。无需补查询层可达投影。
 - [x] **M2-A2**（D-002，`3ae4fd8`）：已加可选 `residency`/`unobservedReason`，§5.4/§15 与测试三处一致；残留 §5.3 形状块/`SectionResidency` 定义按 D-026 交 L-M2-03d/M9。
-- [ ] **M2-A3**（D-003，目标 M9）：M9 发布前决定契约版本（minor/major）并同步宿主；当前保持 `memory-host-contract/1` + 能力协商。
-- [ ] **M2-A4**（D-004，文档目标 L-M2-03d 已完成，M8 基准未开始）：契约 §5.6 已标注 `portals` 的有界全量排序（`docs/memory-host-interface-contract.md:543`）；M8 基准后评估是否需要底层游标。
+- [ ] **M2-A3**（D-003，目标 M9）：M9 发布前决定契约版本（minor/major）并同步宿主；L-M9-1 保持 `memory-host-contract/1`，版本决定（H-02）未决。
+- [ ] **M2-A4**（D-004，文档目标 L-M2-03d 已完成，M8.1 基准已落地）：契约 §5.6 已标注 `portals` 的有界全量排序（`docs/memory-host-interface-contract.md:543`）；`benchmarks/` 已提供分页基准，`portals` 底层游标仍未改。
 - [x] **M2-A5**（D-005，`f09b92e`）：只读测试已直接断言 `observedAt`、fragment `uses`/`lastUsedAt` 不变。
 - [x] **M2-A6**（D-006，2026-11-06；回归 L-M2-04）：M2 只返回位置字段，不做邻域过滤；`tests/query-port.test.ts:55-75` 断言 `near`/`radius`/`pos` 被拒绝。
-- [x] **M2-L1 / M2-L3 / M2-L5**：分别由 `f09b92e` / `4321fda` / `883fe22` 修复；证据见 §3.1。M2-L5 的契约 §5.2 文档同步仍挂 L-M2-03d/M9。
+- [x] **M2-L1 / M2-L3 / M2-L5**：分别由 `f09b92e` / `4321fda` / `883fe22` 修复；证据见 §3.1。M2-L5 的契约 §5.2 文档已由 L-M9-1 同步。
 
 ---
 
@@ -180,8 +180,8 @@
 
 - 真实 Minecraft Java 1.20.1 / mineflayer / Curio 联机验收（M7）；Fake/单测通过不代表真实感知与控制边界通过。
 - D-001（M2.5 范围收窄）的人工复核（`requires_user_review: true`）；本文件不把 workflow 决策当作已获用户确认。
-- M9 契约版本决策与宿主枚举集同步；M8 `portals`/节点扫描性能基准。
-- `./memory`、`./navigation` 包子入口拆分与独立消费者验收（M5/M9）。
+- M9 契约版本决策（H-02）与宿主枚举集同步；M8.1 基准已落地，`portals`/节点扫描优化仍未做。
+- 包子入口：`./memory`/`./navigation` 已拆分（M5，`tests/entrypoints.test.ts`）；独立消费者安装/类型消费验收仍属 M9（L-M9-3）。
 - `npm pack`、独立安装与类型声明消费验证（M9）。
 - JSON→SQLite 权威切换与迁移门禁（M6）。
 

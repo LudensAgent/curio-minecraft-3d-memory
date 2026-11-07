@@ -181,12 +181,12 @@
 - **处理建议**：删除末尾多余空行；后续提交前运行 `git show --check`。
 - **验收标准**：`git show --check` 对修复提交 exit 0。
 
-### M3-A6｜契约类型命名与版本收口（挂 M9）
+### M3-A6｜契约类型命名与版本收口（命名已同步；版本待 H-02）
 
 - **严重度**：低（文档/发布门禁）
-- **状态**：挂 M9
+- **状态**：部分解决——实现名注释已同步（L-M9-1，契约 §6.4）；契约版本 minor/major 仍待 H-02 由用户决定，未完全收口
 - **证据**：
-  - 契约 §6.4 定义 `RouteSegment`（`docs/memory-host-interface-contract.md:674`、`690`）；实现导出 `RoutePlanSegment`（`src/navigation/route-plan-types.ts:53-59`），因为根入口已存在 topology 的 `RouteSegment`（`src/index.ts:220`）。§12.6 已解释映射（`docs/memory-host-interface-contract.md:1156`），但 §6.4/§15 的读者仍可能直接引用错误的类型名。
+  - 契约 §6.4 定义 `RouteSegment`（`docs/memory-host-interface-contract.md:674`、`690`）；实现导出 `RoutePlanSegment`（`src/navigation/route-plan-types.ts:53-59`），因为根入口已存在 topology 的 `RouteSegment`（`src/index.ts:220`）。§12.6 已解释映射（`docs/memory-host-interface-contract.md:1156`）；L-M9-1 已在 §6.4 的类型行加实现名注释，§15 的 `planRoute` 行同步。
   - M3 新增 `budget_exhausted.limit: 'points'`、`RoutePlanResult.message`、必选 `RoutePlanEnvironment.verifier`/`registry` 等接口变化，契约仍为 `memory-host-contract/1` 并依赖能力协商（`docs/memory-host-interface-contract.md:1152`）。
 - **影响**：类型导入与版本协商在 M9 前仍可能产生宿主误解；这与 M2-A3 是同一类发布门禁问题，M3 又扩大了变更面。
 - **处理建议**：在 §6.4 类型处加一行“实现名为 `RoutePlanSegment`”；M9 统一决定 minor/major 并同步宿主；在此之前保留能力协商要求。
@@ -258,21 +258,22 @@
 - [ ] **M3-A3**：校验搜索快照的作用域/目标；补 replay-source 负例。
 - [ ] **M3-A4**：补搜索阶段与复验阶段的 deadline/timeout 回归测试。
 - [x] **M3-A5**：删除 `src/navigation/route-plan-support.ts` 文件末尾空行。
-- [ ] **M3-A6**：在契约 §6.4 标注 `RoutePlanSegment` 实现名；M9 统一决定契约版本并与 M2-A3 合并处理。
+- [x] **M3-A6（命名部分）**：契约 §6.4 已由 L-M9-1 标注 `RoutePlanSegment` 实现名，§15 的 `planRoute` 行同步；命名部分完成。
+- [ ] **M3-A6（版本收口）**：契约版本仍保持 `memory-host-contract/1`，与 M2-A3 合并的 H-02 版本决定未决，尚未完成。
 - [x] **M3-A7**（可选）：由 D-009 解决（L-M3-02）。保留严格顶层字段拒绝；契约 §6.2 记录 `pathId` 仅 history/auto 消费、search 忽略且无效果，以及 `to`/`avoid` 只读 `x`/`y`/`z`、嵌套额外键由宿主类型检查。仅文档，未改运行时。
 - [x] **M3-A8**：由 D-010 接受（L-M3-02）。M3 提前落地的能力位视为已实现能力的提前静态报告；M5.4 收敛 `ROUTE_PLAN_CAPABILITIES` 与 `MemoryHostCapabilities.plan` 的单一来源并记录批次归属。
 - [ ] **M3-S1–S7**（可选，判断项）：按 §4.2 逐项评估，优先第 1、2 项（上下文数据团、复验编排重复）；不阻断 M4。
 
 ---
 
-## 7. 未执行项
+## 7. 未覆盖项与后续状态
 
-- `walkPath(routeId)` 的消费、执行、失效与 grounded 到达（M4）；本审计不证明 routeId 到执行的完整链路。
-- `./memory`、`./navigation` 包子入口拆分、独立安装与类型声明消费验证（M5/M9）。
-- `npm pack`、独立消费者安装（M9）。
-- SQLite 持久化、重启恢复、迁移门禁（M6）。
-- 真实 Minecraft Java 1.20.1 / mineflayer / Curio 联机验收（M7）；Fake/单测通过不代表真实感知、碰撞规则与控制边界通过。
-- 性能基准（M8）；本批未新增基准或未测优化。
+- `walkPath(routeId)` 的消费、执行、失效与 grounded 到达已由 M4 实现（`src/navigation/walk-path.ts`；另有 M4 审计）；本 M3 审计仍只覆盖规划链路。
+- `./memory`、`./navigation` 包子入口已于 M5 拆分（`tests/entrypoints.test.ts`）；独立安装与类型声明消费验证属 M9（L-M9-3）。
+- `npm pack`、独立消费者安装（M9；L-M9-3）。
+- SQLite 持久化与重启已由 M6 实现并有回归；JSON→SQLite 迁移门禁仍只有 dry-run（M6.3）。
+- 真实 Minecraft Java 1.20.1 / mineflayer / Curio 联机验收（M7）；Fake/单测通过不代表真实感知、碰撞规则与控制边界通过（H-01 未验证）。
+- 性能基准 M8.1 已落地（`benchmarks/`）；M8.2/M8.3 热点优化已有前后记录，但不是真实服务器验收。
 
 ---
 
