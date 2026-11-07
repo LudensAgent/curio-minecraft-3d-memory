@@ -11,8 +11,11 @@
  * boundary and never silently floors the body position. Everything the
  * evaluator needs (dimensions, pose, mode, session, time, shape rules) is
  * supplied by the caller or the injected provider — never read from host global
- * state. Reads go through the map's read-only snapshot API, so an evaluation
- * never mutates evidence, time or version.
+ * state. Reads go through the map's live read-only section view
+ * (`VoxelMap.sectionRef`, no deep copy). The view is held only for the call;
+ * no evidence object leaves it — an obstacle `Observation`, the mutable
+ * `BlockState` handed to the shape provider, and observed states are all
+ * copied — so an evaluation never mutates evidence, time or version.
  *
  * Support is checked continuously over the whole move: the swept footprint must
  * overlap some standable top face at every instant (exact interval coverage,
@@ -20,12 +23,13 @@
  * is not mistaken for total loss of support.
  */
 
+import { cloneObservation } from '../observation/clone.js';
 import type { CellEvidence } from '../observation/types.js';
 import type { BlockState, MoveMode, Vec3Like } from '../types.js';
 import { blockToSection, cellIndex } from '../voxel/coordinates.js';
-import type { Section, SectionKey } from '../voxel/section.js';
+import type { SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
-import type { VoxelMap } from '../voxel/voxel-map.js';
+import type { SectionRef, VoxelMap } from '../voxel/voxel-map.js';
 import type { CollisionShape, CollisionShapeProvider, NeighborCellView, NeighborRead, UnitBox } from './collision-shape.js';
 import type { HazardFact, ObstacleEvidence, Traversability } from './types.js';
 
@@ -117,7 +121,7 @@ type CellRead =
   | { kind: 'expired'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'session'; sectionKey: SectionKey; sectionRevision: number }
   | { kind: 'incomplete'; sectionKey: SectionKey; sectionRevision: number }
-  | { kind: 'observed'; sectionKey: SectionKey; sectionRevision: number; evidence: CellEvidence };
+  | { kind: 'observed'; sectionKey: SectionKey; sectionRevision: number; evidence: Readonly<CellEvidence> };
 
 type ShapeResult =
   | { kind: 'shape'; shape: CollisionShape }
@@ -395,7 +399,10 @@ function evaluateWalkGeometry(
     if (!deps.has(ks)) deps.set(ks, { key: { ...key }, revision });
   };
 
-  const sectionCache = new Map<string, Section | null>();
+  // Live read-only section views (no deep copy). The call holds them only for
+  // its own duration; every mutable value that leaves it is copied below
+  // (obstacle observations, `neighborRead` states, observed states).
+  const sectionCache = new Map<string, SectionRef | null>();
   let minValidUntil = Number.POSITIVE_INFINITY;
 
   const readCell = (x: number, y: number, z: number): CellRead => {
@@ -404,7 +411,7 @@ function evaluateWalkGeometry(
     const cacheKey = `${cx},${cz},${sy}`;
     let section = sectionCache.get(cacheKey);
     if (section === undefined) {
-      section = map.sectionAt(dim, x, y, z);
+      section = map.sectionRef(dim, x, y, z);
       sectionCache.set(cacheKey, section);
     }
     if (section === null) {
@@ -442,7 +449,9 @@ function evaluateWalkGeometry(
       const read = readCell(x, y, z);
       switch (read.kind) {
         case 'observed':
-          return { pos, kind: 'observed', state: read.evidence.observation.state };
+          // `BlockState` is a mutable interface, so the provider gets a copy, not
+          // the live evidence object.
+          return { pos, kind: 'observed', state: cloneBlockState(read.evidence.observation.state) };
         case 'missing':
           return { pos, kind: 'unobserved' };
         case 'incomplete':
@@ -457,8 +466,9 @@ function evaluateWalkGeometry(
     },
   };
 
-  const resolveShape = (evidence: CellEvidence, cell: Vec3Like): ShapeResult => {
-    const resolution = shapeProvider.resolve(evidence.observation.state, cell, neighborRead);
+  const resolveShape = (evidence: Readonly<CellEvidence>, cell: Vec3Like): ShapeResult => {
+    // The state is a mutable `BlockState`; hand the host-supplied rules a copy.
+    const resolution = shapeProvider.resolve(cloneBlockState(evidence.observation.state), cell, neighborRead);
     if (resolution.kind === 'unsupported_shape') {
       return { kind: 'unsupported', cell, detail: resolution.detail };
     }
@@ -488,7 +498,7 @@ function evaluateWalkGeometry(
     }
     observedStates.set(`${cell.x},${cell.y},${cell.z}`, {
       pos: cell,
-      state: read.evidence.observation.state,
+      state: cloneBlockState(read.evidence.observation.state),
     });
     const shape = resolveShape(read.evidence, cell);
     if (shape.kind === 'unsupported') {
@@ -509,7 +519,9 @@ function evaluateWalkGeometry(
           acc.blocked = {
             reason: `collision with ${state.name} at (${cell.x}, ${cell.y}, ${cell.z})`,
             problem: { kind: 'collision', cells: [cell] },
-            obstacles: [{ kind: 'block', observation: read.evidence.observation }],
+            // The section view is live, so an obstacle observation that escapes the
+            // evaluation must be a copy, exactly as it was under `sectionAt`.
+            obstacles: [{ kind: 'block', observation: cloneObservation(read.evidence.observation) }],
           };
         }
         break;
@@ -655,6 +667,11 @@ function evaluateWalkGeometry(
       };
     }
   }
+}
+
+/** Copy a live `BlockState` before it crosses into host-supplied shape rules. */
+function cloneBlockState(state: BlockState): BlockState {
+  return { name: state.name, properties: { ...state.properties } };
 }
 
 /**

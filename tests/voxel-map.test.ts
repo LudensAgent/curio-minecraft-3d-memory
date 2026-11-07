@@ -399,6 +399,86 @@ describe('input and read isolation', () => {
     expect(fresh.key.dim).toBe('overworld');
   });
 
+  it('sectionRef reads the live section without copying or changing it', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    const saveRevisionBefore = map.saveRevision;
+
+    const ref = map.sectionRef('overworld', 0, 0, 0)!;
+    const snapshot = map.sectionAt('overworld', 0, 0, 0)!;
+
+    // Live view = fresh shallow binding per call over shared payload; public
+    // read = a deep copy each time.
+    const again = map.sectionRef('overworld', 0, 0, 0)!;
+    expect(again).not.toBe(ref);
+    expect(again.palette).toBe(ref.palette);
+    expect(again.evidence).toBe(ref.evidence);
+    expect(map.sectionAt('overworld', 0, 0, 0)).not.toBe(snapshot);
+    expect(ref).not.toBe(snapshot);
+    expect(snapshot.palette).not.toBe(ref.palette);
+
+    // The cheap read reports the same section content as the defensive copy.
+    expect(ref.key).toEqual(snapshot.key);
+    expect(ref.revision).toBe(snapshot.revision);
+    expect(ref.palette).toEqual(snapshot.palette);
+    expect(ref.bits).toBe(snapshot.bits);
+    expect([...ref.cells]).toEqual([...snapshot.cells]);
+    expect([...ref.explored]).toEqual([...snapshot.explored]);
+    expect([...ref.traversed]).toEqual([...snapshot.traversed]);
+    expect([...ref.stale]).toEqual([...snapshot.stale]);
+    expect([...ref.risk]).toEqual([...snapshot.risk]);
+    expect([...ref.modified]).toEqual([...snapshot.modified]);
+    expect([...ref.evidence.keys()]).toEqual([...snapshot.evidence.keys()]);
+    expect(ref.evidence.get(cellIndex(0, 0, 0))).toEqual(snapshot.evidence.get(cellIndex(0, 0, 0)));
+    expect(ref.lastObservedAt).toBe(snapshot.lastObservedAt);
+
+    // Reading is read-only: no evidence, revision or save change, and an
+    // unallocated section still reads as null with the same coordinate guard.
+    expect(map.saveRevision).toBe(saveRevisionBefore);
+    expect(map.sectionRef('overworld', 0, 0, 0)!.revision).toBe(snapshot.revision);
+    expect(map.cellAt('overworld', 0, 0, 0).observed).toBe(true);
+    expect(map.sectionRef('overworld', 100, 0, 0)).toBeNull();
+    expect(() => map.sectionRef('overworld', 0, 0.5, 0)).toThrow(/integer/);
+  });
+
+  it('mutating the sectionAt snapshot never reaches the sectionRef view', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+
+    const snapshot = map.sectionAt('overworld', 0, 0, 0)!;
+    snapshot.evidence.clear();
+    snapshot.palette.length = 0;
+    snapshot.revision = 999;
+    snapshot.key.dim = 'the_nether';
+
+    const ref = map.sectionRef('overworld', 0, 0, 0)!;
+    expect(ref.evidence.size).toBe(1);
+    expect(ref.palette.length).toBe(2);
+    expect(ref.revision).toBe(1);
+    expect(ref.key.dim).toBe('overworld');
+  });
+
+  it('sectionRef view rejects palette and evidence writes at the type level', () => {
+    const map = new VoxelMap('world');
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+
+    // The body is type-checked even though the test never calls it: if the view
+    // type were not narrowed, these `@ts-expect-error` lines would fail tsc.
+    const mutateView = (ref: NonNullable<ReturnType<VoxelMap['sectionRef']>>): void => {
+      // @ts-expect-error palette is readonly
+      ref.palette.push('minecraft:dirt');
+      // @ts-expect-error evidence is a ReadonlyMap (no set)
+      ref.evidence.set(cellIndex(0, 0, 0), {} as CellEvidence);
+      // @ts-expect-error evidence values are Readonly<CellEvidence> (no freshness write)
+      ref.evidence.get(0)!.freshness = 'STALE';
+    };
+    expect(mutateView).toBeTypeOf('function');
+
+    const ref = map.sectionRef('overworld', 0, 0, 0)!;
+    expect(ref.palette.length).toBe(2);
+    expect(ref.evidence.size).toBe(1);
+  });
+
   it('change report key is isolated from the store', () => {
     const map = new VoxelMap('world');
     const report = map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));

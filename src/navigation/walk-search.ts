@@ -5,7 +5,9 @@
  * in-memory `VoxelMap`. It expands the four horizontal neighbours (±1 X / ±1 Z)
  * of a *fixed continuous feet position* and traverses an edge only when
  * `evaluateWalkStep` currently reports `OPEN`. It never digs, places, selects a
- * goal, explores unknown cells, or reads raw game/chunk data.
+ * goal, explores unknown cells, or reads raw game/chunk data. Edge evaluation
+ * reads sections through the evaluator's trusted non-copy `sectionRef` view;
+ * the search never snapshots or mutates section state itself.
  *
  * The result is a *candidate*: a zero-or-more-edge stance sequence. It is not a
  * navigation success. Callers must still pass the candidate through
