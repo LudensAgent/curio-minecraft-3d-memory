@@ -1246,7 +1246,7 @@ describe('v3 → v4 journal migration', () => {
     expect(schemaVersion(dbPath)).toBe('3');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('7');
+    expect(schemaVersion(dbPath)).toBe('8');
     expect(checkpointColumns(dbPath)).toEqual(
       expect.arrayContaining(['journal_revision', 'has_journal', 'topology_extras']),
     );

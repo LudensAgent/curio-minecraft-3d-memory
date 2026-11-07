@@ -29,6 +29,7 @@ import type { VoxelDirectoryEntry } from '../../voxel/residency.js';
 import {
   decodeVoxelSectionPayload,
   encodeVoxelSectionPayload,
+  UNKNOWN_GAME_VERSION,
 } from '../../voxel/serialization.js';
 import { chunkVisitKey, placedBlockKey, portalTraversalIdentity } from './ledger.js';
 import { DEFAULT_LEDGER_LIMITS } from './types.js';
@@ -48,7 +49,7 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -73,6 +74,9 @@ const KNOWN_TABLES_V5 = new Set([
 ]);
 
 const KNOWN_TABLES_V6 = new Set(KNOWN_TABLES_V5);
+
+/** v8 adds columns only; the table set is unchanged from v7. */
+const KNOWN_TABLES_V8 = new Set(KNOWN_TABLES_V6);
 
 /** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
 const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
@@ -236,6 +240,23 @@ const REQUIRED_COLUMNS_V6: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
   },
 };
 
+/**
+ * Required columns for the v8 schema: committed voxel rows and voxel checkpoints
+ * record the Minecraft game version they were written under (`'unknown'` when the
+ * caller never supplied one, never a guessed current version).
+ */
+const REQUIRED_COLUMNS_V8: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V6,
+  checkpoints: {
+    ...REQUIRED_COLUMNS_V6.checkpoints,
+    game_version: 'TEXT',
+  },
+  spatial_sections: {
+    ...REQUIRED_COLUMNS_V5.spatial_sections,
+    game_version: 'TEXT',
+  },
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -256,6 +277,9 @@ CREATE TABLE checkpoints (
   -- Portal edges + evidence-backed fragment merges: low-frequency, nested
   -- topology facts that do not fit the four walk-edge history arrays.
   topology_extras TEXT NOT NULL DEFAULT '{}',
+  -- Minecraft game version this checkpoint's voxel rows were written under
+  -- ('unknown' when the caller never supplied one).
+  game_version TEXT NOT NULL DEFAULT 'unknown',
   seq INTEGER NOT NULL
 );
 CREATE INDEX checkpoints_world_seq ON checkpoints (world_id, seq);
@@ -304,6 +328,9 @@ CREATE TABLE spatial_sections (
   cx INTEGER NOT NULL DEFAULT 0,
   cz INTEGER NOT NULL DEFAULT 0,
   sy INTEGER NOT NULL DEFAULT 0,
+  -- Minecraft game version this row was written under ('unknown' when the
+  -- caller never supplied one; never a guessed current version).
+  game_version TEXT NOT NULL DEFAULT 'unknown',
   PRIMARY KEY (world_id, id)
 );
 CREATE INDEX spatial_sections_world_coords ON spatial_sections (world_id, dimension, cx, cz, sy);
@@ -488,6 +515,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
+    upgradeV7ToV8(connection, databasePath);
     return connection;
   }
 
@@ -501,6 +529,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
+    upgradeV7ToV8(connection, databasePath);
     return connection;
   }
 
@@ -513,6 +542,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
+    upgradeV7ToV8(connection, databasePath);
     return connection;
   }
 
@@ -524,6 +554,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV4ToV5(connection, databasePath);
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
+    upgradeV7ToV8(connection, databasePath);
     return connection;
   }
 
@@ -534,15 +565,34 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
+    upgradeV7ToV8(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (7) or a schema-6 database awaiting the v7 upgrade.
-  validateKnownTables(connection, names, KNOWN_TABLES_V6);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V6)) {
+  if (version === 6) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V6);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V6)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV6ToV7(connection, databasePath);
+    upgradeV7ToV8(connection, databasePath);
+    return connection;
+  }
+
+  if (version === 7) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V6);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V6)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV7ToV8(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (8).
+  validateKnownTables(connection, names, KNOWN_TABLES_V8);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V8)) {
     assertRequiredColumns(connection, table, columns);
   }
-  if (version === 6) upgradeV6ToV7(connection, databasePath);
   return connection;
 }
 
@@ -842,6 +892,32 @@ function upgradeV6ToV7(connection: Database.Database, databasePath: string): voi
   tx();
 }
 
+/**
+ * Upgrade a validated v7 database in place: add the explicit Minecraft game
+ * version to committed voxel rows and checkpoint rows. Rows written before the
+ * column existed get the recorded marker `'unknown'` — they are never backfilled
+ * with a guessed current version. No other row is rewritten or deleted.
+ */
+function upgradeV7ToV8(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v8-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    const hasColumn = (table: string): boolean => {
+      const columns = connection.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      return columns.some((column) => column.name === 'game_version');
+    };
+    // Idempotent: a downgraded but not column-stripped fixture may already have it.
+    if (!hasColumn('checkpoints')) {
+      connection.exec("ALTER TABLE checkpoints ADD COLUMN game_version TEXT NOT NULL DEFAULT 'unknown'");
+    }
+    if (!hasColumn('spatial_sections')) {
+      connection.exec("ALTER TABLE spatial_sections ADD COLUMN game_version TEXT NOT NULL DEFAULT 'unknown'");
+    }
+    connection.prepare("UPDATE schema_meta SET value = '8' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
 /** Reject a table missing a required column, or whose column has the wrong type affinity. */
 function assertRequiredColumns(
   connection: Database.Database,
@@ -937,12 +1013,15 @@ function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
  * keeps the persisted evidence independent of a later block-state serialization
  * change and avoids storing the same state twice. The section key stays in the
  * payload for self-containment and backward compatibility.
+ *
+ * `gameVersion` is an explicit value handed in by the caller; when absent the
+ * payload records `'unknown'`, never a guessed current version.
  */
-function encodeVoxelSection(section: VoxelSectionSnapshot): string {
+function encodeVoxelSection(section: VoxelSectionSnapshot, gameVersion: string): string {
   // Delegate to the versioned voxel serializer: palette + packed cells + the
   // history/risk bitmaps + compact per-cell evidence. Keeping one encoder avoids
   // silently diverging snapshot formats between the map and the worker.
-  return JSON.stringify(encodeVoxelSectionPayload(section));
+  return JSON.stringify(encodeVoxelSectionPayload(section, gameVersion));
 }
 
 /** Stable id for one voxel section row. */
@@ -955,9 +1034,9 @@ function voxelSectionIdFromKey(key: { dim: string; cx: number; cz: number; sy: n
   return JSON.stringify([key.dim, key.cx, key.cz, key.sy]);
 }
 
-function prepareVoxelSnapshot(snapshot: VoxelCheckpointSnapshot): PreparedVoxelSnapshot {
+function prepareVoxelSnapshot(snapshot: VoxelCheckpointSnapshot, gameVersion: string): PreparedVoxelSnapshot {
   const sections = snapshot.sections.map((section) => {
-    const payload = encodeVoxelSection(section);
+    const payload = encodeVoxelSection(section, gameVersion);
     return {
       id: voxelSectionId(section),
       dim: section.dim,
@@ -1121,6 +1200,7 @@ function writeCheckpoint(
   wId: string,
   fragmentRevision: number,
   topologyRevision: number,
+  gameVersion: string,
   prepared: PreparedSnapshot,
   voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
@@ -1163,7 +1243,7 @@ function writeCheckpoint(
     if (voxel.mode === 'full') {
       connection.prepare('DELETE FROM spatial_sections WHERE world_id = ?').run(wId);
       const insertSection = connection.prepare(
-        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy, game_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       );
       voxel.sections.forEach((s, i) =>
         insertSection.run(
@@ -1178,6 +1258,7 @@ function writeCheckpoint(
           s.cx,
           s.cz,
           s.sy,
+          gameVersion,
         ),
       );
     } else if (voxel.mode === 'incremental') {
@@ -1189,8 +1270,8 @@ function writeCheckpoint(
         .get(wId) as { n: number };
       const baseSeq = maxSeqRow.n;
       const upsertSection = connection.prepare(
-        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
-          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision, dimension = excluded.dimension, cx = excluded.cx, cz = excluded.cz, sy = excluded.sy',
+        'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy, game_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+          'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision, dimension = excluded.dimension, cx = excluded.cx, cz = excluded.cz, sy = excluded.sy, game_version = excluded.game_version',
       );
       voxel.sections.forEach((s, i) =>
         upsertSection.run(
@@ -1205,6 +1286,7 @@ function writeCheckpoint(
           s.cx,
           s.cz,
           s.sy,
+          gameVersion,
         ),
       );
       // The resulting full set must still re-open under the same limits: reject
@@ -1227,7 +1309,7 @@ function writeCheckpoint(
 
     connection
       .prepare(
-        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, topology_extras, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, topology_extras, game_version, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         checkpointId,
@@ -1241,6 +1323,7 @@ function writeCheckpoint(
         ledger.mode === 'none' ? 0 : ledger.revision,
         ledger.mode === 'none' ? 0 : 1,
         prepared.extras,
+        gameVersion,
         nextSeq,
       );
   });
@@ -1756,7 +1839,8 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
               OR typeof(journal_revision) != 'integer' OR journal_revision < 0
               OR typeof(has_ledger) != 'integer' OR (has_ledger != 0 AND has_ledger != 1)
               OR typeof(ledger_revision) != 'integer' OR ledger_revision < 0
-              OR typeof(topology_extras) != 'text')`,
+              OR typeof(topology_extras) != 'text'
+              OR typeof(game_version) != 'text' OR game_version = '')`,
     )
     .get(wId) as { n: number };
   if (bad.n > 0) {
@@ -2077,6 +2161,14 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   try {
     const world = loadWorld(connection, msg.worldId, msg.limits);
     const journal = loadJournalMeta(connection, msg.worldId, msg.journalLimits);
+    // The Minecraft game version of the voxel baseline this open restores from.
+    // It is read from the latest *voxel* checkpoint (`has_voxel = 1`), never from
+    // a newer history-only checkpoint, which writes no voxel rows and records
+    // `'unknown'`. `'unknown'` means the rows never recorded one (pre-v8 rows);
+    // a world with no voxel baseline is reported as null.
+    const voxelBaselineCheckpoint = connection
+      .prepare('SELECT game_version FROM checkpoints WHERE world_id = ? AND has_voxel = 1 ORDER BY seq DESC LIMIT 1')
+      .get(msg.worldId) as { game_version: string } | undefined;
     let voxelBaselineCheckpointId: string | null = null;
     let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
     let voxelDirectory: VoxelDirectoryEntry[] | null = null;
@@ -2113,6 +2205,7 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       journalRecordBytes: journal.recordBytes,
       ledgerBaselineCheckpointId,
       ledgerSnapshot,
+      gameVersion: voxelBaselineCheckpoint?.game_version ?? null,
     });
   } catch (err) {
     db = null;
@@ -2170,6 +2263,11 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode full requires a snapshot' });
     return;
   }
+  const gameVersion = msg.gameVersion === undefined ? UNKNOWN_GAME_VERSION : msg.gameVersion;
+  if (typeof gameVersion !== 'string' || gameVersion.length === 0) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'game version must be a non-empty string' });
+    return;
+  }
   let prepared: PreparedSnapshot;
   let preparedVoxel: PreparedVoxelSnapshot | null = null;
   let preparedJournal: PreparedJournal;
@@ -2181,7 +2279,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       if (msg.voxelSnapshot.worldId !== worldId) {
         throw new Error('voxel snapshot worldId does not match session worldId');
       }
-      preparedVoxel = prepareVoxelSnapshot(msg.voxelSnapshot);
+      preparedVoxel = prepareVoxelSnapshot(msg.voxelSnapshot, gameVersion);
       if (preparedVoxel.sections.length > limits.maxVoxelSections) {
         throw new Error(`snapshot exceeds maxVoxelSections (${preparedVoxel.sections.length})`);
       }
@@ -2207,7 +2305,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     return;
   }
   try {
-    writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, prepared, {
+    writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, prepared, {
       mode: msg.voxelMode,
       voxelRevision: msg.voxelRevision,
       sections: preparedVoxel?.sections ?? [],

@@ -1115,7 +1115,7 @@ describe('v2 → latest migration (real SQLite)', () => {
     makeV2Db(dbPath, payloads);
 
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    expect(schemaVersion(dbPath)).toBe('7');
+    expect(schemaVersion(dbPath)).toBe('8');
     expect(spatialColumns(dbPath)).toEqual(
       expect.arrayContaining(['observed_cells', 'palette_entries', 'revision', 'dimension', 'cx', 'cz', 'sy']),
     );

@@ -116,7 +116,7 @@ describe('schema v7 and metadata persistence', () => {
     await upgraded.close();
 
     const check = new Database(dbPath, { readonly: true });
-    expect((check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('7');
+    expect((check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('8');
     expect(check.prepare('SELECT count(*) AS n FROM placed_blocks WHERE dim IS NULL').get()).toEqual({ n: 1 });
     check.close();
   });

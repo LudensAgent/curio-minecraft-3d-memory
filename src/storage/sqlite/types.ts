@@ -699,6 +699,12 @@ export interface OpenSpatialSessionOptions {
   /** Bounded placement/visit/portal ledger capacities. Defaults are in `DEFAULT_LEDGER_LIMITS`. */
   ledgerLimits?: LedgerLimits;
   /**
+   * Explicit Minecraft game version the caller is writing under. It is forwarded
+   * to every checkpoint and recorded on the committed voxel rows and checkpoint
+   * row. When omitted, checkpoints record `'unknown'` — never a guessed version.
+   */
+  gameVersion?: string;
+  /**
    * Voxel loading mode. `eager` (default) restores every committed section into
    * memory at open, preserving the phase 5B/5C behavior. `manual` reads only the
    * committed section directory at open and requires explicit `loadSections`.
@@ -760,6 +766,13 @@ export interface SpatialPersistenceState {
   confirmedJournalRevision: number;
   /** Journal restore baseline checkpoint id (null when no journal baseline exists). */
   journalBaselineCheckpointId: string | null;
+  /**
+   * Minecraft game version recorded on the voxel baseline this session restored
+   * from, updated whenever a checkpoint that writes voxel rows is confirmed.
+   * `'unknown'` means the baseline rows never recorded a version; null before any
+   * voxel baseline exists. A history-only checkpoint never changes it.
+   */
+  restoredGameVersion: string | null;
   /** Local placement/visit/portal ledger revision (not a save confirmation). */
   ledgerRevision: number;
   /** Ledger revision confirmed by the last committed checkpoint. */
@@ -925,6 +938,12 @@ export type WorkerRequest =
       ledgerRevision?: number;
       /** Complete world-scoped ledger snapshot for `full`. */
       ledgerSnapshot?: LedgerSnapshot;
+      /**
+       * Explicit Minecraft game version this checkpoint's voxel rows were written
+       * under, supplied by the caller (never guessed by the worker). When absent,
+       * the checkpoint and its section rows record `'unknown'`.
+       */
+      gameVersion?: string;
     }
   | {
       type: 'load_sections';
@@ -980,6 +999,13 @@ export type WorkerResponse =
       ledgerBaselineCheckpointId: string | null;
       /** Restored world-scoped ledger (spatial sessions only). */
       ledgerSnapshot: LedgerSnapshot | null;
+      /**
+       * Minecraft game version recorded on the voxel baseline this open restores
+       * from (the latest checkpoint with `has_voxel = 1`), or `'unknown'` when its
+       * rows never recorded one (pre-v8 rows). Null when the world has no voxel
+       * baseline. A newer history-only checkpoint never changes this fact.
+       */
+      gameVersion: string | null;
     }
   | {
       type: 'load_ok';

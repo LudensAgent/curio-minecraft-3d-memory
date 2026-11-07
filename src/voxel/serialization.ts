@@ -63,6 +63,13 @@ export interface VoxelCellPayloadV2 {
 /** Persisted v2 section payload. */
 export interface VoxelSectionPayloadV2 {
   v: typeof VOXEL_SECTION_PAYLOAD_VERSION;
+  /**
+   * Minecraft game version this section was written under, or
+   * `UNKNOWN_GAME_VERSION` when the caller supplied no explicit version. Payloads
+   * written before this field existed have no `gv` at all; read those through
+   * `readVoxelSectionGameVersion`, which reports "never recorded" as `null`.
+   */
+  gv: string;
   dim: string;
   cx: number;
   cz: number;
@@ -83,8 +90,41 @@ export interface VoxelSectionPayloadV2 {
 
 const BITMAP_BYTES = SECTION_CELL_COUNT / 8;
 
-/** Encode one snapshot section as its v2 persisted payload. */
-export function encodeVoxelSectionPayload(section: VoxelSectionSnapshot): VoxelSectionPayloadV2 {
+/**
+ * Explicit marker for a payload/record whose Minecraft game version was never
+ * supplied. It is a recorded fact ("unknown"), never a guess; readers must keep
+ * it distinct from any real version string.
+ */
+export const UNKNOWN_GAME_VERSION = 'unknown';
+
+/**
+ * The Minecraft game version recorded in one persisted section payload, or
+ * `null` when the payload never recorded one (every v1 payload and v2 payloads
+ * written before the field existed). A payload recording
+ * `UNKNOWN_GAME_VERSION` returns that marker, so "never recorded" and
+ * "recorded as unknown" stay distinguishable.
+ *
+ * The payload version tag `v` is *not* this value and must not be read as it.
+ */
+export function readVoxelSectionGameVersion(payload: unknown): string | null {
+  if (payload === null || typeof payload !== 'object') return null;
+  const raw = payload as { v?: unknown; gv?: unknown };
+  if (raw.v !== VOXEL_SECTION_PAYLOAD_VERSION) return null;
+  if (raw.gv === undefined) return null;
+  return requireString(raw.gv, 'gv');
+}
+
+/**
+ * Encode one snapshot section as its v2 persisted payload.
+ *
+ * `gameVersion` is the Minecraft game version the caller observed the section
+ * under. When it is omitted the payload records `UNKNOWN_GAME_VERSION` rather
+ * than assuming the library's target version.
+ */
+export function encodeVoxelSectionPayload(
+  section: VoxelSectionSnapshot,
+  gameVersion?: string,
+): VoxelSectionPayloadV2 {
   const explored = new Uint8Array(BITMAP_BYTES);
   const stale = new Uint8Array(BITMAP_BYTES);
   for (const cell of section.evidence) {
@@ -93,6 +133,7 @@ export function encodeVoxelSectionPayload(section: VoxelSectionSnapshot): VoxelS
   }
   return {
     v: VOXEL_SECTION_PAYLOAD_VERSION,
+    gv: gameVersion ?? UNKNOWN_GAME_VERSION,
     dim: section.dim,
     cx: section.cx,
     cz: section.cz,
