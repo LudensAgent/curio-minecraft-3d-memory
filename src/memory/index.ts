@@ -1,15 +1,21 @@
 /**
- * Pure memory-core exports.
+ * Pure memory-core exports (`curio-minecraft-3d-memory/memory`, plan M5.1).
  *
  * This barrel must stay free of navigation, execution and adapter-body ports.
- * The package-level `./memory` entry is added in a later milestone (M5); this
- * module exists now so the write/change ports have a navigation-free home.
+ * Its runtime dependency graph contains only the memory core, the voxel map and
+ * the dependency-free capability report; type-only exports may name contracts
+ * owned by other modules because they are erased at emit time.
+ *
+ * A pure memory consumer can therefore write observations and query the store
+ * without importing `src/navigation/*`, `src/execution/*` or `src/adapter/*`.
  */
 
-export { CONTRACT_VERSION } from './capabilities.js';
+export { CONTRACT_VERSION, ROUTE_PLAN_CAPABILITIES } from './capabilities.js';
 export type {
   ContractVersion,
   MemoryHostCapabilities,
+  RoutePlanCapabilities,
+  RoutePlanCapabilityName,
 } from './capabilities.js';
 export type {
   ChangeReportErrorHandler,
@@ -18,3 +24,22 @@ export type {
   ChangeReportSubscriptionOptions,
 } from './change-reports.js';
 export type { MemoryIngest, SpatialEdgeRecord } from './ingest.js';
+
+// Observation / evidence
+export type { Observation, ObservationBatch } from '../observation/types.js';
+
+// Sparse in-memory observation map
+export { VoxelMap } from '../voxel/index.js';
+
+// Read-only query port
+export type {
+  SpatialQueryOptions,
+  SpatialQueryPort,
+  SpatialQueryRequest,
+  SpatialQueryResult,
+  SpatialQuerySources,
+} from '../query/types.js';
+
+// Runtime store interface (the implementation lives in `src/store/` and pulls
+// in navigation projections; keep this a type-only export).
+export type { SpatialMemoryStore } from '../store/store.js';
