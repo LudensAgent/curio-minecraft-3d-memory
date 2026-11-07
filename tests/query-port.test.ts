@@ -52,6 +52,28 @@ describe('SpatialQueryPort — request boundary', () => {
     for (const request of cases) invalid(parts, request);
   });
 
+  it('rejects position and neighbourhood filters on anchor queries', () => {
+    const parts = makeQueryParts();
+    const detailOf = (request: unknown): string | undefined => {
+      const problem = parts.store.query(request as SpatialQueryRequest).problem;
+      return problem?.kind === 'invalid_request' ? problem.detail : undefined;
+    };
+    const filters = [
+      ['near', 8],
+      ['radius', 8],
+      ['pos', A],
+    ] as const;
+    for (const kind of ['resourceAnchors', 'containerAnchors'] as const) {
+      for (const [field, value] of filters) {
+        // M2-A6/D-006: anchors return `location`; the library does not filter
+        // by position or neighbourhood, so those request fields must fail closed.
+        expect(detailOf({ kind, dim: DIM, [field]: value })).toBe(
+          `unknown field "${field}" for query kind "${kind}"`,
+        );
+      }
+    }
+  });
+
   it('enforces the 1..1000 limit and rejects non-integers', () => {
     const parts = makeQueryParts();
     for (const limit of [0, 1001, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '10']) {
