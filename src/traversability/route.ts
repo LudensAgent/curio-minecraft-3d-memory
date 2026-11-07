@@ -183,8 +183,22 @@ export class RouteVerifier {
   private readonly pending = new Map<number, PendingReason>();
   /** Section key → step indices that depend on it (reverse dependency index). */
   private readonly sectionToSteps = new Map<string, Set<number>>();
-  /** Step index → dependency sections with the residency generation at verification time. */
-  private readonly stepResidency = new Map<number, { key: SectionKey; generation: number }[]>();
+  /**
+   * Section key → the residency generation recorded when a verified step first
+   * came to depend on it. Checking each distinct section once replaces polling
+   * every verified step's dependency list on every advance.
+   */
+  private readonly sectionResidency = new Map<string, { key: SectionKey; generation: number }>();
+  /**
+   * Smallest index that may still be pending. Pending indices are always
+   * processed in ascending order, so a cursor replaces re-sorting the whole
+   * pending set on every `advance`; invalidations only move it backwards.
+   */
+  private pendingCursor = 0;
+  /** Earliest `validUntil` among verified non-STALE results; gates expiry scans. */
+  private nextExpiry = Number.POSITIVE_INFINITY;
+  /** Set when an invalidation may have removed the earliest expiry; forces a rescan. */
+  private expiryDirty = false;
 
   constructor(map: VoxelMap, options: RouteVerifierOptions = {}) {
     this.map = map;
@@ -257,7 +271,10 @@ export class RouteVerifier {
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
-    this.stepResidency.clear();
+    this.sectionResidency.clear();
+    this.pendingCursor = 0;
+    this.nextExpiry = Number.POSITIVE_INFINITY;
+    this.expiryDirty = false;
     for (let i = 0; i < candidate.queries.length; i++) this.pending.set(i, 'unprocessed');
     return this.snapshot();
   }
@@ -274,6 +291,18 @@ export class RouteVerifier {
    * not recomputed; their results are preserved.
    */
   advance(budget: number): RouteStatus {
+    this.advanceVerification(budget);
+    return this.snapshot();
+  }
+
+  /**
+   * Bounded verification round without building a `RouteStatus`. Internal:
+   * `WalkRouteExecutor` drives this on every step and builds its own status once,
+   * so it does not clone the whole route per step.
+   *
+   * @internal Not part of the package entry-point API.
+   */
+  advanceVerification(budget: number): void {
     this.requireRoute();
     this.reconcileRuleVersion();
     this.expireStale(this.currentNow());
@@ -281,7 +310,33 @@ export class RouteVerifier {
     // advance() both discovers the change and re-verifies the affected step.
     this.invalidateByResidency();
     this.runPending(budget);
-    return this.snapshot();
+  }
+
+  /**
+   * Read one verified step's evaluation without cloning it or building a full
+   * status. Internal: the executor only reads `status`/`validUntil`/dependencies.
+   * Returns `undefined` while the step is pending.
+   *
+   * @internal Not part of the package entry-point API.
+   */
+  stepAt(index: number): StepEvaluation | undefined {
+    // Same freshness reconciliation as `status()`, but O(1)/O(distinct sections)
+    // instead of cloning every verified step.
+    this.reconcileRuleVersion();
+    this.expireStale(this.currentNow());
+    this.invalidateByResidency();
+    return this.results.get(index);
+  }
+
+  /**
+   * Current collision-shape rule version, reconciled like `status()`.
+   *
+   * @internal Not part of the package entry-point API.
+   */
+  currentRuleVersion(): string {
+    this.requireRoute();
+    this.reconcileRuleVersion();
+    return this.route!.ruleVersion;
   }
 
   /**
@@ -343,7 +398,10 @@ export class RouteVerifier {
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
-    this.stepResidency.clear();
+    this.sectionResidency.clear();
+    this.pendingCursor = 0;
+    this.nextExpiry = Number.POSITIVE_INFINITY;
+    this.expiryDirty = false;
   }
 
   // --- internals ---
@@ -380,7 +438,10 @@ export class RouteVerifier {
     this.results.clear();
     this.pending.clear();
     this.sectionToSteps.clear();
-    this.stepResidency.clear();
+    this.sectionResidency.clear();
+    this.pendingCursor = 0;
+    this.nextExpiry = Number.POSITIVE_INFINITY;
+    this.expiryDirty = false;
     for (let i = 0; i < route.queries.length; i++) {
       this.pending.set(i, invalidated.has(i) ? 'invalidated' : 'unprocessed');
     }
@@ -390,13 +451,18 @@ export class RouteVerifier {
     validateBudget(budget);
     const route = this.route;
     if (route === null || route.unsupportedReason !== undefined) return;
-    const indices = [...this.pending.keys()].sort((a, b) => a - b);
     let processed = 0;
-    for (const i of indices) {
-      if (processed >= budget) break;
-      this.verifyStep(i);
-      processed += 1;
+    // Ascending cursor: a step processed mid-route leaves the cursor past the
+    // already-verified prefix, and the next round's scan resumes without re-sorting.
+    let i = this.pendingCursor;
+    while (i < route.queries.length && processed < budget) {
+      if (this.pending.has(i)) {
+        this.verifyStep(i);
+        processed += 1;
+      }
+      i += 1;
     }
+    this.pendingCursor = i;
   }
 
   private verifyStep(i: number): void {
@@ -407,13 +473,18 @@ export class RouteVerifier {
     const evaluation = this.cache.get(query, route.shapeProvider);
     this.results.set(i, evaluation);
     this.pending.delete(i);
-    this.stepResidency.set(
-      i,
-      evaluation.dependencies.map((dep) => ({
-        key: { ...dep.key },
-        generation: this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy),
-      })),
-    );
+    if (evaluation.status !== 'STALE') this.nextExpiry = Math.min(this.nextExpiry, evaluation.validUntil);
+    for (const dep of evaluation.dependencies) {
+      // Record the residency generation the first time a section backs a verified
+      // step; later steps sharing it do not add another check.
+      const depKey = sectionKeyString(dep.key);
+      if (!this.sectionResidency.has(depKey)) {
+        this.sectionResidency.set(depKey, {
+          key: { ...dep.key },
+          generation: this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy),
+        });
+      }
+    }
     for (const dep of evaluation.dependencies) {
       const key = sectionKeyString(dep.key);
       let set = this.sectionToSteps.get(key);
@@ -446,16 +517,20 @@ export class RouteVerifier {
 
   private invalidateStep(i: number): void {
     this.pending.set(i, 'invalidated');
+    if (i < this.pendingCursor) this.pendingCursor = i;
     const result = this.results.get(i);
     if (result === undefined) return;
     this.results.delete(i);
-    this.stepResidency.delete(i);
+    if (result.status !== 'STALE') this.expiryDirty = true;
     for (const dep of result.dependencies) {
       const key = sectionKeyString(dep.key);
       const set = this.sectionToSteps.get(key);
       if (set === undefined) continue;
       set.delete(i);
-      if (set.size === 0) this.sectionToSteps.delete(key);
+      if (set.size === 0) {
+        this.sectionToSteps.delete(key);
+        this.sectionResidency.delete(key);
+      }
     }
   }
 
@@ -466,11 +541,20 @@ export class RouteVerifier {
    * repeatedly consume budget. Never touches map state.
    */
   private expireStale(now: number): void {
+    // Nothing can have expired until the clock passes the earliest horizon, and
+    // an invalidation is the only thing that can lower that horizon.
+    if (!this.expiryDirty && now <= this.nextExpiry) return;
     const expired: number[] = [];
     for (const [i, result] of this.results) {
       if (result.status !== 'STALE' && now > result.validUntil) expired.push(i);
     }
     for (const i of expired) this.invalidateStep(i);
+    let next = Number.POSITIVE_INFINITY;
+    for (const result of this.results.values()) {
+      if (result.status !== 'STALE') next = Math.min(next, result.validUntil);
+    }
+    this.nextExpiry = next;
+    this.expiryDirty = false;
   }
 
   /**
@@ -480,13 +564,12 @@ export class RouteVerifier {
    * report-driven `invalidate`.
    */
   private invalidateByResidency(): void {
-    for (const [i, deps] of this.stepResidency) {
-      for (const dep of deps) {
-        if (this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy) !== dep.generation) {
-          this.invalidateStep(i);
-          break;
-        }
-      }
+    // One check per distinct dependency section, not per verified step.
+    for (const [key, dep] of this.sectionResidency) {
+      if (this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy) === dep.generation) continue;
+      const steps = this.sectionToSteps.get(key);
+      if (steps === undefined) continue;
+      for (const i of [...steps]) this.invalidateStep(i);
     }
   }
 
