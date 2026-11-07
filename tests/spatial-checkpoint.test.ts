@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 
-import { FragmentStore, TopologyStore, VoxelMap } from '../src/index.js';
+import { FragmentStore, RoutePlanRegistryImpl, TopologyStore, VoxelMap } from '../src/index.js';
 import type { CellView, Observation, PathFragment, VoxelCheckpointSnapshot } from '../src/index.js';
 import { decodeVoxelSectionPayload, encodeVoxelSectionPayload } from '../src/voxel/serialization.js';
 import { estimateVoxelSectionSnapshotBytes } from '../src/voxel/snapshot.js';
@@ -13,6 +14,12 @@ import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from '../src/storage/sqlite/t
 
 const WORLD = 'world';
 const DIM = 'overworld';
+
+// Collision/rule version carried in route evidence (`RouteEvidence.ruleVersion`).
+// The library does not hardcode one — it comes from `CollisionShapeProvider.version`
+// supplied by the host — so this names a concrete provider-version value instead of
+// a throwaway literal. The registry treats it as an opaque string.
+const SHAPE_RULE_VERSION = 'land-route-shapes-1';
 
 const stone = { name: 'minecraft:stone', properties: {} };
 const dirt = { name: 'minecraft:dirt', properties: {} };
@@ -923,6 +930,318 @@ describe('SQLite combined spatial persistence', () => {
     expect(reopened.topology.mergeFragments('f1', 'f2', 't-merge')).toEqual({ status: 'unchanged' });
     await reopened.close();
   });
+});
+
+// ==============================================================================
+// M6.4 reboot / checkpoint regression (contract §8.3)
+// ==============================================================================
+
+describe('M6.4 restart and checkpoint boundaries', () => {
+  it('drops an accepted observation that was never checkpointed; only a confirmed checkpoint survives restart', async () => {
+    const dbPath = makeDbPath();
+    const first = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    first.voxel.beginSession('s1');
+    first.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+    const confirmed = await first.checkpoint();
+    expect(first.getPersistenceState()).toMatchObject({
+      dirty: false,
+      lastConfirmedCheckpointId: confirmed.checkpointId,
+    });
+    await first.close();
+
+    const second = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    second.voxel.beginSession('s2');
+    second.voxel.observe(
+      obs({ sessionId: 's2', state: dirt, pos: { x: 1, y: 0, z: 0 }, observedAt: 2000, sequence: 1 }),
+    );
+    // Accepted in memory, but never checkpointed.
+    expect(evidence(second.voxel, 1, 0, 0).observation.state).toEqual(dirt);
+    expect(second.getPersistenceState().dirty).toBe(true);
+    expect((await second.close()).dirty).toBe(true);
+
+    const third = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    // The disk still holds exactly the last committed checkpoint.
+    expect(evidence(third.voxel, 0, 0, 0).observation.state).toEqual(stone);
+    expect(evidence(third.voxel, 0, 0, 0).freshness).toBe('STALE');
+    expect(third.voxel.cellAt(DIM, 1, 0, 0)).toEqual({ observed: false });
+    expect(third.getPersistenceState().dirty).toBe(false);
+
+    // Re-observing and confirming this time makes the fact restart-visible.
+    third.voxel.beginSession('s3');
+    third.voxel.observe(
+      obs({ sessionId: 's3', state: dirt, pos: { x: 1, y: 0, z: 0 }, observedAt: 3000, sequence: 1 }),
+    );
+    await third.checkpoint();
+    await third.close();
+
+    const fourth = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(evidence(fourth.voxel, 1, 0, 0).observation.state).toEqual(dirt);
+    expect(evidence(fourth.voxel, 1, 0, 0).freshness).toBe('STALE');
+    await fourth.close();
+  });
+
+  it('does not revive a routeId issued before restart; the new registry starts empty', async () => {
+    const dbPath = makeDbPath();
+    const before = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    before.voxel.beginSession('s1');
+    before.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+
+    const registry = new RoutePlanRegistryImpl({ now: () => 1000, ttlMs: 60_000 });
+    const start = { x: 0.5, y: 64, z: 0.5 };
+    const end = { x: 1.5, y: 64, z: 0.5 };
+    const issued = registry.register({
+      backend: 'spatial_library',
+      source: 'search',
+      points: [{ ...start }, { ...end }],
+      segments: [{ index: 0, mode: 'walk', points: [{ ...start }, { ...end }], cost: 1 }],
+      cost: 1,
+      confidence: 'verified',
+      executable: true,
+      boundaries: [],
+      evidence: { worldId: WORLD, dim: DIM, sessionId: 's1', validUntil: 50_000, ruleVersion: SHAPE_RULE_VERSION },
+      expiresAt: 50_000,
+      requestedTarget: { ...end },
+      resolvedTarget: { ...end },
+      start: { ...start },
+    });
+    // The handle is real: before any restart it is consumable under its scope.
+    expect(registry.consume(issued.routeId, { worldId: WORLD, dim: DIM, sessionId: 's1' }, 1000)).toMatchObject({
+      routeId: issued.routeId,
+    });
+    await before.checkpoint();
+    await before.close();
+
+    // No checkpoint writes the handle anywhere on disk (there is no restore path).
+    // Contract §8.3: after restart every routeId is invalid; the registry is
+    // process-local state, so scanning the whole persisted payload must not find it.
+    const db = new Database(dbPath, { readonly: true });
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+    const persistedRoute = tables.some(({ name }) =>
+      JSON.stringify(db.prepare(`SELECT * FROM "${name}"`).all()).includes(issued.routeId),
+    );
+    db.close();
+    expect(persistedRoute).toBe(false);
+
+    // A real reopen restores the committed world facts...
+    const after = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(evidence(after.voxel, 0, 0, 0).observation.state).toEqual(stone);
+
+    // ...but route handles are process-local. A fresh registry is empty, and the
+    // pre-restart id is not consumable even under its original planning scope.
+    const restarted = new RoutePlanRegistryImpl({ now: () => 1000, ttlMs: 60_000 });
+    expect(restarted.size).toBe(0);
+    expect(restarted.consume(issued.routeId, { worldId: WORLD, dim: DIM, sessionId: 's1' }, 1000)).toEqual({
+      kind: 'route_not_found',
+      routeId: issued.routeId,
+    });
+    await after.close();
+  });
+
+  // Scope note on contract §8.2 ("process restart: ... do not restore OPEN"):
+  // this case only covers the *expired* OPEN conclusion — validUntil=2000 reached
+  // with now=5000 — and asserts it reopens as STALE, keeps no OPEN mode, and leaves
+  // the route without usable evidence. For an *unexpired* OPEN (validUntil > now),
+  // restore semantics are currently decided by `effectiveStatus()` in
+  // src/topology/edge-runtime.ts, which still returns OPEN after a reopen. That gap
+  // with §8.2 is tracked as dispatcher decision D-096 and needs a src/* change in a
+  // later task; this card neither covers nor claims to cover it. No placeholder
+  // skip/todo case is added here.
+  it('restores an expired OPEN traversal conclusion as STALE, never OPEN, until revalidated', async () => {
+    const dbPath = makeDbPath();
+    let now = 1000;
+    const open = () =>
+      openSpatialSession({ databasePath: dbPath, worldId: WORLD, topologyOptions: { now: () => now } });
+    const a = { x: 0.5, y: 64, z: 0.5 };
+    const b = { x: 1.5, y: 64, z: 0.5 };
+
+    const session = await open();
+    session.history.saveFragment(frag());
+    session.history.addTraversal({
+      id: 'ev-ab',
+      fragmentId: 'f1',
+      from: { ...a },
+      to: { ...b },
+      worldId: WORLD,
+      dim: DIM,
+      sessionId: 's1',
+      observedAt: 900,
+      source: 'confirmed_walk',
+      mode: 'walk',
+    });
+    session.topology.saveNode({
+      id: 'a',
+      kind: 'place',
+      source: 'agent',
+      worldId: WORLD,
+      dim: DIM,
+      location: { kind: 'exact', pos: { ...a } },
+    });
+    session.topology.saveNode({
+      id: 'b',
+      kind: 'place',
+      source: 'agent',
+      worldId: WORLD,
+      dim: DIM,
+      location: { kind: 'exact', pos: { ...b } },
+    });
+    session.topology.saveEdge({
+      id: 'e-ab',
+      from: 'a',
+      to: 'b',
+      type: 'HORIZONTAL',
+      basis: 'traversed',
+      evidenceIds: ['ev-ab'],
+      fragmentId: 'f1',
+    });
+    const dependencies = [{ key: { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 4 }, revision: 1 }];
+    session.topology.verifyEdge('e-ab', {
+      mode: 'walk',
+      status: 'OPEN',
+      computedAt: 900,
+      validUntil: 2000,
+      sessionId: 's1',
+      contextKey: 'body:0.6x1.8',
+      dependencies,
+    });
+    expect(session.topology.edgeRuntime('e-ab')!.forward.status).toBe('OPEN');
+    await session.checkpoint();
+    await session.close();
+
+    now = 5000; // the restart happens after the stored evidence expired
+    const reopened = await open();
+    const restored = reopened.topology.edgeRuntime('e-ab')!;
+    expect(restored.forward.status).toBe('STALE');
+    expect(restored.forward.modes.filter((mode) => mode.status === 'OPEN')).toEqual([]);
+    const staleRoute = reopened.topology.route('a', 'b');
+    expect(staleRoute.status).toBe('INSUFFICIENT_EVIDENCE');
+    expect(staleRoute.gaps).toContain('stale');
+
+    // Only a new verification computed from fresh evidence makes it OPEN again.
+    reopened.topology.verifyEdge('e-ab', {
+      mode: 'walk',
+      status: 'OPEN',
+      computedAt: 4900,
+      validUntil: 8000,
+      sessionId: 's2',
+      contextKey: 'body:0.6x1.8',
+      dependencies: [{ key: { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 4 }, revision: 2 }],
+    });
+    expect(reopened.topology.edgeRuntime('e-ab')!.forward.status).toBe('OPEN');
+    expect(reopened.topology.route('a', 'b').status).toBe('FOUND');
+    await reopened.close();
+  });
+
+  it('close waits for the in-flight checkpoint and commits voxel and history atomically', async () => {
+    const dbPath = makeDbPath();
+    const seed = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    seed.voxel.beginSession('s1');
+    seed.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+    seed.history.saveFragment(frag({ id: 'baseline' }));
+    await seed.checkpoint();
+    await seed.close();
+
+    const live = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    live.voxel.beginSession('s2');
+    live.voxel.observe(
+      obs({ sessionId: 's2', state: dirt, pos: { x: 20, y: 0, z: 0 }, observedAt: 2000, sequence: 1 }),
+    );
+    live.history.saveFragment(frag({ id: 'after-restart' }));
+
+    // `close()` waits for the already-accepted checkpoint before terminating the
+    // worker; the batch spans voxel + history and commits in one transaction, so
+    // both domains land or neither does — never only halfway. (A real process death after
+    // uncommitted writes, with no further checkpoint, is covered by the SIGKILL case below;
+    // an accepted-but-unconfirmed in-flight checkpoint is not simulated here.)
+    const inFlight = live.checkpoint();
+    const closed = await live.close();
+    await inFlight;
+    expect(closed).toMatchObject({ completed: true, unconfirmedRequest: false, dirty: false });
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.history.getFragment('baseline')).not.toBeNull();
+    expect(evidence(reopened.voxel, 0, 0, 0).observation.state).toEqual(stone);
+    // Since close() waited for the checkpoint, both new facts are durable.
+    expect(reopened.voxel.cellAt(DIM, 20, 0, 0).observed).toBe(true);
+    expect(reopened.history.getFragment('after-restart')).not.toBeNull();
+    expect(evidence(reopened.voxel, 20, 0, 0)).toMatchObject({
+      freshness: 'STALE',
+      observation: { state: dirt },
+    });
+    await reopened.close();
+  });
+
+  it(
+    'a real killed process keeps the confirmed checkpoint and drops the uncommitted batch',
+    async () => {
+      const dbPath = makeDbPath();
+      const scriptPath = join(dirname(dbPath), 'kill-child.mjs');
+      const distEntry = new URL('../dist/storage/sqlite/index.js', import.meta.url).href;
+      writeFileSync(
+        scriptPath,
+        `import { openSpatialSession } from ${JSON.stringify(distEntry)};
+const session = await openSpatialSession({ databasePath: process.argv[2], worldId: 'world' });
+const obs = (state, x, observedAt, sequence) => ({
+  worldId: 'world', dim: 'overworld', sessionId: 's1', observedAt, sequence,
+  source: 'vision', evidence: 'seen', stateComplete: true,
+  state: { name: state, properties: {} }, pos: { x, y: 0, z: 0 },
+});
+const frag = (id, createdAt) => ({
+  id, worldId: 'world', dim: 'overworld', kind: 'walked',
+  entrances: [{ x: 0.5, y: 64, z: 0.5 }],
+  polyline: [{ x: 0.5, y: 64, z: 0.5 }, { x: 1.5, y: 64, z: 0.5 }],
+  geometrySource: 'traversal', deepestY: 12, createdAt, lastUsedAt: createdAt, uses: 1,
+});
+session.voxel.beginSession('s1');
+session.voxel.observe(obs('minecraft:stone', 0, 1000, 1));
+session.history.saveFragment(frag('baseline', 1000));
+await session.checkpoint();
+console.log('CHECKPOINTED');
+session.voxel.observe(obs('minecraft:dirt', 20, 2000, 2));
+session.history.saveFragment(frag('after-kill', 2000));
+console.log('PENDING');
+setInterval(() => {}, 1000);
+`,
+      );
+
+      const child = spawn(process.execPath, [scriptPath, dbPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+      const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+
+      const deadline = Date.now() + 20_000;
+      while (
+        !stdout.includes('PENDING') &&
+        Date.now() < deadline &&
+        child.exitCode === null &&
+        child.signalCode === null
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      child.kill('SIGKILL');
+      await exited;
+      if (!stdout.includes('PENDING')) {
+        throw new Error(`child never reached PENDING; stdout=${stdout}; stderr=${stderr}`);
+      }
+
+      // The committed transaction (voxel + history) is durable; the batch accepted
+      // after it never reached disk and is not half-restored.
+      const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+      expect(reopened.history.getFragment('baseline')).not.toBeNull();
+      expect(reopened.history.getFragment('after-kill')).toBeNull();
+      expect(evidence(reopened.voxel, 0, 0, 0)).toMatchObject({
+        freshness: 'STALE',
+        observation: { state: stone },
+      });
+      expect(reopened.voxel.cellAt(DIM, 20, 0, 0)).toEqual({ observed: false });
+      expect(reopened.getPersistenceState().dirty).toBe(false);
+      await reopened.close();
+    },
+    30_000,
+  );
 });
 
 // ==============================================================================

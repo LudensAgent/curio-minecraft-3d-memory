@@ -705,6 +705,58 @@ describe('SQLite history checkpoint persistence', () => {
 });
 
 // ==============================================================================
+// M6.4 reboot / checkpoint regression (contract §8.3)
+// ==============================================================================
+
+describe('M6.4 restart and checkpoint boundaries', () => {
+  it('drops accepted history facts that were never checkpointed and restores the confirmed baseline', async () => {
+    const dbPath = makeDbPath();
+    const first = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    first.history.saveFragment(frag());
+    const confirmed = await first.checkpoint();
+    expect(first.getPersistenceState()).toMatchObject({
+      dirty: false,
+      lastConfirmedCheckpointId: confirmed.checkpointId,
+    });
+    await first.close();
+
+    const second = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    second.history.saveFragment(frag({ id: 'f-unsaved' }));
+    expect(second.history.getFragment('f-unsaved')).not.toBeNull();
+    expect(second.getPersistenceState().dirty).toBe(true);
+    expect((await second.close()).dirty).toBe(true);
+
+    const third = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    expect(third.history.getFragment('f1')).not.toBeNull();
+    expect(third.history.getFragment('f-unsaved')).toBeNull();
+    expect(third.getPersistenceState().dirty).toBe(false);
+    await third.close();
+  });
+
+  it('flush waits only for the accepted checkpoint; a restart drops facts added afterwards', async () => {
+    const dbPath = makeDbPath();
+    const first = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    first.history.saveFragment(frag({ id: 'f-baseline' }));
+    await first.checkpoint();
+
+    first.history.saveFragment(frag({ id: 'f-inflight' }));
+    const pending = first.checkpoint();
+    first.history.saveFragment(frag({ id: 'f-later' })); // accepted after the captured snapshot
+
+    const flushed = await first.flush();
+    expect(flushed).toMatchObject({ pending: true, completed: true, dirty: true });
+    await pending;
+    await first.close();
+
+    const reopened = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.history.getFragment('f-baseline')).not.toBeNull();
+    expect(reopened.history.getFragment('f-inflight')).not.toBeNull();
+    expect(reopened.history.getFragment('f-later')).toBeNull();
+    await reopened.close();
+  });
+});
+
+// ==============================================================================
 // Regression tests for the P1/P2 review findings
 // ==============================================================================
 
