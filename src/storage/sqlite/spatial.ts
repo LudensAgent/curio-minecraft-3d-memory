@@ -75,6 +75,7 @@ import type { ActionRecord } from '../../navigation/types.js';
 import { JournalQueue } from './journal.js';
 import type { JournalCapture } from './journal.js';
 import type { HistorySnapshot } from './types.js';
+import { UNKNOWN_GAME_VERSION } from '../../voxel/serialization.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import { estimateVoxelSectionResidentBytesFromSnapshot } from '../../voxel/snapshot.js';
 
@@ -189,6 +190,10 @@ class SpatialSessionImpl implements SpatialSession {
   private workingSetLock = false;
   private readonly voxelLoadingField: VoxelLoading;
   private readonly residencyLimitsField: ResolvedResidencyLimits;
+  /** Explicit caller-supplied game version (`undefined` records `'unknown'`). */
+  private readonly gameVersionField: string | undefined;
+  /** Game version of the voxel baseline this session restored/established. */
+  private restoredGameVersion: string | null = null;
 
   private confirmedVoxelRevision = 0;
   private confirmedFragmentRevision = 0;
@@ -217,6 +222,11 @@ class SpatialSessionImpl implements SpatialSession {
     if (typeof options.worldId !== 'string' || options.worldId.length === 0) {
       throw new PersistenceError('invalid_argument', 'worldId must be a non-empty string');
     }
+    // Fail closed at the host boundary: an empty version is a caller error, never
+    // silently recorded as `'unknown'`.
+    if (options.gameVersion !== undefined && options.gameVersion.length === 0) {
+      throw new PersistenceError('invalid_argument', 'gameVersion must be a non-empty string when supplied');
+    }
     this.worldId = options.worldId;
     this.databasePath = options.databasePath;
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
@@ -243,6 +253,7 @@ class SpatialSessionImpl implements SpatialSession {
     };
     this.voxelLoadingField = options.voxelLoading ?? 'eager';
     this.residencyLimitsField = resolveResidencyLimits(options.residencyLimits);
+    this.gameVersionField = options.gameVersion;
 
     // Read `validityWindowMs` / `now` explicitly rather than spreading the caller's
     // options object: object spread only copies own enumerable properties, so it
@@ -280,6 +291,7 @@ class SpatialSessionImpl implements SpatialSession {
       journalRecordBytes: number;
       ledgerBaselineCheckpointId: string | null;
       ledgerSnapshot: LedgerSnapshot | null;
+      gameVersion: string | null;
     };
     try {
       result = await this.requestOpen();
@@ -313,6 +325,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
     this.journalBaselineCheckpointId = result.journalBaselineCheckpointId;
     this.ledgerBaselineCheckpointId = result.ledgerBaselineCheckpointId;
+    this.restoredGameVersion = result.gameVersion;
     this.committedJournalRecords = result.journalRecordCount;
     this.committedJournalBytes = result.journalRecordBytes;
     this.journalQueue.resetRevisionForRestore(result.journalRevision);
@@ -510,6 +523,7 @@ class SpatialSessionImpl implements SpatialSession {
         ledgerMode: 'full',
         ledgerRevision,
         ledgerSnapshot,
+        gameVersion: this.gameVersionField,
       } satisfies WorkerRequest);
     });
     this.inFlight = { checkpointId, promise };
@@ -675,6 +689,7 @@ class SpatialSessionImpl implements SpatialSession {
       ledgerRevision: this.ledger.revision,
       confirmedLedgerRevision: this.confirmedLedgerRevision,
       ledgerBaselineCheckpointId: this.ledgerBaselineCheckpointId,
+      restoredGameVersion: this.restoredGameVersion,
       pendingJournalRecords: this.journalQueue.pendingRecords,
       pendingJournalBytes: this.journalQueue.pendingBytes,
       committedJournalRecords: this.committedJournalRecords,
@@ -967,6 +982,7 @@ class SpatialSessionImpl implements SpatialSession {
     journalRecordBytes: number;
     ledgerBaselineCheckpointId: string | null;
     ledgerSnapshot: LedgerSnapshot | null;
+    gameVersion: string | null;
   }> {
     const requestId = this.nextRequestId++;
     return new Promise((resolve, reject) => {
@@ -1067,6 +1083,7 @@ class SpatialSessionImpl implements SpatialSession {
         journalRecordBytes: openMsg.journalRecordBytes,
         ledgerBaselineCheckpointId: openMsg.ledgerBaselineCheckpointId,
         ledgerSnapshot: openMsg.ledgerSnapshot,
+        gameVersion: openMsg.gameVersion,
       });
     } else if (entry.kind === 'load') {
       const loadMsg = msg as WorkerResponse & { type: 'load_ok' };
@@ -1092,6 +1109,10 @@ class SpatialSessionImpl implements SpatialSession {
       // its committed metadata matches what the worker actually wrote.
       if (entry.voxelMode !== undefined && entry.voxelMode !== 'none') {
         this.voxel.commitDirectory(entry.voxelMode, entry.voxelSections ?? [], okMsg.voxelBytes);
+        // This confirmed checkpoint wrote voxel rows, so it is the new voxel
+        // baseline and its rows carry exactly this session's version. A
+        // history-only checkpoint never changes the voxel baseline's version.
+        this.restoredGameVersion = this.gameVersionField ?? UNKNOWN_GAME_VERSION;
       }
       this.voxelBaselineEstablished = true;
       this.confirmedVoxelRevision = entry.voxelRevision!;
