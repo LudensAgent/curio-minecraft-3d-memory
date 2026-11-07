@@ -175,6 +175,27 @@ const DEFAULT_LIMITS: ResolvedLimits = {
   json: DEFAULT_JSON_LIMITS,
 };
 
+/**
+ * Lazily materialized, id-ascending read index for the paginated fragment
+ * listing. A derived view over `fragmentMap`, never a second source of truth:
+ * every write that can change a listed fragment invalidates it, and the next
+ * read rebuilds it from the current map.
+ */
+interface FragmentListingIndex {
+  /** Every fragment id, ascending (the unfiltered listing). */
+  readonly all: string[];
+  readonly byDim: Map<string, string[]>;
+  readonly bySource: Map<PathFragment['geometrySource'], string[]>;
+  readonly byKind: Map<PathFragment['kind'], string[]>;
+}
+
+/** Same materialized index shape for the paginated traversal listing. */
+interface TraversalListingIndex {
+  readonly all: string[];
+  readonly byDim: Map<string, string[]>;
+  readonly byFragmentId: Map<string, string[]>;
+}
+
 const FRAGMENT_KINDS: readonly PathFragment['kind'][] = ['dug', 'walked', 'bridge', 'built'];
 const GEOMETRY_SOURCES: readonly PathFragment['geometrySource'][] = [
   'traversal',
@@ -190,6 +211,9 @@ export class FragmentStore {
   private readonly traversalMap = new Map<string, TraversalEvidence>();
   /** fragmentId → traversal ids owned by that fragment (removed together on delete). */
   private readonly fragmentToTraversalIds = new Map<string, Set<string>>();
+  /** Materialized paging indexes; `null` after a listing-relevant write. */
+  private fragmentListingIndex: FragmentListingIndex | null = null;
+  private traversalListingIndex: TraversalListingIndex | null = null;
   /**
    * Session-local mutation revision, bumped only by writes that actually change a
    * fact. Not a time, observation number, or traversal count; it is reset on
@@ -225,6 +249,7 @@ export class FragmentStore {
       );
     }
     this.fragmentMap.set(fragment.id, snapshot);
+    this.fragmentListingIndex = null;
     this.mutationRevision += 1;
     return { status: 'inserted' };
   }
@@ -243,6 +268,7 @@ export class FragmentStore {
     const snapshot = snapshotFragment(this.worldId, merged, this.limits);
     if (fragmentsEqual(existing, snapshot)) return { status: 'unchanged' };
     this.fragmentMap.set(id, snapshot);
+    this.fragmentListingIndex = null;
     this.mutationRevision += 1;
     return { status: 'updated' };
   }
@@ -278,26 +304,57 @@ export class FragmentStore {
     }
     // Deleting an unknown id (or an id whose cascade removed nothing) is a no-op;
     // only an actual removal — including its cascade — counts as a change.
-    if (existed) this.mutationRevision += 1;
+    if (existed) {
+      this.fragmentListingIndex = null;
+      this.traversalListingIndex = null;
+      this.mutationRevision += 1;
+    }
   }
 
   /** Paginated read of fragments. Read-only: never changes time, uses, or content. */
   fragments(query: FragmentQuery = {}): FragmentPage {
     const limit = clampLimit(query.limit, this.limits.maxQueryBatch);
-    const ids = [...this.fragmentMap.keys()]
-      .filter((id) => {
-        const fragment = this.fragmentMap.get(id)!;
-        if (query.dim !== undefined && fragment.dim !== query.dim) return false;
-        if (query.source !== undefined && fragment.geometrySource !== query.source) return false;
-        if (query.kind !== undefined && fragment.kind !== query.kind) return false;
-        return true;
-      })
-      .sort();
-    const { pageIds, nextAfter } = selectPage(ids, query.after, limit);
+    const index = this.getFragmentListingIndex();
+    const filterCount =
+      (query.dim === undefined ? 0 : 1) +
+      (query.source === undefined ? 0 : 1) +
+      (query.kind === undefined ? 0 : 1);
+    // First existing bucket by this fixed priority; its ids are already ascending.
+    const bucket =
+      query.source !== undefined
+        ? index.bySource.get(query.source)
+        : query.kind !== undefined
+          ? index.byKind.get(query.kind)
+          : query.dim !== undefined
+            ? index.byDim.get(query.dim)
+            : undefined;
+    if (filterCount === 0) {
+      const { pageIds, nextAfter } = selectPage(index.all, query.after, limit);
+      return {
+        items: pageIds.map((id) => cloneFragment(this.fragmentMap.get(id)!)),
+        total: index.all.length,
+        nextAfter,
+      };
+    }
+    if (filterCount === 1 && bucket !== undefined) {
+      const { pageIds, nextAfter } = selectPage(bucket, query.after, limit);
+      return {
+        items: pageIds.map((id) => cloneFragment(this.fragmentMap.get(id)!)),
+        total: bucket.length,
+        nextAfter,
+      };
+    }
+    const page = selectFilteredPage(bucket ?? [], query.after, limit, (id) => {
+      const fragment = this.fragmentMap.get(id)!;
+      if (query.dim !== undefined && fragment.dim !== query.dim) return false;
+      if (query.source !== undefined && fragment.geometrySource !== query.source) return false;
+      if (query.kind !== undefined && fragment.kind !== query.kind) return false;
+      return true;
+    });
     return {
-      items: pageIds.map((id) => cloneFragment(this.fragmentMap.get(id)!)),
-      total: ids.length,
-      nextAfter,
+      items: page.pageIds.map((id) => cloneFragment(this.fragmentMap.get(id)!)),
+      total: page.total,
+      nextAfter: page.nextAfter,
     };
   }
 
@@ -347,6 +404,7 @@ export class FragmentStore {
       this.fragmentToTraversalIds.set(evidence.fragmentId, owned);
     }
     owned.add(evidence.id);
+    this.traversalListingIndex = null;
     this.mutationRevision += 1;
     return { status: 'inserted' };
   }
@@ -364,20 +422,101 @@ export class FragmentStore {
   /** Paginated read of traversal evidence. Read-only, and directional: A→B never implies B→A. */
   traversals(query: TraversalQuery = {}): TraversalPage {
     const limit = clampLimit(query.limit, this.limits.maxQueryBatch);
-    const ids = [...this.traversalMap.keys()]
-      .filter((id) => {
-        const evidence = this.traversalMap.get(id)!;
-        if (query.fragmentId !== undefined && evidence.fragmentId !== query.fragmentId) return false;
-        if (query.dim !== undefined && evidence.dim !== query.dim) return false;
-        return true;
-      })
-      .sort();
-    const { pageIds, nextAfter } = selectPage(ids, query.after, limit);
+    const index = this.getTraversalListingIndex();
+    const filterCount =
+      (query.fragmentId === undefined ? 0 : 1) + (query.dim === undefined ? 0 : 1);
+    // `fragmentId` is usually the narrow key; its ids are already ascending.
+    const bucket =
+      query.fragmentId !== undefined
+        ? index.byFragmentId.get(query.fragmentId)
+        : query.dim !== undefined
+          ? index.byDim.get(query.dim)
+          : undefined;
+    if (filterCount === 0) {
+      const { pageIds, nextAfter } = selectPage(index.all, query.after, limit);
+      return {
+        items: pageIds.map((id) => cloneTraversalEvidence(this.traversalMap.get(id)!)),
+        total: index.all.length,
+        nextAfter,
+      };
+    }
+    if (filterCount === 1 && bucket !== undefined) {
+      const { pageIds, nextAfter } = selectPage(bucket, query.after, limit);
+      return {
+        items: pageIds.map((id) => cloneTraversalEvidence(this.traversalMap.get(id)!)),
+        total: bucket.length,
+        nextAfter,
+      };
+    }
+    const page = selectFilteredPage(bucket ?? [], query.after, limit, (id) => {
+      const evidence = this.traversalMap.get(id)!;
+      if (query.fragmentId !== undefined && evidence.fragmentId !== query.fragmentId) return false;
+      if (query.dim !== undefined && evidence.dim !== query.dim) return false;
+      return true;
+    });
     return {
-      items: pageIds.map((id) => cloneTraversalEvidence(this.traversalMap.get(id)!)),
-      total: ids.length,
-      nextAfter,
+      items: page.pageIds.map((id) => cloneTraversalEvidence(this.traversalMap.get(id)!)),
+      total: page.total,
+      nextAfter: page.nextAfter,
     };
+  }
+
+  /** The fragment listing index, rebuilt from `fragmentMap` after an invalidation. */
+  private getFragmentListingIndex(): FragmentListingIndex {
+    const cached = this.fragmentListingIndex;
+    if (cached !== null) return cached;
+    const byDim = new Map<string, string[]>();
+    const bySource = new Map<PathFragment['geometrySource'], string[]>();
+    const byKind = new Map<PathFragment['kind'], string[]>();
+    const push = <K>(bucket: Map<K, string[]>, key: K, id: string): void => {
+      const list = bucket.get(key);
+      if (list === undefined) bucket.set(key, [id]);
+      else list.push(id);
+    };
+    for (const fragment of this.fragmentMap.values()) {
+      push(byDim, fragment.dim, fragment.id);
+      push(bySource, fragment.geometrySource, fragment.id);
+      push(byKind, fragment.kind, fragment.id);
+    }
+    // Map insertion order is not id order; sort once per bucket so a page is a slice.
+    for (const bucket of [byDim, bySource, byKind]) {
+      for (const list of bucket.values()) list.sort();
+    }
+    const index: FragmentListingIndex = {
+      all: [...this.fragmentMap.keys()].sort(),
+      byDim,
+      bySource,
+      byKind,
+    };
+    this.fragmentListingIndex = index;
+    return index;
+  }
+
+  /** The traversal listing index, rebuilt from `traversalMap` after an invalidation. */
+  private getTraversalListingIndex(): TraversalListingIndex {
+    const cached = this.traversalListingIndex;
+    if (cached !== null) return cached;
+    const byDim = new Map<string, string[]>();
+    const byFragmentId = new Map<string, string[]>();
+    const push = <K>(bucket: Map<K, string[]>, key: K, id: string): void => {
+      const list = bucket.get(key);
+      if (list === undefined) bucket.set(key, [id]);
+      else list.push(id);
+    };
+    for (const evidence of this.traversalMap.values()) {
+      push(byDim, evidence.dim, evidence.id);
+      push(byFragmentId, evidence.fragmentId, evidence.id);
+    }
+    for (const bucket of [byDim, byFragmentId]) {
+      for (const list of bucket.values()) list.sort();
+    }
+    const index: TraversalListingIndex = {
+      all: [...this.traversalMap.keys()].sort(),
+      byDim,
+      byFragmentId,
+    };
+    this.traversalListingIndex = index;
+    return index;
   }
 
   // --- checkpoint support (phase 5A): bounded export + validated restore ---
@@ -504,6 +643,8 @@ export class FragmentStore {
     for (const [id, value] of traversals) this.traversalMap.set(id, value);
     this.fragmentToTraversalIds.clear();
     for (const [id, value] of fragmentToTraversalIds) this.fragmentToTraversalIds.set(id, value);
+    this.fragmentListingIndex = null;
+    this.traversalListingIndex = null;
     // Restore is a mutation: it replaces the store's facts, so it must mark the
     // store dirty. Only a session initializer (which then sets the confirmed
     // baseline to the post-restore revision) treats it as a clean baseline.
@@ -752,9 +893,45 @@ function selectPage(
 }
 
 function firstIndexAfter(sortedIds: string[], after: string): number {
-  let i = 0;
-  while (i < sortedIds.length && sortedIds[i]! <= after) i += 1;
-  return i;
+  // Upper bound: the first id strictly greater than the exclusive cursor.
+  let low = 0;
+  let high = sortedIds.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (sortedIds[mid]! <= after) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+/**
+ * Select one page of `candidates` (ascending ids) that pass `matches`, with the
+ * same `after`/`limit`/`nextAfter` semantics as `selectPage`. `total` is the
+ * number of matching ids, independent of the page. Used for multi-condition
+ * queries that are not exactly one materialized bucket.
+ */
+function selectFilteredPage(
+  candidates: readonly string[],
+  after: string | undefined,
+  limit: number,
+  matches: (id: string) => boolean,
+): { pageIds: string[]; total: number; nextAfter: string | undefined } {
+  let total = 0;
+  let beforeCursor = 0;
+  const pageIds: string[] = [];
+  for (const id of candidates) {
+    if (!matches(id)) continue;
+    // `total` is the whole match count, independent of the cursor.
+    total += 1;
+    if (after !== undefined && id <= after) {
+      beforeCursor += 1;
+      continue;
+    }
+    if (pageIds.length < limit) pageIds.push(id);
+  }
+  const nextAfter =
+    beforeCursor + pageIds.length < total ? pageIds[pageIds.length - 1] : undefined;
+  return { pageIds, total, nextAfter };
 }
 
 // --- checkpoint byte estimation (conservative upper bound; no full copy or stringify) ---
