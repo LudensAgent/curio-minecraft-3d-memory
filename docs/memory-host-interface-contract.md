@@ -889,6 +889,7 @@ export interface ChangeReportSource {
 - `ExecutableMove`：单段授权移动；不得隐藏寻路、施工、挖/放/搭柱或换目标。
 - `stop(executionId)`：只停止所属执行；不得 `stopAll()` 或影响新动作。
 - 观测变化：`observeBatch` → `BatchChangeReport` → `changes`/executor；不得只更新地图而不通知执行器。
+- `walkPath` 对宿主暴露稳定的 `executionId = exec_<routeId>`；`ExecutableMove.executionId` 与宿主回传的 `BodySample.executionId` 都使用该值。`WalkRouteExecutor` 的内部 delegation id 不是宿主身份，宿主不得回传。
 
 ### 7.4 结果
 

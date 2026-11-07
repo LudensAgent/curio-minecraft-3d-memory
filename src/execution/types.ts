@@ -33,9 +33,11 @@ export interface BodySample {
   onGround: boolean;
   inWater: boolean;
   /**
-   * Execution identity this sample belongs to. A move result echoes the move's
-   * `ExecutableMove.executionId`; a host push uses the delegation id. The loop
-   * only trusts a sample whose identity matches — never by timestamp alone.
+   * Execution identity this sample belongs to. `walkPath` exposes a stable
+   * external identity (`exec_<routeId>`) and rebinds it to the executor's
+   * internal delegation id inside the binding; direct `WalkRouteExecutor`
+   * callers echo the move/delegation id. The loop only trusts a sample whose
+   * identity matches — never by timestamp alone.
    */
   executionId: string;
   /**
@@ -157,7 +159,11 @@ export interface WalkRouteStatus {
   worldId: string;
   dim: string;
   sessionId: string;
-  /** Stable identity of this delegation; host samples must carry it in `BodySample.executionId`. */
+  /**
+   * Internal delegation identity used by the executor's own association checks.
+   * `walkPath` does not expose it to the host; host-facing samples use the
+   * stable `exec_<routeId>` identity instead.
+   */
   delegationId: string;
   /** Terminal result, or null while running. */
   result: NavResult | null;
