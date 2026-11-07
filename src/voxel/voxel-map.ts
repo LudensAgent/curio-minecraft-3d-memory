@@ -10,6 +10,8 @@
  * Facts can only change through the controlled update path. Observations are
  * snapshotted on write, `cellAt` and `sectionAt` return snapshots, and change
  * reports never alias the store's internal objects (including the section key).
+ * `sectionRef` is a trusted internal read for hot evaluators: it returns the
+ * live section and must be treated as read-only, never exposed to callers.
  *
  * This is deliberately *not* the full `SpatialMemoryStore`: routing, topology,
  * frontiers and persistence are composed beside it later, so none of their
@@ -200,6 +202,36 @@ export interface VoxelMapOptions {
    * (the initialization path) never fires it.
    */
   onChange?: ChangeReportListener;
+}
+
+/**
+ * Live, type-level read-only view of one stored `Section` (see
+ * `VoxelMap.sectionRef`). Freshly bound per call over the store's own object;
+ * no entry point re-exports this type.
+ *
+ * The type rejects the writes that would change facts through the store at two
+ * levels: `palette` is `readonly string[]`, and `evidence` is a
+ * `ReadonlyMap` of `Readonly<CellEvidence>` values (so `evidence.set(...)` and
+ * `evidence.get(i)!.freshness = ...` are type errors). The bit-packed arrays
+ * and the nested `Observation.state` / `BlockState.properties` are *not*
+ * narrowed — typing a `Uint8Array` read-only would make every legitimate read
+ * awkward, and the nested block state is a shared mutable value — so those
+ * parts are a call contract: do not write them, do not retain the view across
+ * a write or an await, and do not expose it or its arrays to a host caller.
+ */
+export interface SectionRef {
+  readonly key: Readonly<SectionKey>;
+  readonly palette: readonly string[];
+  readonly cells: Uint8Array;
+  readonly bits: number;
+  readonly explored: Uint8Array;
+  readonly traversed: Uint8Array;
+  readonly stale: Uint8Array;
+  readonly risk: Uint8Array;
+  readonly modified: Uint8Array;
+  readonly evidence: ReadonlyMap<number, Readonly<CellEvidence>>;
+  readonly revision: number;
+  readonly lastObservedAt: number | undefined;
 }
 
 /** Read-only view of one cell. `observed: false` means never observed (UNKNOWN). */
@@ -513,13 +545,34 @@ export class VoxelMap {
   /**
    * Snapshot of the section containing (x,y,z) in `dim`, or null when never
    * allocated. The returned section is a copy; mutating it never changes the
-   * store. (The future traversability/topology layers read the live sections
-   * through internal, non-public access when they land.)
+   * store. This is the public read contract — hot internal evaluators use the
+   * non-copy `sectionRef` instead.
    */
   sectionAt(dim: string, x: number, y: number, z: number): Section | null {
-    assertIntegerCoords(x, y, z);
-    const section = this.lookupSection(dim, x, y, z);
+    const section = this.sectionForRead(dim, x, y, z);
     return section === undefined ? null : snapshotSection(section);
+  }
+
+  /**
+   * Cheap read of the live resident section containing (x,y,z) for hot library
+   * evaluators (`step.ts`), or null when never allocated. Unlike `sectionAt`
+   * it does not deep-copy, so a per-step evaluator does not pay a full Section
+   * copy on every section cache miss.
+   *
+   * The returned view is a fresh shallow binding of the live section on every
+   * call. Its type rejects the writes that would change facts through the
+   * store: `palette` is `readonly string[]` and `evidence` is a
+   * `ReadonlyMap`, so `palette.push(...)` / `evidence.set(...)` are type
+   * errors. The bit-packed arrays (`cells`, `explored`, `traversed`, `stale`,
+   * `risk`, `modified`) are *not* copied — typing a `Uint8Array` read-only
+   * would make every legitimate palette read awkward, so that part is a call
+   * contract: do not write them, do not retain the view across a write or an
+   * await, and do not expose it or its arrays to a host caller. Use
+   * `sectionAt` for any read whose result escapes to a caller.
+   */
+  sectionRef(dim: string, x: number, y: number, z: number): SectionRef | null {
+    const section = this.sectionForRead(dim, x, y, z);
+    return section === undefined ? null : liveSectionRef(section);
   }
 
   // --- checkpoint support (phase 5B): bounded export + validated restore ---
@@ -1176,6 +1229,12 @@ export class VoxelMap {
     return report;
   }
 
+  /** Shared validated non-copy lookup behind `sectionAt` and `sectionRef`. */
+  private sectionForRead(dim: string, x: number, y: number, z: number): Section | undefined {
+    assertIntegerCoords(x, y, z);
+    return this.lookupSection(dim, x, y, z);
+  }
+
   private lookupSection(dim: string, x: number, y: number, z: number): Section | undefined {
     const { cx, cz, sy } = blockToSection(x, y, z);
     return this.sections.get(dim)?.get(innerKey(cx, cz, sy));
@@ -1510,6 +1569,26 @@ function addChange(
 /** Key for a section inside one dimension; integers make commas an unambiguous separator. */
 function innerKey(cx: number, cz: number, sy: number): string {
   return `${cx},${cz},${sy}`;
+}
+
+/** Shallow read-only binding of a live section; payload arrays/maps are shared. */
+function liveSectionRef(section: Section): SectionRef {
+  return {
+    // The key is the one mutable-value-shaped field that a view could corrupt,
+    // so bind a cheap copy of it; everything else is shared.
+    key: { ...section.key },
+    palette: section.palette,
+    cells: section.cells,
+    bits: section.bits,
+    explored: section.explored,
+    traversed: section.traversed,
+    stale: section.stale,
+    risk: section.risk,
+    modified: section.modified,
+    evidence: section.evidence,
+    revision: section.revision,
+    lastObservedAt: section.lastObservedAt,
+  };
 }
 
 /** Deep-copy a section so a public read cannot mutate the store. */
