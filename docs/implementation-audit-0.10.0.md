@@ -241,8 +241,8 @@
 
 | # | 缺口 | 现状证据 | 影响 |
 |---|---|---|---|
-| P2-1 | 文档/版本漂移 | 设计头部仍说 SQLite 未完成；README 写 0.9.0，`package.json` 是 0.10.0；仓库内 tgz 是 0.7.4；acceptance runner 仍写 0.7.6 | 读者容易误判当前状态 |
-| P2-2 | `compat` 未从包入口导出 | `package.json` exports 只有 `.`、`./storage/sqlite`、`./water`；`src/index.ts` 不导出 `src/compat/*` | README 宣称的迁移 dry-run 对包消费者不可达 |
+| P2-1 | 文档/版本漂移 | 基线审计快照（历史）：设计头部称 SQLite 未完成，README 写 0.9.0，`package.json` 已是 0.10.0，当时仓库内 tgz 是 0.7.4，acceptance runner 仍写 0.7.6。当前：L-M9-1 已把 README 状态/版本改为 0.10.0 并修正失效链接；acceptance runner 仍为 0.7.6，发布 tgz 待 M9.3 | 读者容易误判当前状态 |
+| P2-2 | `compat` 未从包入口导出 | `package.json` exports 现有 `.`、`./memory`、`./navigation`、`./storage/sqlite`、`./water`；`src/index.ts` 仍不导出 `src/compat/*` | README 宣称的迁移 dry-run 对包消费者仍不可达；M5 只拆了 memory/navigation |
 | P2-3 | 打包验收可能受 LICENSE 影响 | `acceptance/run.mjs` 预期非 dist 入包项为 `package.json` + `README.md`；根目录已新增 `LICENSE` | 需要实际跑一次 pack 验收确认；本文未执行 |
 | P2-4 | 源码注释过期 | `topology-store.ts` 仍称 PORTAL/cross-dimension 在本阶段被拒绝（实际是步行边 API 拒绝，独立 portal API 已支持）；`spatial-memory-store.ts` 仍称 `portalEdges` 不支持，但方法已实现 | 维护者容易被误导 |
 | P2-5 | 水面预算语义与陆地不一致 | 水验证预算耗尽报 `UNSUPPORTED/budget_exceeded`，陆地为 `INCOMPLETE` | 调用方需要分别处理；不是世界事实 |
@@ -393,8 +393,8 @@ flowchart LR
 | 位置 | 当前内容 | 与代码/制品的关系 |
 |---|---|---|
 | `docs/spatial-memory-library-design.md` 头部 | 称 SQLite 持久化尚未完成 | 落后于 0.9.0/0.10.0 的 SQLite 实现 |
-| `docs/design-progress-0.9.0.md` | 记录 955/959 项测试（同文两处不一致）、§3–§9 约 90% | 历史记录；本轮实际为 968 vitest + 32 node |
-| `README.md` | 0.9.0、安装 `0.9.0.tgz` | `package.json` 已是 0.10.0；仓库 tgz 是 0.7.4 |
+| `docs/design-progress-0.9.0.md` | 记录 955/959 项测试（同文两处不一致）、§3–§9 约 90% | 历史记录；该文件当前已不存在，README 不再链接；本轮实际为 968 vitest + 32 node |
+| `README.md` | 基线时写 0.9.0、安装 `0.9.0.tgz`；当前为 0.10.0（L-M9-1 已修正） | 当前状态与 `package.json` 的 0.10.0 一致；仓库内无已跟踪 tgz，发布 tarball 仍需 M9.3 打包确认 |
 | `README.md` 功能列表 | 包含 migration dry-run | `src/compat/*` 未从包入口导出 |
 | `acceptance/run.mjs` | 版本 0.7.6、非 dist 入包项预期 | 新增 `LICENSE` 后需实际跑一次 pack 验收确认 |
 | 源码注释 | 部分 portal/迁移注释已过期 | 以当前导出与测试为准 |
@@ -507,19 +507,32 @@ node --test acceptance/provenance.test.mjs acceptance/run.test.mjs acceptance/co
 - [设计文档](./spatial-memory-library-design.md)
 - [Agent/宿主接口契约](./memory-host-interface-contract.md)
 - [Agent/宿主实现计划与代码审计要求](./memory-host-implementation-plan.md)
-- [0.9.0 实现进度（历史）](./design-progress-0.9.0.md)
-- [导航 API 状态](./navigation-api-status.md)
+- 0.10.0 实现审计（本文件；历史基线 `0737f30`）
+- [记忆宿主 M2 查询审计](./memory-host-m2-query-audit.md)
+- [记忆宿主 M3 规划审计](./memory-host-m3-route-plan-audit.md)
+- [记忆宿主 M4 walkPath 审计](./memory-host-m4-walk-path-audit.md)
 - [运行时 store 组合](./spatial-memory-store.md)
-- [陆地路线验证](./land-route-validation.md)
-- [水面验证](./water-validation.md)
-- [事件与动作 journal](./event-persistence.md)
-- [共享会话生命周期](./shared-session-lifecycle-b1.md)
+- [旧账迁移门禁](./legacy-migration-gate.md)
 
 ---
 
 ## 13. 结论
 
 按“纯记忆库”定位，当前实现已经具备可用的核心：它能记录宿主提供的合法观测，保留历史路径和拓扑，按证据回答“这里观察到什么、哪些路线曾走过、锚点在哪里、当前证据是否支持通行”，并能通过 SQLite 持久化。
+
+但它还不是一个边界清晰的纯记忆库产品（M9.1 状态更新：下列为当前状态，历史基线见文首）：
+
+- 根入口仍同时包含记忆和动作编排；`memory`/`navigation` 子入口已于 M5 拆分，新宿主应使用子入口；
+- 没有运行时感知适配器；
+- 资源/容器/路线查询已统一到 `SpatialQueryPort`（M2），容器内容仍不在库内（宿主精确账本）；
+- `planRoute`/`walkPath` 已实现并有可选 `ActionRecord` 持久化钩子（M4/M6.2），但“走过即存图”仍需宿主显式接线；
+- 迁移权威切换和真实宿主验收未完成（H-01）；`MemoryHostCapabilities.execute.*`/`persistence.*` 仍为 `false`（D-059）。
+
+**M5–M8 已收口入口拆分、查询/规划/执行、持久化与性能记录；剩余发布项是 M9 的版本/消费者验收（H-02 未决）与 Curio 真实联调。**
+
+### 13.1 历史结论（审计基线原文，保留对照）
+
+> 以下为 `0737f30` 基线审计中随后被状态更新替换的结论段落原文，仅作历史对照，不代表当前状态；当前状态见上文 §13。
 
 但它还不是一个边界清晰的纯记忆库产品：
 

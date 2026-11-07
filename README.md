@@ -1,7 +1,7 @@
 # Spatial Memory Library
 
 <p>
-  <img src="https://img.shields.io/badge/version-0.9.0-blue.svg" alt="Version 0.9.0">
+  <img src="https://img.shields.io/badge/version-0.10.0-blue.svg" alt="Version 0.10.0">
   <img src="https://img.shields.io/badge/node-%3E%3D18-339933.svg" alt="Node 18+">
   <img src="https://img.shields.io/badge/minecraft-1.20.1-62B47A.svg" alt="Minecraft 1.20.1">
   <img src="https://img.shields.io/badge/typescript-5.x-3178C6.svg" alt="TypeScript 5.x">
@@ -15,7 +15,7 @@ A standalone TypeScript library for Minecraft Java 1.20.1 agents. It records wha
 
 The scope is **land walking and surface-water movement** — jumps, steps, ladders, drop transitions, surface swimming, riding a boat, and shore entry/exit. Flight, elytra and underwater 3D navigation are out of scope.
 
-**Status: 0.9.0.** The first-version walk navigation pipeline, runtime store composition, topology runtime state and SQLite persistence are implemented and covered by offline tests. Real Minecraft / mineflayer / Curio integration is not yet validated.
+**Status: 0.10.0 (unreleased).** Observation/query, `planRoute` + `walkPath` walk navigation, runtime store composition, topology runtime state, SQLite persistence and the M6 restart/checkpoint regression are implemented and covered by offline tests. The `memory` and `navigation` subpath entries are exposed by the package `exports`; `MemoryHostCapabilities.execute.*`/`persistence.*` remain `false` pending host wiring (D-059). Real Minecraft / mineflayer / Curio integration is not validated (H-01).
 
 ## Features
 
@@ -23,10 +23,10 @@ The scope is **land walking and surface-water movement** — jumps, steps, ladde
 - **Historical geometry kept separate from current state** (`topology/`): `FragmentStore` stores path fragments and confirmed traversal evidence; `TopologyStore` stores explicit nodes and directional edges. Blockage elsewhere never deletes history, and history never proves current passability.
 - **Bounded historical queries**: `adjacency`, `reachable`, `route`, and `historicalAnchorCandidates` return recorded facts with finite work budgets — never a live `OPEN`, arrival claim, or executable point list.
 - **Runtime topology state** (`topology/`): directional edge verification, separate portal edges, anchor queries, transient occupancy, and evidence-backed fragment connectivity/merge records. Derived state is invalidated without deleting history.
-- **First-version walk navigation** (`navigation/`): `navigateTo` performs measured start → bounded search → re-verified execution → measured arrival. `followKnownPath` follows an explicit historical fragment; `inspectRoute`, `inspectKnownRoute` and `frontierCandidates` are read-only projections. `recall_route` is not implemented.
+- **Walk navigation pipeline** (`navigation/`): `planRoute` issues a single-use `routeId` from bounded search/history evidence; `walkPath` executes that handle through a caller-supplied single-step body port with grounded `bodyArrival`, `INVALIDATED` evidence/session stops and an optional `persistAction` hook. `navigateTo` performs measured start → bounded search → re-verified execution → measured arrival. `followKnownPath` follows an explicit historical fragment; `inspectRoute`, `inspectKnownRoute` and `frontierCandidates` are read-only projections. `recall_route` is not implemented.
 - **Controlled route execution** (`execution/`): `WalkRouteExecutor` drives an injected single-step `MoveExecutor`, requires current `OPEN` evidence before each segment, accepts arrival only from a measured exact position, and revokes in-flight segments when their evidence changes.
 - **Land and water validation** (`traversability/`, `water/`): `evaluateLandTransition` / `LandRouteVerifier` check caller-declared land transitions and routes; `evaluateWaterRoute` / `checkWaterArrival` check surface swimming and mounted-boat geometry. Results carry `assurance: 'geometry_only'` and `executable: false`.
-- **Explicit SQLite persistence** (`storage/`, `curio-minecraft-3d-memory/storage/sqlite`): one worker owns the connection and transactions. `checkpoint()` is the only explicit save trigger; incremental voxel checkpoints, manual Section residency, `WorkingSetManager`, placement/visit/portal ledgers, an append-only journal and an offline legacy-migration dry-run are included.
+- **Explicit SQLite persistence** (`storage/`, `curio-minecraft-3d-memory/storage/sqlite`): one worker owns the connection and transactions. `checkpoint()` is the only explicit save trigger and returns a confirmed `CheckpointResult`; incremental voxel checkpoints, manual Section residency, `WorkingSetManager`, placement/visit/portal ledgers, an append-only journal and an offline legacy-migration dry-run are included.
 - **Host-independent integration surface**: `SpatialMemoryStoreImpl` composes the runtime stores with a scope guard; the library consumes perception and execution through narrow adapter types and never imports host source.
 
 ## Requirements
@@ -51,7 +51,7 @@ Consumers install the real `.tgz` into their own project and import by package n
 ```json
 {
   "dependencies": {
-    "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.9.0.tgz",
+    "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.10.0.tgz",
     "better-sqlite3": "^12.0.0"
   }
 }
@@ -59,7 +59,9 @@ Consumers install the real `.tgz` into their own project and import by package n
 
 | Entry | Contents | Native dependency |
 |---|---|---|
-| `curio-minecraft-3d-memory` | observation, voxel, traversability, topology, navigation, execution and runtime store | none |
+| `curio-minecraft-3d-memory` | compatibility root entry: observation, voxel, traversability, topology, navigation, execution and runtime store | none |
+| `curio-minecraft-3d-memory/memory` | pure memory core: observation, voxel, topology, query and capability report; no navigation or body entries | none |
+| `curio-minecraft-3d-memory/navigation` | `planRoute`, `walkPath`, route registry, search/execution bindings and read-only navigation projections | none |
 | `curio-minecraft-3d-memory/water` | water-surface and mounted-boat validation | none |
 | `curio-minecraft-3d-memory/storage/sqlite` | SQLite sessions, ledgers, journal and `WorkingSetManager` | `better-sqlite3@^12` |
 
@@ -217,6 +219,8 @@ The library provides facts and execution assistance; the host owns the connectio
 
 `navigateTo` explicitly rejects `near` / `reach_block` arrival, non-walk modes, digging, placing, towering, non-empty material lists, non-empty `avoid` constraints and `allow_frontier`. Those rejections are structured results, never silently ignored settings.
 
+`planRoute` reports walk search/history/auto as `true` and the wider modes as `false`; `walkPath` accepts only registry-issued, single-use walk routes and never re-plans. The canonical `MemoryHostCapabilities` still keeps every `execute.*` and `persistence.*` bit `false` (D-059) until host consumption is validated, so negotiate before wiring rather than treating runtime entries as declared capabilities.
+
 ## Project structure
 
 ```
@@ -282,13 +286,12 @@ The examples and tests use Fake perception, Fake bodies and Fake move executors.
 
 - [Design and development constraints](docs/spatial-memory-library-design.md) — target contracts, data model, and implementation order.
 - [AGENTS.md](AGENTS.md) — repository development rules and boundaries.
-- [Navigation API status](docs/navigation-api-status.md) — the current §7 capability table and unsupported cases.
+- [Memory-host interface contract](docs/memory-host-interface-contract.md) — the §15 implementation status table and capability negotiation.
+- [Memory-host implementation plan](docs/memory-host-implementation-plan.md) — milestones, file-level tasks, and exit conditions.
+- [0.10.0 implementation audit](docs/implementation-audit-0.10.0.md) — the historical pure-memory audit and known gaps.
+- M2/M3/M4 audits: [query](docs/memory-host-m2-query-audit.md), [route planning](docs/memory-host-m3-route-plan-audit.md), [walk path](docs/memory-host-m4-walk-path-audit.md).
 - [Runtime store composition](docs/spatial-memory-store.md) — `SpatialMemoryStoreImpl` behavior and known truth gaps.
-- [Land route validation](docs/land-route-validation.md) — transition and route geometry contract.
-- [Water validation](docs/water-validation.md) — surface-swim and mounted-boat contract.
-- [0.9.0 implementation progress](docs/design-progress-0.9.0.md) — implemented sections, verification, and remaining gaps.
-- Persistence acceptance: [5A](docs/phase-5a-history-checkpoint-acceptance.md), [5B](docs/phase-5b-spatial-checkpoint-acceptance.md), [5C](docs/phase-5c-voxel-incremental-checkpoint-acceptance.md), [5D1](docs/phase-5d1-section-residency-acceptance.md), [5D2](docs/phase-5d2-working-set-acceptance.md), [storage ledger](docs/phase-l5-storage-ledger-acceptance.md).
-- [Event and action journal](docs/event-persistence.md) — append-only journal semantics.
+- [Legacy migration gate](docs/legacy-migration-gate.md) — the offline JSON → SQLite dry-run and authority gate.
 
 ## Known limitations
 
@@ -300,7 +303,7 @@ The examples and tests use Fake perception, Fake bodies and Fake move executors.
 - **Perception is host-owned.** The library does not scan the client world, load chunks, or treat raw `blockUpdate` events as evidence. It records only observations the host legally supplies.
 - **Containers and inventory remain host-led.** The library associates locations and reachability evidence; it does not copy or maintain item counts.
 - **No flight, elytra, or underwater 3D navigation.** These are outside the library's scope.
-- **Known store truth gaps.** `markTraversed` / `markModified` are not available on the current `VoxelMap`; `SpatialEdge` is a lossy projection of `TopologyStore`; portal edges are separate from the walk graph; `Frontier.historicalConnection` cannot express unknown. Use the detailed reads and inspection APIs named in the store documentation.
+- **Known store truth gaps.** `SpatialEdge` is a lossy projection of `TopologyStore`; portal edges are separate from the walk graph; `Frontier.historicalConnection` cannot express unknown. Use the detailed reads and inspection APIs named in the store documentation.
 
 ## License
 
