@@ -46,6 +46,34 @@ export function chunkVisitKey(worldId: string, dim: string, cx: number, cz: numb
   return `${worldId}:${dim}:${cx}:${cz}`;
 }
 
+/**
+ * Ledger delta on the wire: only the placed/visit rows inserted, rewritten or
+ * removed since the previous capture, plus the portal crossings added since
+ * then. A removed key is only ever sent as a removal when the same key is not
+ * also sent as an upsert. The worker reads the committed set back inside the
+ * transaction to enforce the full-set capacities and byte bound; this delta is
+ * never the authority for what stays on disk.
+ */
+export interface LedgerDelta {
+  worldId: string;
+  placedUpserts: PlacedBlockRecord[];
+  placedRemovals: string[];
+  visitUpserts: ChunkVisitRecord[];
+  visitRemovals: string[];
+  /** Portal crossings not yet captured; a crossing record is never deleted. */
+  traversals: PortalTraversalRecord[];
+}
+
+/** One captured delta plus the per-key tokens that make ACK confirmation exact. */
+export interface LedgerDeltaCapture extends LedgerDelta {
+  revision: number;
+  tokens: {
+    placed: Map<string, number>;
+    visits: Map<string, number>;
+    traversals: Map<string, number>;
+  };
+}
+
 export interface PortalTraversalInput {
   fromId: string;
   toId: string;
@@ -186,6 +214,16 @@ export class LedgerStore {
   private revisionField = 0;
   /** Same-chunk repeat visits do not increment, matching the legacy counter. */
   private lastChunkKey: string | null = null;
+  /**
+   * Delta pending for the next capture: every key whose placed/visit row was
+   * inserted, rewritten or removed since the last `capture`, as of
+   * `pendingRevision`. Empty means this ledger state is fully committed.
+   */
+  private pending: {
+    placed: Map<string, { token: number; record: PlacedBlockRecord | null }>;
+    visits: Map<string, { token: number; record: ChunkVisitRecord | null }>;
+    traversals: Map<string, { token: number; record: PortalTraversalRecord }>;
+  } = { placed: new Map(), visits: new Map(), traversals: new Map() };
 
   constructor(worldId: string, limits?: LedgerLimits) {
     this.worldId = requireString(worldId, 'ledger worldId');
@@ -287,6 +325,7 @@ export class LedgerStore {
     }
     this.placed.set(key, record);
     this.revisionField += 1;
+    this.pending.placed.set(key, { token: this.revisionField, record });
     return cloneRecord(record);
   }
 
@@ -305,6 +344,7 @@ export class LedgerStore {
     const key = placedBlockKey(this.worldId, dim, grid.x, grid.y, grid.z);
     if (!this.placed.delete(key)) return false;
     this.revisionField += 1;
+    this.pending.placed.set(key, { token: this.revisionField, record: null });
     return true;
   }
 
@@ -354,6 +394,7 @@ export class LedgerStore {
       this.lruClock += 1;
       this.placed.set(refreshed.key, refreshed);
       this.revisionField += 1;
+      this.pending.placed.set(refreshed.key, { token: this.revisionField, record: refreshed });
       return { record: cloneRecord(refreshed), dist: hit.dist };
     });
   }
@@ -385,6 +426,7 @@ export class LedgerStore {
       : { ...existing, count: existing.count + 1 };
     this.visits.set(key, record);
     this.revisionField += 1;
+    this.pending.visits.set(key, { token: this.revisionField, record });
     return { first: existing === undefined, record: cloneRecord(record) };
   }
 
@@ -416,6 +458,7 @@ export class LedgerStore {
     }
     this.visits.set(key, record);
     this.revisionField += 1;
+    this.pending.visits.set(key, { token: this.revisionField, record });
     return cloneRecord(record);
   }
 
@@ -529,6 +572,7 @@ export class LedgerStore {
     }
     this.traversals.set(id, record);
     this.revisionField += 1;
+    this.pending.traversals.set(id, { token: this.revisionField, record });
     return cloneRecord(record);
   }
 
@@ -564,6 +608,66 @@ export class LedgerStore {
       visits: this.chunkVisits(),
       traversals: this.portalTraversals(),
     };
+  }
+
+  /**
+   * Capture only the rows that changed since the previous capture, in a stable
+   * order. The returned `tokens` are opaque to the caller: pass the whole capture
+   * back to `confirmDelta` once the worker has ACKed the commit, so a row
+   * re-dirtied after capture keeps its newer pending entry.
+   */
+  captureDelta(): LedgerDeltaCapture {
+    const placedUpserts: PlacedBlockRecord[] = [];
+    const placedRemovals: string[] = [];
+    const placedTokens = new Map<string, number>();
+    for (const [key, entry] of this.pending.placed) {
+      placedTokens.set(key, entry.token);
+      if (entry.record === null) placedRemovals.push(key);
+      else placedUpserts.push(cloneRecord(entry.record));
+    }
+    placedUpserts.sort((a, b) => a.lruAt - b.lruAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    placedRemovals.sort();
+
+    const visitUpserts: ChunkVisitRecord[] = [];
+    const visitRemovals: string[] = [];
+    const visitTokens = new Map<string, number>();
+    for (const [key, entry] of this.pending.visits) {
+      visitTokens.set(key, entry.token);
+      if (entry.record === null) visitRemovals.push(key);
+      else visitUpserts.push(cloneRecord(entry.record));
+    }
+    visitUpserts.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    visitRemovals.sort();
+
+    const traversals = [...this.pending.traversals.values()]
+      .map((entry) => cloneRecord(entry.record))
+      .sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const traversalTokens = new Map<string, number>();
+    for (const [id, entry] of this.pending.traversals) traversalTokens.set(id, entry.token);
+
+    return {
+      worldId: this.worldId,
+      revision: this.revisionField,
+      placedUpserts,
+      placedRemovals,
+      visitUpserts,
+      visitRemovals,
+      traversals,
+      tokens: { placed: placedTokens, visits: visitTokens, traversals: traversalTokens },
+    };
+  }
+
+  /** Drop exactly the pending entries covered by a confirmed capture. */
+  confirmDelta(capture: LedgerDeltaCapture): void {
+    for (const [key, token] of capture.tokens.placed) {
+      if (this.pending.placed.get(key)?.token === token) this.pending.placed.delete(key);
+    }
+    for (const [key, token] of capture.tokens.visits) {
+      if (this.pending.visits.get(key)?.token === token) this.pending.visits.delete(key);
+    }
+    for (const [id, token] of capture.tokens.traversals) {
+      if (this.pending.traversals.get(id)?.token === token) this.pending.traversals.delete(id);
+    }
   }
 
   /** Cheap, bounded pre-flight of what a checkpoint would send. */
@@ -659,6 +763,11 @@ export class LedgerStore {
     this.lruClock = maxLru;
     this.lastChunkKey = null;
     this.revisionField += 1;
+    // The restored set replaces every row, so nothing pending can be described
+    // as a delta against it; a later capture re-sends it as a full replacement.
+    this.pending.placed.clear();
+    this.pending.visits.clear();
+    this.pending.traversals.clear();
   }
 
   private validateStoredTraversal(raw: PortalTraversalRecord): PortalTraversalRecord {

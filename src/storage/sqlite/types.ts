@@ -11,7 +11,7 @@
 
 import type { ActionRecord } from '../../navigation/types.js';
 import type { Observation, ObservationGap } from '../../observation/types.js';
-import type { LedgerStore } from './ledger.js';
+import type { LedgerDelta, LedgerStore } from './ledger.js';
 import type { FragmentStore, FragmentStoreOptions } from '../../topology/fragment-store.js';
 import type { TopologyStore, TopologyStoreOptions } from '../../topology/topology-store.js';
 import type {
@@ -917,6 +917,15 @@ export type WorkerRequest =
       fragmentRevision: number;
       topologyRevision: number;
       snapshot: HistorySnapshot;
+      /**
+       * Whether this checkpoint persists the history (fragments + traversals) and
+       * topology (nodes, edges, portal edges, merges) domains. Omitted means
+       * `full` (every existing caller's behavior). `none` writes no rows for that
+       * domain and keeps its committed baseline untouched, so the omitted arrays
+       * in `snapshot` are never read as "clear this domain".
+       */
+      historyMode?: 'full' | 'none';
+      topologyMode?: 'full' | 'none';
       /** How this checkpoint persists voxel state (history-only / full / incremental). */
       voxelMode: VoxelSaveMode;
       voxelRevision: number;
@@ -931,13 +940,16 @@ export type WorkerRequest =
       /**
        * Ledger persistence mode. `none` (default for history-only checkpoints)
        * never touches ledger rows; `full` replaces this world's ledger rows in the
-       * same transaction.
+       * same transaction; `delta` upserts/removes only the changed rows (the first
+       * ledger save is still `full`, so an omission is never a deletion).
        */
-      ledgerMode?: 'none' | 'full';
+      ledgerMode?: 'none' | 'full' | 'delta';
       /** Captured ledger revision. */
       ledgerRevision?: number;
       /** Complete world-scoped ledger snapshot for `full`. */
       ledgerSnapshot?: LedgerSnapshot;
+      /** Changed placed/visit rows plus new portal crossings for `delta`. */
+      ledgerDelta?: LedgerDelta;
       /**
        * Explicit Minecraft game version this checkpoint's voxel rows were written
        * under, supplied by the caller (never guessed by the worker). When absent,
@@ -1038,6 +1050,14 @@ export type WorkerResponse =
       /** Committed journal row count/bytes for this world after the transaction. */
       journalRecordCount: number;
       journalRecordBytes: number;
+      /**
+       * Committed ledger row count/bytes for this world after the transaction, when
+       * this checkpoint wrote the ledger. Computed by the worker from the committed
+       * rows (never from a delta), so a caller does not need to serialize the
+       * full set to learn its size.
+       */
+      ledgerRecordCount?: number;
+      ledgerRecordBytes?: number;
     }
   | { type: 'closed'; requestId: number }
   | { type: 'error'; requestId: number; kind: PersistenceErrorKind; message: string };
