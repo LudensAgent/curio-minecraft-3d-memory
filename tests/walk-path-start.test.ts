@@ -64,7 +64,7 @@ function arrived(start: WalkPathStartContext): WalkPathResult {
     contract: 'memory-host-contract/1',
     routeId: start.plan.routeId,
     executionId: start.executionId,
-    lastPosition: { ...start.sample.pos },
+    lastPosition: { ...start.plan.points[start.plan.points.length - 1]! },
     lastObservation: {
       worldId: start.sample.worldId,
       dim: start.sample.dim,
