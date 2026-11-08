@@ -54,6 +54,7 @@ describe('query capabilities', () => {
       portals: true,
       resourceAnchors: true,
       containerAnchors: false,
+      frontiers: false,
       containerContents: false,
     });
   });

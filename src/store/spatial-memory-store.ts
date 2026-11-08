@@ -38,6 +38,7 @@ import type { Observation, ObservationBatch } from '../observation/types.js';
 import type { Frontier } from '../navigation/types.js';
 import { createSpatialQueryPort } from '../query/index.js';
 import type {
+  FrontierQuerySource,
   HistoricalRouteInspection,
   SpatialMemoryCapabilities,
   SpatialMemoryCapabilityName,
@@ -88,7 +89,7 @@ import type {
   TraversalEvidence,
 } from '../topology/index.js';
 import { FragmentStore, TopologyStore } from '../topology/index.js';
-import type { Vec3Like } from '../types.js';
+import type { Vec3Like, WorldScope } from '../types.js';
 import { blockToSection } from '../voxel/coordinates.js';
 import type { Section } from '../voxel/section.js';
 import type { BatchChangeReport, ChangeReport, StaleReason } from '../voxel/voxel-map.js';
@@ -162,6 +163,16 @@ export type FrontierInspection =
       historicalConnection: 'unknown';
       note: string;
     };
+
+/**
+ * How the caller-supplied `frontierSource` resolved. The query port needs the
+ * scope mismatch as a value (structured `scope_mismatch`); the legacy
+ * `frontierCandidates` method maps it to its existing thrown error.
+ */
+type FrontierSnapshotResolution =
+  | { status: 'available'; snapshot: WalkSearchSnapshot }
+  | { status: 'unavailable'; reason: string }
+  | { status: 'scope_mismatch'; expected: WorldScope; actual: WorldScope };
 
 /** A write or read named a different world than the one this store is bound to. */
 export class SpatialMemoryScopeError extends Error {
@@ -801,6 +812,23 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
         components: (dim) => this.components(dim),
         segments: (fragmentId) => this.segments(fragmentId),
       },
+      // Same caller-supplied snapshot as `frontierCandidates`; the projection is
+      // still only a read of data the caller already has. The source and its
+      // capability bit exist only when a provider was injected.
+      ...(this.frontierSource === undefined
+        ? {}
+        : {
+            frontiers: (dim: string, here: Vec3Like): FrontierQuerySource => {
+              const resolved = this.frontierSnapshot(dim, here);
+              return resolved.status === 'available'
+                ? {
+                    status: 'available',
+                    result: projectFrontierCandidates(resolved.snapshot),
+                    snapshot: resolved.snapshot,
+                  }
+                : resolved;
+            },
+          }),
       snapshot: () => this.snapshot(),
       memoryCapabilities: () => this.describeCapabilities(),
     };
@@ -1113,14 +1141,16 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
     return copyPoint(exact.node.location.pos);
   }
 
-  private resolveFrontierSnapshot(
-    dim: string,
-    here: Vec3Like,
-  ): { available: true; snapshot: WalkSearchSnapshot } | { available: false; reason: string } {
+  /**
+   * Resolve the caller-supplied snapshot without deciding how a scope mismatch
+   * is reported. The query port turns it into a structured `scope_mismatch`;
+   * `frontierCandidates`/`frontierInspection` keep their thrown semantics.
+   */
+  private frontierSnapshot(dim: string, here: Vec3Like): FrontierSnapshotResolution {
     const provider = this.frontierSource;
     if (provider === undefined) {
       return {
-        available: false,
+        status: 'unavailable',
         reason:
           'no caller-supplied WalkSearchSnapshot provider was injected; this store never runs its own scan',
       };
@@ -1128,21 +1158,33 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
     const snapshot = provider(dim, copyPoint(here));
     if (snapshot === null) {
       return {
-        available: false,
+        status: 'unavailable',
         reason: `the caller-supplied provider has no WalkSearchSnapshot for dim "${dim}" at this position`,
       };
     }
-    if (snapshot.worldId !== this.worldId) {
+    if (snapshot.worldId !== this.worldId || snapshot.dim !== dim) {
+      return {
+        status: 'scope_mismatch',
+        expected: { worldId: this.worldId, dim },
+        actual: { worldId: snapshot.worldId, dim: snapshot.dim },
+      };
+    }
+    return { status: 'available', snapshot };
+  }
+
+  private resolveFrontierSnapshot(
+    dim: string,
+    here: Vec3Like,
+  ): { available: true; snapshot: WalkSearchSnapshot } | { available: false; reason: string } {
+    const resolved = this.frontierSnapshot(dim, here);
+    if (resolved.status === 'scope_mismatch') {
       throw new SpatialMemoryScopeError(
-        `frontier snapshot worldId "${snapshot.worldId}" does not match this store's world "${this.worldId}"`,
+        `frontier snapshot scope (${resolved.actual.worldId}/${resolved.actual.dim}) does not match this store (${resolved.expected.worldId}/${resolved.expected.dim})`,
       );
     }
-    if (snapshot.dim !== dim) {
-      throw new SpatialMemoryScopeError(
-        `frontier snapshot dim "${snapshot.dim}" does not match the requested dim "${dim}"`,
-      );
-    }
-    return { available: true, snapshot };
+    return resolved.status === 'available'
+      ? { available: true, snapshot: resolved.snapshot }
+      : { available: false, reason: resolved.reason };
   }
 }
 

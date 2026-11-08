@@ -250,6 +250,7 @@ const FIELD_SPECS: Record<SpatialQueryKind, readonly FieldSpec[]> = {
     LIMIT_FIELD,
   ],
   containerAnchors: [stringField('dim', false), stringField('after', false), LIMIT_FIELD],
+  frontiers: [stringField('dim', true), pointField('here', false), LIMIT_FIELD],
   containerContents: [stringField('dim', false)],
   snapshot: [],
   capabilities: [],

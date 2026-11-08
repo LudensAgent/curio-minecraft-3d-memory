@@ -146,6 +146,8 @@ export interface MemoryHostCapabilities {
     /** 增量：§5.2 暴露了独立 kind，宿主需要能协商。 */
     resourceAnchors: boolean;
     containerAnchors: boolean;
+    /** 增量（D-V4-017）：仅当宿主注入了调用方快照源（`frontierSource`）时为 true；库从不自行搜索。 */
+    frontiers: boolean;
     containerContents: false; // 永远为 false：宿主账本职责
   };
   plan: {
@@ -416,6 +418,9 @@ export type SpatialQueryRequest =
   | { kind: 'portals'; after?: string; limit?: number }
   | { kind: 'resourceAnchors'; dim?: string; tag?: LandmarkTag; label?: string; after?: string; limit?: number }
   | { kind: 'containerAnchors'; dim?: string; after?: string; limit?: number }
+  // 增量（D-V4-017）：调用方已提供的 WalkSearchSnapshot 的只读投影。无 `after`：
+  // 候选集已由快照自身的 maxFrontiers 界住；`limit` 只限制返回窗口。
+  | { kind: 'frontiers'; dim: string; here: Vec3Like; limit?: number }
   // 增量（M2）：内容永远转交宿主账本；该 kind 不产生 data。请求只接受 `dim`；`nodeId` 等未知字段失败关闭为 `invalid_request`（D-057，`src/query/validate.ts`）。
   | { kind: 'containerContents'; dim?: string }
   | { kind: 'snapshot' }
@@ -460,8 +465,61 @@ export type SpatialQueryData =
   | { kind: 'portals'; items: PortalEdgeView[]; total: number; nextAfter?: string }
   | { kind: 'resourceAnchors'; items: SpatialNode[]; total: number; nextAfter?: string }
   | { kind: 'containerAnchors'; items: SpatialNode[]; total: number; nextAfter?: string }
+  | FrontierQueryData
   | { kind: 'snapshot'; snapshot: SpatialMemoryStoreSnapshot }
   | { kind: 'capabilities'; capabilities: MemoryHostCapabilities };
+
+/**
+ * 增量（D-V4-017）：从未观察边界的只读投影。`pos` 是相邻边界格，未被进入、
+ * 不被声称可达；只有 `stance` 带可达性结论。未知 ≠ 空气。
+ */
+export interface FrontierCandidateQueryView {
+  /** 由 `dim` + 边界格坐标稳定生成，可跨快照重复引用。 */
+  id: string;
+  pos: Vec3Like;
+  /** 搜索验证过的 approach stance；可达性只针对它。 */
+  stance: Vec3Like;
+  reachability: 'OPEN';            // 仅 stance
+  boundaryReachability: 'unknown'; // 边界格未被进入
+  direction: { axis: 'x' | 'z'; sign: 1 | -1 } | null;
+  gap: Vec3Like[];
+  gapCount: number;
+  /** stance 的局部观测证据（feet/head/support），不是任意身体净空证明。 */
+  basis: Observation[];
+  reason: string;
+  historicalConnection: boolean | 'unknown';
+  computedAt: number;
+  validUntil: number;
+  /** 查询时钟减 `computedAt`，下限为 0。 */
+  ageMs: number;
+}
+
+export interface FrontierQueryData {
+  kind: 'frontiers';
+  source: 'walk_search_snapshot';
+  /** 快照自带的证据作用域；不与信封的当前会话混同。 */
+  scope: { worldId: string; dim: string; sessionId: string };
+  snapshotState: WalkSearchState;
+  items: FrontierCandidateQueryView[];
+  total: number;
+  /** `limit` 截断了本窗口。 */
+  truncated: boolean;
+  /** 快照自身触达 maxFrontiers。 */
+  snapshotTruncated: boolean;
+  /** snapshot.diagnostics 中 `status:'STALE'` 的数量；不是空气/可通行事实。 */
+  staleCount: number;
+  /** 快照 diagnostics 触达上限；为 true 时 `staleCount` 是部分计数。 */
+  diagnosticsTruncated: boolean;
+  /** STALE/未驻留等不可用历史证据的边界数；不混入 items。 */
+  unavailableHistoricalCount: number;
+  unavailableHistoricalTruncated: boolean;
+  /** `unavailableHistorical` 边界涉及的 Section residency 分类计数（按 section 计）。 */
+  unavailableHistoricalResidency: {
+    not_resident: number;
+    loading: number;
+    load_failed: number;
+  };
+}
 
 // `containerContents` 没有 data 变体：其成功形态就是结构化 `host_ledger`
 // problem（见 §5.5）。不得返回 `items: []`。
@@ -510,6 +568,7 @@ export type SpatialQueryProblem =
 | `portals` | 独立 portal 边与原始穿越证据 | 接近门 = 已穿越 |
 | `resourceAnchors` | `tag`/`label` 过滤后的 `SpatialNode` 位置、精度、观测时间、来源 | 资源数量/价值/自动采集；M2 不计算可达性 |
 | `containerAnchors` | 容器位置、存在性、精确坐标、观测时间；需要宿主注入 `isContainer` 分类器；只返回 exact 节点 | **容器内容/数量/空槽**；区域中心 = 精确容器目标 |
+| `frontiers` | 调用方已提供 `WalkSearchSnapshot` 的只读投影（D-V4-017）：稳定候选 id、快照作用域、边界格与 axis/sign 方向、未知 gap 格与计数、`computedAt`/`validUntil`/`ageMs`、approach stance 的 `reachability:'OPEN'`、`basis` 观测、`historicalConnection:'unknown'`（无宿主历史查询时）；按快照发现顺序返回，不排序/不选目标/不启动搜索。无快照源或快照时 `unsupported`；世界/维度不符 `scope_mismatch`。三类证据分离：`items` 只含从未观察边界；`staleCount`（+`diagnosticsTruncated`）汇总 STALE diagnostics；`unavailableHistoricalCount`/`unavailableHistoricalResidency` 汇总不可用保存 Section 的 not_resident/loading/load_failed；三者互不混入 | 边界格/`gap` 可达或可通行；`OPEN` 是施工授权；候选排序或资源偏好；未知 = 空气；STALE/未驻留 = 从未观察；旧快照 = 当前证据；查询会启动搜索或刷新证据 |
 | `containerContents` | 固定 `status:'unsupported'` + `problem.kind:'host_ledger'`，无 `data` | 空箱；`items:[]`；任何内容/数量 |
 | `snapshot` | 只读计数/版本/能力 | 当前通行结论 |
 | `capabilities` | 能力报告 | 未实现能力已可用 |
@@ -541,17 +600,20 @@ export type SpatialQueryProblem =
 - `total` 是匹配总数；不得用整页长度代替。
 - `cells` 查询位置数量上限为 4096；超过返回 `invalid_request`。
 - `containerAnchors` 的分类器没有索引，因此会分页扫描节点直到耗尽；扫描范围由 `TopologyStore` 的节点容量上限约束，`total` 是完整匹配数。大节点集上的频繁调用列为 M8 基准候选，不得用固定前缀预算牺牲游标正确性。`portals` 类似：每次查询克隆 `portalEdges()` 返回的完整边集合并按 `id` 排序后应用 `after`/`limit`（`after` 不是底层游标），规模受 `TopologyStore.maxPortalEdges`（默认 1000）约束；是否改为底层游标由 M8 基准决定。
+- `frontiers` 没有 `after`：候选集本身受快照 `maxFrontiers` 约束，且每次查询都以同一快照的发现顺序投影。`limit` 只限制本窗口；被限制时 `truncated:true` 且 `total` 仍是快照候选总数（不静默截断），调用方可提高 `limit`（≤1000）。`snapshotTruncated` 单独表示快照自身的 `maxFrontiers` 已满，两者不得混为一个标志。
 - 查询 MUST 只读：不移动、不转头、不扫描、不刷新观测时间、不写库、不 pin/保存。
 - 查询不得隐式重试或回退到世界/区块扫描。`containerAnchors` 的宿主分类器没有索引，会对**内存节点索引**做一次只读遍历以获得精确 `total`；该 O(nodes) 工作是 M8 基准候选，不是世界扫描。
-- M2 的请求不带 `worldId`：store 绑定单一不可变世界，`scope_mismatch` 保留给未来的世界寻址适配器，当前没有产生者。
+- M2 的请求不带 `worldId`：store 绑定单一不可变世界。`frontiers` 是当前唯一会产生 `scope_mismatch` 的 kind：调用方快照的 world/dim 与 store/请求不符时返回该状态；世界寻址仍留给未来适配器。
 
 ### 5.7 当前实现映射
 
 - `[已实现]` `SpatialMemoryStore.sectionAt`、`fragments`、`graph`、`displayNodes`、`edgeRuntime`、`portalEdges`、`route`、`routeInspection`、`surfaceAnchor`、`deepestAnchor`、`components`、`segments`、`fragmentation`。
 - `[已实现]` `TopologyStore.nodes({ dim, source, tag, label, after, limit })`。
 - `[已实现]` `FragmentStore.fragments/traversals`。
-- `[已实现]` 统一 `SpatialQueryPort` 投影（`src/query/*`，通过 `SpatialMemoryStore.query(request)` 暴露）：cells、fragments、traversals、nodes、edges、historyRoute、anchor、components、segments、portals、resourceAnchors、containerAnchors、containerContents、snapshot、capabilities；未知字段/未知 kind 拒绝；列表分页 100/1000；查询只读。
+- `[已实现]` 统一 `SpatialQueryPort` 投影（`src/query/*`，通过 `SpatialMemoryStore.query(request)` 暴露）：cells、fragments、traversals、nodes、edges、historyRoute、anchor、components、segments、portals、resourceAnchors、containerAnchors、frontiers、containerContents、snapshot、capabilities；未知字段/未知 kind 拒绝；列表分页 100/1000；查询只读。
 - `[增量]` `containerContents` 与 `segments` 是 M2 新增请求 kind；`containerContents` 固定返回 `host_ledger`，无 `data`；`MemoryHostCapabilities.query.segments`/`resourceAnchors` 是 §2.3 的增量能力位。`not_found` 也作为新增状态用于未知 fragment。
+- `[增量，D-V4-017，requires_user_review: true]` `frontiers` kind 由 `src/query/frontiers.ts` 实现，复用 `SpatialMemoryStoreImpl` 的 `frontierSource`（调用方已提供的 `WalkSearchSnapshot`）与 `navigation/route-inspection.ts` 的 `frontierCandidates` 投影；不新增 frontier 扫描、不启动搜索、不建索引。`query.frontiers` 能力位仅表示宿主注入了快照源（`frontierSource`）；未注入或该维度/位置无快照时返回 `unsupported`。快照 world/dim 与请求不符返回 `scope_mismatch`。查询只读：不加载 Section、不刷新证据、不改 revision/`observedAt`。
+- `[增量]` `frontiers` 只断言 `stance` 可达（`reachability:'OPEN'`）；`pos`/`gap` 未进入，`boundaryReachability:'unknown'`。三类证据分开：`items` 只含从未观察边界；`staleCount`/`diagnosticsTruncated` 汇总 snapshot 的 STALE diagnostics；`unavailableHistoricalCount`/`unavailableHistoricalResidency` 汇总 not_resident/loading/load_failed（保存 Section 不可用），避免把“没有候选”读成“没有未知边界”或把 STALE/未驻留当成从未观察。
 - `[已实现，需宿主配置]` `containerAnchors` 依赖宿主注入 `isContainer` 分类器；未配置时返回 `unsupported` 且能力为 `false`。库不解释 label/metadata；扫描受节点容量约束并返回完整 `total`。
 - `[宿主职责]` 容器内容、库存、玩家/生物实时占位语义（库可存位置/可达证据，但不复制账本）。
 

@@ -50,6 +50,9 @@ export function buildMemoryHostCapabilities(
       portals: true,
       resourceAnchors: true,
       containerAnchors: context.isContainer !== undefined,
+      // Available only when the host injected the caller-supplied snapshot
+      // source; the library never starts a search of its own.
+      frontiers: context.sources.frontiers !== undefined,
       containerContents: false,
     },
     // M3 planning is present in this package. Reference the single source in
