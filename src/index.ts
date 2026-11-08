@@ -181,12 +181,25 @@ export type {
 // Topology — historical geometry + confirmed traversal evidence (phase 4A),
 // explicit in-memory topology facts (phase 4B), and bounded historical graph
 // queries (phase 4C)
-export { FragmentStore, TopologyStore } from './topology/index.js';
+export {
+  canonicalCellKey,
+  canonicalCellPoint,
+  FragmentStore,
+  TopologyStore,
+  writeConfirmedCorridor,
+} from './topology/index.js';
 export type {
   AdjacencyOptions,
   AdjacencyResult,
   AnchorOrder,
+  ConfirmedCorridorEdge,
+  ConfirmedCorridorInput,
+  ConfirmedCorridorNode,
   ConnectionType,
+  CorridorCoordinateMode,
+  CorridorWriteProblem,
+  CorridorWriteProblemKind,
+  CorridorWriteReceipt,
   EdgeBasis,
   EdgeChanges,
   EdgePage,
@@ -277,11 +290,23 @@ export type {
 } from './topology/index.js';
 
 // Memory write/change ports (pure memory core)
-export { CONTRACT_VERSION } from './memory/index.js';
+export {
+  CAPABILITY_DOMAINS,
+  CapabilityContractError,
+  CapabilityUnavailableError,
+  composeCapabilities,
+  CONTRACT_VERSION,
+  hasCapability,
+  requireCapability,
+} from './memory/index.js';
 export type {
+  CapabilityDomain,
+  CapabilityNameOf,
   ChangeReportSink,
   ChangeReportSource,
+  ComposedCapabilityReport,
   ContractVersion,
+  HostCapabilityDeclaration,
   MemoryHostCapabilities,
   MemoryIngest,
 } from './memory/index.js';

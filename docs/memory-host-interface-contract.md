@@ -1290,7 +1290,7 @@ export interface ChangeReport {
 | `SpatialMemoryStore` 查询方法 | 已实现（分散） | `src/store/store.ts` |
 | 统一 `SpatialQueryPort` | 已实现 | `src/query/*`；`SpatialMemoryStore.query(request)` 暴露；含 segments；未知字段/kind 拒绝、分页 100/1000、只读 |
 | `segments` 查询 | 已实现 | 包装 `TopologyStore.segments`；未知 fragment 返回 `not_found`；不删除/改写 fragment 历史 |
-| `MemoryHostCapabilities` / `CONTRACT_VERSION` / 包入口 | 已实现（按域如实） | `src/memory/capabilities.ts`；memory/query 按实际能力，plan 的 walk search/history/auto 为 `true`；`execute.*`/`persistence.*` 仍全为 `false`（D-059，不因 M4/M6 已有运行时入口而翻真）；契约版本保持 `memory-host-contract/1`（H-02 未决）。M5 入口：`package.json` 的 `./memory`/`./navigation` 子路径与入口隔离由 `tests/entrypoints.test.ts` 锁定 |
+| `MemoryHostCapabilities` / `CONTRACT_VERSION` / 包入口 | 已实现（按域如实） | `src/memory/capabilities.ts`；memory/query 按实际能力，plan 的 walk search/history/auto 为 `true`；`execute.walk`/`groundedArrival`/`invalidation`/`cancellation` 因运行时入口已实现而报告 `true`，`execute.swim`/`boat` 与 `persistence.*` 保持 `false`（D-059 仅继续约束 persistence）；宿主必须用 `composeCapabilities` 与自身接线求交集；契约版本保持 `memory-host-contract/1`（H-02 未决）。M5 入口：`package.json` 的 `./memory`/`./navigation` 子路径与入口隔离由 `tests/entrypoints.test.ts` 锁定 |
 | `cells` 未驻留/gap 语义 | 已实现 | 对外三类：已观察、未观察且无 gap、不可读（`gap.reason:'unloaded'` + `status:'partial'`）；未观察格另带可选 `residency`（`SectionResidency`）与 `unobservedReason: 'no_record' \| 'resident'`，可细分 `no_record`/resident-unobserved/`not_resident`/`loading`/`load_failed`，旧消费者忽略新字段后仍只见三类；历史 `ObservationGap` 未持久化，只报告当前驻留 gap |
 | `WalkRouteSearch` | 已实现 | `src/navigation/walk-search.ts`；M8.1 基准见 `benchmarks/walk-search.bench.ts`、`benchmarks/baseline.md`（Fake 碰撞规则，不是真实服务器） |
 | `WalkRouteExecutor` + `bodyArrival` | 已实现（含 M8.3b 单步访问器） | `src/execution/*`；`stepAt` 逐段验证不复制整条路线，见 `benchmarks/m8-3b.md` |

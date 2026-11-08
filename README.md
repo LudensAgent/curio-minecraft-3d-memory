@@ -15,7 +15,7 @@ A standalone TypeScript library for Minecraft Java 1.20.1 agents. It records wha
 
 The scope is **land walking and surface-water movement** — jumps, steps, ladders, drop transitions, surface swimming, riding a boat, and shore entry/exit. Flight, elytra and underwater 3D navigation are out of scope.
 
-**Status: 0.10.0 (unreleased).** Observation/query, `planRoute` + `walkPath` walk navigation, runtime store composition, topology runtime state, SQLite persistence and the M6 restart/checkpoint regression are implemented and covered by offline tests. The `memory` and `navigation` subpath entries are exposed by the package `exports`; `MemoryHostCapabilities.execute.*`/`persistence.*` remain `false` pending host wiring (D-059). Real Minecraft / mineflayer / Curio integration is not validated (H-01).
+**Status: 0.10.0 (unreleased).** Observation/query, `planRoute` + `walkPath` walk navigation, runtime store composition, topology runtime state, SQLite persistence and the M6 restart/checkpoint regression are implemented and covered by offline tests. The `memory` and `navigation` subpath entries are exposed by the package `exports`; `MemoryHostCapabilities.execute.walk`/`groundedArrival`/`invalidation`/`cancellation` are `true` because those runtime entries are implemented, while `execute.swim`/`boat` and `persistence.*` remain `false` (D-059). Real Minecraft / mineflayer / Curio integration is not validated (H-01).
 
 ## Features
 
@@ -175,6 +175,27 @@ const route = topology.route('a', 'b', { mode: 'walk' });
 
 A→B and B→A are independent records. Only `traversed` edges whose evidence still resolves participate in historical queries. A candidate edge is a relation to verify, not proof that a traversal happened. See the acceptance documents linked below for full result and failure semantics.
 
+Write one actually-confirmed corridor as a single atomic unit instead of calling the per-record APIs in sequence:
+
+```ts
+import { writeConfirmedCorridor } from 'curio-minecraft-3d-memory';
+
+const receipt = writeConfirmedCorridor(history, topology, {
+  fragment,                 // confirmed geometry only
+  traversals,               // one record per actually-walked segment
+  nodes,                    // exact endpoints; ids must be stable
+  edges,                    // directed traversed edges, each citing evidence
+  sessionId,
+  coordinate: 'cell',       // explicit cell canonicalization; 'exact' keeps floats
+});
+// receipt.status: 'written' | 'unchanged' | 'rejected'
+// receipt.committed: 'all' | 'none' (no prefix state)
+// receipt.problem: node_referenced | endpoint_mismatch | scope_mismatch | ...
+```
+
+The writer validates the whole corridor before mutating anything, rolls back both stores on any failure, and is idempotent for an identical retry. It never snaps by proximity: a changed node that an edge outside this corridor still references is rejected with the external edge ids, never silently rebased. Plan points, unconfirmed motion and historical geometry must not be submitted as traversals.
+
+
 ### Manage a bounded working set
 
 ```ts
@@ -219,7 +240,7 @@ The library provides facts and execution assistance; the host owns the connectio
 
 `navigateTo` explicitly rejects `near` / `reach_block` arrival, non-walk modes, digging, placing, towering, non-empty material lists, non-empty `avoid` constraints and `allow_frontier`. Those rejections are structured results, never silently ignored settings.
 
-`planRoute` reports walk search/history/auto as `true` and the wider modes as `false`; `walkPath` accepts only registry-issued, single-use walk routes and never re-plans. The canonical `MemoryHostCapabilities` still keeps every `execute.*` and `persistence.*` bit `false` (D-059) until host consumption is validated, so negotiate before wiring rather than treating runtime entries as declared capabilities.
+`planRoute` reports walk search/history/auto as `true` and the wider modes as `false`; `walkPath` accepts only registry-issued, single-use walk routes and never re-plans. The canonical `MemoryHostCapabilities` reports the implemented walk execution bits (`walk`, `groundedArrival`, `invalidation`, `cancellation`) as `true`; `swim`, `boat` and every `persistence.*` bit stay `false` (D-059). Use `composeCapabilities` to intersect the library report with the host's own wiring before calling anything; a `false` or omitted capability is an explicit `unsupported` refusal, not a silent fallback.
 
 ## Project structure
 

@@ -60,6 +60,14 @@ export interface RoutePlanRegistry extends RoutePlanRegistrar {
   consume(routeId: string, scope: RoutePlanScope, now: number): RoutePlan | RoutePlanRegistryProblem;
   /** Release an execution pin after a terminal outcome; the handle stays consumed. */
   release(routeId: string): void;
+  /**
+   * Invalidate every handle that does not match `scope`, e.g. after a session,
+   * dimension, reconnect or death change. Unpinned entries are dropped
+   * (`route_not_found`); pinned entries stay as consumed tombstones so the
+   * active execution can still release them, and a second consume reports
+   * `route_consumed`. Returns the number of affected handles.
+   */
+  invalidateScope(scope: RoutePlanScope): number;
   /** Retained handles, including consumed tombstones. */
   readonly size: number;
 }
@@ -183,6 +191,29 @@ export class RoutePlanRegistryImpl implements RoutePlanRegistry {
   release(routeId: string): void {
     const entry = this.entries.get(routeId);
     if (entry !== undefined) entry.pinned = false;
+  }
+
+  invalidateScope(scope: RoutePlanScope): number {
+    let affected = 0;
+    for (const [id, entry] of [...this.entries]) {
+      const planScope = routeScopeOf(entry.plan.evidence);
+      if (
+        planScope.worldId === scope.worldId
+        && planScope.dim === scope.dim
+        && planScope.sessionId === scope.sessionId
+      ) {
+        continue;
+      }
+      affected += 1;
+      if (entry.pinned) {
+        // The active execution still owns the pin; keep a consumed tombstone
+        // until it settles, but the handle can never be consumed again.
+        entry.consumed = true;
+      } else {
+        this.entries.delete(id);
+      }
+    }
+    return affected;
   }
 
   // --- internals ---

@@ -173,3 +173,43 @@ describe('RoutePlanRegistry — capacity and pinning', () => {
     expect('kind' in registry.consume(available.routeId, SCOPE, 5000)).toBe(false);
   });
 });
+
+describe('RoutePlanRegistry — scope invalidation', () => {
+  it('rejects a dimension-only mismatch and burns the handle', () => {
+    const registry = new RoutePlanRegistryImpl({ now: () => 5000 });
+    const plan = registry.register(draft());
+
+    expect(registry.consume(plan.routeId, { ...SCOPE, dim: 'nether' }, 5000)).toMatchObject({
+      kind: 'scope_mismatch',
+      routeId: plan.routeId,
+      expected: SCOPE,
+      actual: { ...SCOPE, dim: 'nether' },
+    });
+    expect(registry.consume(plan.routeId, SCOPE, 5000)).toMatchObject({ kind: 'route_consumed' });
+  });
+
+  it('drops unpinned handles from another session and keeps the current scope', () => {
+    const registry = new RoutePlanRegistryImpl({ now: () => 5000 });
+    const stale = registry.register(draft());
+    const current = registry.register(draft({
+      evidence: { ...draft().evidence, sessionId: 's2' },
+    }));
+
+    expect(registry.invalidateScope({ worldId: 'world', dim: 'overworld', sessionId: 's2' })).toBe(1);
+    expect(registry.consume(stale.routeId, SCOPE, 5000)).toMatchObject({ kind: 'route_not_found' });
+    expect('kind' in registry.consume(current.routeId, { ...SCOPE, sessionId: 's2' }, 5000)).toBe(false);
+  });
+
+  it('turns a pinned handle into a consumed tombstone until its execution releases it', () => {
+    const registry = new RoutePlanRegistryImpl({ now: () => 5000 });
+    const active = registry.register(draft());
+    expect('kind' in registry.consume(active.routeId, SCOPE, 5000)).toBe(false);
+
+    expect(registry.invalidateScope({ worldId: 'world', dim: 'nether', sessionId: 's9' })).toBe(1);
+    expect(registry.size).toBe(1);
+    expect(registry.consume(active.routeId, SCOPE, 5000)).toMatchObject({ kind: 'route_consumed' });
+
+    registry.release(active.routeId);
+    expect(registry.consume(active.routeId, SCOPE, 5000)).toMatchObject({ kind: 'route_consumed' });
+  });
+});

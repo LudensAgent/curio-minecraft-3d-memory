@@ -42,6 +42,20 @@ export type {
   FragmentSegmentsView,
   FragmentationResult,
 } from './connectivity.js';
+export {
+  canonicalCellKey,
+  canonicalCellPoint,
+  writeConfirmedCorridor,
+} from './confirmed-corridor.js';
+export type {
+  ConfirmedCorridorEdge,
+  ConfirmedCorridorInput,
+  ConfirmedCorridorNode,
+  CorridorCoordinateMode,
+  CorridorWriteProblem,
+  CorridorWriteProblemKind,
+  CorridorWriteReceipt,
+} from './confirmed-corridor.js';
 export { FragmentStore } from './fragment-store.js';
 export type {
   FragmentChanges,

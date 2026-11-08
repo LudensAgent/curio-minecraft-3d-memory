@@ -56,11 +56,17 @@ export function buildMemoryHostCapabilities(
     // `src/memory/capabilities.ts` directly (D-010) so the report and the
     // constant cannot drift; the constant is frozen against host mutation.
     plan: ROUTE_PLAN_CAPABILITIES,
+    // These four entries have real runtime implementations in this package:
+    // WalkRouteExecutor + walkPath (walk), measured grounded arrival,
+    // ChangeReport-driven current-segment invalidation, and delegation-scoped
+    // cancellation. Reporting `true` is a library fact; the host must still
+    // intersect it with its own wiring via `composeCapabilities`. Swim/boat
+    // execution remain false (geometry validation only).
     execute: {
-      walk: false,
-      groundedArrival: false,
-      invalidation: false,
-      cancellation: false,
+      walk: true,
+      groundedArrival: true,
+      invalidation: true,
+      cancellation: true,
       swim: false,
       boat: false,
     },

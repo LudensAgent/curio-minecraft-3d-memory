@@ -290,6 +290,12 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
   markTraversed(dim: string, pos: Vec3Like): void {
     this.assertDim(dim, 'markTraversed');
     assertFinitePoint(pos, 'markTraversed');
+    if (typeof this.voxel.markTraversed !== 'function') {
+      throw new SpatialMemoryUnsupportedError(
+        'markTraversed',
+        'the injected VoxelMap does not implement markTraversed; no fact was written',
+      );
+    }
     this.voxel.markTraversed(dim, copyPoint(pos));
   }
 
@@ -298,6 +304,12 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
     assertFinitePoint(pos, 'markModified');
     if (typeof actionId !== 'string' || actionId.length === 0) {
       throw new Error('markModified: actionId must be a non-empty string');
+    }
+    if (typeof this.voxel.markModified !== 'function') {
+      throw new SpatialMemoryUnsupportedError(
+        'markModified',
+        'the injected VoxelMap does not implement markModified; no fact was written',
+      );
     }
     this.voxel.markModified(dim, copyPoint(pos), actionId);
   }
@@ -829,14 +841,24 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
         reason:
           'Read-only projection over the composed stores. containerAnchors requires a host-injected isContainer classifier; containerContents always returns host_ledger/unsupported.',
       },
-      markTraversed: {
-        available: true,
-        reason: 'Measured stance history only; never inferred from proximity or requests.',
-      },
-      markModified: {
-        available: true,
-        reason: 'Requires a confirmed actionId; block-content revision is not advanced.',
-      },
+      markTraversed: typeof this.voxel.markTraversed === 'function'
+        ? {
+            available: true,
+            reason: 'Measured stance history only; never inferred from proximity or requests.',
+          }
+        : {
+            available: false,
+            reason: 'The injected VoxelMap does not implement markTraversed; calls return unsupported.',
+          },
+      markModified: typeof this.voxel.markModified === 'function'
+        ? {
+            available: true,
+            reason: 'Requires a confirmed actionId; block-content revision is not advanced.',
+          }
+        : {
+            available: false,
+            reason: 'The injected VoxelMap does not implement markModified; calls return unsupported.',
+          },
       saveFragment: { available: true },
       addTraversal: {
         available: true,

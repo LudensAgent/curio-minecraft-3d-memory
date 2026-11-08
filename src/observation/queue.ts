@@ -25,6 +25,11 @@ export interface ObservationQueueOptions {
    * override when the host has a more accurate measure.
    */
   estimateBytes?: (item: Observation | ObservationGap) => number;
+  /**
+   * Maximum stable identifiers retained per refused batch. Defaults to 64.
+   * Counts are always exact; only the identifier list is bounded.
+   */
+  maxRejectedIds?: number;
 }
 
 /** Explicit overflow report: what was refused because of a capacity bound. */
@@ -33,6 +38,16 @@ export interface ObservationOverflow {
   gaps: number;
   bytes: number;
   reason: 'max_items' | 'max_bytes' | 'both';
+  /**
+   * Stable identities of the refused observations, in batch order. Bounded by
+   * the queue's `maxRejectedIds`; the counterpart counts stay exact so a caller
+   * can tell which cells to re-observe when identifiers were truncated.
+   */
+  rejectedObservations: string[];
+  /** Stable identities of refused gaps, in batch order (same bound). */
+  rejectedGaps: string[];
+  /** True when at least one refused item has no retained identifier. */
+  truncated: boolean;
 }
 
 export interface ObservationEnqueueResult {
@@ -64,6 +79,7 @@ export interface ObservationDrainResult {
 
 const DEFAULT_MAX_ITEMS = 4096;
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_REJECTED_IDS = 64;
 const OBSERVATION_FIXED_BYTES = 256;
 const GAP_FIXED_BYTES = 48;
 
@@ -75,6 +91,7 @@ export class ObservationQueue {
   private readonly maxItems: number;
   private readonly maxBytes: number;
   private readonly estimateBytes: (item: Observation | ObservationGap) => number;
+  private readonly maxRejectedIds: number;
   private readonly items: QueueItem[] = [];
   private queuedBytes = 0;
   private queuedObservations = 0;
@@ -90,9 +107,14 @@ export class ObservationQueue {
     if (!Number.isFinite(maxBytes) || maxBytes < 1) {
       throw new Error(`maxBytes must be a positive finite number: ${String(maxBytes)}`);
     }
+    const maxRejectedIds = options.maxRejectedIds ?? DEFAULT_MAX_REJECTED_IDS;
+    if (!Number.isSafeInteger(maxRejectedIds) || maxRejectedIds < 1) {
+      throw new Error(`maxRejectedIds must be a positive safe integer: ${String(maxRejectedIds)}`);
+    }
     this.maxItems = maxItems;
     this.maxBytes = maxBytes;
     this.estimateBytes = options.estimateBytes ?? defaultEstimateBytes;
+    this.maxRejectedIds = maxRejectedIds;
   }
 
   /** Current backlog (read-only; draining is the only way items leave). */
@@ -119,13 +141,21 @@ export class ObservationQueue {
     const overItems = this.queuedObservations + observations + this.queuedGaps + gaps > this.maxItems;
     const overBytes = this.queuedBytes + bytes > this.maxBytes;
     if (overItems || overBytes) {
+      const rejectedObservations = batch.observations
+        .slice(0, this.maxRejectedIds)
+        .map(observationIdentity);
+      const remaining = Math.max(0, this.maxRejectedIds - rejectedObservations.length);
+      const rejectedGaps = batch.unobserved.slice(0, remaining).map(gapIdentity);
       const overflow: ObservationOverflow = {
         observations,
         gaps,
         bytes,
         reason: overItems && overBytes ? 'both' : overItems ? 'max_items' : 'max_bytes',
+        rejectedObservations,
+        rejectedGaps,
+        truncated: rejectedObservations.length + rejectedGaps.length < observations + gaps,
       };
-      this.pendingOverflow = mergeOverflow(this.pendingOverflow, overflow);
+      this.pendingOverflow = mergeOverflow(this.pendingOverflow, overflow, this.maxRejectedIds);
       return { accepted: false, observations: 0, gaps: 0, bytes: 0, overflow };
     }
 
@@ -173,15 +203,37 @@ export class ObservationQueue {
 function mergeOverflow(
   previous: ObservationOverflow | null,
   next: ObservationOverflow,
+  maxRejectedIds: number,
 ): ObservationOverflow {
   if (previous === null) return next;
   const reason = previous.reason === next.reason ? next.reason : 'both';
+  const rejectedObservations = [...previous.rejectedObservations, ...next.rejectedObservations]
+    .slice(0, maxRejectedIds);
+  const remaining = Math.max(0, maxRejectedIds - rejectedObservations.length);
+  const rejectedGaps = [...previous.rejectedGaps, ...next.rejectedGaps].slice(0, remaining);
   return {
     observations: previous.observations + next.observations,
     gaps: previous.gaps + next.gaps,
     bytes: previous.bytes + next.bytes,
     reason,
+    rejectedObservations,
+    rejectedGaps,
+    truncated: previous.truncated || next.truncated
+      || rejectedObservations.length + rejectedGaps.length
+        < previous.observations + next.observations + previous.gaps + next.gaps,
   };
+}
+
+/** Stable identity for a refused observation: scope + cell + acquisition time + sequence. */
+function observationIdentity(observation: Observation): string {
+  const { x, y, z } = observation.pos;
+  return `${observation.worldId}/${observation.dim}/${x},${y},${z}@${observation.observedAt}#${observation.sequence}`;
+}
+
+/** Stable identity for a refused gap: cell + reason. Gaps carry no world/dim. */
+function gapIdentity(gap: ObservationGap): string {
+  const { x, y, z } = gap.pos;
+  return `${x},${y},${z}:${gap.reason}`;
 }
 
 /**

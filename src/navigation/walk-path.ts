@@ -69,6 +69,7 @@ export type WalkPathInvalidationReason =
   | 'deviation'
   | 'unconfirmed_arrival'
   | 'unmeasured_position'
+  | 'effect_not_confirmed'
   | 'execution_failed'
   | 'unsupported_mode'
   | 'unsupported_target'
@@ -156,7 +157,17 @@ async function walkPathCore(
     return registryFailure(request.routeId, executionId, consumed, environment);
   }
   const plan = consumed;
-  const sample = environment.sample();
+  let sample: BodySample | null;
+  try {
+    sample = environment.sample();
+  } catch (error) {
+    registry.release(plan.routeId);
+    // A throwing sample provider is a host seam failure, not a world fact.
+    return planInvalidated(plan, executionId, null, 'route_start_unmeasured', {
+      kind: 'unavailable',
+      detail: `the measured sample provider threw: ${errorMessage(error)}`,
+    });
+  }
   if (sample === null) {
     registry.release(plan.routeId);
     return planInvalidated(plan, executionId, null, 'route_start_unmeasured', {
@@ -176,9 +187,19 @@ async function walkPathCore(
 
   // Every precheck passed. The executor owns the run; the handle stays pinned
   // until it settles and is released even if the executor rejects.
-  const terminal = await options.execute({ plan, executionId, sample, request, environment }).finally(() => {
-    registry.release(plan.routeId);
-  });
+  let terminal: WalkPathResult;
+  try {
+    terminal = await options.execute({ plan, executionId, sample, request, environment }).finally(() => {
+      registry.release(plan.routeId);
+    });
+  } catch (error) {
+    // An injected executor rejection is an execution failure, not an escape from
+    // the contract. The measured start remains the only evidence this entry has.
+    return planInvalidated(plan, executionId, sample, 'execution_failed', {
+      kind: 'execution_failed',
+      detail: `the walk executor rejected: ${errorMessage(error)}`,
+    });
+  }
   return enforceTerminalContract(plan, executionId, request, environment, terminal);
 }
 
@@ -254,13 +275,18 @@ function enforceTerminalContract(
     // The result is this execution's, but malformed numeric/evidence fields
     // must still not escape the public envelope (contract §7.4).
     const { lastPosition, lastObservation, ...rest } = result;
+    const remaining = Array.isArray(result.remainingPoints)
+      ? result.remainingPoints.map(clonePoint)
+      : undefined;
     return {
       ...rest,
       routeId: plan.routeId,
       executionId,
       confirmed: false,
       confirmedSegments: validSegments ? result.confirmedSegments : 0,
-      remainingPoints: validSegments ? result.remainingPoints : plan.points.map(clonePoint),
+      remainingPoints: validSegments && remaining !== undefined
+        ? remaining
+        : plan.points.map(clonePoint),
       ...(lastPosition !== undefined && isFinitePoint(lastPosition)
         ? { lastPosition: { ...lastPosition } }
         : {}),
@@ -278,6 +304,7 @@ function enforceTerminalContract(
     && result.executionId === executionId
     && validSegments
     && result.confirmedSegments === maxSegments
+    && Array.isArray(result.remainingPoints)
     && result.remainingPoints.length === 0
     && position !== undefined
     && isFinitePoint(position)
@@ -296,13 +323,15 @@ function enforceTerminalContract(
     ...rest,
     routeId: plan.routeId,
     executionId,
-    outcome: zero ? 'INVALIDATED' : 'PARTIAL',
+    // An unbacked ARRIVED with no confirmed segment is "no confirmed effect",
+    // not evidence invalidation. With progress it stays PARTIAL.
+    outcome: zero ? 'EFFECT_NOT_CONFIRMED' : 'PARTIAL',
     confirmedSegments,
     remainingPoints: zero
       ? plan.points.map(clonePoint)
       : plan.points.slice(confirmedSegments + 1).map(clonePoint),
     ...(zero
-      ? { invalidation: { segment: confirmedSegments, reason: 'unconfirmed_arrival' } }
+      ? { invalidation: { segment: confirmedSegments, reason: 'effect_not_confirmed' } }
       : {}),
     problem: { kind: 'unconfirmed_arrival', expected: { ...target } },
     confirmed: false,
@@ -313,6 +342,10 @@ function enforceTerminalContract(
       ? { lastObservation: { ...lastObservation } }
       : {}),
   };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Finite observation time in this execution's scope. */
@@ -693,6 +726,19 @@ function toWalkPathResult(
   if (kind === 'no_path') return { ...base, outcome: 'NO_PATH', ...(result.problem === undefined ? {} : { problem: result.problem }), confirmed: false };
   if (kind === 'cancelled') return { ...base, outcome: 'CANCELLED', ...(result.problem === undefined ? {} : { problem: result.problem }), confirmed: false };
   if (kind === 'timeout') return { ...base, outcome: 'TIMEOUT', ...(result.problem === undefined ? {} : { problem: result.problem }), confirmed: false };
+
+  // The body was asked to move but no confirmed displacement backs it. This is
+  // its own terminal outcome: not `INVALIDATED` (evidence did not change) and
+  // not `BLOCKED` (no evidence claims the world blocks).
+  if (zero && (kind === 'unconfirmed_arrival' || kind === 'unmeasured_position')) {
+    return {
+      ...base,
+      outcome: 'EFFECT_NOT_CONFIRMED',
+      invalidation: { segment: confirmedSegments, reason: kind },
+      ...(result.problem === undefined ? {} : { problem: result.problem }),
+      confirmed: false,
+    };
+  }
 
   // Non-invalidation execution failures retain confirmed progress as PARTIAL
   // (contract §7.4). With zero confirmed segments there is no partial progress;

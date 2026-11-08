@@ -779,6 +779,8 @@ export class TopologyStore {
    * `restoreSnapshot` and only exists to mark checkpoint cut-points and `dirty`.
    */
   private mutationRevision = 0;
+  /** Nesting depth of `runAtomic`; only the outermost call owns the rollback. */
+  private transactionDepth = 0;
 
   constructor(history: TopologyHistorySource, options: TopologyStoreOptions = {}) {
     this.worldId = history.worldId;
@@ -795,6 +797,91 @@ export class TopologyStore {
   /** Current mutation revision (see `mutationRevision`). */
   get revision(): number {
     return this.mutationRevision;
+  }
+
+  /**
+   * Run synchronous topology writes as one all-or-nothing unit. Per-call
+   * validation already prevents half-written single records; this covers a
+   * caller that updates nodes and edges together. The mutable maps are
+   * snapshotted first and restored on any throw. Nested calls join the outer
+   * transaction. Reads are never restricted, so the operation must not await.
+   *
+   * This is an in-memory transaction, not a persistence checkpoint.
+   */
+  runAtomic<T>(operation: () => T): T {
+    if (this.transactionDepth > 0) {
+      this.transactionDepth += 1;
+      try {
+        return operation();
+      } finally {
+        this.transactionDepth -= 1;
+      }
+    }
+    const snapshot = this.snapshotMutableState();
+    this.transactionDepth = 1;
+    try {
+      const value = operation();
+      this.transactionDepth = 0;
+      return value;
+    } catch (error) {
+      this.restoreMutableState(snapshot);
+      this.transactionDepth = 0;
+      throw error;
+    }
+  }
+
+  private snapshotMutableState(): {
+    nodes: Map<string, SpatialNode>;
+    edges: Map<string, StoredEdge>;
+    portalEdges: Map<string, StoredPortalEdge>;
+    portalTraversals: Map<string, PortalTraversalEvidence>;
+    merges: FragmentMerge[];
+    programOrder: string[];
+    componentCache: Map<string, Map<string, number>>;
+    componentNext: Map<string, number>;
+    nodeIndex: NodeListingIndex | null;
+    edgeIndex: EdgeListingIndex | null;
+    nodeToEdges: Map<string, Set<string>>;
+    revision: number;
+  } {
+    return {
+      nodes: new Map(this.nodeMap),
+      edges: new Map(this.edgeMap),
+      portalEdges: new Map(this.portalEdgeMap),
+      portalTraversals: new Map(this.portalTraversalMap),
+      merges: [...this.fragmentMerges],
+      programOrder: [...this.programNodeOrder],
+      componentCache: new Map(
+        [...this.componentCache].map(([dim, components]) => [dim, new Map(components)]),
+      ),
+      componentNext: new Map(this.componentNext),
+      nodeIndex: this.nodeListingIndex,
+      edgeIndex: this.edgeListingIndex,
+      nodeToEdges: new Map([...this.nodeToEdgeIds].map(([id, edges]) => [id, new Set(edges)])),
+      revision: this.mutationRevision,
+    };
+  }
+
+  private restoreMutableState(snapshot: ReturnType<TopologyStore['snapshotMutableState']>): void {
+    this.nodeMap.clear();
+    for (const [id, node] of snapshot.nodes) this.nodeMap.set(id, node);
+    this.edgeMap.clear();
+    for (const [id, edge] of snapshot.edges) this.edgeMap.set(id, edge);
+    this.portalEdgeMap.clear();
+    for (const [id, edge] of snapshot.portalEdges) this.portalEdgeMap.set(id, edge);
+    this.portalTraversalMap.clear();
+    for (const [id, traversal] of snapshot.portalTraversals) this.portalTraversalMap.set(id, traversal);
+    this.fragmentMerges = snapshot.merges;
+    this.programNodeOrder = snapshot.programOrder;
+    this.componentCache.clear();
+    for (const [dim, components] of snapshot.componentCache) this.componentCache.set(dim, components);
+    this.componentNext.clear();
+    for (const [dim, next] of snapshot.componentNext) this.componentNext.set(dim, next);
+    this.nodeListingIndex = snapshot.nodeIndex;
+    this.edgeListingIndex = snapshot.edgeIndex;
+    this.nodeToEdgeIds.clear();
+    for (const [id, edges] of snapshot.nodeToEdges) this.nodeToEdgeIds.set(id, edges);
+    this.mutationRevision = snapshot.revision;
   }
 
   // --- nodes ---
@@ -866,6 +953,21 @@ export class TopologyStore {
   getNode(id: string): SpatialNode | null {
     const node = this.nodeMap.get(id);
     return node === undefined ? null : cloneNode(node);
+  }
+
+  /**
+   * Read-only list of every walk-graph edge id that references `nodeId`, in
+   * insertion order. Unlike `adjacency()`, this is not filtered by current
+   * verification state and is not subject to a query budget — callers that must
+   * decide whether a node location can change need the complete reference set.
+   */
+  incidentEdgeIds(nodeId: string): string[] {
+    return [...(this.nodeToEdgeIds.get(nodeId) ?? [])];
+  }
+
+  /** Read-only list of every portal-edge id that references `nodeId`. */
+  incidentPortalEdgeIds(nodeId: string): string[] {
+    return this.portalEdgeIdsForNode(nodeId);
   }
 
   /** Delete a node. Refused while any edge references it; unknown id is a no-op. */

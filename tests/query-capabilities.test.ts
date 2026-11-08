@@ -68,7 +68,7 @@ describe('query capabilities', () => {
     expect(withClassifier.query.containerContents).toBe(false);
   });
 
-  it('reports implemented walk planning and keeps execute/persistence false', () => {
+  it('reports implemented walk planning and execution, keeps swim/boat and persistence false', () => {
     const parts = makeQueryParts();
     const capabilities = capabilitiesOf(runQuery(parts, { kind: 'capabilities' }));
 
@@ -84,7 +84,14 @@ describe('query capabilities', () => {
     });
     // The canonical host report must not drift from the navigation-layer table.
     expect(capabilities.plan).toEqual({ ...ROUTE_PLAN_CAPABILITIES });
-    expect(Object.values(capabilities.execute).some(Boolean)).toBe(false);
+    expect(capabilities.execute).toEqual({
+      walk: true,
+      groundedArrival: true,
+      invalidation: true,
+      cancellation: true,
+      swim: false,
+      boat: false,
+    });
     expect(Object.values(capabilities.persistence).some(Boolean)).toBe(false);
   });
 

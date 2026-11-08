@@ -10,9 +10,22 @@
  * without importing `src/navigation/*`, `src/execution/*` or `src/adapter/*`.
  */
 
-export { CONTRACT_VERSION, ROUTE_PLAN_CAPABILITIES } from './capabilities.js';
+export {
+  CAPABILITY_DOMAINS,
+  CapabilityContractError,
+  CapabilityUnavailableError,
+  composeCapabilities,
+  CONTRACT_VERSION,
+  hasCapability,
+  requireCapability,
+  ROUTE_PLAN_CAPABILITIES,
+} from './capabilities.js';
 export type {
+  CapabilityDomain,
+  CapabilityNameOf,
+  ComposedCapabilityReport,
   ContractVersion,
+  HostCapabilityDeclaration,
   MemoryHostCapabilities,
   RoutePlanCapabilities,
   RoutePlanCapabilityName,

@@ -15,7 +15,7 @@
 
 范围限于**陆地行走与水面移动**——跳跃、台阶、梯子、下落衔接、水面游泳、已乘船移动以及上下岸。飞行、鞘翅与水下三维导航不在范围内。
 
-**状态：0.10.0（未发布）。** 观测/查询、`planRoute` + `walkPath` walk 导航、运行态 Store 组合、拓扑运行态、SQLite 持久化与 M6 重启/checkpoint 回归已实现并有离线测试覆盖；`memory`/`navigation` 子路径已由包 `exports` 暴露；`MemoryHostCapabilities.execute.*`/`persistence.*` 保持 `false`（D-059，待宿主消费验证）。真实 Minecraft / mineflayer / Curio 接入尚未验收（H-01）。
+**状态：0.10.0（未发布）。** 观测/查询、`planRoute` + `walkPath` walk 导航、运行态 Store 组合、拓扑运行态、SQLite 持久化与 M6 重启/checkpoint 回归已实现并有离线测试覆盖；`memory`/`navigation` 子路径已由包 `exports` 暴露；`MemoryHostCapabilities.execute.walk`/`groundedArrival`/`invalidation`/`cancellation` 因运行时入口已实现而报告 `true`，`execute.swim`/`boat` 与 `persistence.*` 仍为 `false`（D-059）。真实 Minecraft / mineflayer / Curio 接入尚未验收（H-01）。
 
 ## 功能
 
@@ -175,6 +175,26 @@ const route = topology.route('a', 'b', { mode: 'walk' });
 
 A→B 与 B→A 是两条独立记录。只有证据仍可解析的 `traversed` 边参与历史查询。候选边只是待验证关系，不证明曾经经过。完整结果与失败语义见下方验收文档。
 
+一条实际确认走过的通道应作为一个原子单元写入，而不是依次调用单记录接口：
+
+```ts
+import { writeConfirmedCorridor } from 'curio-minecraft-3d-memory';
+
+const receipt = writeConfirmedCorridor(history, topology, {
+  fragment,                 // 只含确认几何
+  traversals,               // 每个确认走过的段一条
+  nodes,                    // 精确端点；id 必须稳定
+  edges,                    // 有向 traversed 边，引用 evidence
+  sessionId,
+  coordinate: 'cell',       // 显式按整数格规范化；'exact' 保留浮点
+});
+// receipt.status: 'written' | 'unchanged' | 'rejected'
+// receipt.committed: 'all' | 'none'（没有 prefix 半写入）
+// receipt.problem: node_referenced | endpoint_mismatch | scope_mismatch | ...
+```
+
+写入器先校验整条通道再改动，任一失败同时回滚两个 store，相同重试幂等。它不按邻近格缝合：节点位置变化但仍被本次通道之外的边引用时，返回外部边 id 并拒绝，不会静默改端点。规划点列、未确认位移和历史几何不得作为 traversal 提交。
+
 ### 管理有界工作集
 
 ```ts
@@ -219,7 +239,7 @@ const prepared = await manager.prepare(routeDependencySections);
 
 `navigateTo` 会明确拒绝 `near` / `reach_block` 到达条件、非 walk 模式、挖掘、放置、搭柱、非空材料列表、非空 `avoid` 约束与 `allow_frontier`。这些拒绝以结构化结果返回，绝不静默忽略设置。
 
-`planRoute` 报告 walk search/history/auto 为 `true`，更宽模式为 `false`；`walkPath` 只接受注册表发出、单次使用的 walk 路线，且从不重新规划。规范的 `MemoryHostCapabilities` 中所有 `execute.*` 与 `persistence.*` 位仍为 `false`（D-059），直到宿主消费被验证；接线时应先协商，不能把运行时入口当作已声明能力。
+`planRoute` 报告 walk search/history/auto 为 `true`，更宽模式为 `false`；`walkPath` 只接受注册表发出、单次使用的 walk 路线，且从不重新规划。规范的 `MemoryHostCapabilities` 将已实现的 walk 执行位（`walk`、`groundedArrival`、`invalidation`、`cancellation`）报告为 `true`；`swim`、`boat` 与全部 `persistence.*` 位保持 `false`（D-059）。接线时应使用 `composeCapabilities` 与宿主自身接线求交集；`false` 或未声明的能力是明确的 `unsupported` 拒绝，不是静默回退。
 
 ## 目录结构
 

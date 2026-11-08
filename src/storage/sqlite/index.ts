@@ -107,6 +107,8 @@ export type {
   PrepareResult,
   ResolvedWorkingSetLimits,
   WorkingSetLimits,
+  WorkingSetRejection,
+  WorkingSetRejectionKind,
   WorkingSetStats,
 } from './working-set.js';
 

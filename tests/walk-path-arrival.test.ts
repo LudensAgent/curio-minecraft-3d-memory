@@ -243,7 +243,7 @@ describe('walkPath grounded arrival — multi-point executor path (M4.5)', () =>
     const result = await h.walkPath({ routeId: h.plan.routeId, deadlineMs: DEADLINE }, h.environment);
 
     expect(result.outcome).not.toBe('ARRIVED');
-    expect(result.outcome).toBe('INVALIDATED');
+    expect(result.outcome).toBe('EFFECT_NOT_CONFIRMED');
     expect(result.confirmed).toBe(false);
     expect(result.problem).toMatchObject({ kind: 'unconfirmed_arrival' });
     // The sample was measured at the target; only the grounded/stable
@@ -257,7 +257,7 @@ describe('walkPath grounded arrival — multi-point executor path (M4.5)', () =>
 
     const result = await h.walkPath({ routeId: h.plan.routeId, deadlineMs: DEADLINE }, h.environment);
 
-    expect(result.outcome).toBe('INVALIDATED');
+    expect(result.outcome).toBe('EFFECT_NOT_CONFIRMED');
     expect(result.confirmed).toBe(false);
     expect(result.problem).toMatchObject({ kind: 'unconfirmed_arrival' });
     expect(result.confirmedSegments).toBe(0);
@@ -565,7 +565,7 @@ describe('walkPath arrival envelope — injected executor boundary (M4.5)', () =
 
     const result = await walkPath({ routeId: b.plan.routeId, deadlineMs: DEADLINE }, b.environment);
 
-    expect(result.outcome).toBe('INVALIDATED');
+    expect(result.outcome).toBe('EFFECT_NOT_CONFIRMED');
     expect(result.confirmed).toBe(false);
   });
 
@@ -589,10 +589,10 @@ describe('walkPath arrival envelope — injected executor boundary (M4.5)', () =
 
       expect(Number.isSafeInteger(result.confirmedSegments)).toBe(true);
       expect(result.confirmedSegments).toBe(0);
-      expect(result.outcome).toBe('INVALIDATED');
+      expect(result.outcome).toBe('EFFECT_NOT_CONFIRMED');
       expect(result.confirmed).toBe(false);
       expect(result.problem).toMatchObject({ kind: 'unconfirmed_arrival' });
-      expect(result.invalidation).toMatchObject({ segment: 0, reason: 'unconfirmed_arrival' });
+      expect(result.invalidation).toMatchObject({ segment: 0, reason: 'effect_not_confirmed' });
     },
   );
 
@@ -658,7 +658,7 @@ describe('walkPath arrival envelope — injected executor boundary (M4.5)', () =
     expect(result.confirmed).toBe(false);
   });
 
-  it('reports an unbacked zero-edge ARRIVED as INVALIDATED with unconfirmed_arrival', async () => {
+  it('reports an unbacked zero-edge ARRIVED as EFFECT_NOT_CONFIRMED', async () => {
     const points = routeAlong(0);
     const b = boundaryHarness(points);
     const walkPath = createWalkPath(b.registry, {
@@ -672,10 +672,53 @@ describe('walkPath arrival envelope — injected executor boundary (M4.5)', () =
 
     const result = await walkPath({ routeId: b.plan.routeId, deadlineMs: DEADLINE }, b.environment);
 
-    expect(result.outcome).toBe('INVALIDATED');
+    expect(result.outcome).toBe('EFFECT_NOT_CONFIRMED');
     expect(result.confirmed).toBe(false);
-    expect(result.invalidation).toMatchObject({ segment: 0, reason: 'unconfirmed_arrival' });
+    expect(result.invalidation).toMatchObject({ segment: 0, reason: 'effect_not_confirmed' });
     expect(result.problem).toMatchObject({ kind: 'unconfirmed_arrival' });
     expect(result.remainingPoints).toEqual(points);
+  });
+});
+
+describe('walkPath — executor seam failures stay inside the contract', () => {
+  it('maps an injected executor rejection to INVALIDATED without escaping', async () => {
+    const points = routeAlong(0, 1);
+    const b = boundaryHarness(points);
+    const walkPath = createWalkPath(b.registry, {
+      execute: async () => {
+        throw new Error('body adapter exploded');
+      },
+    });
+
+    const result = await walkPath({ routeId: b.plan.routeId, deadlineMs: DEADLINE }, b.environment);
+
+    expect(result.outcome).toBe('INVALIDATED');
+    expect(result.confirmed).toBe(false);
+    expect(result.problem).toMatchObject({
+      kind: 'execution_failed',
+      detail: expect.stringContaining('body adapter exploded'),
+    });
+    expect(result.invalidation).toMatchObject({ segment: 0, reason: 'execution_failed' });
+    // Only the measured start is known; no plan point is promoted to measured.
+    expect(result.lastPosition).toEqual(b.environment.sample()?.pos);
+  });
+
+  it('does not throw when an injected ARRIVED omits remainingPoints', async () => {
+    const points = routeAlong(0, 1);
+    const b = boundaryHarness(points);
+    const walkPath = createWalkPath(b.registry, {
+      execute: async () =>
+        synthesizedArrival(b.plan, b.executionId, {
+          remainingPoints: undefined as never,
+        }),
+    });
+
+    const result = await walkPath({ routeId: b.plan.routeId, deadlineMs: DEADLINE }, b.environment);
+
+    // The confirmed segment count is retained as progress; only the unbacked
+    // ARRIVED is withheld. The important invariant is that it did not throw.
+    expect(result.outcome).toBe('PARTIAL');
+    expect(result.confirmed).toBe(false);
+    expect(result.remainingPoints).toEqual([]);
   });
 });

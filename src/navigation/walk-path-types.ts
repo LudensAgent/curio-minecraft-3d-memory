@@ -101,7 +101,14 @@ export type WalkPathOutcome =
   | 'BLOCKED'
   | 'INVALIDATED'
   | 'TIMEOUT'
-  | 'CANCELLED';
+  | 'CANCELLED'
+  /**
+   * The body was asked to move (or an arrival was claimed) but no confirmed
+   * displacement/standing evidence backs it. Distinct from `INVALIDATED`
+   * (evidence/scope changed) and from `BLOCKED` (evidence says the world blocks).
+   * Never `confirmed`.
+   */
+  | 'EFFECT_NOT_CONFIRMED';
 
 /** Result of one bounded walk execution (contract §7.4). */
 export interface WalkPathResult {

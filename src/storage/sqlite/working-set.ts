@@ -122,6 +122,29 @@ export interface FreeResult {
   diagnostics: string[];
 }
 
+/** Why a working-set request was refused or could not be satisfied. */
+export type WorkingSetRejectionKind =
+  | 'busy'
+  | 'closed'
+  | 'capacity'
+  | 'no_record'
+  | 'not_ready'
+  | 'read_failed'
+  | 'invalid_argument';
+
+/**
+ * One observable refusal. `keys` are the caller-supplied request keys (bounded);
+ * `kind` distinguishes a transient gate (`busy`) from an unavailable record
+ * (`no_record`) and from a hard bound (`capacity`). A rejection is a fact about
+ * the request, never a claim that the data was deleted or never observed.
+ */
+export interface WorkingSetRejection {
+  operation: 'prepare' | 'free';
+  kind: WorkingSetRejectionKind;
+  detail: string;
+  keys: SectionKey[];
+}
+
 /** Bounded read-only snapshot of the working set. */
 export interface WorkingSetStats {
   residentSections: number;
@@ -133,6 +156,28 @@ export interface WorkingSetStats {
   /** Active pin leases and distinct pinned sections (across the whole session). */
   pinnedLeases: number;
   pinnedSections: number;
+  /**
+   * Every observed section in the full map (resident + non-resident directory
+   * sections). This is an observation fact, not a residency fact.
+   */
+  observedSections: number;
+  /** Every observed cell in the full map. */
+  observedCells: number;
+  /** Sections currently decoded in memory. */
+  residentObservedSections: number;
+  /** Observed sections that are not resident (committed, on disk only). */
+  notResidentSections: number;
+  /**
+   * Clean sections whose latest change is covered by a confirmed checkpoint.
+   * `observedSections - pendingSections`; it is not a row count and never
+   * refreshes evidence time.
+   */
+  persistedSections: number;
+  /** Sections changed since the last confirmed checkpoint (queued for saving). */
+  pendingSections: number;
+  pendingBytes: number;
+  /** Cumulative request refusals by kind (busy/closed/capacity/no_record/not_ready). */
+  rejections: Record<WorkingSetRejectionKind, number>;
 }
 
 const DEFAULT_MAX_EVICTION_CANDIDATES = 1024;
@@ -174,6 +219,20 @@ export class WorkingSetManager {
   private readonly lru = new LruOrder();
   /** Section key string → SectionKey, rebuilt from the resident set on reconcile. */
   private readonly keyIndex = new Map<string, SectionKey>();
+  /** Cumulative request refusals by kind. */
+  private readonly rejectionCounts: Record<WorkingSetRejectionKind, number> = {
+    busy: 0,
+    closed: 0,
+    capacity: 0,
+    no_record: 0,
+    not_ready: 0,
+    read_failed: 0,
+    invalid_argument: 0,
+  };
+  /** Bounded ledger of recent refusals; the oldest entries are dropped first. */
+  private readonly rejectionLedger: WorkingSetRejection[] = [];
+  /** Bound for `recentRejections`; the ledger never grows without limit. */
+  private static readonly MAX_REJECTION_LEDGER = 64;
 
   constructor(session: SpatialSession, options: WorkingSetLimits = {}) {
     if (session.voxelLoading !== 'manual') {
@@ -211,14 +270,24 @@ export class WorkingSetManager {
       diagnostics: diagnostics.items,
     };
 
-    this.session.acquireWorkingSetOperation();
+    try {
+      this.session.acquireWorkingSetOperation();
+    } catch (error) {
+      this.recordRejection('prepare', rejectionKindOf(error), messageOf(error), keys);
+      throw error;
+    }
     let toLoad: SectionKey[] = [];
     let lease: { token: string; keys: SectionKey[] } = { token: '', keys: [] };
     let hardFailure = false;
     let complete = true;
     let deduped: SectionKey[] = [];
     try {
-      deduped = this.validateKeys(keys);
+      try {
+        deduped = this.validateKeys(keys);
+      } catch (error) {
+        this.recordRejection('prepare', rejectionKindOf(error), messageOf(error), keys);
+        throw error;
+      }
       if (deduped.length > this.residency.maxLoadBatchSections) {
         result.capacity = this.gap(
           'request_too_large',
@@ -346,7 +415,54 @@ export class WorkingSetManager {
 
     for (const key of result.loaded) diagnostics.push(`loaded ${fmt(key)}`);
     for (const key of result.evicted) diagnostics.push(`evicted ${fmt(key)}`);
+
+    // Every non-ready outcome is an observable rejection: the request keys keep
+    // their individual state above, and the aggregate ledger names why.
+    if (result.status === 'failed') {
+      const kind = result.capacity === null ? 'read_failed' : capacityKind(result.capacity.kind);
+      this.recordRejection('prepare', kind, result.capacity?.message ?? 'working-set prepare failed', deduped.length > 0 ? deduped : keys);
+    } else if (result.status === 'incomplete') {
+      if (result.noRecord.length > 0) {
+        this.recordRejection('prepare', 'no_record', 'requested sections have no committed record', result.noRecord);
+      }
+      if (result.notReady.length > 0) {
+        this.recordRejection('prepare', 'not_ready', 'requested sections are loading or failed a previous load', result.notReady);
+      }
+    }
     return result;
+  }
+
+  /**
+   * Bounded, newest-last ledger of recent refusals. Read-only; it never loads,
+   * evicts, or mutates request state. `max` is clamped to the ledger bound.
+   */
+  recentRejections(max = 16): WorkingSetRejection[] {
+    if (!Number.isSafeInteger(max) || max < 0) {
+      throw new PersistenceError('invalid_argument', `max must be a non-negative safe integer: ${String(max)}`);
+    }
+    const take = Math.min(max, this.rejectionLedger.length);
+    return this.rejectionLedger.slice(this.rejectionLedger.length - take).map((entry) => ({
+      ...entry,
+      keys: entry.keys.map((key) => ({ ...key })),
+    }));
+  }
+
+  private recordRejection(
+    operation: WorkingSetRejection['operation'],
+    kind: WorkingSetRejectionKind,
+    detail: string,
+    keys: readonly SectionKey[],
+  ): void {
+    this.rejectionCounts[kind] += 1;
+    this.rejectionLedger.push({
+      operation,
+      kind,
+      detail,
+      keys: keys.slice(0, 256).map((key) => ({ ...key })),
+    });
+    while (this.rejectionLedger.length > WorkingSetManager.MAX_REJECTION_LEDGER) {
+      this.rejectionLedger.shift();
+    }
   }
 
   /**
@@ -360,16 +476,25 @@ export class WorkingSetManager {
    * always before any mutation.
    */
   free(target?: { sections?: number; bytes?: number }): FreeResult {
-    this.session.acquireWorkingSetOperation();
+    try {
+      this.session.acquireWorkingSetOperation();
+    } catch (error) {
+      this.recordRejection('free', rejectionKindOf(error), messageOf(error), []);
+      throw error;
+    }
     try {
       const diagnostics = new DiagnosticBuffer(this.bounds.maxDiagnostics);
       const result: FreeResult = { evicted: [], evictionRejected: [], capacity: null, diagnostics: diagnostics.items };
 
       if (target !== undefined && target.sections !== undefined && (!Number.isSafeInteger(target.sections) || target.sections < 0)) {
-        throw new PersistenceError('invalid_argument', `free target.sections must be a non-negative safe integer: ${String(target.sections)}`);
+        const detail = `free target.sections must be a non-negative safe integer: ${String(target.sections)}`;
+        this.recordRejection('free', 'invalid_argument', detail, []);
+        throw new PersistenceError('invalid_argument', detail);
       }
       if (target !== undefined && target.bytes !== undefined && (!Number.isSafeInteger(target.bytes) || target.bytes < 0)) {
-        throw new PersistenceError('invalid_argument', `free target.bytes must be a non-negative safe integer: ${String(target.bytes)}`);
+        const detail = `free target.bytes must be a non-negative safe integer: ${String(target.bytes)}`;
+        this.recordRejection('free', 'invalid_argument', detail, []);
+        throw new PersistenceError('invalid_argument', detail);
       }
 
       this.reconcile();
@@ -424,17 +549,32 @@ export class WorkingSetManager {
           result.evictionRejected.push({ key: { ...next.candidate }, reason });
         }
       }
+      if (result.capacity !== null) {
+        this.recordRejection(
+          'free',
+          capacityKind(result.capacity.kind),
+          result.capacity.message,
+          result.evictionRejected.map((entry) => entry.key),
+        );
+      }
       return result;
     } finally {
       this.session.releaseWorkingSetOperation();
     }
   }
 
-  /** Bounded read-only snapshot of the working set (no load/evict/save/world scan). */
+  /**
+   * Bounded read-only snapshot of the working set (no load/evict/save/world
+   * scan). Observation, residency, dirty and persistence state are reported as
+   * separate counts so "observed", "resident" and "persisted" never stand in for
+   * one another.
+   */
   stats(): WorkingSetStats {
     this.reconcile();
     const size = this.session.voxel.residentSize();
     const pins = this.session.voxel.pinState();
+    const full = this.session.voxel.checkpointFullCounts();
+    const dirty = this.session.voxel.checkpointDirtyMeasure();
     return {
       residentSections: size.sections,
       residentBytes: size.bytes,
@@ -443,6 +583,14 @@ export class WorkingSetManager {
       lruTracked: this.lru.size,
       pinnedLeases: pins.leases,
       pinnedSections: pins.pinnedSections,
+      observedSections: full.sections,
+      observedCells: full.observedCells,
+      residentObservedSections: size.sections,
+      notResidentSections: Math.max(0, full.sections - size.sections),
+      persistedSections: Math.max(0, full.sections - dirty.count),
+      pendingSections: dirty.count,
+      pendingBytes: dirty.bytes,
+      rejections: { ...this.rejectionCounts },
     };
   }
 
@@ -652,4 +800,40 @@ class DiagnosticBuffer {
 
 function fmt(key: SectionKey): string {
   return `(${key.dim}, ${key.cx}, ${key.cz}, ${key.sy})`;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Map a thrown persistence error to the observable rejection taxonomy. */
+function rejectionKindOf(error: unknown): WorkingSetRejectionKind {
+  if (error instanceof PersistenceError) {
+    switch (error.kind) {
+      case 'busy':
+        return 'busy';
+      case 'closing':
+      case 'closed':
+        return 'closed';
+      case 'invalid_argument':
+        return 'invalid_argument';
+      default:
+        return 'read_failed';
+    }
+  }
+  return 'read_failed';
+}
+
+/** Map a `CapacityGap` kind to the observable rejection taxonomy. */
+function capacityKind(kind: CapacityGapKind): WorkingSetRejectionKind {
+  switch (kind) {
+    case 'busy':
+      return 'busy';
+    case 'closed':
+      return 'closed';
+    case 'read_failed':
+      return 'read_failed';
+    default:
+      return 'capacity';
+  }
 }

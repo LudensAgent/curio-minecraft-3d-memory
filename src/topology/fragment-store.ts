@@ -220,6 +220,8 @@ export class FragmentStore {
    * `restoreSnapshot` and only exists to mark checkpoint cut-points and `dirty`.
    */
   private mutationRevision = 0;
+  /** Nesting depth of `runAtomic`; only the outermost call owns the rollback. */
+  private transactionDepth = 0;
 
   constructor(worldId: string, options: FragmentStoreOptions = {}) {
     this.worldId = worldId;
@@ -229,6 +231,68 @@ export class FragmentStore {
   /** Current mutation revision (see `mutationRevision`). */
   get revision(): number {
     return this.mutationRevision;
+  }
+
+  /**
+   * Run synchronous writes as one all-or-nothing unit. Every mutating method
+   * already validates before writing, but a caller that writes several records
+   * (fragment + traversals) can still leave an earlier record applied when a
+   * later call fails. `runAtomic` snapshots the mutable maps first; any throw
+   * restores them before rethrowing. Nested calls join the outer transaction.
+   *
+   * This is an in-memory transaction, not a persistence checkpoint: it neither
+   * saves nor rolls back an already-accepted checkpoint.
+   */
+  runAtomic<T>(operation: () => T): T {
+    if (this.transactionDepth > 0) {
+      this.transactionDepth += 1;
+      try {
+        return operation();
+      } finally {
+        this.transactionDepth -= 1;
+      }
+    }
+    const snapshot = this.snapshotMutableState();
+    this.transactionDepth = 1;
+    try {
+      const value = operation();
+      this.transactionDepth = 0;
+      return value;
+    } catch (error) {
+      this.restoreMutableState(snapshot);
+      this.transactionDepth = 0;
+      throw error;
+    }
+  }
+
+  private snapshotMutableState(): {
+    fragments: Map<string, PathFragment>;
+    traversals: Map<string, TraversalEvidence>;
+    owned: Map<string, Set<string>>;
+    fragmentIndex: FragmentListingIndex | null;
+    traversalIndex: TraversalListingIndex | null;
+    revision: number;
+  } {
+    return {
+      fragments: new Map(this.fragmentMap),
+      traversals: new Map(this.traversalMap),
+      owned: new Map([...this.fragmentToTraversalIds].map(([id, owned]) => [id, new Set(owned)])),
+      fragmentIndex: this.fragmentListingIndex,
+      traversalIndex: this.traversalListingIndex,
+      revision: this.mutationRevision,
+    };
+  }
+
+  private restoreMutableState(snapshot: ReturnType<FragmentStore['snapshotMutableState']>): void {
+    this.fragmentMap.clear();
+    for (const [id, fragment] of snapshot.fragments) this.fragmentMap.set(id, fragment);
+    this.traversalMap.clear();
+    for (const [id, traversal] of snapshot.traversals) this.traversalMap.set(id, traversal);
+    this.fragmentToTraversalIds.clear();
+    for (const [id, owned] of snapshot.owned) this.fragmentToTraversalIds.set(id, owned);
+    this.fragmentListingIndex = snapshot.fragmentIndex;
+    this.traversalListingIndex = snapshot.traversalIndex;
+    this.mutationRevision = snapshot.revision;
   }
 
   /**
