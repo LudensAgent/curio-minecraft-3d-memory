@@ -186,6 +186,15 @@ export function writeConfirmedCorridor(
 
   const nodes: PlannedNode[] = [];
   const nodeById = new Map<string, PlannedNode>();
+  /**
+   * Legacy upgrade rule for `cell` mode: if an existing node for this id already
+   * lives in the same integer cell but stores a measured (sub-cell) position,
+   * reuse that existing exact endpoint for this corridor instead of moving the
+   * node. External edges stay resolvable because their evidence still matches
+   * the unchanged node position. This is a same-cell identity rule, never
+   * proximity snapping across cells.
+   */
+  const endpointByCell = new Map<string, Vec3Like>();
   for (const candidate of input.nodes) {
     if (typeof candidate.id !== 'string' || candidate.id.length === 0) {
       return empty({ kind: 'invalid_request', detail: 'every corridor node requires a non-empty id' });
@@ -197,18 +206,7 @@ export function writeConfirmedCorridor(
         nodeId: candidate.id,
       });
     }
-    const pos = canonical(candidate.pos);
-    const duplicate = nodeById.get(candidate.id);
-    if (duplicate !== undefined) {
-      // A corridor may revisit the same canonical cell. Identical endpoints are
-      // one node; a second position for the same id is ambiguous, not a merge.
-      if (pointsEqual(duplicate.pos, pos)) continue;
-      return empty({
-        kind: 'duplicate_id',
-        detail: `node id "${candidate.id}" appears with two different positions`,
-        nodeId: candidate.id,
-      });
-    }
+    const canonicalPos = canonical(candidate.pos);
     const existing = topology.getNode(candidate.id);
     if (existing !== null && (existing.worldId !== history.worldId || existing.dim !== fragment.dim)) {
       return empty({
@@ -224,6 +222,24 @@ export function writeConfirmedCorridor(
         nodeId: candidate.id,
       });
     }
+    const existingPos = existing !== null && existing.location.kind === 'exact'
+      ? existing.location.pos
+      : null;
+    const sameCellLegacy = mode === 'cell' && existingPos !== null
+      && pointsEqual(canonicalCellPoint(existingPos), canonicalPos);
+    const pos = sameCellLegacy ? clonePoint(existingPos) : canonicalPos;
+    if (!pointsEqual(pos, canonicalPos)) endpointByCell.set(canonicalCellKey(canonicalPos), pos);
+    const duplicate = nodeById.get(candidate.id);
+    if (duplicate !== undefined) {
+      // A corridor may revisit the same canonical cell. Identical endpoints are
+      // one node; a second position for the same id is ambiguous, not a merge.
+      if (pointsEqual(duplicate.pos, pos)) continue;
+      return empty({
+        kind: 'duplicate_id',
+        detail: `node id "${candidate.id}" appears with two different positions`,
+        nodeId: candidate.id,
+      });
+    }
     const source: NodeSource = candidate.source ?? 'program';
     const node: SpatialNode = {
       id: candidate.id,
@@ -235,9 +251,6 @@ export function writeConfirmedCorridor(
     };
     if (candidate.observedAt !== undefined) node.observedAt = candidate.observedAt;
     if (existing !== null) node.source = existing.source;
-    const existingPos = existing !== null && existing.location.kind === 'exact'
-      ? existing.location.pos
-      : null;
     const planned: PlannedNode = {
       node,
       pos,
@@ -287,10 +300,14 @@ export function writeConfirmedCorridor(
         evidenceId: raw.id,
       });
     }
+    const from = canonical(raw.from);
+    const to = canonical(raw.to);
     const canonicalTraversal: TraversalEvidence = {
       ...raw,
-      from: canonical(raw.from),
-      to: canonical(raw.to),
+      // A same-cell legacy node keeps its measured endpoint; this corridor's
+      // evidence must use the same endpoint so the edge stays evidence-resolved.
+      from: endpointByCell.get(canonicalCellKey(from)) ?? from,
+      to: endpointByCell.get(canonicalCellKey(to)) ?? to,
     };
     inputTraversals.set(raw.id, canonicalTraversal);
   }

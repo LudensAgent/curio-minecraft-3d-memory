@@ -185,6 +185,51 @@ describe('writeConfirmedCorridor — atomic confirmed facts', () => {
     expect(topology.getEdge('e-ab')).not.toBeNull();
   });
 
+  it('cell mode reuses a legacy same-cell endpoint without moving a referenced node', () => {
+    const { history, topology } = pair();
+    // Legacy corridor: node b stores a measured endpoint inside cell (1,64,0).
+    const legacyB = pt(1.4, 64, 0.1);
+    expect(writeConfirmedCorridor(history, topology, {
+      fragment: fragment('f1', [A, legacyB]),
+      traversals: [traversal('ev-ab', 'f1', A, legacyB)],
+      nodes: [node('a', A), node('b', legacyB)],
+      edges: [edge('e-ab', 'a', 'b', ['ev-ab'])],
+      sessionId: SESSION,
+    }).status).toBe('written');
+
+    // New corridor reaches the same cell; cell mode must adopt the existing
+    // measured endpoint, not rebase the node that e-ab still references.
+    const C2 = pt(1.4, 64, 1.1);
+    const result = writeConfirmedCorridor(history, topology, {
+      fragment: fragment('f2', [B, C2]),
+      traversals: [traversal('ev-bc', 'f2', B, C2)],
+      nodes: [node('b', B), node('c', C2)],
+      edges: [edge('e-bc', 'b', 'c', ['ev-bc'])],
+      sessionId: SESSION,
+      coordinate: 'cell',
+    });
+
+    expect(result.status).toBe('written');
+    expect(result.nodes.updated).toEqual([]);
+    expect(topology.getNode('b')!.location).toEqual({ kind: 'exact', pos: legacyB });
+    expect(history.getTraversal('ev-bc')!.from).toEqual(legacyB);
+    expect(history.getTraversal('ev-bc')!.to).toEqual(pt(1, 64, 1));
+    expect(topology.getEdge('e-ab')).not.toBeNull();
+    expect(topology.getEdge('e-bc')).not.toBeNull();
+
+    // A different cell is still a real move: the external edge guard rejects it.
+    const cross = writeConfirmedCorridor(history, topology, {
+      fragment: fragment('f3', [pt(2.2, 64, 0.2), pt(2.2, 64, 1.2)]),
+      traversals: [traversal('ev-cross', 'f3', pt(2.2, 64, 0.2), pt(2.2, 64, 1.2))],
+      nodes: [node('b', pt(2.2, 64, 0.2)), node('d', pt(2.2, 64, 1.2))],
+      edges: [edge('e-bd', 'b', 'd', ['ev-cross'])],
+      sessionId: SESSION,
+      coordinate: 'cell',
+    });
+    expect(cross.status).toBe('rejected');
+    expect(cross.problem?.kind).toBe('node_referenced');
+  });
+
   it('rolls back a fragment written before a conflicting traversal is detected', () => {
     const { history, topology } = pair();
     expect(writeConfirmedCorridor(history, topology, {
