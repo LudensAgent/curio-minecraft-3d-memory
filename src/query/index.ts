@@ -14,6 +14,7 @@ import { queryAnchors } from './anchors.js';
 import { queryCapabilities, querySnapshot } from './capabilities.js';
 import { queryCells } from './cells.js';
 import { invalidQueryResult } from './envelope.js';
+import { queryFrontiers } from './frontiers.js';
 import { queryHistory } from './history.js';
 import { queryTopology } from './topology.js';
 import { validateSpatialQueryRequest } from './validate.js';
@@ -29,6 +30,10 @@ import type {
 
 export type {
   CellQueryView,
+  FrontierBoundaryDirection,
+  FrontierCandidateQueryView,
+  FrontierQueryData,
+  FrontierQuerySource,
   SpatialQueryContext,
   SpatialQueryData,
   SpatialQueryKind,
@@ -78,6 +83,7 @@ const QUERY_HANDLERS: { [K in SpatialQueryKind]: QueryHandler<K> } = {
   resourceAnchors: queryAnchors,
   containerAnchors: queryAnchors,
   containerContents: queryAnchors,
+  frontiers: queryFrontiers,
   snapshot: querySnapshot,
   capabilities: queryCapabilities,
 };

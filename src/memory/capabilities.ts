@@ -99,6 +99,8 @@ export interface MemoryHostCapabilities {
     /** Additive to contract §2.3: resource anchors are a separate query kind. */
     resourceAnchors: boolean;
     containerAnchors: boolean;
+    /** Additive to contract §2.3: never-observed boundary projection from a caller snapshot. */
+    frontiers: boolean;
     /** Always false: container contents are owned by the host precise ledger. */
     containerContents: false;
   };

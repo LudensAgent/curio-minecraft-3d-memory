@@ -11,10 +11,13 @@
  */
 
 import type { MemoryHostCapabilities } from '../memory/capabilities.js';
+import type { FrontierCandidatesResult } from '../navigation/route-inspection.js';
+import type { WalkSearchSnapshot } from '../navigation/walk-search.js';
 import type { QueryPage } from './paging.js';
 import type {
   EvidenceKind,
   Freshness,
+  Observation,
   ObservationGap,
 } from '../observation/types.js';
 import type {
@@ -91,6 +94,12 @@ export type SpatialQueryRequest =
     }
   | { kind: 'containerAnchors'; dim?: string; after?: string; limit?: number }
   /**
+   * Additive to contract §5.2 (D-V4-017): read-only projection of never-observed
+   * boundary candidates from a caller-supplied `WalkSearchSnapshot`. It never
+   * starts a search, scans the map, ranks candidates, or selects a target.
+   */
+  | { kind: 'frontiers'; dim: string; here: Vec3Like; limit?: number }
+  /**
    * Additive to contract §5.2: a contents request is always answered by the
    * structured `host_ledger` boundary, never by an empty list.
    */
@@ -105,7 +114,11 @@ export type SpatialQueryStatus =
   | 'partial'
   | 'not_found'
   | 'unsupported'
-  /** Contract §5.6-reserved for future world-addressing adapters; no M2 producer. */
+  /**
+   * `frontiers` is the current producer: it rejects a caller snapshot whose
+   * world/dim does not match the store/request. Other kinds keep the reserved
+   * world-addressing semantics.
+   */
   | 'scope_mismatch'
   | 'invalid_request';
 
@@ -238,7 +251,88 @@ export interface HistoricalRouteInspection {
   message: string;
 }
 
-/** Every list kind carries the one bounded page window (`QueryPage`). */
+/** Axis/sign of the boundary step from the approach stance to the boundary cell. */
+export interface FrontierBoundaryDirection {
+  axis: 'x' | 'z';
+  sign: 1 | -1;
+}
+
+/**
+ * One never-observed boundary candidate projected from a caller-supplied
+ * `WalkSearchSnapshot`. `pos` is the adjacent boundary cell (`WalkSearchFrontier.to`);
+ * it was never entered and is not claimed reachable. Only `stance` carries a
+ * reachability claim, and `basis` is the local stance evidence that makes the
+ * boundary interpretable. A missing candidate is not proof the boundary is air
+ * or passable.
+ */
+export interface FrontierCandidateQueryView {
+  /** Stable id derived from `dim` and the boundary cell coordinates. */
+  id: string;
+  pos: Vec3Like;
+  /** The approach stance the search validated; reachability applies here only. */
+  stance: Vec3Like;
+  /** `OPEN` for `stance`; never for `pos` or `gap`. */
+  reachability: 'OPEN';
+  /** The boundary cell itself was not entered. Never inferred from `OPEN`. */
+  boundaryReachability: 'unknown';
+  /** Axis/sign from `stance` to `pos`; null when they are not axis-adjacent. */
+  direction: FrontierBoundaryDirection | null;
+  /** Adjacent never-observed cells beyond the boundary. Never air. */
+  gap: Vec3Like[];
+  gapCount: number;
+  /** Locally observed stance cells (feet/head/support); not arbitrary body clearance. */
+  basis: Observation[];
+  reason: string;
+  /** `unknown` unless the caller supplied a history lookup; never a fabricated false. */
+  historicalConnection: boolean | 'unknown';
+  computedAt: number;
+  validUntil: number;
+  /** Query clock minus `computedAt`, clamped at zero. */
+  ageMs: number;
+}
+
+/**
+ * Read-only frontier window. Candidates keep snapshot discovery order; this
+ * projection never re-sorts, ranks or selects one. `truncated` is a `limit`
+ * window cut, while `snapshotTruncated` is the snapshot's own `maxFrontiers`
+ * bound. `unavailableHistorical*` counts evidence boundaries whose saved
+ * Section is stale/unavailable; those are not never-observed frontiers and are
+ * deliberately not mixed into `items`.
+ */
+export interface FrontierQueryData {
+  kind: 'frontiers';
+  source: 'walk_search_snapshot';
+  /** Scope carried by the snapshot the candidates were projected from. */
+  scope: { worldId: string; dim: string; sessionId: string };
+  snapshotState: FrontierCandidatesResult['state'];
+  items: FrontierCandidateQueryView[];
+  total: number;
+  truncated: boolean;
+  snapshotTruncated: boolean;
+  /**
+   * Snapshot diagnostics with `status:'STALE'`. These are boundaries whose
+   * saved evidence is stale, not never-observed cells and not air/passable.
+   */
+  staleCount: number;
+  /** True when the snapshot hit its diagnostic cap; `staleCount` is then partial. */
+  diagnosticsTruncated: boolean;
+  /** STALE/not-resident boundaries whose saved Section is unavailable. */
+  unavailableHistoricalCount: number;
+  unavailableHistoricalTruncated: boolean;
+  /** Section residency occurrences across `unavailableHistorical` boundaries. */
+  unavailableHistoricalResidency: {
+    not_resident: number;
+    loading: number;
+    load_failed: number;
+  };
+}
+
+/**
+ * Query data variants. Most list kinds carry one bounded `QueryPage` window.
+ * `frontiers` is the deliberate exception: it has no cursor (`after`) and
+ * returns a `limit`-bounded window over the snapshot's own bounded candidate
+ * set, with `total`/`truncated` flags instead of `nextAfter`.
+ */
 export type SpatialQueryData =
   | { kind: 'cells'; cells: CellQueryView[]; gaps: ObservationGap[] }
   | ({ kind: 'fragments' } & QueryPage<PathFragment>)
@@ -252,6 +346,7 @@ export type SpatialQueryData =
   | ({ kind: 'portals' } & QueryPage<PortalEdgeView>)
   | ({ kind: 'resourceAnchors' } & QueryPage<SpatialNode>)
   | ({ kind: 'containerAnchors' } & QueryPage<SpatialNode>)
+  | FrontierQueryData
   | { kind: 'snapshot'; snapshot: SpatialMemoryStoreSnapshot }
   | { kind: 'capabilities'; capabilities: MemoryHostCapabilities };
 
@@ -273,7 +368,11 @@ export interface SpatialQueryResult {
 
 export type SpatialQueryProblem =
   | { kind: 'invalid_request'; detail: string }
-  /** Contract §5.6-reserved for future world-addressing adapters; no M2 producer. */
+  /**
+   * `frontiers` is the current producer: a caller snapshot whose world/dim does
+   * not match the store/request is rejected with this problem. Other kinds keep
+   * the reserved world-addressing semantics.
+   */
   | { kind: 'scope_mismatch'; expected: WorldScope; actual: WorldScope }
   | { kind: 'unsupported'; query: SpatialQueryKind; detail: string }
   | { kind: 'host_ledger'; detail: string }
@@ -290,6 +389,25 @@ export interface SpatialQueryOptions {
    */
   isContainer?: (node: SpatialNode) => boolean;
 }
+
+/**
+ * One already-run frontier projection, or the reason none can be projected.
+ * The store resolves its existing `frontierSource` into this union; the query
+ * handler never runs a search itself.
+ */
+export type FrontierQuerySource =
+  | {
+      status: 'available';
+      result: FrontierCandidatesResult;
+      /**
+       * The resolved caller snapshot behind `result`. The handler reads only
+       * bounded evidence summaries (STALE diagnostics, unavailable residency)
+       * from it; it is never returned wholesale and no search is re-run.
+       */
+      snapshot: WalkSearchSnapshot;
+    }
+  | { status: 'unavailable'; reason: string }
+  | { status: 'scope_mismatch'; expected: WorldScope; actual: WorldScope };
 
 /**
  * Narrow read-only source set for the query handlers. It deliberately does not
@@ -315,6 +433,12 @@ export interface SpatialQuerySources {
     components(dim: string): ComponentReport;
     segments(fragmentId: string): FragmentSegmentsResult;
   };
+  /**
+   * Optional caller-supplied frontier projection source (the store's
+   * `frontierSource`). Absent means the composition cannot answer `frontiers`
+   * truthfully → `unsupported`; it never triggers a scan.
+   */
+  frontiers?(dim: string, here: Vec3Like): FrontierQuerySource;
   snapshot(): SpatialMemoryStoreSnapshot;
   memoryCapabilities(): SpatialMemoryCapabilities;
 }

@@ -314,6 +314,9 @@ export type {
 // Query — read-only projection (contract §5, plan M2)
 export type {
   CellQueryView,
+  FrontierBoundaryDirection,
+  FrontierCandidateQueryView,
+  FrontierQueryData,
   SpatialQueryData,
   SpatialQueryKind,
   SpatialQueryOptions,
