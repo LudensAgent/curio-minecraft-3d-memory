@@ -43,7 +43,7 @@ import { blockToSection, cellIndex } from '../voxel/coordinates.js';
 import type { Section, SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { SectionResidency } from '../voxel/residency.js';
-import type { VoxelMap } from '../voxel/voxel-map.js';
+import type { SectionRef, VoxelMap } from '../voxel/voxel-map.js';
 import type {
   CollisionShape,
   CollisionShapeProvider,
@@ -374,7 +374,7 @@ export function evaluateLandTransition(
   const height = body.height;
 
   const deps = new Map<string, LandSectionDependency>();
-  const sectionCache = new Map<string, Section | null>();
+  const sectionCache = new Map<string, SectionRef | null>();
   const residencyCache = new Map<string, SectionResidency>();
 
   const unobserved = new Map<string, Vec3Like>();
@@ -521,7 +521,7 @@ export function evaluateLandTransition(
     const ks = sectionKeyString(key);
     let section = sectionCache.get(ks);
     if (section === undefined) {
-      section = map.sectionAt(dim, x, y, z);
+      section = map.sectionRef(dim, x, y, z);
       sectionCache.set(ks, section);
     }
     if (section === null) {
@@ -546,7 +546,10 @@ export function evaluateLandTransition(
     if (now > evidence.validUntil) return { kind: 'stale', reason: 'expired', key };
     dep.validUntil = Math.min(dep.validUntil, evidence.validUntil);
     if (!evidence.observation.stateComplete) return { kind: 'incomplete', key };
-    return { kind: 'observed', evidence };
+    // The live SectionRef is not copied. Copy the evidence/observation that
+    // leaves this evaluation so a caller/provider cannot mutate the store and
+    // cannot retain a live view across a write.
+    return { kind: 'observed', evidence: { ...evidence, observation: cloneObservation(evidence.observation) } };
   };
 
   const noteGap = (view: NeighborCellView): void => {

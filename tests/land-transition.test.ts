@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   evaluateLandTransition,
@@ -1191,5 +1191,30 @@ describe('land evidence boundaries and hard limits', () => {
     expect(() =>
       evaluateLandTransition(map, mismatched, { shapeProvider: landProvider }, 2000, resolveLandLimits()),
     ).toThrow(/must exactly equal/);
+  });
+});
+
+describe('land transition hot reads', () => {
+  it('uses live sectionRef instead of deep-copying every Section', () => {
+    const map = new VoxelMap('world', { now: () => 2000 });
+    fillOpenStep(map);
+    const sectionAt = vi.spyOn(map, 'sectionAt');
+    const sectionRef = vi.spyOn(map, 'sectionRef');
+
+    const evaluation = evaluate(map, STEP);
+
+    expect(evaluation.status).toBe('OPEN');
+    expect(sectionAt).not.toHaveBeenCalled();
+    expect(sectionRef).toHaveBeenCalled();
+    // The returned evidence must not be the store's live cell record.
+    const stored = map.cellAt('overworld', 1, 0, 0);
+    expect(stored.observed).toBe(true);
+    if (stored.observed) {
+      const before = stored.evidence.observation.state.name;
+      stored.evidence.observation.state.name = 'mutated';
+      const again = map.cellAt('overworld', 1, 0, 0);
+      expect(again.observed).toBe(true);
+      if (again.observed) expect(again.evidence.observation.state.name).toBe(before);
+    }
   });
 });
