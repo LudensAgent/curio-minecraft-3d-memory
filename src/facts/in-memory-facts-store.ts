@@ -44,6 +44,7 @@ import {
   type SemanticFactKind,
 } from './types.js';
 import {
+  assertCellVersion,
   assertContainer,
   assertFiniteNumber,
   assertGoneEvidence,
@@ -56,6 +57,21 @@ import {
 
 export class InMemoryFactStore {
   private readonly maxQueryLimit: number;
+  private revisionField = 0;
+
+  /**
+   * Local write revision: advanced only by an insert/update that actually
+   * changed memory. It makes the in-memory store satisfy the `FactStore`
+   * revision shape without inventing persistence confirmation.
+   */
+  get revision(): number {
+    return this.revisionField;
+  }
+
+  private track<T>(result: FactWriteResult<T>): FactWriteResult<T> {
+    if (result.outcome === 'inserted' || result.outcome === 'updated') this.revisionField += 1;
+    return result;
+  }
 
   private readonly placesByKey = new Map<string, PlaceFact>();
   private readonly placeKeysById = new Map<string, string>();
@@ -82,6 +98,10 @@ export class InMemoryFactStore {
    * an older/equal observation never rewrites the record.
    */
   upsertPlace(place: PlaceFact): FactWriteResult<PlaceFact> {
+    return this.track(this.upsertPlaceImpl(place));
+  }
+
+  private upsertPlaceImpl(place: PlaceFact): FactWriteResult<PlaceFact> {
     assertPlace(place);
     const key = placeCanonicalKey(place);
     const indexKey = this.placeKeysById.get(place.id);
@@ -103,6 +123,10 @@ export class InMemoryFactStore {
 
   /** Insert or re-observe one resource anchor (including a move to a new cell). */
   upsertResource(resource: ResourceAnchorFact): FactWriteResult<ResourceAnchorFact> {
+    return this.track(this.upsertResourceImpl(resource));
+  }
+
+  private upsertResourceImpl(resource: ResourceAnchorFact): FactWriteResult<ResourceAnchorFact> {
     assertResource(resource);
     const key = resourceCanonicalKey(resource);
     const indexKey = this.resourceKeysById.get(resource.id);
@@ -147,6 +171,10 @@ export class InMemoryFactStore {
 
   /** Insert or re-observe one container anchor, deduped by stable identity. */
   upsertContainer(container: ContainerAnchorFact): FactWriteResult<ContainerAnchorFact> {
+    return this.track(this.upsertContainerImpl(container));
+  }
+
+  private upsertContainerImpl(container: ContainerAnchorFact): FactWriteResult<ContainerAnchorFact> {
     assertContainer(container);
     const key = containerCanonicalKey(container);
     const existing = this.containersByKey.get(key);
@@ -182,6 +210,10 @@ export class InMemoryFactStore {
   }
 
   updateHostData(kind: SemanticFactKind, id: string, hostData: JsonObject): FactWriteResult<SemanticFact> {
+    return this.track(this.updateHostDataImpl(kind, id, hostData));
+  }
+
+  private updateHostDataImpl(kind: SemanticFactKind, id: string, hostData: JsonObject): FactWriteResult<SemanticFact> {
     const data = snapshotJsonObject(hostData, 'fact hostData');
     const update = <T extends SemanticFact>(
       keys: ReadonlyMap<string, string>,
@@ -208,6 +240,10 @@ export class InMemoryFactStore {
    * history stay in the store; only the query projection changes.
    */
   markPlaceGone(id: string, evidence: FactGoneEvidence): FactWriteResult<PlaceFact> {
+    return this.track(this.markPlaceGoneImpl(id, evidence));
+  }
+
+  private markPlaceGoneImpl(id: string, evidence: FactGoneEvidence): FactWriteResult<PlaceFact> {
     assertGoneEvidence(evidence);
     const key = this.placeKeysById.get(id);
     if (key === undefined) throw new Error(`unknown place id: ${id}`);
@@ -233,6 +269,10 @@ export class InMemoryFactStore {
    * anchor (identity, position, ledger link) is retained; only presence changes.
    */
   markContainerGone(id: string, evidence: FactGoneEvidence): FactWriteResult<ContainerAnchorFact> {
+    return this.track(this.markContainerGoneImpl(id, evidence));
+  }
+
+  private markContainerGoneImpl(id: string, evidence: FactGoneEvidence): FactWriteResult<ContainerAnchorFact> {
     assertGoneEvidence(evidence);
     const key = this.containerKeysById.get(id);
     if (key === undefined) throw new Error(`unknown container id: ${id}`);
@@ -258,7 +298,7 @@ export class InMemoryFactStore {
     assertGoneEvidence(evidence);
     const key = this.resourceKeysById.get(id);
     if (key === undefined) throw new Error(`unknown resource id: ${id}`);
-    return this.applyResourceRevocation(this.requireResource(key), evidence);
+    return this.track(this.applyResourceRevocation(this.requireResource(key), evidence));
   }
 
   /** Revoke a resource by its canonical source cell + label. */
@@ -276,7 +316,7 @@ export class InMemoryFactStore {
     if (existing === undefined) {
       throw new Error(`unknown resource source: ${ref.worldId}/${ref.dim} ${ref.label}`);
     }
-    return this.applyResourceRevocation(existing, evidence);
+    return this.track(this.applyResourceRevocation(existing, evidence));
   }
 
   /**
@@ -287,8 +327,18 @@ export class InMemoryFactStore {
     id: string,
     update: ResourceSourceUpdate,
   ): FactWriteResult<ResourceAnchorFact> {
+    return this.track(this.updateResourceSourceImpl(id, update));
+  }
+
+  private updateResourceSourceImpl(
+    id: string,
+    update: ResourceSourceUpdate,
+  ): FactWriteResult<ResourceAnchorFact> {
     assertNonEmptyString(id, 'resource id');
     assertPoint(update.sourceCell, 'resource sourceCell');
+    if (update.sourceCellVersion !== undefined) {
+      assertCellVersion(update.sourceCellVersion, 'resource sourceCellVersion');
+    }
     assertFiniteNumber(update.observedAt, 'resource observedAt');
     assertProvenance(update.source);
     const existingKey = this.resourceKeysById.get(id);
@@ -311,7 +361,11 @@ export class InMemoryFactStore {
       label,
     });
     if (update.observedAt === existing.observedAt) {
+      // A same-time replay is idempotent, but a different source-cell version
+      // would silently drop a real observation; report it as a conflict.
       return nextKey === existingKey
+        && (update.sourceCellVersion === undefined
+          || update.sourceCellVersion === existing.sourceCellVersion)
         ? { outcome: 'duplicate', record: snapshotResource(existing) }
         : { outcome: 'conflict', record: snapshotResource(existing) };
     }
@@ -327,6 +381,9 @@ export class InMemoryFactStore {
     const record: ResourceAnchorFact = {
       ...existing,
       sourceCell: { ...update.sourceCell },
+      ...(update.sourceCellVersion === undefined
+        ? {}
+        : { sourceCellVersion: update.sourceCellVersion }),
       label,
       observedAt: update.observedAt,
       source: snapshotProvenance(update.source),
@@ -418,6 +475,8 @@ export class InMemoryFactStore {
     resources: ResourceAnchorFact[];
     containers: ContainerAnchorFact[];
   }): void {
+    // A restored capture is the new baseline; local write history restarts.
+    this.revisionField = 0;
     const placesByKey = new Map<string, PlaceFact>();
     const placeKeysById = new Map<string, string>();
     const placeOrder: string[] = [];
@@ -652,6 +711,7 @@ function sameResource(a: ResourceAnchorFact, b: ResourceAnchorFact): boolean {
     a.label === b.label &&
     a.resourceType === b.resourceType &&
     pointsEqual(a.sourceCell, b.sourceCell) &&
+    a.sourceCellVersion === b.sourceCellVersion &&
     a.revoked === b.revoked &&
     a.revokedAt === b.revokedAt &&
     jsonObjectsEqual(a.hostData, b.hostData)

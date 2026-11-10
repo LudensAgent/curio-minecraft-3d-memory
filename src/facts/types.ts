@@ -77,6 +77,16 @@ export interface ResourceAnchorFact {
   resourceType?: string;
   /** Exact cell the resource was observed in. Area locations are not resources. */
   sourceCell: Vec3Like;
+  /**
+   * Revision of the source cell's voxel evidence at the last confirmed
+   * observation (`CellEvidence.revision` for the same world/dim/cell).
+   *
+   * It links the anchor to the exact observed block state without storing a
+   * second copy of that state. An absent value means the record has no reliable
+   * source-cell version (legacy or older disk record), which is an explicit
+   * gap — never fill it with `observedAt`, a save batch number, or `0`.
+   */
+  sourceCellVersion?: number;
   /** Real observation time in milliseconds. */
   observedAt: number;
   source: FactProvenance;
@@ -203,6 +213,11 @@ export interface ResourceSourceUpdate {
   sourceCell: Vec3Like;
   /** Defaults to the current label. */
   label?: string;
+  /**
+   * Source-cell evidence revision at this update. Omitted means the caller has
+   * no reliable version: the previous value is retained rather than invented.
+   */
+  sourceCellVersion?: number;
   /** Must not be older than the stored observation, or the update is a duplicate. */
   observedAt: number;
   source: FactProvenance;

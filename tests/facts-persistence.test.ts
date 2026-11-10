@@ -567,3 +567,29 @@ describe('SQLite facts persistence', () => {
     db.close();
   });
 });
+
+describe('resource source-cell version persistence', () => {
+  it('round-trips the source cell version and a late ACK leaves it unchanged', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    session.facts.upsertResource(resource('ore', { sourceCellVersion: 7 }));
+    const first = session.facts.checkpointSnapshot();
+    await session.checkpoint();
+    expect(session.facts.resources().items[0]?.sourceCellVersion).toBe(7);
+
+    // A newer observation after the capture is not cleared by the old ACK.
+    session.facts.upsertResource(
+      resource('ore', { observedAt: 1_700_000_002_000, sourceCellVersion: 9 }),
+    );
+    session.facts.confirmRevision(first.revision);
+    expect(session.facts.resources().items[0]?.sourceCellVersion).toBe(9);
+    expect(session.facts.hasPendingChanges()).toBe(true);
+
+    await session.checkpoint();
+    await session.close();
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.facts.resources().items[0]?.sourceCellVersion).toBe(9);
+    expect(reopened.facts.resources().items[0]?.observedAt).toBe(1_700_000_002_000);
+    await reopened.close();
+  });
+});
