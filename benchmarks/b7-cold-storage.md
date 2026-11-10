@@ -39,3 +39,16 @@ Cold-read assertions:
 This probe proves bounded dirty-batch save/restart at 4M cells and >64 MiB payload.
 It does not prove real Minecraft physics, host event-loop/ACK latency, 8-hour
 throughput, or a real host session's 4M-cell runtime.
+
+## Limits and caveats
+
+- `voxelBatchMaxBytes` is a soft cap for a single oversized Section: the first dirty
+  Section is always included so a batch can make progress. Callers must not assume
+  the cap is a hard per-Section bound.
+- `snapshotLimits.maxBytes` is the full committed-set quota checked by the worker,
+  not a per-batch quota. The measured 4M payload was 505.6–530.1 MiB; the probe
+  defaults to 3 GiB for frame/history/state-property headroom. A too-small total
+  quota can accept earlier batches and then reject a later one with `capacity`;
+  the earlier committed batches stay readable and the remaining dirty is reported.
+- `voxelBatchMaxBytes` must not exceed `snapshotLimits.maxBytes`; the library
+  rejects that configuration at open instead of silently clamping it.

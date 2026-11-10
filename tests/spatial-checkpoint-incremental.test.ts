@@ -252,6 +252,16 @@ describe('VoxelMap pending-section tracking', () => {
 // ==============================================================================
 
 describe('SQLite incremental voxel checkpoint', () => {
+  it('rejects voxelBatchMaxBytes above the total snapshot limit instead of clamping', async () => {
+    const dbPath = makeDbPath();
+    await expect(openSpatialSession({
+      databasePath: dbPath,
+      worldId: WORLD,
+      snapshotLimits: { maxBytes: 8192 },
+      voxelBatchMaxBytes: 8193,
+    })).rejects.toMatchObject({ kind: 'invalid_argument' });
+  });
+
   it('first save establishes a full baseline; reopen fully recovers it', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });

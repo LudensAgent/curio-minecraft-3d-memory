@@ -250,9 +250,15 @@ class SpatialSessionImpl implements SpatialSession {
     if (!Number.isSafeInteger(batchMaxBytes) || batchMaxBytes < 1) {
       throw new PersistenceError('invalid_argument', `voxelBatchMaxBytes must be a positive safe integer: ${String(batchMaxBytes)}`);
     }
-    // A batch cannot exceed the total snapshot byte limit; clamp instead of letting
-    // the worker reject an otherwise valid batch after the copy.
-    this.voxelBatchMaxBytes = Math.min(batchMaxBytes, this.limits.maxBytes);
+    // A batch cannot exceed the total snapshot byte limit; reject at the boundary
+    // instead of silently clamping a caller's configuration.
+    if (batchMaxBytes > this.limits.maxBytes) {
+      throw new PersistenceError(
+        'invalid_argument',
+        `voxelBatchMaxBytes (${batchMaxBytes}) must not exceed snapshotLimits.maxBytes (${this.limits.maxBytes})`,
+      );
+    }
+    this.voxelBatchMaxBytes = batchMaxBytes;
     this.journalLimitsField = resolveJournalLimits(options.journalLimits);
     this.journalQueue = new JournalQueue(this.worldId, this.journalLimitsField);
     this.ledgerLimitsField = resolveLedgerLimits(options.ledgerLimits);

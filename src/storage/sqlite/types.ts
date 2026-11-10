@@ -699,6 +699,11 @@ export interface OpenSpatialSessionOptions {
    * (one batch, preserving the previous behavior). A smaller value makes each
    * checkpoint commit a bounded dirty prefix; remaining dirty sections stay pending
    * and require a later checkpoint. The ACK confirms only the captured section keys.
+   *
+   * The cap is a soft bound for one oversized Section: the first dirty Section is
+   * always included so a batch can make progress. `snapshotLimits.maxBytes` remains
+   * the full committed-set quota checked by the worker, not a per-batch quota.
+   * Must not exceed `snapshotLimits.maxBytes`.
    */
   voxelBatchMaxBytes?: number;
   /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
