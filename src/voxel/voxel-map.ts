@@ -1530,7 +1530,7 @@ export class VoxelMap {
       const nextBytes = byteMap.get(key) ?? estimateVoxelSectionSnapshotBytes(raw);
       const next: VoxelDirectoryEntry = {
         key: { worldId: this.worldId, dim: raw.dim, cx: raw.cx, cz: raw.cz, sy: raw.sy },
-        seq: existing?.seq ?? this.nextDirectorySeq++,
+        seq: existing?.seq ?? (this.directoryMetadataComplete ? this.nextDirectorySeq++ : 0),
         // The worker returns the actual committed octet_length; the estimate is only
         // a fallback if the ACK did not carry bytes (never the normal path).
         bytes: nextBytes,
@@ -1550,7 +1550,9 @@ export class VoxelMap {
       this.directoryTotals.observedCells += next.observedCells;
       this.directoryTotals.paletteEntries += next.paletteEntries;
       this.directoryTotals.bytes += next.bytes;
-      this.directory.set(key, next);
+      // Summary mode keeps only key membership and bounded recent metadata;
+      // cold pages must not rebuild a full in-memory directory through ACKs.
+      if (this.directoryMetadataComplete) this.directory.set(key, next);
       this.committedDirectoryKeys.add(key);
       this.rememberCommittedInfo(next.key, {
         revision: next.revision,
@@ -1870,10 +1872,12 @@ export class VoxelMap {
     this.knownCommittedMeta.delete(dk);
     this.knownCommittedMeta.set(dk, info);
     const limit = Math.max(16, this.residentLimits.maxResidentSections * 2);
-    while (this.knownCommittedMeta.size > limit) {
-      const oldest = this.knownCommittedMeta.keys().next().value;
-      if (oldest === undefined) break;
-      this.knownCommittedMeta.delete(oldest);
+    for (const candidate of this.knownCommittedMeta.keys()) {
+      if (this.knownCommittedMeta.size <= limit) break;
+      const [dim, cx, cz, sy] = splitDirKey(candidate);
+      // Resident sections need their committed baseline for aggregate deltas.
+      // At most maxResidentSections are protected, below this cache's limit.
+      if (!this.hasSectionKey(dim, cx, cz, sy)) this.knownCommittedMeta.delete(candidate);
     }
   }
 

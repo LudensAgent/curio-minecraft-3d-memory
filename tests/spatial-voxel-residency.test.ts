@@ -202,6 +202,46 @@ describe('VoxelMap manual residency (pure core)', () => {
     expect(map.checkpointCounts().sections).toBe(0); // resident-only
   });
 
+  it('keeps summary metadata bounded without losing resident aggregate baselines', () => {
+    const map = manualMap({ residencyLimits: { maxResidentSections: 2 } });
+    map.installDirectorySummary({ sections: 0, observedCells: 0, paletteEntries: 0, bytes: 0, maxSeq: -1 }, []);
+    map.beginSession('s1');
+    const save = () => {
+      const sections = map.captureDirtySections();
+      map.commitDirectory('incremental', sections, []);
+      map.confirmSections(map.saveRevision);
+      return sections;
+    };
+    const warmKey = sectionKey(DIM, 0, 0, 0);
+    const coldKey = sectionKey(DIM, 16, 0, 0);
+    map.observe(voxelObs());
+    save();
+    map.observe(voxelObs({ pos: { x: 16, y: 0, z: 0 }, sequence: 2 }));
+    const firstCold = save();
+    expect(map.unloadSections([coldKey]).unloaded).toEqual([coldKey]);
+    for (let cx = 2; cx <= 20; cx += 1) {
+      map.observe(voxelObs({ pos: { x: cx * 16, y: 0, z: 0 }, sequence: cx + 1 }));
+      save();
+      const key = sectionKey(DIM, cx * 16, 0, 0);
+      expect(map.unloadSections([key]).unloaded).toEqual([key]);
+    }
+    // The exact cold key survives; its old detail can leave the bounded cache.
+    expect(map.sectionResidency(coldKey)).toMatchObject({ residency: 'not_resident' });
+    expect(map.sectionResidency(coldKey).committed).toBeUndefined();
+    expect(map.sectionResidency(warmKey).committed?.observedCells).toBe(1);
+    expect(map.checkpointFullCounts()).toEqual({ sections: 21, observedCells: 21, paletteEntries: 42 });
+
+    map.observe(voxelObs({ pos: { x: 1, y: 0, z: 0 }, observedAt: 2000, sequence: 100 }));
+    expect(map.checkpointFullCounts().observedCells).toBe(22);
+    save();
+    expect(map.checkpointFullCounts().observedCells).toBe(22);
+    map.installLoadedSections(firstCold);
+    map.observe(voxelObs({ pos: { x: 17, y: 0, z: 0 }, observedAt: 2000, sequence: 101 }));
+    save();
+    map.unloadSections([coldKey]);
+    expect(map.checkpointFullCounts()).toEqual({ sections: 21, observedCells: 23, paletteEntries: 42 });
+  });
+
   it('checkpointSnapshot refuses a partial-resident map', () => {
     const map = manualMap();
     map.installDirectory([directoryEntry(DIM, 0, 0, 0)]);
