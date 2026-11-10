@@ -110,6 +110,7 @@ export type {
 export {
   DEFAULT_LAND_LIMITS,
   evaluateLandTransition,
+  evaluateWalkSegment,
   evaluateWalkStep,
   LandRouteVerifier,
   resolveLandLimits,

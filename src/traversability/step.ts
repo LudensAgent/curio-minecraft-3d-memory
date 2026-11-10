@@ -333,7 +333,40 @@ export function evaluateRememberedWalkStep(
   };
 }
 
-/** Internal continuous correction corridor for measured route execution, not route search. */
+/**
+ * Continuous corridor from actual feet to the unchanged next route endpoint.
+ * For measured execution/arrival, not route search: horizontal length is bounded
+ * to one block plus the 0.12-block body arrival tolerance. All swept collision
+ * and support evidence is checked at the supplied continuous coordinates.
+ */
+export function evaluateWalkSegment(
+  map: VoxelMap,
+  query: StepQuery,
+  to: Vec3Like,
+  shapeProvider: CollisionShapeProvider,
+  now: number,
+  feetTolerance: number,
+): StepEvaluation {
+  if (![to.x, to.y, to.z, feetTolerance].every(Number.isFinite)) {
+    throw new Error('walk segment endpoint and feetTolerance must be finite');
+  }
+  if (feetTolerance < 0 || feetTolerance >= 0.5) {
+    throw new Error('walk segment feetTolerance must be in [0, 0.5)');
+  }
+  if (Math.hypot(to.x - query.body.feet.x, to.z - query.body.feet.z) > 1.12 + EPS
+    || Math.abs(to.y - query.body.feet.y) > feetTolerance + EPS) {
+    return {
+      status: 'UNSUPPORTED', from: { ...query.body.feet }, to: { ...to }, mode: 'walk',
+      reason: 'measured walk segment exceeds the supported local correction range',
+      problem: { kind: 'unsupported_mode', cells: [], detail: 'horizontal distance must be at most 1.12 blocks and vertical distance within feetTolerance' },
+      obstacles: [], hazards: [], dependencies: [], sessionId: query.sessionId,
+      computedAt: now, validUntil: Number.POSITIVE_INFINITY,
+    };
+  }
+  return evaluateGroundedWalkSegment(map, query, to, shapeProvider, now, feetTolerance);
+}
+
+/** Internal measured corridor, including non-walk arrival diagnostics. */
 export function evaluateGroundedWalkSegment(
   map: VoxelMap,
   query: StepQuery,

@@ -13,7 +13,7 @@ export type {
   SupportFace,
   UnitBox,
 } from './collision-shape.js';
-export { evaluateWalkStep } from './step.js';
+export { evaluateWalkSegment, evaluateWalkStep } from './step.js';
 export type {
   BodyContext,
   StepConstraints,
