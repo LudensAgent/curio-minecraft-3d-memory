@@ -1,6 +1,6 @@
 {
   "name": "curio-minecraft-3d-memory",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "Spatial memory and navigation library for a Minecraft Java 1.20.1 agent — historical geometry, recent observation state, derived traversability, and composable navigation helpers for land walking and surface-water movement.",
   "type": "module",
   "main": "./dist/index.js",
