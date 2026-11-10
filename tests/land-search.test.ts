@@ -216,6 +216,9 @@ describe('bounded voxel land search', () => {
       ['ladder', { x: 0.5, y: 1, z: 0.5 }, { x: 1.5, y: 1, z: 0.5 }],
     ]);
     expect(result.cost).toBe(3);
+    expect(result.cost).toBe(searchLandRoute(map, request({
+      body: bodyAt(-0.5, 0, 0.5), to: { x: 1.5, y: 1, z: 0.5 }, rules, allowed: ['ladder'], heuristic: 'zero',
+    }), 2000).cost);
   });
 
   it('plans a ladder-top exit when the feet are in the air cell above the climb source', () => {
@@ -308,6 +311,8 @@ describe('bounded voxel land search', () => {
     expect(reference.cost).toBe(6);
     expect(result.cost).toBe(reference.cost);
     expect(result.transitions).toHaveLength(3);
+    expect(result.stats.nodesExpanded).toBe(reference.stats.nodesExpanded);
+    expect(result.stats.edgesEvaluated).toBe(reference.stats.edgesEvaluated);
   });
 
   it('preserves fractional starting offsets and exact targets without centering or height snapping', () => {
@@ -467,6 +472,39 @@ describe('bounded voxel land search', () => {
 });
 
 describe('A* cost and cooperative work', () => {
+  it.each([
+    { heights: [4, 0], cost: 6 },
+    { heights: [0, 0.5, 1, 0.5, 0], cost: 10 },
+  ])('keeps optimal cost across four-block drops and fractional steps: $heights', ({ heights, cost }) => {
+    const map = terrain(heights.map((height, x) => ({ x, z: 0, height })));
+    for (const arrival of [{ kind: 'exact' as const }, { kind: 'near' as const, radius: 0, coordinates: 'cell' as const }]) {
+      const query = request({ body: bodyAt(0.5, heights[0]!, 0.5), to: { x: heights.length - 0.5, y: heights.at(-1)!, z: 0.5 }, arrival });
+      const result = searchLandRoute(map, query, 2000);
+      const reference = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
+      expect(result.status).toBe('FOUND');
+      expect(reference.status).toBe('FOUND');
+      expect(result.cost).toBe(cost);
+      expect(result.cost).toBe(reference.cost);
+    }
+  });
+
+  it('avoids expanding the high plateau while preserving the optimal downhill near-cell route', () => {
+    const map = terrain(Array.from({ length: 17 }, (_, x) => Array.from({ length: 21 }, (_, index) => ({
+      x, z: index - 10, height: index === 10 ? 8 - x / 2 : 8,
+    }))).flat());
+    const query = request({ body: bodyAt(0.5, 8, 0.5), to: { x: 16.5, y: 0, z: 0.5 }, arrival: { kind: 'near', radius: 1, coordinates: 'cell' }, maxSearchMs: 5000 });
+    const result = searchLandRoute(map, query, 2000);
+    const horizontal = searchLandRoute(map, { ...query, heuristic: 'horizontal' }, 2000);
+    const reference = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
+    expect(result.status).toBe('FOUND');
+    expect(horizontal.status).toBe('FOUND');
+    expect(reference.status).toBe('FOUND');
+    expect(result.cost).toBe(reference.cost);
+    expect(horizontal.cost).toBe(reference.cost);
+    expect(result.stats.nodesExpanded).toBeLessThan(horizontal.stats.nodesExpanded);
+    expect(result.stats.edgesEvaluated).toBeLessThan(horizontal.stats.edgesEvaluated);
+  });
+
   it.each([
     [0, 0, 0, 0, 0, 0, 0, 0, 0],
     [4, 0, 0, 4, 1, 0, 4, 2, 0],

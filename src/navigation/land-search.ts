@@ -94,8 +94,8 @@ export interface LandSearchRequest {
   maxSliceMs?: number;
   maxWorkPerSlice?: number;
   geometryLimits?: Partial<LandLimits>;
-  /** 'zero' runs the same graph and costs as Dijkstra, for comparison. */
-  heuristic?: 'horizontal' | 'zero';
+  /** Default distance uses every goal dimension; horizontal and zero remain available for comparison. */
+  heuristic?: 'distance' | 'horizontal' | 'zero';
   signal?: AbortSignal;
   /** Budget clock; evidence freshness is evaluated at the entry point's `now` argument. */
   clock?: () => number;
@@ -364,8 +364,8 @@ function* searchChunks(
   if (goalMetric !== '3d' && goalMetric !== 'horizontal') throw new Error('unsupported land search goal metric');
   const evidenceMode = request.evidenceMode ?? 'current';
   if (evidenceMode !== 'current' && evidenceMode !== 'remembered') throw new Error('unsupported land search evidence mode');
-  const heuristicMode = request.heuristic ?? 'horizontal';
-  if (heuristicMode !== 'horizontal' && heuristicMode !== 'zero') throw new Error('unsupported land search heuristic');
+  const heuristicMode = request.heuristic ?? 'distance';
+  if (heuristicMode !== 'distance' && heuristicMode !== 'horizontal' && heuristicMode !== 'zero') throw new Error('unsupported land search heuristic');
   const allowed = new Set(request.allowed ?? ['walk', 'step', 'drop']);
   if ([...allowed].some((kind) => kind !== 'walk' && kind !== 'step' && kind !== 'drop' && kind !== 'jump' && kind !== 'ladder')) {
     throw new Error('land search supports walk, step, drop, jump and ladder geometry only');
@@ -788,14 +788,17 @@ function* searchChunks(
     ? Math.abs(point.x - target.x) <= EPS && (goalMetric === 'horizontal' || Math.abs(point.y - target.y) <= EPS)
       && Math.abs(point.z - target.z) <= EPS
     : targetDistance(point) <= arrival.radius + EPS;
-  // Without jumps, each edge changes horizontal L1 distance by at most one and costs >= 1.
-  // Caller policy surcharges are nonnegative, so this remains a lower bound.
-  // Subtracting sqrt(2)*radius is an admissible L1 lower bound for a near sphere.
-  // Vertical distance is deliberately absent: a four-block drop costs six, not nine.
-  // Jumps can travel more than two horizontal blocks for cost two; use h=0 when allowed.
+  // Without jumps, walk costs 1, ladder costs 1, and step/drop costs 2+|dy|.
+  // These bound horizontal L1 plus vertical distance, including floored cell Y:
+  // its change is at most |dy|+1, covered by the step/drop overhead.
+  // L1 inside a near sphere is at most sqrt(dimensions)*radius. Subtracting it
+  // keeps the heuristic admissible and consistent; policy costs are nonnegative.
+  // Jumps can travel more than two horizontal blocks for cost two, so use h=0.
+  const verticalHeuristic = heuristicMode === 'distance' && goalMetric === '3d';
   const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' || allowed.has('jump') ? 0
     : Math.max(0, Math.abs(coordinateDelta(point.x, target.x)) + Math.abs(coordinateDelta(point.z, target.z))
-      - (arrival.kind === 'near' ? Math.SQRT2 * arrival.radius : 0));
+      + (verticalHeuristic ? Math.abs(coordinateDelta(point.y, target.y)) : 0)
+      - (arrival.kind === 'near' ? Math.sqrt(verticalHeuristic ? 3 : 2) * arrival.radius : 0));
   const keyOf = (point: Vec3Like): string => `${Math.round(point.x - start.x)},${point.y},${Math.round(point.z - start.z)}`;
 
   const initialStop = stopped();
