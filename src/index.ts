@@ -516,3 +516,40 @@ export type {
 // Storage
 export { TABLE_NAMES } from './storage/index.js';
 export type { PersistenceWorker, SaveBatch, SaveConfirmation } from './storage/index.js';
+
+// Facts — semantic place/resource/container anchors (v0.11 plan §3.2).
+// Deliberately separate from topology nodes: flat, bounded, queryable facts
+// with gone/revocation retained, plus a pure legacy-node migration dry run.
+export {
+  InMemoryFactStore,
+  applyLegacySemanticMigration,
+  runLegacySemanticMigrationDryRun,
+} from './facts/index.js';
+export type {
+  ContainerAnchorFact,
+  FactGoneEvidence,
+  FactLocation,
+  FactPage,
+  FactProvenance,
+  FactQuery,
+  FactWriteOutcome,
+  FactWriteResult,
+  InMemoryFactStoreOptions,
+  LegacyRouteRecord,
+  LegacySemanticExactLocation,
+  LegacySemanticLocation,
+  LegacySemanticMigrationApplyReport,
+  LegacySemanticMigrationOptions,
+  LegacySemanticMigrationPlan,
+  LegacySemanticMigrationReport,
+  LegacySemanticNode,
+  LegacySemanticRegionLocation,
+  LegacySemanticSnapshot,
+  PlaceFact,
+  PlaceKind,
+  ResourceAnchorFact,
+  ResourceFactQuery,
+  ResourceSourceRef,
+  ResourceSourceUpdate,
+  SemanticFact,
+} from './facts/index.js';
