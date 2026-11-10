@@ -1,7 +1,7 @@
 # 空间记忆库
 
 <p>
-  <img src="https://img.shields.io/badge/version-0.10.0-blue.svg" alt="Version 0.10.0">
+  <img src="https://img.shields.io/badge/version-0.11.0-blue.svg" alt="Version 0.11.0">
   <img src="https://img.shields.io/badge/node-%3E%3D18-339933.svg" alt="Node 18+">
   <img src="https://img.shields.io/badge/minecraft-1.20.1-62B47A.svg" alt="Minecraft 1.20.1">
   <img src="https://img.shields.io/badge/typescript-5.x-3178C6.svg" alt="TypeScript 5.x">
@@ -49,7 +49,7 @@ npm pack
 ```json
 {
   "dependencies": {
-    "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.10.0.tgz",
+    "curio-minecraft-3d-memory": "file:./curio-minecraft-3d-memory-0.11.0.tgz",
     "better-sqlite3": "^12.0.0"
   }
 }
