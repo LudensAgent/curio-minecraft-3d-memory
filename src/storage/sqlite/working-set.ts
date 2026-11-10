@@ -145,6 +145,28 @@ export interface WorkingSetRejection {
   keys: SectionKey[];
 }
 
+/**
+ * Cumulative work actually performed through this manager. It reports real
+ * prepare/free results only: requests rejected before any load or eviction
+ * still count as requested, never as loaded/evicted.
+ */
+export interface WorkingSetCounters {
+  /** Unique sections submitted to `prepare`, across all calls. */
+  requestedSections: number;
+  /** Requested sections that were already resident (no disk read). */
+  alreadyResidentSections: number;
+  /** Sections actually installed by a completed `prepare`. */
+  loadedSections: number;
+  /** Estimated resident bytes of the sections installed by `prepare`. */
+  loadBytes: number;
+  /** Wall time spent measuring and installing sections that were installed. */
+  loadMs: number;
+  /** Sections actually unloaded by `prepare` or `free`. */
+  evictedSections: number;
+  /** Candidate unloads refused by the map (pinned/dirty/not_committed). */
+  rejectedSections: number;
+}
+
 /** Bounded read-only snapshot of the working set. */
 export interface WorkingSetStats {
   residentSections: number;
@@ -178,6 +200,8 @@ export interface WorkingSetStats {
   pendingBytes: number;
   /** Cumulative request refusals by kind (busy/closed/capacity/no_record/not_ready). */
   rejections: Record<WorkingSetRejectionKind, number>;
+  /** Cumulative real prepare/free work; never derived from residency alone. */
+  counters: WorkingSetCounters;
 }
 
 const DEFAULT_MAX_EVICTION_CANDIDATES = 1024;
@@ -233,6 +257,16 @@ export class WorkingSetManager {
   private readonly rejectionLedger: WorkingSetRejection[] = [];
   /** Bound for `recentRejections`; the ledger never grows without limit. */
   private static readonly MAX_REJECTION_LEDGER = 64;
+  /** Cumulative real work; saturated so a long-lived session cannot overflow. */
+  private readonly counters: WorkingSetCounters = {
+    requestedSections: 0,
+    alreadyResidentSections: 0,
+    loadedSections: 0,
+    loadBytes: 0,
+    loadMs: 0,
+    evictedSections: 0,
+    rejectedSections: 0,
+  };
 
   constructor(session: SpatialSession, options: WorkingSetLimits = {}) {
     if (session.voxelLoading !== 'manual') {
@@ -296,6 +330,7 @@ export class WorkingSetManager {
         diagnostics.push(result.capacity.message);
         return result;
       }
+      this.bump('requestedSections', deduped.length);
 
       const resident: SectionKey[] = [];
       for (const key of deduped) {
@@ -328,6 +363,7 @@ export class WorkingSetManager {
       }
 
       result.alreadyResident = resident.map((k) => ({ ...k }));
+      this.bump('alreadyResidentSections', resident.length);
 
       // Protect the sections that are (or will be) resident, so the manager can never
       // evict the first half of the request to make room for the second half.
@@ -343,6 +379,7 @@ export class WorkingSetManager {
 
       if (toLoad.length > 0) {
         const protectedSet = new Set(protectedKeys.map(sectionKeyString));
+        const loadStarted = Date.now();
         try {
           const measured = await this.session.measureSections(toLoad);
           for (const missing of measured.missing) result.noRecord.push({ ...missing });
@@ -371,6 +408,8 @@ export class WorkingSetManager {
               const eviction = this.evictToFit(toLoad.length, measured.residentBytes, protectedSet, diagnostics);
               result.evicted = eviction.evicted.map((k) => ({ ...k }));
               result.evictionRejected = eviction.rejected.map((r) => ({ key: { ...r.key }, reason: r.reason }));
+              this.bump('evictedSections', eviction.evicted.length);
+              this.bump('rejectedSections', eviction.rejected.length);
               if (eviction.gap !== null) {
                 result.capacity = eviction.gap;
                 hardFailure = true;
@@ -379,6 +418,9 @@ export class WorkingSetManager {
                 const installed = this.session.installSections(measured.sections);
                 result.loaded = installed.map((k) => ({ ...k }));
                 for (const key of installed) this.lru.insert(sectionKeyString(key));
+                this.bump('loadedSections', installed.length);
+                this.bump('loadBytes', measured.residentBytes);
+                this.bump('loadMs', Date.now() - loadStarted);
                 this.reconcile();
               }
             }
@@ -544,9 +586,11 @@ export class WorkingSetManager {
           this.lru.remove(sectionKeyString(next.candidate));
           diagnostics.push(`evicted ${fmt(next.candidate)}`);
           unloadCount += 1;
+          this.bump('evictedSections', 1);
         } else {
           const reason = res.rejected[0]?.reason ?? 'not_committed';
           result.evictionRejected.push({ key: { ...next.candidate }, reason });
+          this.bump('rejectedSections', 1);
         }
       }
       if (result.capacity !== null) {
@@ -591,10 +635,16 @@ export class WorkingSetManager {
       pendingSections: dirty.count,
       pendingBytes: dirty.bytes,
       rejections: { ...this.rejectionCounts },
+      counters: { ...this.counters },
     };
   }
 
   // --- internals ---
+
+  /** Saturating cumulative counter; it never wraps or becomes non-finite. */
+  private bump(field: keyof WorkingSetCounters, amount: number): void {
+    this.counters[field] = Math.min(Number.MAX_SAFE_INTEGER, this.counters[field] + amount);
+  }
 
   /** Validate every key (scope, dim, integer coords) before any state change. */
   private validateKeys(keys: readonly SectionKey[]): SectionKey[] {

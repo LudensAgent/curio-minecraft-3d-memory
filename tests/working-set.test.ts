@@ -699,6 +699,45 @@ describe('WorkingSetManager', () => {
     ).toThrow(/worldId/);
     await session.close();
   });
+
+  it('counters record only real loads, hits and evictions', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 1 } });
+
+    const first = await manager.prepare([keyAt(0)]);
+    session.releasePins([first.lease.token]);
+    let stats = manager.stats();
+    expect(stats.counters.requestedSections).toBe(1);
+    expect(stats.counters.loadedSections).toBe(1);
+    expect(stats.counters.alreadyResidentSections).toBe(0);
+    expect(stats.counters.loadBytes).toBeGreaterThan(0);
+    expect(stats.counters.loadMs).toBeGreaterThanOrEqual(0);
+    expect(stats.counters.evictedSections).toBe(0);
+
+    // A repeat request is a hit: no second load and no new bytes.
+    const hit = await manager.prepare([keyAt(0)]);
+    session.releasePins([hit.lease.token]);
+    stats = manager.stats();
+    expect(stats.counters.requestedSections).toBe(2);
+    expect(stats.counters.alreadyResidentSections).toBe(1);
+    expect(stats.counters.loadedSections).toBe(1);
+
+    // Filling the request set evicts the LRU section and counts it exactly once.
+    const second = await manager.prepare([keyAt(1)]);
+    session.releasePins([second.lease.token]);
+    stats = manager.stats();
+    expect(stats.counters.loadedSections).toBe(2);
+    expect(stats.counters.evictedSections).toBe(1);
+    expect(stats.residentSections).toBe(1);
+
+    const freed = manager.free({ sections: 0 });
+    expect(freed.evicted).toHaveLength(1);
+    expect(manager.stats().counters.evictedSections).toBe(2);
+    expect(manager.stats().counters.rejectedSections).toBe(0);
+
+    await session.close();
+  });
 });
 
 // ==============================================================================
