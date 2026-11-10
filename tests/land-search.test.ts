@@ -101,6 +101,66 @@ describe('bounded voxel land search', () => {
     expect(defaultKinds.status).not.toBe('FOUND');
   });
 
+  it('plans ladder entry from adjacent ground and exit onto a platform as explicit ladder edges', () => {
+    const map = new VoxelMap('world', { now: () => 1000 });
+    let sequence = 0;
+    const observe = (state: typeof AIR, pos: { x: number; y: number; z: number }) => {
+      sequence += 1;
+      map.observe(obs(state, pos, { sequence, observedAt: 1000 + sequence }));
+    };
+    // Start platform at x=-1 (top y=0), hanging ladder at x=0, landing platform
+    // top at x=1, y=1. The entry and exit are both one horizontal cell.
+    for (let y = 0; y <= 2; y++) {
+      observe(AIR, { x: -1, y, z: 0 });
+      observe(y <= 1 ? LADDER : AIR, { x: 0, y, z: 0 });
+      observe(AIR, { x: 1, y, z: 0 });
+    }
+    observe(STONE, { x: -1, y: -1, z: 0 });
+    observe(STONE, { x: 1, y: 0, z: 0 });
+    const rules = { shapeProvider: ladderShapes, climbProvider: ladderClimb };
+    const result = searchLandRoute(map, request({
+      body: bodyAt(-0.5, 0, 0.5),
+      to: { x: 1.5, y: 1, z: 0.5 },
+      rules,
+      allowed: ['ladder'],
+    }), 2000);
+
+    expect(result.status).toBe('FOUND');
+    expect(result.transitions.map((transition) => [transition.kind, transition.from, transition.to])).toEqual([
+      ['ladder', { x: -0.5, y: 0, z: 0.5 }, { x: 0.5, y: 0, z: 0.5 }],
+      ['ladder', { x: 0.5, y: 0, z: 0.5 }, { x: 0.5, y: 1, z: 0.5 }],
+      ['ladder', { x: 0.5, y: 1, z: 0.5 }, { x: 1.5, y: 1, z: 0.5 }],
+    ]);
+    expect(result.cost).toBe(3);
+  });
+
+  it('plans an independent horizontal jump only when jump is explicitly allowed', () => {
+    const jumpModel = {
+      version: 'test-jump-v1',
+      resolve: () => ({ kind: 'supported' as const, trajectory: { apexHeight: 1.25 } }),
+    };
+    // A one-cell gap: support at x=-1 and x=1, no support under x=0.
+    const map = terrain([
+      { x: -1, z: 0, height: 0 },
+      { x: 0, z: 0, height: -2 },
+      { x: 1, z: 0, height: 0 },
+    ]);
+    const jumpRequest = request({
+      body: bodyAt(-0.5, 0, 0.5),
+      to: { x: 1.5, y: 0, z: 0.5 },
+      rules: { shapeProvider: fakeProvider, jumpModel },
+      allowed: ['jump'],
+    });
+    const result = searchLandRoute(map, jumpRequest, 2000);
+    expect(result.status).toBe('FOUND');
+    expect(result.transitions.map((transition) => transition.kind)).toEqual(['jump']);
+    expect(result.points).toEqual([{ x: -0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }]);
+    expect(result.cost).toBe(2);
+
+    const walkOnly = searchLandRoute(map, { ...jumpRequest, allowed: ['walk', 'step', 'drop'] }, 2000);
+    expect(walkOnly.status).not.toBe('FOUND');
+  });
+
   it('preserves fractional starting offsets and exact targets without centering or height snapping', () => {
     const map = terrain(flat());
     const exact = request({ body: bodyAt(0.4, 0, 0.4), to: { x: 2.4, y: 0, z: 0.4 } });

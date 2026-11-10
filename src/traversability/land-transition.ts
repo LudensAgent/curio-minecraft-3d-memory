@@ -1111,8 +1111,13 @@ function evaluateLandGeometry(
 
         const lo = Math.min(from.y, to.y);
         const hi = Math.max(from.y, to.y);
+        const horizontalEntryOrExit =
+          Math.abs(to.y - from.y) <= LAND_EPS
+          && (Math.abs(to.x - from.x) > LAND_EPS || Math.abs(to.z - from.z) > LAND_EPS);
 
         const regions: Array<[number, number]> = [];
+        /** Cells whose provider region covers the common endpoint feet height. */
+        const endpointClimbCells = new Set<string>();
         for (const cell of bodyCells) {
           const read = readCell(cell.x, cell.y, cell.z);
           if (read.kind !== 'observed') {
@@ -1156,6 +1161,13 @@ function evaluateLandGeometry(
               continue;
             }
             regions.push([region.minFeetY, region.maxFeetY]);
+            if (
+              horizontalEntryOrExit
+              && region.minFeetY <= from.y + LAND_EPS
+              && region.maxFeetY >= from.y - LAND_EPS
+            ) {
+              endpointClimbCells.add(keyOf(cell));
+            }
           }
         }
 
@@ -1181,6 +1193,30 @@ function evaluateLandGeometry(
               const chosen = gapCells.length > 0 ? gapCells : bodyCells.slice(0, 1);
               for (const cell of chosen) addCell(missingClimb, cell);
             }
+          }
+        }
+
+        // One endpoint of an entry/exit is the climb source; the other must
+        // prove a standable platform at the same exact feet height. A ladder
+        // cell itself is not a support face, so only the non-climb endpoint is
+        // checked. If neither endpoint is climbable the uncovered interval above
+        // already reports missing climb contact.
+        if (horizontalEntryOrExit) {
+          const fromCell = {
+            x: Math.floor(from.x),
+            y: Math.floor(from.y),
+            z: Math.floor(from.z),
+          };
+          const toCell = {
+            x: Math.floor(to.x),
+            y: Math.floor(to.y),
+            z: Math.floor(to.z),
+          };
+          const fromClimb = endpointClimbCells.has(keyOf(fromCell));
+          const toClimb = endpointClimbCells.has(keyOf(toCell));
+          if (fromClimb || toClimb) {
+            if (!fromClimb) checkSupport(from);
+            if (!toClimb) checkSupport(to);
           }
         }
         break;
@@ -1250,10 +1286,21 @@ function jumpRangeProblem(from: Vec3Like, to: Vec3Like, maxJumpDistance: number)
 }
 
 function ladderRangeProblem(from: Vec3Like, to: Vec3Like): string | null {
-  if (Math.abs(to.x - from.x) > LAND_EPS || Math.abs(to.z - from.z) > LAND_EPS) {
-    return 'ladder travel must keep a fixed XZ position';
+  const dx = Math.abs(to.x - from.x);
+  const dz = Math.abs(to.z - from.z);
+  const dy = Math.abs(to.y - from.y);
+  if (dx <= LAND_EPS && dz <= LAND_EPS) {
+    // Same-column ladder travel is a climb or descent. Entry/exit at the same
+    // feet height is handled by the adjacent-cell branch below.
+    if (dy <= LAND_EPS) return 'ladder travel must change feet height or move to an adjacent cell';
+    return null;
   }
-  if (Math.abs(to.y - from.y) <= LAND_EPS) return 'ladder travel must change feet height';
+  // Hanging-ladder entry and platform exit are one horizontal cell at the same
+  // feet height. Diagonal or height-changing step-offs are not ladder geometry.
+  const adjacent = (dx <= LAND_EPS && Math.abs(dz - 1) <= LAND_EPS)
+    || (dz <= LAND_EPS && Math.abs(dx - 1) <= LAND_EPS);
+  if (!adjacent) return 'ladder entry/exit must move exactly one adjacent horizontal cell';
+  if (dy > LAND_EPS) return 'ladder entry/exit must keep the same feet height';
   return null;
 }
 

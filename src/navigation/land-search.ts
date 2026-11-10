@@ -19,7 +19,7 @@ import type { SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
 
-export type LandSearchKind = 'walk' | 'step' | 'drop' | 'ladder';
+export type LandSearchKind = 'walk' | 'step' | 'drop' | 'jump' | 'ladder';
 export type LandSearchArrival = { kind: 'exact' } | { kind: 'near'; radius: number };
 export type LandSearchStatus =
   | 'FOUND'
@@ -347,8 +347,8 @@ function* searchChunks(
   const heuristicMode = request.heuristic ?? 'horizontal';
   if (heuristicMode !== 'horizontal' && heuristicMode !== 'zero') throw new Error('unsupported land search heuristic');
   const allowed = new Set(request.allowed ?? ['walk', 'step', 'drop']);
-  if ([...allowed].some((kind) => kind !== 'walk' && kind !== 'step' && kind !== 'drop' && kind !== 'ladder')) {
-    throw new Error('land search supports walk, step, drop and ladder geometry only');
+  if ([...allowed].some((kind) => kind !== 'walk' && kind !== 'step' && kind !== 'drop' && kind !== 'jump' && kind !== 'ladder')) {
+    throw new Error('land search supports walk, step, drop, jump and ladder geometry only');
   }
   // Validate, copy and normalize the corridor exactly once at the request
   // boundary so the hot expansion loop only compares finite numbers.
@@ -554,6 +554,84 @@ function* searchChunks(
     yield;
     if (cooperative) sliceStart = clock();
   }
+  /** Support heights under the body footprint at one horizontal column. */
+  function* columnSurfaces(
+    x: number,
+    z: number,
+    fromY: number,
+  ): Generator<void, { surfaces: Set<number>; gaps: Set<LandSearchBoundaryStatus> }, void> {
+    const half = body.width / 2;
+    const surfaces = new Set<number>();
+    const gaps = new Set<LandSearchBoundaryStatus>();
+    // Candidate heights come from actual support faces under the body footprint.
+    // No top-of-column shortcut merges a bridge with the cave below it.
+    for (let bx = Math.floor(x - half + EPS); bx <= Math.floor(x + half - EPS); bx++) {
+      for (let bz = Math.floor(z - half + EPS); bz <= Math.floor(z + half - EPS); bz++) {
+        for (let by = Math.floor(fromY - maxDrop) - 1; by <= Math.ceil(fromY + 1); by++) {
+          if (stopped() !== null) return { surfaces, gaps };
+          const cell = read.cell(bx, by, bz);
+          if (cell.kind === 'stale') gaps.add('STALE');
+          if (cell.kind === 'unobserved' || cell.kind === 'incomplete') gaps.add('UNKNOWN');
+          if (cell.kind === 'observed') {
+            const resolution = request.rules.shapeProvider.resolve(cell.state, cell.pos, read);
+            if (resolution.kind === 'shape') {
+              if (resolution.shape.supportFaces.length > geometryLimits.maxSupportFaces
+                || resolution.shape.boxes.length > geometryLimits.maxShapeBoxes) {
+                budget = 'geometry';
+                return { surfaces, gaps };
+              }
+              for (const face of resolution.shape.supportFaces) {
+                const y = by + face.top;
+                if (y < fromY - maxDrop - EPS || y > fromY + 1 + EPS) continue;
+                if (bx + face.maxX <= x - half + EPS || bx + face.minX >= x + half - EPS
+                  || bz + face.maxZ <= z - half + EPS || bz + face.minZ >= z + half - EPS) continue;
+                surfaces.add(Math.abs(y - fromY) <= EPS ? fromY : y);
+              }
+            } else if (resolution.kind === 'unsupported_shape') gaps.add('UNSUPPORTED');
+            else gaps.add(resolution.view.kind === 'stale' ? 'STALE' : 'UNKNOWN');
+          }
+          yield* pause();
+        }
+      }
+    }
+    return { surfaces, gaps };
+  }
+  const cellKeyOf = (point: Vec3Like): string =>
+    `${Math.floor(point.x)},${Math.floor(point.y)},${Math.floor(point.z)}`;
+  const climbSourceCache = new Map<string, boolean>();
+  /**
+   * Classify a node as a climb source using the same explicit provider that
+   * proves ladder transitions. A ladder cell is not inferred from its name or
+   * empty collision, and a platform node remains walkable after an exit.
+   */
+  const isClimbSource = (point: Vec3Like): boolean => {
+    const provider = request.rules.climbProvider;
+    if (!allowed.has('ladder') || provider === undefined) return false;
+    const key = cellKeyOf(point);
+    const cached = climbSourceCache.get(key);
+    if (cached !== undefined) return cached;
+    const cell = { x: Math.floor(point.x), y: Math.floor(point.y), z: Math.floor(point.z) };
+    const readCell = read.cell(cell.x, cell.y, cell.z);
+    if (readCell.kind !== 'observed') {
+      climbSourceCache.set(key, false);
+      return false;
+    }
+    const resolution = provider.resolve(
+      { cell, state: readCell.state, body: { ...body, feet: point } },
+      read,
+    );
+    const climbable = resolution.kind === 'regions'
+      && Array.isArray(resolution.regions)
+      && resolution.regions.some((region) =>
+        region !== null
+        && typeof region === 'object'
+        && Number.isFinite(region.minFeetY)
+        && Number.isFinite(region.maxFeetY)
+        && region.minFeetY <= point.y + EPS
+        && region.maxFeetY >= point.y - EPS);
+    climbSourceCache.set(key, climbable);
+    return climbable;
+  };
   const finish = (
     status: LandSearchStatus,
     reason: string,
@@ -861,65 +939,64 @@ function* searchChunks(
         yield* pause();
         return 'ok';
       };
-      for (const [dx, dz] of DIRECTIONS) {
-        const x = node.point.x + dx;
-        const z = node.point.z + dz;
-        if (!fromInCorridor || !corridorContains({ x, y: node.point.y, z })) {
-          // Delegation limit only: no boundary, no map read, no terrain claim.
-          stats.corridorSkipped += 1;
-          continue;
-        }
-        const half = body.width / 2;
-        const surfaces = new Set<number>();
-        const columnGaps = new Set<LandSearchBoundaryStatus>();
-        // Candidate heights come from actual support faces under the body footprint.
-        // No top-of-column shortcut merges a bridge with the cave below it.
-        for (let bx = Math.floor(x - half + EPS); bx <= Math.floor(x + half - EPS); bx++) {
-          for (let bz = Math.floor(z - half + EPS); bz <= Math.floor(z + half - EPS); bz++) {
-            for (let by = Math.floor(node.point.y - maxDrop) - 1; by <= Math.ceil(node.point.y + 1); by++) {
-              if (stopped() !== null) break search;
-              const cell = read.cell(bx, by, bz);
-              if (cell.kind === 'stale') columnGaps.add('STALE');
-              if (cell.kind === 'unobserved' || cell.kind === 'incomplete') columnGaps.add('UNKNOWN');
-              if (cell.kind === 'observed') {
-                const resolution = request.rules.shapeProvider.resolve(cell.state, cell.pos, read);
-                if (resolution.kind === 'shape') {
-                  if (resolution.shape.supportFaces.length > geometryLimits.maxSupportFaces
-                    || resolution.shape.boxes.length > geometryLimits.maxShapeBoxes) {
-                    budget = 'geometry';
-                    break search;
-                  }
-                  for (const face of resolution.shape.supportFaces) {
-                    const y = by + face.top;
-                    if (y < node.point.y - maxDrop - EPS || y > node.point.y + 1 + EPS) continue;
-                    if (bx + face.maxX <= x - half + EPS || bx + face.minX >= x + half - EPS
-                      || bz + face.maxZ <= z - half + EPS || bz + face.minZ >= z + half - EPS) continue;
-                    surfaces.add(Math.abs(y - node.point.y) <= EPS ? node.point.y : y);
-                  }
-                } else if (resolution.kind === 'unsupported_shape') columnGaps.add('UNSUPPORTED');
-                else columnGaps.add(resolution.view.kind === 'stale' ? 'STALE' : 'UNKNOWN');
-              }
-              yield* pause();
-            }
+      // A node held by a climb source has no ordinary support. Its horizontal
+      // moves must be proved as ladder exit (or ladder-to-ladder), not as a
+      // walk that silently assumes a platform under the ladder.
+      const nodeClimb = allowed.has('ladder') && fromInCorridor && isClimbSource(node.point);
+      if (!nodeClimb) {
+        for (const [dx, dz] of DIRECTIONS) {
+          const x = node.point.x + dx;
+          const z = node.point.z + dz;
+          if (!fromInCorridor || !corridorContains({ x, y: node.point.y, z })) {
+            // Delegation limit only: no boundary, no map read, no terrain claim.
+            stats.corridorSkipped += 1;
+            continue;
+          }
+          const { surfaces, gaps: columnGaps } = yield* columnSurfaces(x, z, node.point.y);
+          if (stopped() !== null) break search;
+          if (surfaces.size === 0) {
+            const columnStatus = columnGaps.has('UNKNOWN') ? 'UNKNOWN' : columnGaps.has('STALE') ? 'STALE'
+              : columnGaps.has('UNSUPPORTED') ? 'UNSUPPORTED' : 'BLOCKED';
+            const columnReason = columnStatus === 'BLOCKED'
+              ? 'fully observed column has no support within the requested step/drop range'
+              : 'support-surface coverage or shape rules are incomplete in the bounded column';
+            const candidate = { x, y: node.point.y, z };
+            boundary(node.point, candidate, columnStatus, columnReason);
+            noteBlocker(node, candidate, columnStatus, columnReason);
+          }
+          for (const y of surfaces) {
+            if (stopped() !== null) break search;
+            const dy = y - node.point.y;
+            const kind: LandSearchKind = Math.abs(dy) <= EPS ? 'walk' : dy > 0 ? 'step' : 'drop';
+            const to = { x, y, z };
+            const outcome = yield* considerEdge(kind, to, dx, dz);
+            if (outcome === 'stop') break search;
           }
         }
-        if (surfaces.size === 0) {
-          const columnStatus = columnGaps.has('UNKNOWN') ? 'UNKNOWN' : columnGaps.has('STALE') ? 'STALE'
-            : columnGaps.has('UNSUPPORTED') ? 'UNSUPPORTED' : 'BLOCKED';
-          const columnReason = columnStatus === 'BLOCKED'
-            ? 'fully observed column has no support within the requested step/drop range'
-            : 'support-surface coverage or shape rules are incomplete in the bounded column';
-          const candidate = { x, y: node.point.y, z };
-          boundary(node.point, candidate, columnStatus, columnReason);
-          noteBlocker(node, candidate, columnStatus, columnReason);
-        }
-        for (const y of surfaces) {
-          if (stopped() !== null) break search;
-          const dy = y - node.point.y;
-          const kind: LandSearchKind = Math.abs(dy) <= EPS ? 'walk' : dy > 0 ? 'step' : 'drop';
-          const to = { x, y, z };
-          const outcome = yield* considerEdge(kind, to, dx, dz);
-          if (outcome === 'stop') break search;
+      }
+      if (allowed.has('jump') && fromInCorridor && !nodeClimb) {
+        const maxJumpCells = Math.floor(geometryLimits.maxJumpDistance + EPS);
+        for (const [dx, dz] of DIRECTIONS) {
+          for (let distance = 2; distance <= maxJumpCells; distance++) {
+            if (stopped() !== null) break search;
+            const to = {
+              x: node.point.x + dx * distance,
+              y: node.point.y,
+              z: node.point.z + dz * distance,
+            };
+            if (!corridorContains(to)) {
+              stats.corridorSkipped += 1;
+              continue;
+            }
+            // Jump geometry still needs a local landing surface at the same
+            // feet height; the transition evaluator then proves the swept body
+            // envelope and the observed gap.
+            const { surfaces } = yield* columnSurfaces(to.x, to.z, node.point.y);
+            if (stopped() !== null) break search;
+            if (!surfaces.has(node.point.y)) continue;
+            const outcome = yield* considerEdge('jump', to, dx * distance, dz * distance);
+            if (outcome === 'stop') break search;
+          }
         }
       }
       if (allowed.has('ladder') && fromInCorridor) {
@@ -930,7 +1007,22 @@ function* searchChunks(
             stats.corridorSkipped += 1;
             continue;
           }
+          if (!nodeClimb && !isClimbSource(to)) continue;
           const outcome = yield* considerEdge('ladder', to, 0, 0);
+          if (outcome === 'stop') break search;
+        }
+        for (const [dx, dz] of DIRECTIONS) {
+          if (stopped() !== null) break search;
+          const to = { x: node.point.x + dx, y: node.point.y, z: node.point.z + dz };
+          if (!corridorContains(to)) {
+            stats.corridorSkipped += 1;
+            continue;
+          }
+          // From a platform, only entry into a climb source is a ladder edge.
+          // From a climb source, every adjacent move is an exit candidate and
+          // the evaluator proves the destination platform support.
+          if (!nodeClimb && !isClimbSource(to)) continue;
+          const outcome = yield* considerEdge('ladder', to, dx, dz);
           if (outcome === 'stop') break search;
         }
       }
