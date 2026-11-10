@@ -1204,7 +1204,7 @@ function writeCheckpoint(
   gameVersion: string,
   domain: { history: 'full' | 'none'; topology: 'full' | 'none' },
   prepared: PreparedSnapshot,
-  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
+  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections']; removedIds?: string[] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
   ledger: { mode: 'none' | 'full' | 'delta'; revision: number; prepared: PreparedLedgerWrite | null },
   resolved: ResolvedSnapshotLimits,
@@ -1275,6 +1275,12 @@ function writeCheckpoint(
         .prepare('SELECT COALESCE(MAX(seq), 0) AS n FROM spatial_sections WHERE world_id = ?')
         .get(wId) as { n: number };
       const baseSeq = maxSeqRow.n;
+      // Sections dropped by observation retention: delete before the upsert, so a
+      // section re-created after its removal is written back as a fresh row.
+      if (voxel.removedIds?.length) {
+        const deleteSection = connection.prepare('DELETE FROM spatial_sections WHERE world_id = ? AND id = ?');
+        for (const id of voxel.removedIds) deleteSection.run(wId, id);
+      }
       const upsertSection = connection.prepare(
         'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy, game_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
           'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision, dimension = excluded.dimension, cx = excluded.cx, cz = excluded.cz, sy = excluded.sy, game_version = excluded.game_version',
@@ -2516,6 +2522,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       mode: msg.voxelMode,
       voxelRevision: msg.voxelRevision,
       sections: preparedVoxel?.sections ?? [],
+      removedIds: (msg.voxelSnapshot?.removedSections ?? []).map(voxelSectionIdFromKey),
     }, {
       mode: msg.journalMode,
       revision: msg.journalRevision,

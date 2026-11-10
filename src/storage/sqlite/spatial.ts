@@ -478,7 +478,7 @@ class SpatialSessionImpl implements SpatialSession {
     const voxelSnapshot: VoxelCheckpointSnapshot =
       voxelMode === 'full'
         ? this.voxel.checkpointSnapshot()
-        : { worldId: this.worldId, sections: this.voxel.captureDirtySections() };
+        : { worldId: this.worldId, sections: this.voxel.captureDirtySections(), removedSections: this.voxel.captureRemovedSections() };
 
     // Capture the exact pending batch/revision now. Records accepted after this
     // line keep a higher local revision and survive this ACK.

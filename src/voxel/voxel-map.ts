@@ -303,6 +303,13 @@ export class VoxelMap {
    */
   private readonly pendingSections = new Map<Section, number>();
   /**
+   * Sections removed by `retainNewestObservedCells` since the last confirmed save,
+   * keyed by `dirKey` with the save revision of the removal. The next incremental
+   * checkpoint deletes their rows; a section re-created later is simply upserted
+   * again after the delete.
+   */
+  private readonly removedSections = new Map<string, { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }>();
+  /**
    * True once the owning session has finished initialization and handed the map to
    * the caller. `restoreSnapshot` is the initialization path only: after this flag
    * is set it is rejected, so a delivered (even still-empty) map can never have its
@@ -716,6 +723,76 @@ export class VoxelMap {
     for (const [section, revision] of this.pendingSections) {
       if (revision <= capturedRevision) this.pendingSections.delete(section);
     }
+    for (const [key, removed] of this.removedSections) {
+      if (removed.revision <= capturedRevision) this.removedSections.delete(key);
+    }
+  }
+
+  /** Keys of sections removed since the last confirmed save (for the next incremental checkpoint to delete). */
+  captureRemovedSections(): { dim: string; cx: number; cz: number; sy: number }[] {
+    return [...this.removedSections.values()].map((r) => ({ ...r.key }));
+  }
+
+  /**
+   * Bounded observation retention: keep only the `maxCells` most recently observed
+   * cells (by `observedAt`) and forget the rest. A forgotten cell loses its evidence,
+   * explored/stale/risk bits and content — it reads as unknown, exactly like a cell
+   * never observed. The historical `traversed`/`modified` marks are kept (they are
+   * history, not observation). A section left with no evidence and no history marks
+   * is removed from the map and its row is deleted by the next incremental
+   * checkpoint; a pinned section is only emptied, never removed.
+   *
+   * Every touched section advances its revision and is reported once as
+   * `invalidated` (without per-cell entries, which could be hundreds of thousands).
+   * Eager residency only: in manual mode non-resident committed sections cannot be
+   * ranked against resident ones, so this throws instead of silently under-trimming.
+   */
+  retainNewestObservedCells(maxCells: number): { forgottenCells: number; removedSections: number; keptCells: number } {
+    if (!Number.isInteger(maxCells) || maxCells < 0) throw new Error(`maxCells must be a non-negative integer: ${maxCells}`);
+    if (this.manualResidency) throw new Error('retainNewestObservedCells requires eager residency');
+    const all: { section: Section; index: number; at: number }[] = [];
+    for (const dimMap of this.sections.values()) {
+      for (const section of dimMap.values()) {
+        for (const [index, evidence] of section.evidence) all.push({ section, index, at: evidence.observation.observedAt });
+      }
+    }
+    if (all.length <= maxCells) return { forgottenCells: 0, removedSections: 0, keptCells: all.length };
+    all.sort((a, b) => a.at - b.at);
+    const forget = all.slice(0, all.length - maxCells);
+    const touched = new Set<Section>();
+    for (const { section, index } of forget) {
+      section.evidence.delete(index);
+      setBit(section.explored, index, false);
+      setBit(section.stale, index, false);
+      setBit(section.risk, index, false);
+      writeCell(section.cells, section.bits, index, 0);
+      touched.add(section);
+    }
+    const changes: SectionChange[] = [];
+    let removed = 0;
+    for (const section of touched) {
+      section.revision += 1;
+      changes.push({ key: { ...section.key }, revision: section.revision, invalidated: true, cells: [] });
+      const { dim, cx, cz, sy } = section.key;
+      const dk = dirKey(dim, cx, cz, sy);
+      const hasHistory = section.traversed.some((b) => b !== 0) || section.modified.some((b) => b !== 0);
+      if (section.evidence.size === 0 && !hasHistory && (this.pinCounts.get(dk) ?? 0) === 0) {
+        const dimMap = this.sections.get(dim)!;
+        dimMap.delete(innerKey(cx, cz, sy));
+        if (dimMap.size === 0) this.sections.delete(dim);
+        this.residentBytes -= estimateVoxelSectionResidentBytes(section);
+        this.residentSectionCount -= 1;
+        this.bumpResidencyGeneration(dim, cx, cz, sy);
+        this.pendingSections.delete(section);
+        this.saveRevisionCount += 1;
+        this.removedSections.set(dk, { key: { dim, cx, cz, sy }, revision: this.saveRevisionCount });
+        removed += 1;
+      } else {
+        this.recordSaveChange(section);
+      }
+    }
+    this.emit({ sections: changes });
+    return { forgottenCells: forget.length, removedSections: removed, keptCells: all.length - forget.length };
   }
 
   /**

@@ -113,6 +113,11 @@ export interface VoxelCheckpointSnapshot {
   /** Snapshot schema version; absent means v1 (full state in evidence, no history). */
   schemaVersion?: number;
   sections: VoxelSectionSnapshot[];
+  /**
+   * Incremental saves only: sections removed by observation retention since the last
+   * confirmed save. Their rows are deleted before `sections` are upserted.
+   */
+  removedSections?: { dim: string; cx: number; cz: number; sy: number }[];
 }
 
 // --- deep copy ---------------------------------------------------------------
