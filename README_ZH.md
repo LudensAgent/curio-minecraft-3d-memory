@@ -30,7 +30,7 @@
 - **有界派生缓存**：`TraversabilityCache` 默认最多 2048 项、最长复用年龄 60 秒。查询时有限清理过期项，宿主可显式调用 `pruneExpired()` / `clear()` 维护或释放；这些操作不删除地图观察。
 - **受控路线执行**（`execution/`）：`WalkRouteExecutor` 驱动注入的单步 `MoveExecutor`；每段开始前要求当前 `OPEN` 证据；仅接受实测精确位置作为到达；证据变化时撤销在途路段。
 - **陆地与水面验证**（`traversability/`、`water/`）：`evaluateLandTransition` / `LandRouteVerifier` 检查调用方声明的陆地转换与路线；`evaluateWaterRoute` / `checkWaterArrival` 检查水面游泳与已乘船几何。结果固定带 `assurance: 'geometry_only'` 与 `executable: false`。
-- **显式 SQLite 持久化**（`storage/`，`curio-minecraft-3d-memory/storage/sqlite`）：单个 Worker 独占连接与事务。`checkpoint()` 是唯一显式保存触发点并返回确认后的 `CheckpointResult`；包含体素增量 checkpoint、手动 Section 驻留、`WorkingSetManager`、放置/访问/门户账本、追加式 journal，以及离线旧账本迁移演练。
+- **显式 SQLite 持久化**（`storage/`，`curio-minecraft-3d-memory/storage/sqlite`）：单个 Worker 独占连接与事务。`checkpoint()` 是唯一显式保存触发点并返回确认后的 `CheckpointResult`；包含体素增量 checkpoint、手动 Section 驻留、`WorkingSetManager`、放置/访问/门户账本、追加式 journal，以及离线旧账本迁移演练。manual 打开只安装目录聚合与精确 key 成员，`directoryPage()` 由 Worker 按 SQL 页读取；checkpoint 可带绝对期限，脏批捕获有时间切片，已提交体素/journal 统计按增量维护，`historyLoading: 'none'` 只校验旧基线而不恢复或静默覆盖。
 - **与宿主解耦的集成面**：`SpatialMemoryStoreImpl` 组合运行态 Store 并提供作用域守卫；库通过窄适配类型消费感知与执行，从不 import 宿主源码。
 
 ## 运行要求
