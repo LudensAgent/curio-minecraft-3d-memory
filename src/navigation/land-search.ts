@@ -20,7 +20,12 @@ import { sectionKeyString } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
 
 export type LandSearchKind = 'walk' | 'step' | 'drop' | 'jump' | 'ladder';
-export type LandSearchArrival = { kind: 'exact' } | { kind: 'near'; radius: number };
+export type LandSearchArrival = { kind: 'exact' } | {
+  kind: 'near';
+  radius: number;
+  /** Default continuous; cell measures Euclidean distance after flooring each coordinate. */
+  coordinates?: 'continuous' | 'cell';
+};
 export type LandSearchStatus =
   | 'FOUND'
   | 'NO_PATH_IN_MEMORY'
@@ -351,6 +356,10 @@ function* searchChunks(
   if (arrival.kind !== 'exact' && (arrival.kind !== 'near' || !Number.isFinite(arrival.radius) || arrival.radius < 0)) {
     throw new Error('land search arrival must be exact or near with a finite nonnegative radius');
   }
+  if (arrival.kind === 'near' && arrival.coordinates !== undefined
+    && arrival.coordinates !== 'continuous' && arrival.coordinates !== 'cell') {
+    throw new Error('land search near coordinates must be continuous or cell');
+  }
   const goalMetric = request.goalMetric ?? '3d';
   if (goalMetric !== '3d' && goalMetric !== 'horizontal') throw new Error('unsupported land search goal metric');
   const evidenceMode = request.evidenceMode ?? 'current';
@@ -443,8 +452,11 @@ function* searchChunks(
   // heuristic. Directional goals do not impose an unobserved waypoint height.
   let closest: SearchNode | null = null;
   let closestMetric = Number.POSITIVE_INFINITY;
+  const cellCoordinates = arrival.kind === 'near' && arrival.coordinates === 'cell';
+  const coordinateDelta = (from: number, to: number): number => cellCoordinates
+    ? Math.floor(from) - Math.floor(to) : from - to;
   const targetDistance = (point: Vec3Like): number =>
-    Math.hypot(point.x - target.x, goalMetric === 'horizontal' ? 0 : point.y - target.y, point.z - target.z);
+    Math.hypot(coordinateDelta(point.x, target.x), goalMetric === 'horizontal' ? 0 : coordinateDelta(point.y, target.y), coordinateDelta(point.z, target.z));
   const remainingMetric = (point: Vec3Like): number => arrival.kind === 'near'
     ? Math.max(0, targetDistance(point) - arrival.radius)
     : targetDistance(point);
@@ -782,7 +794,7 @@ function* searchChunks(
   // Vertical distance is deliberately absent: a four-block drop costs six, not nine.
   // Jumps can travel more than two horizontal blocks for cost two; use h=0 when allowed.
   const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' || allowed.has('jump') ? 0
-    : Math.max(0, Math.abs(point.x - target.x) + Math.abs(point.z - target.z)
+    : Math.max(0, Math.abs(coordinateDelta(point.x, target.x)) + Math.abs(coordinateDelta(point.z, target.z))
       - (arrival.kind === 'near' ? Math.SQRT2 * arrival.radius : 0));
   const keyOf = (point: Vec3Like): string => `${Math.round(point.x - start.x)},${point.y},${Math.round(point.z - start.z)}`;
 
@@ -1126,7 +1138,13 @@ export async function searchLandRouteAsync(map: VoxelMap, request: LandSearchReq
   const chunks = searchChunks(map, request, now, true);
   let step = chunks.next();
   while (!step.done) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // A zero-delay timer can wait a whole platform timer tick per slice.
+    // Node's check phase still yields to I/O/timers without that minimum delay;
+    // other runtimes retain the task-based timer fallback (never a microtask).
+    await new Promise<void>((resolve) => {
+      if (typeof globalThis.setImmediate === 'function') globalThis.setImmediate(resolve);
+      else setTimeout(resolve, 0);
+    });
     step = chunks.next();
   }
   return step.value;

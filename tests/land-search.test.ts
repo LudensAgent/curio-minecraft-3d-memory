@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { searchLandRoute, searchLandRouteAsync } from '../src/navigation/index.js';
 import type { LandSearchRequest } from '../src/navigation/index.js';
 import { evaluateRememberedWalkStep, evaluateWalkStep } from '../src/traversability/step.js';
@@ -44,6 +44,90 @@ function request(overrides: Partial<LandSearchRequest> = {}): LandSearchRequest 
 }
 
 const flat = (length = 3): Column[] => Array.from({ length }, (_, x) => ({ x, z: 0, height: 0 }));
+
+describe('cooperative search task scheduling', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('uses immediate tasks when available without changing the route or work counts', async () => {
+    const immediate = vi.spyOn(globalThis, 'setImmediate');
+    const map = terrain(flat(8));
+    const query = request({ to: { x: 7.5, y: 0, z: 0.5 }, maxWorkPerSlice: 4, maxSearchMs: 5000 });
+    const result = await searchLandRouteAsync(map, query, 2000);
+    const sync = searchLandRoute(map, query, 2000);
+    expect(result.status).toBe('FOUND');
+    expect(immediate).toHaveBeenCalledTimes(result.stats.yieldCount);
+    expect(result.stats.yieldCount).toBeGreaterThan(0);
+    expect(result.points).toEqual(sync.points);
+    expect(result.stats.edgesEvaluated).toBe(sync.stats.edgesEvaluated);
+  });
+
+  it('continues to run timers and observe cancellation between immediate slices', async () => {
+    const controller = new AbortController();
+    const map = terrain(flat(32));
+    const timer = setTimeout(() => controller.abort(), 0);
+    const result = await searchLandRouteAsync(map, request({
+      to: { x: 31.5, y: 0, z: 0.5 }, maxWorkPerSlice: 1, signal: controller.signal,
+    }), 2000);
+    clearTimeout(timer);
+    expect(result.status).toBe('CANCELLED');
+    expect(result.stats.yieldCount).toBeGreaterThan(0);
+    expect(result.points).toEqual([]);
+  });
+
+  it('falls back to timer tasks in runtimes without setImmediate', async () => {
+    vi.stubGlobal('setImmediate', undefined);
+    let timerRan = false;
+    setTimeout(() => { timerRan = true; }, 0);
+    const result = await searchLandRouteAsync(terrain(flat(8)), request({
+      to: { x: 7.5, y: 0, z: 0.5 }, maxWorkPerSlice: 16, maxSearchMs: 5000,
+    }), 2000);
+    expect(result.status).toBe('FOUND');
+    expect(timerRan).toBe(true);
+    expect(result.stats.yieldCount).toBeGreaterThan(0);
+  });
+});
+
+describe('cell-coordinate near arrival', () => {
+  it.each(['current', 'remembered'] as const)('preserves the target and radius while measuring %s candidates by cell distance', (evidenceMode) => {
+    const map = terrain(Array.from({ length: 8 }, (_, index) => [-1, 0, 1].map((z) => ({ x: index - 1, z, height: 0 }))).flat());
+    const query = request({ body: bodyAt(0.1, 0, 0.1), to: { x: 4.9, y: 0.9, z: 0.9 }, evidenceMode });
+    const cell = searchLandRoute(map, { ...query, arrival: { kind: 'near', radius: 1, coordinates: 'cell' } }, 2000);
+    const continuous = searchLandRoute(map, { ...query, arrival: { kind: 'near', radius: 1 } }, 2000);
+    expect(cell.status).toBe('FOUND');
+    expect(cell.target).toEqual(query.to);
+    expect(cell.arrival).toEqual({ kind: 'near', radius: 1, coordinates: 'cell' });
+    expect(cell.points.at(-1)).toEqual({ x: 3.1, y: 0, z: 0.1 });
+    expect(cell.transitions).toHaveLength(3);
+    expect(continuous.status).toBe('FOUND');
+    expect(continuous.transitions.length).toBeGreaterThan(cell.transitions.length);
+  });
+
+  it('floors negative coordinates and keeps vertical cell distance unless horizontal was requested', () => {
+    const map = terrain(Array.from({ length: 7 }, (_, index) => ({ x: index - 5, z: -1, height: 0 })));
+    const query = request({ body: bodyAt(-4.6, 0, -0.5), to: { x: -0.1, y: 1.9, z: -0.1 }, arrival: { kind: 'near', radius: 1, coordinates: 'cell' } });
+    const threeD = searchLandRoute(map, query, 2000);
+    const horizontal = searchLandRoute(map, { ...query, goalMetric: 'horizontal' }, 2000);
+    expect(threeD.status).toBe('FOUND');
+    expect(horizontal.status).toBe('FOUND');
+    expect(threeD.points.at(-1)!.x).toBeCloseTo(-0.6);
+    expect(horizontal.points.at(-1)!.x).toBeCloseTo(-1.6);
+    expect(threeD.target).toEqual(query.to);
+    expect(horizontal.target).toEqual(query.to);
+  });
+
+  it('ranks incomplete prefixes by the same cell metric and rejects an unknown coordinate mode', () => {
+    const map = terrain(flat(4));
+    const query = request({ to: { x: 8.9, y: 0.9, z: 0.9 }, arrival: { kind: 'near', radius: 1, coordinates: 'cell' } });
+    const result = searchLandRoute(map, query, 2000);
+    expect(result.prefix?.endpoint).toEqual({ x: 3.5, y: 0, z: 0.5 });
+    expect(result.prefix?.distanceToTarget).toBe(5);
+    expect(result.prefix?.atTarget).toBe(false);
+    expect(() => searchLandRoute(map, { ...query, arrival: { kind: 'near', radius: 1, coordinates: 'unknown' as 'cell' } }, 2000)).toThrow(/coordinates/);
+  });
+});
 
 const LADDER = { name: 'minecraft:ladder', properties: { facing: 'north' } };
 const ladderShapes: CollisionShapeProvider = {
