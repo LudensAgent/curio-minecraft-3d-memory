@@ -43,7 +43,13 @@ export function buildMemoryHostCapabilities(
   const topology = context.sources.topology !== undefined;
   const fragments = context.sources.fragments !== undefined;
   const history = context.sources.history !== undefined;
-  const routeMemory = fragments && topology && history;
+  /**
+   * Dispatch retires legacy route reads as soon as a facts store is composed,
+   * regardless of which compatibility stores happen to be present. The
+   * capability report must describe that same callable surface, not the
+   * package's optional legacy stores.
+   */
+  const routeMemory = !facts && fragments && topology && history;
   return {
     contract: CONTRACT_VERSION,
     memory: {
@@ -74,7 +80,7 @@ export function buildMemoryHostCapabilities(
       segments: routeMemory,
       portals: routeMemory,
       resourceAnchors: facts || topology,
-      containerAnchors: facts || context.isContainer !== undefined,
+      containerAnchors: facts || (topology && context.isContainer !== undefined),
       // Available only when the host injected the caller-supplied snapshot
       // source; the library never starts a search of its own.
       frontiers: context.sources.frontiers !== undefined,

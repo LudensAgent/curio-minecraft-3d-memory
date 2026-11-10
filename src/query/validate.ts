@@ -231,6 +231,15 @@ const FIELD_SPECS: Record<SpatialQueryKind, readonly FieldSpec[]> = {
     stringField('after', false),
     LIMIT_FIELD,
   ],
+  places: [
+    stringField('dim', false),
+    enumField('tag', LANDMARK_TAGS, false),
+    stringField('label', false),
+    enumField('source', NODE_SOURCES, false),
+    booleanField('includeGone', false),
+    stringField('after', false),
+    LIMIT_FIELD,
+  ],
   edges: [
     stringField('dim', false),
     stringField('from', false),

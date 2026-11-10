@@ -357,8 +357,8 @@ describe('SpatialMemoryStoreImpl — batch and lifecycle write ports', () => {
 
     // Session changes never delete historical geometry or traversal history.
     expect(store.fragments(DIM).map((fragment) => fragment.id)).toEqual(['f1']);
-    expect(fragments.revision).toBe(history.fragments.revision);
-    expect(store.snapshot().fragments.total).toBe(1);
+    expect(fragments.revision).toBe(history.fragments!.revision);
+    expect(store.snapshot().fragments!.total).toBe(1);
 
     // Same-session beginSession is an idempotent no-op.
     expect(store.beginSession('s2').sections).toEqual([]);
@@ -874,8 +874,8 @@ describe('SpatialMemoryStoreImpl — read-only queries and capability reports', 
     expect(snapshot.worldId).toBe(WORLD);
     expect(snapshot.voxel.saveRevision).toBe(map.saveRevision);
     expect(snapshot.fragments).toEqual({ revision: 1, total: 1 });
-    expect(snapshot.topology.nodes).toBe(1);
-    expect(snapshot.topology.edges).toBe(0);
+    expect(snapshot.topology!.nodes).toBe(1);
+    expect(snapshot.topology!.edges).toBe(0);
     expect(snapshot.capabilities).toEqual(capabilities);
   });
 });

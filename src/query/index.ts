@@ -83,6 +83,7 @@ const QUERY_HANDLERS: { [K in SpatialQueryKind]: QueryHandler<K> } = {
   fragments: queryTopology,
   traversals: queryTopology,
   nodes: queryTopology,
+  places: queryFacts,
   edges: queryTopology,
   portals: queryTopology,
   historyRoute: queryHistory,
@@ -110,12 +111,16 @@ function dispatch(
   request: SpatialQueryRequest,
 ): SpatialQueryResult {
   if (context.sources.facts !== undefined) {
-    if (request.kind === 'nodes' || request.kind === 'resourceAnchors' || request.kind === 'containerAnchors') {
+    if (request.kind === 'nodes' || request.kind === 'places'
+      || request.kind === 'resourceAnchors' || request.kind === 'containerAnchors') {
       return queryFacts(context, request);
     }
     if (LEGACY_ROUTE_KINDS.has(request.kind)) {
       return unsupportedQueryResult(context, request.kind, 'legacy route queries are retired; query facts for places and voxel cells for geometry');
     }
+  }
+  if (request.kind === 'places') {
+    return unsupportedQueryResult(context, request.kind, LEGACY_STORES_ABSENT, request.dim);
   }
   if (LEGACY_ROUTE_KINDS.has(request.kind)
     && (context.sources.fragments === undefined
@@ -216,9 +221,11 @@ export function createVoxelFactsQueryPort(options: VoxelFactsQueryOptions): Spat
       },
       facts: {
         revision: facts.revision,
-        places: facts.places({ limit: 1 }).total,
-        resources: facts.resources({ limit: 1 }).total,
-        containers: facts.containers({ limit: 1 }).total,
+        // The shared in-memory store may hold other worlds; a snapshot is
+        // scoped to this query port's world.
+        places: facts.places({ worldId, limit: 1 }).total,
+        resources: facts.resources({ worldId, limit: 1 }).total,
+        containers: facts.containers({ worldId, limit: 1 }).total,
       },
       capabilities: memoryCapabilities(),
     };

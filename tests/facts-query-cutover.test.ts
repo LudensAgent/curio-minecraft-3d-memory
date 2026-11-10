@@ -45,6 +45,6 @@ it('distinguishes saving facts from committing the legacy migration receipt', as
   const restored = await openSpatialSession(options);
   try {
     expect(restored.legacyFactsMigrationVersion).toBe(1);
-    expect(restored.facts.places().items[0].observedAt).toBe(100);
+    expect(restored.facts.places().items[0]!.observedAt).toBe(100);
   } finally { await restored.close(); }
 });
