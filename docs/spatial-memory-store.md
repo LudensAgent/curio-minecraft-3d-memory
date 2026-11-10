@@ -103,16 +103,16 @@ never start movement and carry no current-passability claim.
   `SpatialMemoryUnsupportedError` rather than silently ignoring it.
 - `surfaceAnchor` returns the highest reachable recorded exact node by `y`;
   `deepestAnchor` returns the lowest. Both require a recorded node within
-  `near` of `here` (default 6). `deepestAnchor` returns `null` when `here` is
+  `near` of `here` (default 3.5). `deepestAnchor` returns `null` when `here` is
   absent or too far from the network: there is no whole-network fallback,
   because that fallback did not establish connection evidence. Neither method
   proves a surface opening or current reachability.
-- `fragmentation(dim)` is geometric, computed over `FragmentStore` polylines.
-  It uses recorded `links` when present and consecutive-polyline inference
-  otherwise, plus cross-record proximity (legacy thresholds
-  `FRAGMENTATION_LINK_DISTANCE = 3.5`, `FRAGMENTATION_HOP_DISTANCE = 7`).
-  It counts connected components; it does not prove current passability or
-  merge fragments or edges.
+- `fragmentation(dim)` delegates to `TopologyStore` and computes components
+  from recorded links and actual traversal evidence. Proximity and consecutive
+  polyline points alone never create a connection. The legacy
+  `FRAGMENTATION_LINK_DISTANCE` / `FRAGMENTATION_HOP_DISTANCE` exports remain
+  deprecated compatibility constants and do not affect the result. Reading
+  components does not prove current passability or merge fragments or edges.
 
 ### Frontier candidates
 
@@ -120,14 +120,14 @@ never start movement and carry no current-passability claim.
 function returning an already-computed `WalkSearchSnapshot` (or `null`). The
 store does not run a walk search, read the map, or start exploration.
 
-- At least one candidate is projected from the snapshot's bounded `frontiers`
+- Candidates are projected from the snapshot's bounded `frontiers`
   via `frontierCandidates` in `src/navigation/route-inspection.ts`.
 - `reachability: 'OPEN'` refers to the validated stance next to the boundary,
   never to `pos` or the gap beyond it.
-- The `Frontier` interface has only a boolean `historicalConnection`.
-  `frontierInspection` preserves the view's explicit `'unknown'`; the
-  `Frontier[]` projection reports `false`, which means “not established” and
-  never “disproved”.
+- `Frontier.historicalConnection` accepts `boolean | 'unknown'`.
+  Both `frontierInspection` and the `Frontier[]` projection preserve
+  `'unknown'` when no historical lookup was made; absence of a lookup is not
+  evidence of disconnection.
 - Without a provider, or when the provider returns `null` for that dim/here,
   `frontierCandidates` raises `SpatialMemoryUnsupportedError` and
   `frontierInspection` returns `{ status: 'unavailable', reason }`. Neither is
@@ -213,10 +213,10 @@ These are gaps between the `SpatialMemoryStore` interface / `SpatialEdge`
 design type and the current `TopologyStore` model. They are surfaced, not
 papered over.
 
-1. **`markTraversed` / `markModified` are not on `VoxelMap` in this branch.**
-   The facade detects them at runtime. When a later `VoxelMap` build adds them,
-   the same facade forwards to them without another interface change; until
-   then the methods are explicitly unsupported.
+1. **Markers record confirmed facts only.** `VoxelMap` implements
+   `markTraversed` / `markModified`; the facade forwards them after scope and
+   input checks. The markers do not prove neighboring connectivity or current
+   passability.
 2. **`SpatialEdge` cannot be stored faithfully.** `TopologyStore` keeps
    `id/from/to/type/basis/evidenceIds`, not `directed/modes/verifications`.
    `graph()` projects `directed: true` (each record supports `from → to` only;
@@ -235,18 +235,18 @@ papered over.
    only the portal graph; walk routing never sees those edges. The checkpoint
    persists portal edges and evidence-backed fragment merges in the low-frequency
    `topology_extras` checkpoint column.
-5. **`Frontier.historicalConnection: boolean` cannot express unknown**, and
+5. **Frontier availability needs the detailed inspection.**
+   `Frontier.historicalConnection` preserves `'unknown'`, but
    `frontierCandidates` cannot express `unavailable` in its `Frontier[]` return
-   type. Use `frontierInspection` for the explicit form. A future interface
-   should use a tri-state and a discriminated availability result.
+   type. Use `frontierInspection` for the explicit availability result.
 6. **Endpoint-addressed methods have no `dim`.** `forgetFragment(id)` and
    `dropEdge(from, to)` cannot take a dimension under the current signatures;
    they rely on the composed stores' single-world, id/nodes-addressed scope.
    `graph(dim)` and all coordinate queries do take an explicit dimension.
-7. **Not yet re-exported from `src/index.ts`.** This work package only owns
-   `src/store/**`; the package root entry must re-export the class and its
-   types when the store interface is integrated with the rest of the public
-   surface.
+7. **The composition remains a compatibility surface.** The package root
+   exports `SpatialMemoryStoreImpl` and its public types. It still composes
+   the legacy stores; the v0.11 development plan separates the ordinary voxel
+   workflow from those explicit historical APIs.
 
 ## Boundaries
 

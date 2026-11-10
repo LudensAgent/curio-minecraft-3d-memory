@@ -17,10 +17,6 @@
  * sources. They raise `SpatialMemoryUnsupportedError` or return an explicit
  * `unavailable` result instead of inventing an answer:
  *
- * - `markTraversed` / `markModified` exist only when the injected `VoxelMap`
- *   actually implements them (this build may not);
- * - `portalEdges` is unsupported because `TopologyStore` rejects `PORTAL` edges
- *   and no portal-traversal history store is composed;
  * - `frontierCandidates` requires a caller-supplied `WalkSearchSnapshot`
  *   provider; it never starts a search itself.
  *
@@ -60,7 +56,6 @@ import type {
 } from '../navigation/route-inspection.js';
 import type { WalkSearchSnapshot } from '../navigation/walk-search.js';
 import type {
-  AnchorOrder,
   AnchorQueryOptions,
   AnchorResult,
   ComponentReport,
@@ -79,7 +74,6 @@ import type {
   PortalEdgeView,
   PortalTraversalEvidence,
   RecordNodeOptions,
-  RouteQueryResult,
   RouteQueryStatus,
   RuntimeQueryOptions,
   SaveResult,
@@ -198,19 +192,12 @@ export class SpatialMemoryUnsupportedError extends Error {
   }
 }
 
-/** Optional markers a newer `VoxelMap` build may provide; never assumed. */
-interface OptionalTraversalMarkers {
-  markTraversed?: (dim: string, pos: Vec3Like) => void;
-  markModified?: (dim: string, pos: Vec3Like, actionId: string) => void;
-}
-
-/** Legacy geometric thresholds used only to count fragment connected components. */
+/** @deprecated Legacy thresholds retained for import compatibility; not used by connectivity. */
 export const FRAGMENTATION_HOP_DISTANCE = 7;
+/** @deprecated Legacy threshold retained for import compatibility; not used by connectivity. */
 export const FRAGMENTATION_LINK_DISTANCE = 3.5;
 
 const DEFAULT_ENDPOINT_NEAR = 5;
-const DEFAULT_ANCHOR_NEAR = 6;
-const ANCHOR_QUERY_LIMIT = 20;
 
 export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest, SpatialQueryPort {
   readonly worldId: string;
@@ -625,110 +612,13 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
   }
 
   /**
-   * Fragment connected components in `dim`. Uses recorded `links` when present
-   * and falls back to consecutive-polyline inference otherwise; cross-record
-   * proximity within `FRAGMENTATION_LINK_DISTANCE` is a legacy geometric
-   * heuristic, not evidence of current passability.
+   * Fragment connected components in `dim`, based on recorded links and
+   * actual traversal evidence. Proximity never creates a connection, and
+   * historical connectivity does not prove current passability.
    */
   fragmentation(dim: string): FragmentationResult {
     this.assertDim(dim, 'fragmentation');
     return this.topologyStore.fragmentation(dim);
-  }
-
-  /** Legacy geometric projection retained for callers that need it; not evidence. */
-  private fragmentationGeometric(dim: string): {
-    records: number;
-    points: number;
-    components: number;
-    pieces: { points: number; records: number }[];
-  } {
-    this.assertDim(dim, 'fragmentation');
-    const records = this.drainFragments(dim);
-    const nodes: Vec3Like[] = [];
-    const owner: number[] = [];
-    const byCoordinate = new Map<string, number>();
-    const adjacency = new Map<number, Set<number>>();
-
-    const indexOf = (point: Vec3Like, recordIndex: number): number => {
-      const key = `${point.x},${point.y},${point.z}`;
-      const existing = byCoordinate.get(key);
-      if (existing !== undefined) return existing;
-      const index = nodes.length;
-      nodes.push(copyPoint(point));
-      owner.push(recordIndex);
-      byCoordinate.set(key, index);
-      return index;
-    };
-    const connect = (a: number, b: number): void => {
-      if (a === b) return;
-      const fromSet = adjacency.get(a) ?? new Set<number>();
-      fromSet.add(b);
-      adjacency.set(a, fromSet);
-      const toSet = adjacency.get(b) ?? new Set<number>();
-      toSet.add(a);
-      adjacency.set(b, toSet);
-    };
-
-    records.forEach((record, recordIndex) => {
-      if (record.links !== undefined && record.links.length > 0) {
-        for (const link of record.links) {
-          connect(indexOf(link.a, recordIndex), indexOf(link.b, recordIndex));
-        }
-        return;
-      }
-      let previous = -1;
-      for (const point of record.polyline) {
-        const index = indexOf(point, recordIndex);
-        if (previous >= 0) {
-          const previousPoint = nodes[previous];
-          if (
-            previousPoint !== undefined &&
-            distance3(previousPoint, point) <= FRAGMENTATION_HOP_DISTANCE
-          ) {
-            connect(previous, index);
-          }
-        }
-        previous = index;
-      }
-    });
-
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i];
-        const b = nodes[j];
-        if (a === undefined || b === undefined) continue;
-        if (owner[i] !== owner[j] && distance3(a, b) <= FRAGMENTATION_LINK_DISTANCE) {
-          connect(i, j);
-        }
-      }
-    }
-
-    const component = new Array<number>(nodes.length).fill(-1);
-    const pieces: { points: number; records: number }[] = [];
-    for (let start = 0; start < nodes.length; start++) {
-      if (component[start] !== -1) continue;
-      const componentId = pieces.length;
-      const stack = [start];
-      component[start] = componentId;
-      const recordsInPiece = new Set<number>();
-      let points = 0;
-      while (stack.length > 0) {
-        const index = stack.pop() as number;
-        points += 1;
-        const recordIndex = owner[index];
-        if (recordIndex !== undefined) recordsInPiece.add(recordIndex);
-        for (const neighbour of adjacency.get(index) ?? []) {
-          if (component[neighbour] === -1) {
-            component[neighbour] = componentId;
-            stack.push(neighbour);
-          }
-        }
-      }
-      pieces.push({ points, records: recordsInPiece.size });
-    }
-    pieces.sort((a, b) => b.points - a.points);
-
-    return { records: records.length, points: nodes.length, components: pieces.length, pieces };
   }
 
   // --- Frontier (candidates only — never selects a target) ---
@@ -766,7 +656,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
       status: 'available',
       result: projectFrontierCandidates(resolved.snapshot),
       historicalConnection: 'unknown',
-      note: 'Candidates come from a caller-supplied WalkSearchSnapshot. The Frontier projection cannot express an unknown historical connection, so it reports false for "not established" (never "disproved").',
+      note: 'Candidates come from a caller-supplied WalkSearchSnapshot. Without a history lookup, historicalConnection remains unknown; this is not evidence of disconnection.',
     };
   }
 
@@ -988,7 +878,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
       fragmentation: {
         available: true,
         reason:
-          'Geometric connected components over recorded fragments using legacy link/hop thresholds; not current passability.',
+          'Connected components over recorded links and actual traversal evidence; proximity never creates a connection and history does not prove current passability.',
       },
       frontierCandidates: hasFrontierSource
         ? {
@@ -1032,10 +922,6 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
 
   // --- internals ---
 
-  private get markers(): VoxelMap & OptionalTraversalMarkers {
-    return this.voxel as VoxelMap & OptionalTraversalMarkers;
-  }
-
   private assertWorld(worldId: string, method: string): void {
     if (worldId !== this.worldId) {
       throw new SpatialMemoryScopeError(
@@ -1048,23 +934,6 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
     if (typeof dim !== 'string' || dim.length === 0) {
       throw new Error(`${method}: dim must be a non-empty string`);
     }
-  }
-
-  private nextNodeId(label: string): string {
-    const slug =
-      label
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_-]+/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .slice(0, 32) || 'place';
-    let id = `agent:${slug}`;
-    let suffix = 1;
-    while (this.topologyStore.getNode(id) !== null) {
-      suffix += 1;
-      id = `agent:${slug}:${suffix}`;
-    }
-    return id;
   }
 
   private drainFragments(dim: string | undefined): PathFragment[] {
@@ -1121,24 +990,6 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
       const node = this.topologyStore.getNode(id);
       return node !== null && node.location.kind === 'exact' ? [copyPoint(node.location.pos)] : [];
     });
-  }
-
-  private anchorPoint(
-    dim: string,
-    here: Vec3Like,
-    order: AnchorOrder,
-    near: number,
-  ): Vec3Like | null {
-    const start = this.findNodeNear(dim, here, near);
-    if (start === null) return null;
-    const result = this.topologyStore.historicalAnchorCandidates(start.id, {
-      order,
-      includeStart: true,
-      limit: ANCHOR_QUERY_LIMIT,
-    });
-    const exact = result.items.find((item) => item.node.location.kind === 'exact');
-    if (exact === undefined || exact.node.location.kind !== 'exact') return null;
-    return copyPoint(exact.node.location.pos);
   }
 
   /**

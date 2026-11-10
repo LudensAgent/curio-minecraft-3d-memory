@@ -346,4 +346,82 @@ describe('TraversabilityCache', () => {
     const fresh = new TraversabilityCache(map, { now: () => Number.NEGATIVE_INFINITY });
     expect(() => fresh.get(stepQuery(), fakeProvider)).toThrow(/finite/);
   });
+
+  it('evicts the least recently used result and cleans every dependency mapping', () => {
+    const map = openMap();
+    const cache = new TraversabilityCache(map, { now: () => 2000, maxEntries: 2 });
+    let resolves = 0;
+    const counting: CollisionShapeProvider = {
+      version: fakeProvider.version,
+      resolve(state, cell, read) {
+        resolves += 1;
+        return fakeProvider.resolve(state, cell, read);
+      },
+    };
+    const a = stepQuery();
+    const b = stepQuery({ body: bodyAt(0.5, 0, 0.5, 0.5) });
+    const c = stepQuery({ body: bodyAt(0.5, 0, 0.5, 0.4) });
+    cache.get(a, counting);
+    cache.get(b, counting);
+    cache.get(a, counting);
+    cache.get(c, counting);
+    expect(cache.size).toBe(2);
+    const afterC = resolves;
+    cache.get(a, counting);
+    expect(resolves).toBe(afterC);
+    cache.get(b, counting);
+    expect(resolves).toBeGreaterThan(afterC);
+    expect(cache.size).toBe(2);
+    cache.invalidateSections([{ worldId: 'world', dim: 'overworld', cx: 0, cz: 0, sy: 0 }]);
+    expect(cache.size).toBe(0);
+    expect(cache.dependencyIndexSize).toBe(0);
+  });
+
+  it('reclaims expired entries without another query for the same key', () => {
+    const map = openMap();
+    let clock = 2000;
+    const cache = new TraversabilityCache(map, { now: () => clock });
+    cache.get(stepQuery(), fakeProvider);
+    const revision = map.saveRevision;
+    clock = 70_000;
+    expect(cache.pruneExpired()).toBe(1);
+    expect(cache.size).toBe(0);
+    expect(cache.dependencyIndexSize).toBe(0);
+    expect(map.saveRevision).toBe(revision);
+  });
+
+  it('bounds negative-result retention and idle work, and can release all task data', () => {
+    const map = new VoxelMap('world');
+    let clock = 2000;
+    const cache = new TraversabilityCache(map, { now: () => clock, maxEntries: 4, maxAgeMs: 100 });
+    for (let x = 0; x < 10; x += 1) {
+      expect(cache.get(stepQuery({ body: bodyAt(x + 0.5, 0, 0.5) }), fakeProvider).status).toBe('UNKNOWN');
+      expect(cache.size).toBeLessThanOrEqual(4);
+    }
+    clock = 2101;
+    expect(cache.pruneExpired(1)).toBe(1);
+    expect(cache.size).toBe(3);
+    // A finite sweep eventually visits the retained keys, including keys never requested again.
+    for (let i = 0; i < 5; i += 1) cache.pruneExpired(1);
+    expect(cache.size).toBe(0);
+    expect(cache.dependencyIndexSize).toBe(0);
+    cache.get(stepQuery(), fakeProvider);
+    cache.clear();
+    expect(cache.size).toBe(0);
+    expect(cache.dependencyIndexSize).toBe(0);
+    expect(map.saveRevision).toBe(0);
+  });
+
+  it('validates cache limits at construction and maintenance boundaries', () => {
+    const map = openMap();
+    for (const maxEntries of [0, -1, 1.5, Infinity, NaN]) {
+      expect(() => new TraversabilityCache(map, { maxEntries })).toThrow(/maxEntries/);
+    }
+    for (const maxAgeMs of [0, -1, Infinity, NaN]) {
+      expect(() => new TraversabilityCache(map, { maxAgeMs })).toThrow(/maxAgeMs/);
+    }
+    const cache = new TraversabilityCache(map);
+    expect(() => cache.pruneExpired(0)).toThrow(/maxChecks/);
+    expect(() => cache.pruneExpired(Infinity)).toThrow(/maxChecks/);
+  });
 });

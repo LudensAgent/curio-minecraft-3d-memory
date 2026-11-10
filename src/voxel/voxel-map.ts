@@ -31,7 +31,9 @@ import type { Section, SectionKey } from './section.js';
 import {
   cloneCellEvidence,
   cloneObservation,
-  estimateObservationResidentGrowth,
+  estimateCellEvidenceResidentBytes,
+  estimatePackedCellsResidentBytes,
+  estimatePaletteEntryResidentBytes,
   estimateVoxelSectionBytes,
   estimateVoxelSectionResidentBytes,
   estimateVoxelSectionSnapshotBytes,
@@ -246,6 +248,8 @@ const DEFAULT_VALIDITY_WINDOW_MS = 60_000;
 
 type AppliedCell = { section: Section; kind: CellChangeKind; x: number; y: number; z: number };
 
+type ObservationChangeKind = 'inserted' | 'changed' | 'refreshed' | 'restored' | 'staled';
+
 export class VoxelMap {
   readonly worldId: string;
   private readonly sections = new Map<string, Map<string, Section>>();
@@ -268,13 +272,15 @@ export class VoxelMap {
   private readonly pinCounts = new Map<string, number>();
   /**
    * Conservative resident working-set size: the sum of `estimateVoxelSectionBytes`
-   * over resident sections, maintained by before/after estimates on observe, load
-   * and unload. A conservative estimate, not exact heap usage. `markStale` /
+   * over resident sections, maintained by per-cell/palette deltas on observe and
+   * one estimate on load. A conservative estimate, not exact heap usage. `markStale` /
    * `beginSession` only flip freshness (a small `staleReason` string per cell) and
    * do not change the dominant palette/cells/evidence terms.
    */
   private residentBytes = 0;
   private residentSectionCount = 0;
+  private readonly residentSectionBytes = new WeakMap<Section, number>();
+  private readonly paletteIndices = new WeakMap<Section, Map<string, number>>();
   private directoryInstalled = false;
   private nextPinToken = 1;
   /**
@@ -873,8 +879,27 @@ export class VoxelMap {
       dimMap.set(keyString, section);
     }
 
+    const billing = this.manualResidency
+      ? [...restored.values()].flatMap((dimMap) => [...dimMap.values()].map((section) => ({
+        section,
+        bytes: estimateVoxelSectionResidentBytes(section),
+      })))
+      : [];
+    const restoredBytes = billing.reduce((sum, entry) => sum + entry.bytes, 0);
+    if (billing.length > this.residentLimits.maxResidentSections) {
+      throw new Error(`resident sections would exceed maxResidentSections (${billing.length} > ${this.residentLimits.maxResidentSections})`);
+    }
+    if (restoredBytes > this.residentLimits.maxResidentBytes) {
+      throw new Error(`resident working set would exceed maxResidentBytes (${restoredBytes} > ${this.residentLimits.maxResidentBytes})`);
+    }
+
     this.sections.clear();
     for (const [dim, dimMap] of restored) this.sections.set(dim, dimMap);
+    if (this.manualResidency) {
+      for (const entry of billing) this.residentSectionBytes.set(entry.section, entry.bytes);
+      this.residentBytes = restoredBytes;
+      this.residentSectionCount = billing.length;
+    }
     this.currentSessionId = null;
     this.staleBoundaries.clear();
     // Restore establishes a clean baseline: nothing is pending, and the confirmed
@@ -978,7 +1003,7 @@ export class VoxelMap {
     for (const key of keys) {
       assertSectionKey(this.worldId, key);
       const section = this.residentSection(key);
-      if (section !== undefined) total += estimateVoxelSectionResidentBytes(section);
+      if (section !== undefined) total += this.residentSectionBytes.get(section) ?? estimateVoxelSectionResidentBytes(section);
     }
     return total;
   }
@@ -1049,7 +1074,8 @@ export class VoxelMap {
     }
 
     const fresh = built;
-    const addedBytes = fresh.reduce((sum, s) => sum + estimateVoxelSectionResidentBytes(s), 0);
+    const sectionBytes = fresh.map((section) => estimateVoxelSectionResidentBytes(section));
+    const addedBytes = sectionBytes.reduce((sum, bytes) => sum + bytes, 0);
     if (this.residentSectionCount + fresh.length > this.residentLimits.maxResidentSections) {
       throw new Error(
         `resident sections would exceed maxResidentSections (${this.residentSectionCount + fresh.length} > ${this.residentLimits.maxResidentSections})`,
@@ -1061,8 +1087,9 @@ export class VoxelMap {
       );
     }
 
-    for (const section of built) {
+    for (const [index, section] of built.entries()) {
       this.setSection(section);
+      this.residentSectionBytes.set(section, sectionBytes[index]!);
       this.bumpResidencyGeneration(section.key.dim, section.key.cx, section.key.cz, section.key.sy);
     }
     this.residentSectionCount += fresh.length;
@@ -1103,7 +1130,7 @@ export class VoxelMap {
       const dimMap = this.sections.get(key.dim)!;
       dimMap.delete(innerKey(key.cx, key.cz, key.sy));
       if (dimMap.size === 0) this.sections.delete(key.dim);
-      this.residentBytes -= estimateVoxelSectionResidentBytes(section);
+      this.residentBytes -= this.residentSectionBytes.get(section)!;
       this.residentSectionCount -= 1;
       this.bumpResidencyGeneration(key.dim, key.cx, key.cz, key.sy);
       result.unloaded.push({ ...key });
@@ -1221,10 +1248,6 @@ export class VoxelMap {
     if (section === undefined) {
       this.assertHistoryAllocatable(dim, cx, cz, sy);
       section = this.getOrCreateSection(dim, cx, cz, sy);
-      if (this.manualResidency) {
-        this.residentSectionCount += 1;
-        this.residentBytes += estimateVoxelSectionResidentBytes(section);
-      }
     }
     const bitmap = kind === 'traversed' ? section.traversed : section.modified;
     const index = cellIndex(lx, ly, lz);
@@ -1369,88 +1392,31 @@ export class VoxelMap {
     const index = cellIndex(lx, ly, lz);
     const existing = section.evidence.get(index);
 
-    if (existing !== undefined && observation.observedAt < existing.observation.observedAt) {
-      // Genuinely older acquisition (same-session out-of-order): never overwrite
-      // newer evidence. `sequence` is receive order, not acquisition order.
-      return null;
-    }
-
-    const validUntil = observation.observedAt + this.validityWindowMs;
     const serialized = serializeBlockState(observation.state);
+    const update = prepareCellUpdate(existing, observation, serialized, this.validityWindowMs);
+    if (update === null) return null;
 
-    if (existing !== undefined && observation.observedAt === existing.observation.observedAt) {
-      const sameContent =
-        serializeBlockState(existing.observation.state) === serialized &&
-        existing.observation.stateComplete === observation.stateComplete;
-      if (sameContent || existing.freshness === 'STALE') {
-        // Exact duplicate at the same timestamp, or the cell is already invalid —
-        // nothing further to change. Avoids repeated revision bumps for a conflict
-        // that has already been recorded.
-        return null;
-      }
-      // Same timestamp, conflicting content: the timestamp carries no uniqueness
-      // guarantee, so these cannot be ordered. Invalidate the old conclusion
-      // instead of silently keeping it, and report the conflict explicitly.
-      section.evidence.set(index, {
-        ...existing,
-        freshness: 'STALE',
-        staleReason: 'conflict',
-        revision: existing.revision + 1,
-      });
-      section.revision += 1;
-      setBit(section.stale, index, true);
-      return { section, kind: 'staled', x, y, z };
+    let growth = 0;
+    if (this.manualResidency) {
+      growth = estimateCellEvidenceResidentBytes(update.evidence) -
+        (existing === undefined ? 0 : estimateCellEvidenceResidentBytes(existing));
+      if (existing === undefined && section.evidence.size > 0) growth += 1;
     }
-
-    if (existing !== undefined) {
-      const sameContent =
-        serializeBlockState(existing.observation.state) === serialized &&
-        existing.observation.stateComplete === observation.stateComplete;
-
-      if (sameContent && existing.freshness === 'FRESH') {
-        // Re-confirmation of the same content while still fresh: refresh only.
-        section.evidence.set(index, {
-          revision: existing.revision,
-          observation: cloneObservation(observation),
-          freshness: 'FRESH',
-          staleReason: undefined,
-          validUntil,
-        });
-        this.touch(section, observation.observedAt);
-        return { section, kind: 'refreshed', x, y, z };
-      }
-
-      // Content changed, or recovering from STALE — both advance validity.
-      const kind = sameContent ? 'restored' : 'changed';
-      section.evidence.set(index, {
-        revision: existing.revision + 1,
-        observation: cloneObservation(observation),
-        freshness: 'FRESH',
-        staleReason: undefined,
-        validUntil,
-      });
-      section.revision += 1;
-      setBit(section.stale, index, false);
-      if (!sameContent) {
-        this.writePalette(section, index, serialized);
-      }
-      this.touch(section, observation.observedAt);
-      return { section, kind, x, y, z };
+    section.evidence.set(index, update.kind === 'staled'
+      ? update.evidence
+      : { ...update.evidence, observation: cloneObservation(observation) });
+    if (update.kind !== 'refreshed') section.revision += 1;
+    setBit(section.stale, index, update.kind === 'staled');
+    if (update.kind === 'inserted') setBit(section.explored, index, true);
+    if (update.kind === 'inserted' || update.kind === 'changed') {
+      growth += this.writePalette(section, index, serialized);
     }
-
-    // First observation of this cell.
-    section.evidence.set(index, {
-      revision: 1,
-      observation: cloneObservation(observation),
-      freshness: 'FRESH',
-      staleReason: undefined,
-      validUntil,
-    });
-    section.revision += 1;
-    setBit(section.explored, index, true);
-    this.writePalette(section, index, serialized);
-    this.touch(section, observation.observedAt);
-    return { section, kind: 'inserted', x, y, z };
+    if (this.manualResidency) {
+      this.residentBytes += growth;
+      this.residentSectionBytes.set(section, this.residentSectionBytes.get(section)! + growth);
+    }
+    if (update.kind !== 'staled') this.touch(section, observation.observedAt);
+    return { section, kind: update.kind, x, y, z };
   }
 
   private boundaryFor(dim: string): number {
@@ -1469,22 +1435,42 @@ export class VoxelMap {
     if (existing !== undefined) return existing;
     const section = createSection(key);
     dimMap.set(keyString, section);
+    if (this.manualResidency) {
+      const bytes = estimateVoxelSectionResidentBytes(section);
+      this.residentSectionBytes.set(section, bytes);
+      this.residentBytes += bytes;
+      this.residentSectionCount += 1;
+    }
     return section;
   }
 
   /** Store a palette index for the cell, growing the palette and re-packing as needed. */
-  private writePalette(section: Section, index: number, serialized: string): void {
-    let paletteIndex = section.palette.indexOf(serialized);
-    if (paletteIndex === -1) {
+  private writePalette(section: Section, index: number, serialized: string): number {
+    const indices = this.paletteIndexFor(section);
+    let paletteIndex = indices.get(serialized);
+    let growth = 0;
+    if (paletteIndex === undefined) {
       paletteIndex = section.palette.length;
+      indices.set(serialized, paletteIndex);
       section.palette.push(serialized);
+      growth += estimatePaletteEntryResidentBytes(serialized) + 1;
       const newBits = bitsRequired(section.palette.length);
       if (newBits !== section.bits) {
+        growth += estimatePackedCellsResidentBytes(newBits) - estimatePackedCellsResidentBytes(section.bits);
         section.cells = repack(section.cells, section.bits, newBits);
         section.bits = newBits;
       }
     }
     writeCell(section.cells, section.bits, index, paletteIndex);
+    return growth;
+  }
+
+  private paletteIndexFor(section: Section): Map<string, number> {
+    const existing = this.paletteIndices.get(section);
+    if (existing !== undefined) return existing;
+    const indices = new Map(section.palette.map((state, index) => [state, index]));
+    this.paletteIndices.set(section, indices);
+    return indices;
   }
 
   /** Statistics-only last-observation time; never proof the whole section is fresh. */
@@ -1552,7 +1538,6 @@ export class VoxelMap {
     if (!this.manualResidency) return;
     const missing: SectionKey[] = [];
     const missingSeen = new Set<string>();
-    const newSections = new Set<string>();
     for (const observation of observations) {
       const { cx, cz, sy } = blockToSection(observation.pos.x, observation.pos.y, observation.pos.z);
       const key = dirKey(observation.dim, cx, cz, sy);
@@ -1563,65 +1548,124 @@ export class VoxelMap {
           missingSeen.add(key);
           missing.push({ worldId: this.worldId, dim: observation.dim, cx, cz, sy });
         }
-      } else {
-        newSections.add(key);
       }
     }
     if (missing.length > 0) throw new VoxelResidencyError(missing);
 
-    if (this.residentSectionCount + newSections.size > this.residentLimits.maxResidentSections) {
-      throw new Error(
-        `resident sections would exceed maxResidentSections (${this.residentSectionCount + newSections.size} > ${this.residentLimits.maxResidentSections})`,
-      );
-    }
-    let growth = 0;
-    for (const observation of observations) growth += estimateObservationResidentGrowth(observation);
-    if (this.residentBytes + growth > this.residentLimits.maxResidentBytes) {
-      throw new Error(
-        `resident working set would exceed maxResidentBytes (${this.residentBytes + growth} > ${this.residentLimits.maxResidentBytes})`,
-      );
+    // Model only the cells touched by this batch. The same acceptance rule is
+    // used when applying it, so duplicate, stale-session and out-of-order input
+    // cannot consume capacity; repeated updates to one cell bill its net change.
+    const planned = new Map<string, {
+      section: Section;
+      evidence: Map<number, CellEvidence>;
+      palette: Set<string>;
+      paletteLength: number;
+      evidenceCount: number;
+    }>();
+    let sessionId = this.currentSessionId;
+    let bytes = this.residentBytes;
+    let sections = this.residentSectionCount;
+    for (const observation of observations) {
+      if (sessionId === null) {
+        if (this.requireSession) continue;
+        sessionId = observation.sessionId;
+      }
+      if (observation.sessionId !== sessionId || observation.observedAt <= this.boundaryFor(observation.dim)) continue;
+      const { cx, cz, sy, lx, ly, lz } = blockToSection(observation.pos.x, observation.pos.y, observation.pos.z);
+      const key = dirKey(observation.dim, cx, cz, sy);
+      let plan = planned.get(key);
+      if (plan === undefined) {
+        const resident = this.sections.get(observation.dim)?.get(innerKey(cx, cz, sy));
+        const section = resident ?? createSection({ worldId: this.worldId, dim: observation.dim, cx, cz, sy });
+        plan = {
+          section,
+          evidence: new Map(),
+          palette: new Set(),
+          paletteLength: section.palette.length,
+          evidenceCount: section.evidence.size,
+        };
+        planned.set(key, plan);
+        if (resident === undefined) {
+          sections += 1;
+          bytes += estimateVoxelSectionResidentBytes(section);
+        }
+      }
+      const index = cellIndex(lx, ly, lz);
+      const existing = plan.evidence.get(index) ?? plan.section.evidence.get(index);
+      const serialized = serializeBlockState(observation.state);
+      const update = prepareCellUpdate(existing, observation, serialized, this.validityWindowMs);
+      if (update === null) continue;
+      bytes += estimateCellEvidenceResidentBytes(update.evidence) -
+        (existing === undefined ? 0 : estimateCellEvidenceResidentBytes(existing));
+      if (existing === undefined) {
+        if (plan.evidenceCount > 0) bytes += 1;
+        plan.evidenceCount += 1;
+      }
+      plan.evidence.set(index, update.evidence);
+      if ((update.kind === 'inserted' || update.kind === 'changed') &&
+        !this.paletteIndexFor(plan.section).has(serialized) && !plan.palette.has(serialized)) {
+        const beforeBits = bitsRequired(plan.paletteLength);
+        plan.palette.add(serialized);
+        plan.paletteLength += 1;
+        bytes += estimatePaletteEntryResidentBytes(serialized) + 1 +
+          estimatePackedCellsResidentBytes(bitsRequired(plan.paletteLength)) - estimatePackedCellsResidentBytes(beforeBits);
+      }
+      if (sections > this.residentLimits.maxResidentSections) {
+        throw new Error(`resident sections would exceed maxResidentSections (${sections} > ${this.residentLimits.maxResidentSections})`);
+      }
+      if (bytes > this.residentLimits.maxResidentBytes) {
+        throw new Error(`resident working set would exceed maxResidentBytes (${bytes} > ${this.residentLimits.maxResidentBytes})`);
+      }
     }
   }
 
   /**
-   * Apply validated observations and keep the conservative resident working-set
-   * size exact. In manual mode the accounting is aggregated per touched section
-   * (one before/after estimate each), not per observation, so a full-section batch
-   * stays O(section) rather than O(section²).
+   * Apply validated observations. Resident accounting is updated by the same
+   * per-cell and palette deltas used in pre-flight; a refresh never scans the
+   * other evidence in its section.
    */
   private applyObservations(observations: readonly Observation[]): ChangeReport {
-    if (!this.manualResidency) {
-      const bySection = new Map<Section, SectionChange>();
-      for (const observation of observations) {
-        const applied = this.applyValidated(observation);
-        if (applied === null) continue;
-        this.recordSaveChange(applied.section);
-        addChange(bySection, applied.section, { pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind });
-      }
-      return { sections: [...bySection.values()] };
-    }
-
     const bySection = new Map<Section, SectionChange>();
-    const touched = new Map<Section, number>(); // section → pre-mutation resident bytes (0 = brand new)
     for (const observation of observations) {
-      const existing = this.lookupSection(observation.dim, observation.pos.x, observation.pos.y, observation.pos.z);
-      if (existing !== undefined && !touched.has(existing)) {
-        touched.set(existing, estimateVoxelSectionResidentBytes(existing));
-      }
       const applied = this.applyValidated(observation);
       if (applied === null) continue;
-      if (existing === undefined && !touched.has(applied.section)) {
-        touched.set(applied.section, 0);
-      }
       this.recordSaveChange(applied.section);
       addChange(bySection, applied.section, { pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind });
     }
-    for (const [section, before] of touched) {
-      this.residentBytes += estimateVoxelSectionResidentBytes(section) - before;
-      if (before === 0) this.residentSectionCount += 1;
-    }
     return { sections: [...bySection.values()] };
   }
+}
+
+/** Shared ordering/content decision for byte pre-flight and the accepted write. */
+function prepareCellUpdate(
+  existing: CellEvidence | undefined,
+  observation: Observation,
+  serialized: string,
+  validityWindowMs: number,
+): { kind: ObservationChangeKind; evidence: CellEvidence } | null {
+  if (existing !== undefined && observation.observedAt < existing.observation.observedAt) return null;
+  const sameContent = existing !== undefined &&
+    serializeBlockState(existing.observation.state) === serialized &&
+    existing.observation.stateComplete === observation.stateComplete;
+  if (existing !== undefined && observation.observedAt === existing.observation.observedAt) {
+    if (sameContent || existing.freshness === 'STALE') return null;
+    return {
+      kind: 'staled',
+      evidence: { ...existing, freshness: 'STALE', staleReason: 'conflict', revision: existing.revision + 1 },
+    };
+  }
+  const kind = existing === undefined ? 'inserted' :
+    sameContent ? existing.freshness === 'FRESH' ? 'refreshed' : 'restored' : 'changed';
+  return {
+    kind,
+    evidence: {
+      revision: (existing?.revision ?? 0) + (kind === 'refreshed' ? 0 : 1),
+      observation,
+      freshness: 'FRESH',
+      staleReason: undefined,
+      validUntil: observation.observedAt + validityWindowMs,
+    },
+  };
 }
 
 function addChange(

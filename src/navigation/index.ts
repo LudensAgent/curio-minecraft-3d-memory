@@ -128,6 +128,18 @@ export type {
   KnownWalkRouteStart,
 } from './known-walk-route.js';
 export { WalkRouteSearch } from './walk-search.js';
+export { searchLandRoute, searchLandRouteAsync } from './land-search.js';
+export type {
+  LandSearchArrival,
+  LandSearchBoundary,
+  LandSearchBoundaryStatus,
+  LandSearchBudget,
+  LandSearchKind,
+  LandSearchRequest,
+  LandSearchResult,
+  LandSearchStatus,
+  LandSearchTransition,
+} from './land-search.js';
 export type {
   WalkSearchArrival,
   WalkSearchCandidate,

@@ -5,9 +5,9 @@
  *
  * - validates every request field at the boundary (unknown fields rejected);
  * - takes the start from a measured `BodySample`, never from the request target;
- * - runs a bounded `WalkRouteSearch` for `source:'search'`, reads one explicit
- *   historical fragment for `source:'history'`, and prefers that explicit
- *   history fragment then falls back to search for `source:'auto'`;
+ * - runs the supplied bounded voxel search for `source:'search'` and
+ *   `source:'auto'`; reads one explicit historical fragment only for
+ *   `source:'history'`;
  * - re-verifies the selected points through `RouteVerifier` and reports
  *   `verified`/`candidate` from current evidence;
  * - returns ordered boundaries, structured unsupported/budget/evidence
@@ -156,6 +156,7 @@ async function planRouteCore(
 
 async function planBySource(context: PlanContext): Promise<PlanOutcome> {
   switch (context.request.source) {
+    case 'auto':
     case 'search':
       return planWithSearch(context);
     case 'history':
@@ -171,56 +172,7 @@ async function planBySource(context: PlanContext): Promise<PlanOutcome> {
         wait: context.wait,
         cancellationOrigin: context.cancellationOrigin,
       });
-    case 'auto':
-      return planAuto(context);
   }
-}
-
-/**
- * Explicit history first; search fallback. A history candidate (blocked or
- * mismatched endpoint) is not an executable success, so it does not prevent the
- * search fallback. The reported `source` is always the source actually used.
- */
-async function planAuto(context: PlanContext): Promise<PlanOutcome> {
-  if (context.request.pathId === undefined) {
-    if (context.environment.search === undefined) {
-      return {
-        problem: {
-          kind: 'unavailable',
-          detail: 'auto planning without a pathId requires a search source',
-        },
-        message: 'no planning backend is available for this auto request',
-      };
-    }
-    return planWithSearch(context);
-  }
-
-  const history = await buildHistoryPlan({
-    request: context.request,
-    environment: context.environment,
-    start: context.start,
-    now: context.now,
-    deadlineMs: context.deadlineMs,
-    budget: context.budget,
-    maxRoutePoints: context.maxRoutePoints,
-    planTtlMs: context.planTtlMs,
-    wait: context.wait,
-    cancellationOrigin: context.cancellationOrigin,
-  });
-  if ('draft' in history && history.draft.executable) return history;
-  // Cancellation and deadline are delegation-level stops, not "history has no
-  // route": never start a second backend after them.
-  if ('problem' in history && (history.problem.kind === 'cancelled' || history.problem.kind === 'timeout')) {
-    return history;
-  }
-  if (context.environment.search === undefined) return history;
-
-  const search = await planWithSearch(context);
-  if ('draft' in search) return search;
-  // The search conclusion is about the requested target with current evidence;
-  // it replaces the discarded history attempt rather than being reported as
-  // "no history exists".
-  return search;
 }
 
 async function planWithSearch(context: PlanContext): Promise<PlanOutcome> {

@@ -241,10 +241,6 @@ function boxSweepOverlaps(
   return tMax - tMin > EPS;
 }
 
-function overlaps(min1: number, max1: number, min2: number, max2: number): boolean {
-  return max1 > min2 && min1 < max2;
-}
-
 /**
  * Maximal closed sub-intervals of [segMin, segMax] that no support interval
  * covers. Intervals are open (positive-area contact only), so edge contact and
@@ -301,6 +297,42 @@ export function evaluateWalkStep(
   return evaluateWalkGeometry(map, query, shapeProvider, now);
 }
 
+/** Historical geometry is a candidate, never a current OPEN passage proof. */
+export interface RememberedWalkGeometry {
+  geometry: 'PASSABLE' | 'OBSTRUCTED' | 'UNKNOWN' | 'UNSUPPORTED';
+  assurance: 'historical_geometry';
+  executable: false;
+  from: Vec3Like;
+  to: Vec3Like;
+  reason?: string;
+  hazards: HazardFact[];
+  obstacles: ObstacleEvidence[];
+  dependencies: StepEvaluation['dependencies'];
+}
+
+/** Internal planning boundary: use recorded shapes without changing their evidence. */
+export function evaluateRememberedWalkStep(
+  map: VoxelMap,
+  query: StepQuery,
+  shapeProvider: CollisionShapeProvider,
+  now: number,
+): RememberedWalkGeometry {
+  const result = evaluateWalkGeometry(map, query, shapeProvider, now, undefined, true);
+  return {
+    geometry: result.status === 'OPEN' ? 'PASSABLE'
+      : result.status === 'BLOCKED' ? 'OBSTRUCTED'
+      : result.status === 'UNSUPPORTED' ? 'UNSUPPORTED' : 'UNKNOWN',
+    assurance: 'historical_geometry',
+    executable: false,
+    from: result.from,
+    to: result.to,
+    ...(result.reason === undefined ? {} : { reason: result.reason }),
+    hazards: result.hazards ?? [],
+    obstacles: result.obstacles,
+    dependencies: result.dependencies,
+  };
+}
+
 /** Internal continuous correction corridor for measured route execution, not route search. */
 export function evaluateGroundedWalkSegment(
   map: VoxelMap,
@@ -319,6 +351,7 @@ function evaluateWalkGeometry(
   shapeProvider: CollisionShapeProvider,
   now: number,
   measured?: { to: Vec3Like; feetTolerance: number },
+  remembered = false,
 ): StepEvaluation {
   if (query.worldId !== map.worldId) {
     throw new Error(`query worldId "${query.worldId}" does not match map worldId "${map.worldId}"`);
@@ -423,13 +456,13 @@ function evaluateWalkGeometry(
     if (evidence === undefined) {
       return { kind: 'missing', sectionKey, sectionRevision: section.revision };
     }
-    if (evidence.freshness === 'STALE') {
+    if (!remembered && evidence.freshness === 'STALE') {
       return { kind: 'stale', sectionKey, sectionRevision: section.revision };
     }
-    if (evidence.observation.sessionId !== query.sessionId) {
+    if (!remembered && evidence.observation.sessionId !== query.sessionId) {
       return { kind: 'session', sectionKey, sectionRevision: section.revision };
     }
-    if (now > evidence.validUntil) {
+    if (!remembered && now > evidence.validUntil) {
       return { kind: 'expired', sectionKey, sectionRevision: section.revision };
     }
     // Only evidence that is still valid at evaluation time bounds the conclusion's

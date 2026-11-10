@@ -26,11 +26,16 @@ import type { StepConstraints, StepEvaluation, StepQuery } from './step.js';
 export interface TraversabilityCacheOptions {
   /** Clock used to check entry validity; defaults to `Date.now`. */
   now?: () => number;
+  /** Maximum cached evaluations, including negative results. Default 2048. */
+  maxEntries?: number;
+  /** Maximum reuse age. Queries or pruneExpired() reclaim expired entries; no background timer. Default 60000 ms. */
+  maxAgeMs?: number;
 }
 
 interface CacheEntry {
   evaluation: StepEvaluation;
   validUntil: number;
+  expiresAt: number;
   /** Section key string → residency generation at store time, for each dependency. */
   residency: Map<string, number>;
 }
@@ -38,12 +43,23 @@ interface CacheEntry {
 export class TraversabilityCache {
   private readonly map: VoxelMap;
   private readonly now: () => number;
+  private readonly maxEntries: number;
+  private readonly maxAgeMs: number;
   private readonly entries = new Map<string, CacheEntry>();
   private readonly bySection = new Map<string, Set<string>>();
+  private sweepCursor: IterableIterator<[string, CacheEntry]> | undefined;
 
   constructor(map: VoxelMap, options: TraversabilityCacheOptions = {}) {
     this.map = map;
     this.now = options.now ?? Date.now;
+    this.maxEntries = options.maxEntries ?? 2048;
+    this.maxAgeMs = options.maxAgeMs ?? 60_000;
+    if (!Number.isSafeInteger(this.maxEntries) || this.maxEntries < 1) {
+      throw new Error('maxEntries must be a positive safe integer');
+    }
+    if (!Number.isFinite(this.maxAgeMs) || this.maxAgeMs <= 0) {
+      throw new Error('maxAgeMs must be a positive finite number');
+    }
   }
 
   /** Number of cached entries; exposed for cache-hit observability (§6.2). */
@@ -67,14 +83,52 @@ export class TraversabilityCache {
     if (!Number.isFinite(now)) {
       throw new Error(`now() must return a finite number: ${now}`);
     }
+    this.sweepExpired(now, 16);
     const key = stepKey(query, shapeProvider.version);
     const entry = this.entries.get(key);
-    if (entry !== undefined && now <= entry.validUntil && this.residencyCurrent(entry)) {
+    if (entry !== undefined && now <= entry.validUntil && now <= entry.expiresAt && this.residencyCurrent(entry)) {
+      // Map insertion order is the access order; capacity eviction removes the least recently used entry.
+      this.entries.delete(key);
+      this.entries.set(key, entry);
       return cloneEvaluation(entry.evaluation);
     }
     const evaluation = evaluateWalkStep(this.map, query, shapeProvider, now);
-    this.store(key, evaluation);
+    this.store(key, evaluation, now);
     return cloneEvaluation(evaluation);
+  }
+
+  /** Bounded idle maintenance. Removes expired entries without reading or refreshing the map. */
+  pruneExpired(maxChecks = 64): number {
+    if (!Number.isSafeInteger(maxChecks) || maxChecks < 1) {
+      throw new Error('maxChecks must be a positive safe integer');
+    }
+    const now = this.now();
+    if (!Number.isFinite(now)) throw new Error(`now() must return a finite number: ${now}`);
+    return this.sweepExpired(now, maxChecks);
+  }
+
+  /** Release this task's derived data; observed map facts are unaffected. */
+  clear(): void {
+    this.entries.clear();
+    this.bySection.clear();
+    this.sweepCursor = undefined;
+  }
+
+  private sweepExpired(now: number, maxChecks: number): number {
+    this.sweepCursor ??= this.entries.entries();
+    let removed = 0;
+    for (let checked = 0; checked < maxChecks; checked += 1) {
+      const next = this.sweepCursor.next();
+      if (next.done) {
+        this.sweepCursor = undefined;
+        break;
+      }
+      const [key, entry] = next.value;
+      if (now <= entry.validUntil && now <= entry.expiresAt) continue;
+      this.removeEntry(key);
+      removed += 1;
+    }
+    return removed;
   }
 
   /**
@@ -110,8 +164,12 @@ export class TraversabilityCache {
     for (const key of toDelete) this.removeEntry(key);
   }
 
-  private store(key: string, evaluation: StepEvaluation): void {
+  private store(key: string, evaluation: StepEvaluation, now: number): void {
     this.removeEntry(key);
+    if (this.entries.size >= this.maxEntries) {
+      const oldest = this.entries.keys().next();
+      if (!oldest.done) this.removeEntry(oldest.value);
+    }
     const residency = new Map<string, number>();
     for (const dep of evaluation.dependencies) {
       residency.set(
@@ -119,7 +177,12 @@ export class TraversabilityCache {
         this.map.residencyGeneration(dep.key.dim, dep.key.cx, dep.key.cz, dep.key.sy),
       );
     }
-    this.entries.set(key, { evaluation, validUntil: evaluation.validUntil, residency });
+    this.entries.set(key, {
+      evaluation,
+      validUntil: evaluation.validUntil,
+      expiresAt: now + this.maxAgeMs,
+      residency,
+    });
     for (const dep of evaluation.dependencies) {
       const depKey = sectionKeyString(dep.key);
       let set = this.bySection.get(depKey);

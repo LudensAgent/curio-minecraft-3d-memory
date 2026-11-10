@@ -572,6 +572,21 @@ export function estimateVoxelSectionResidentBytes(section: Section): number {
   return bytes;
 }
 
+/** Resident cost of one evidence entry, including its reserved stale metadata. */
+export function estimateCellEvidenceResidentBytes(evidence: CellEvidence): number {
+  return cellEvidenceBytes(evidence, jsonEscapedByteLength, true);
+}
+
+/** Resident palette-entry cost, excluding the separator between entries. */
+export function estimatePaletteEntryResidentBytes(serialized: string): number {
+  return jsonEscapedByteLength(serialized) + STRING_QUOTES;
+}
+
+/** Resident cost of the packed cell stream at one palette width. */
+export function estimatePackedCellsResidentBytes(bits: number): number {
+  return STRING_QUOTES + base64Length(Math.ceil((SECTION_CELL_COUNT * bits) / 8));
+}
+
 function observationBytes(observation: Observation, cost: StringCost): number {
   let bytes = OBSERVATION_FIXED_BYTES;
   bytes += 3 * BYTES_PER_NUMBER; // pos x/y/z
@@ -611,45 +626,6 @@ function cellEvidenceBytes(evidence: CellEvidence, cost: StringCost, forceStaleR
   }
   bytes += BYTES_PER_NUMBER; // validUntil
   return bytes;
-}
-
-/**
- * Conservative upper bound on the resident-byte growth one observation can add to
- * a section — whether the section is brand-new or already resident. It is the full
- * `estimateVoxelSectionResidentBytes` of a synthetic single-cell section containing
- * that observation (fixed overhead + one palette entry + one packed cell + one
- * evidence entry), which is always ≥ the true marginal growth: a brand-new section
- * costs exactly this, and adding a cell to an existing section costs at most the
- * same marginal evidence/palette/cells terms.
- */
-export function estimateObservationResidentGrowth(observation: Observation): number {
-  const section: Section = {
-    key: { worldId: observation.worldId, dim: observation.dim, cx: 0, cz: 0, sy: 0 },
-    palette: [AIR_BLOCK_NAME, serializeBlockState(observation.state)],
-    cells: new Uint8Array(Math.ceil((SECTION_CELL_COUNT * 1) / 8)),
-    bits: 1,
-    explored: new Uint8Array(0),
-    traversed: new Uint8Array(0),
-    stale: new Uint8Array(0),
-    risk: new Uint8Array(0),
-    modified: new Uint8Array(0),
-    evidence: new Map([
-      [
-        0,
-        {
-          observation: cloneObservation(observation),
-          revision: 1,
-          freshness: 'FRESH',
-          staleReason: undefined,
-          validUntil: observation.observedAt + 1,
-        },
-      ],
-    ]),
-    revision: 1,
-  };
-  // Bill the worst-case (stale) footprint, so the pre-flight reserves the space a
-  // later markStale/beginSession would need.
-  return estimateVoxelSectionResidentBytes(section);
 }
 
 /**

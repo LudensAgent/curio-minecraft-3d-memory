@@ -55,7 +55,7 @@ export type HistoryPlanOutcome =
 
 /**
  * Build (but do not register) one history-sourced plan. The caller decides
- * whether to register it or continue with a search fallback in `auto`.
+ * whether to register it for the explicit `history` request.
  */
 export async function buildHistoryPlan(input: HistoryPlanInput): Promise<HistoryPlanOutcome> {
   const { environment, request } = input;

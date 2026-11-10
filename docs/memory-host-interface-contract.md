@@ -642,7 +642,7 @@ export interface RoutePlanRequest {
   mode: 'walk';
   /** auto | search | history */
   source: RoutePlanSource;
-  /** 仅 history（必需）与 auto（可选）消费；search 不消费。 */
+  /** 仅 history（必需）消费；auto/search 兼容接收但不使用。 */
   pathId?: string;
   /** v1 只接受 exact。 */
   arrival: { kind: 'exact' };
@@ -667,7 +667,7 @@ export interface RoutePlanRequest {
 - `arrival.kind !== 'exact'` → `unsupported_arrival`。
 - 非空 `avoid` → `unsupported_constraint`（v1 的 walk evaluator 不消费）。
 - `source:'history'` 且缺少 `pathId` → `invalid_request`。
-- `pathId` 只由 `source:'history'`（必需）与 `source:'auto'`（可选）消费。`source:'search'` 不消费 `pathId`：提供它不会改变规划，也不会被拒绝（提供时仍须为非空字符串）；宿主不得依赖 `pathId` 在 `search` 下生效。
+- `pathId` 只由 `source:'history'`（必需）消费。v0.11 开发分支的 `source:'auto'` 与 `source:'search'` 均不消费 `pathId`：提供它不会改变规划，也不会被拒绝（提供时仍须为非空字符串）；宿主需要沿旧记录规划时必须显式选择 `history`。
 - `maxNodes`/`maxEdges` 超过实现上限 → `invalid_request` 或明确截断（不得静默）。
 - `deadlineMs` 已过期 → `timeout`/`invalid_request`。
 
@@ -685,7 +685,7 @@ export interface RoutePlanEnvironment {
   sample(): BodySample | null;
   /** 已知空间搜索源；source:'search'/'auto' 必需。 */
   search?: RouteSearchSource;
-  /** 历史来源；source:'history'/'auto' 必需。 */
+  /** 历史来源；仅显式 source:'history' 使用。 */
   history?: FragmentStore;
   /**
    * 专用只读复验器，必须绑定同一个 `VoxelMap`。规划只通过它复验已经选出的
@@ -724,7 +724,7 @@ export interface RouteSearchSource {
 - `sample()` 返回的必须是实测样本；`null`/scope 不匹配/未连接 → 结构化失败，不得用 `to` 当起点。
 - `source:'search'`：只走已知且已验证空间；不自动 frontier 探索。
 - `source:'history'`：v1 只接受显式 `pathId`；不做无限历史召回。
-- `source:'auto'`：有 `pathId` 时先尝试 history；否则走 search。不得把“没找到历史”写成“世界无路”。
+- `source:'auto'`：直接走提供的体素 search，不读取历史记录，也不以历史路线作为后备；无 search 时报告 `unavailable`。不得把“没找到历史”写成“世界无路”。
 - 规划 MUST 只读：不移动、不转头、不扫描、不写记忆、不消耗材料。
 - 规划在 `deadlineMs` 内必须让出事件循环；超时返回 `budget_exhausted`/`timeout`，不得阻塞控制线程。
 
@@ -859,8 +859,8 @@ export type RoutePlanRegistryProblem =
 ### 6.7 历史与自动来源
 
 - `source:'history'`：v1 要求显式 `pathId`，返回 `kind`/`pathId`/历史 `verdict`；路线仍须当前证据复验。
-- `source:'auto'`：v1 = 显式 pathId 的 history 优先，否则 search；不做无限历史召回。
-- 未来可增加宿主提供的 `historyCandidates` 有界召回接口；在契约扩展前不得隐式扩大。
+- `source:'auto'`：v0.11 开发分支直接使用体素 search；兼容接收 `pathId` 但不使用，不执行隐式历史召回或后备。
+- 显式旧路线入口独立保留；普通自动导航不依赖旧记录是否存在。
 - `source:'search'`：`WalkRouteSearch` 的有界搜索；只走已知空间；不自动 frontier 探索。
 
 ### 6.8 锚点解析（`resolve_target` 的库侧部分）
@@ -1516,7 +1516,7 @@ export interface ChangeReport {
 1. **`routeId` 单次使用**：推荐是。失败后重新规划，避免陈旧路线复用。
 2. **`INVALIDATED` 作为独立 outcome**：推荐是；当前 `NavOutcome` 没有，需要扩展或由 `WalkPathResult` 单独表达。
 3. **`walkPath` 归属**：推荐放在可选 `navigation` 入口；宿主也可以按本契约自行实现，但语义必须一致。
-4. **`source:'auto'` 的历史召回**：v1 只接受显式 `pathId`；未来由宿主提供有界候选。
+4. **`source:'auto'` 的来源已确定**：v0.11 开发分支直接使用体素搜索；历史路线只在显式 `source:'history'` 中读取，宿主接线需同步。
 5. **容器内容查询**：永久 `host_ledger`；不进入空间库。
 6. **水面/船执行**：v1 只保留几何验证；执行作为后续契约扩展。
 7. **根入口拆分**：推荐新增 `./memory`/`./navigation`，根入口保留兼容；新宿主使用子入口。

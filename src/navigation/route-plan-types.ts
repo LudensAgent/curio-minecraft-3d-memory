@@ -41,7 +41,7 @@ export interface RoutePlanRequest {
   /** v1 accepts `walk` only; runtime validation rejects any other value structurally. */
   mode: 'walk';
   source: RoutePlanSource;
-  /** Required by `source:'history'` and by `source:'auto'` when history should be preferred. */
+  /** Required by `source:'history'`; accepted but unused by `auto` and `search`. */
   pathId?: string;
   /** v1 accepts exact foot-position completion only. */
   arrival: { kind: 'exact' };
@@ -150,7 +150,7 @@ export interface RoutePlanEnvironment {
   sample(): BodySample | null;
   /** Known-space search source; required by `source:'search'` and `source:'auto'`. */
   search?: RouteSearchSource;
-  /** History source; required by `source:'history'` and by `auto` with `pathId`. */
+  /** History source; used only by the explicit `source:'history'` compatibility entry. */
   history?: FragmentStore;
   /**
    * Dedicated read-only verifier bound to the same map. Planning never searches

@@ -42,6 +42,8 @@ const L1_ACTION_NAMES = [
 
 const FORBIDDEN_ENTRY_NAMES = [
   'planRoute',
+  'searchLandRoute',
+  'searchLandRouteAsync',
   'createWalkPath',
   'createWalkPathExecution',
   'navigateTo',
@@ -168,6 +170,8 @@ describe('package subpath exports', () => {
     expect('createWalkPath' in publishedMemory).toBe(false);
 
     expect(typeof publishedNavigation.planRoute).toBe('function');
+    expect(typeof publishedNavigation.searchLandRoute).toBe('function');
+    expect(typeof publishedNavigation.searchLandRouteAsync).toBe('function');
     expect(typeof publishedNavigation.createWalkPath).toBe('function');
     expect(typeof publishedNavigation.createWalkPathExecution).toBe('function');
     expect(typeof publishedNavigation.RoutePlanRegistryImpl).toBe('function');
@@ -217,6 +221,8 @@ describe('memory entry', () => {
 describe('navigation entry', () => {
   it('exports the navigation layer without L1 actions', () => {
     expect(typeof navigation.planRoute).toBe('function');
+    expect(typeof navigation.searchLandRoute).toBe('function');
+    expect(typeof navigation.searchLandRouteAsync).toBe('function');
     expect(typeof navigation.createWalkPath).toBe('function');
     expect(typeof navigation.createWalkPathExecution).toBe('function');
     expect(typeof navigation.RoutePlanRegistryImpl).toBe('function');
@@ -247,6 +253,8 @@ describe('root entry compatibility', () => {
     expect(root.CONTRACT_VERSION).toBe(memory.CONTRACT_VERSION);
     expect(root.ROUTE_PLAN_CAPABILITIES).toBe(navigation.ROUTE_PLAN_CAPABILITIES);
     expect(root.planRoute).toBe(navigation.planRoute);
+    expect(root.searchLandRoute).toBe(navigation.searchLandRoute);
+    expect(root.searchLandRouteAsync).toBe(navigation.searchLandRouteAsync);
     expect(root.createWalkPath).toBe(navigation.createWalkPath);
     expect(root.createWalkPathExecution).toBe(navigation.createWalkPathExecution);
     expect(root.VoxelMap).toBe(memory.VoxelMap);

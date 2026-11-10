@@ -1,7 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { planRoute } from '../src/index.js';
-import type { RouteSearchSource } from '../src/index.js';
 import { obs, STONE } from './fakes.js';
 import {
   historyWith,
@@ -18,23 +17,29 @@ import {
 } from './route-plan-fixtures.js';
 
 describe('planRoute — auto source', () => {
-  it('uses an explicit executable history fragment first', async () => {
+  it('uses voxel search without reading an otherwise executable historical fragment', async () => {
     const clock = new TestClock();
     const map = straightCorridor(3, { now: clock.now });
     const history = historyWith([straightFragment('frag', 3)]);
+    const revision = history.revision;
+    const readHistory = vi.spyOn(history, 'getFragment').mockImplementation(() => {
+      throw new Error('auto planning must not read legacy fragments');
+    });
     const parts = makePlanParts({ map, clock });
     const environment = makePlanEnvironment(parts, { history, search: searchSource(map, clock) });
 
     const result = await planRoute(planRequest({ source: 'auto', pathId: 'frag' }), environment);
     const plan = planOf(result);
 
-    expect(plan.source).toBe('history');
-    expect(plan.pathId).toBe('frag');
+    expect(plan.source).toBe('search');
+    expect(plan.pathId).toBeUndefined();
     expect(plan.executable).toBe(true);
     expect(parts.registry.size).toBe(1);
+    expect(readHistory).not.toHaveBeenCalled();
+    expect(history.revision).toBe(revision);
   });
 
-  it('falls back to search when the historical fragment is currently blocked', async () => {
+  it('plans a current detour without being constrained by a blocked historical fragment', async () => {
     const clock = new TestClock();
     const map = openFloorMap(
       [
@@ -62,7 +67,7 @@ describe('planRoute — auto source', () => {
     expect(plan.points.some((point) => point.z === 1.5)).toBe(true);
   });
 
-  it('falls back to search when the historical endpoint is nearer than the requested target', async () => {
+  it('keeps the requested target when a historical endpoint is nearer', async () => {
     const clock = new TestClock();
     const map = straightCorridor(3, { now: clock.now });
     const history = historyWith([straightFragment('frag', 2)]); // ends at 1.5
@@ -90,46 +95,36 @@ describe('planRoute — auto source', () => {
     expect(planOf(result).source).toBe('search');
   });
 
-  it('never reports a missing history as "no path" when search is unavailable', async () => {
+  it.each(['frag', 'missing'])('requires a search source even when pathId is %s', async (pathId) => {
     const clock = new TestClock();
     const map = straightCorridor(3, { now: clock.now });
     const parts = makePlanParts({ map, clock });
     const environment = makePlanEnvironment(parts, {
-      history: historyWith([straightFragment('other', 3)]),
+      history: historyWith([straightFragment('frag', 3)]),
     });
 
-    const result = await planRoute(planRequest({ source: 'auto', pathId: 'frag' }), environment);
+    const result = await planRoute(planRequest({ source: 'auto', pathId }), environment);
 
     expect(result.plan).toBeUndefined();
     expect(result.problem).toMatchObject({ kind: 'unavailable' });
     expect(result.problem?.kind).not.toBe('no_path');
   });
 
-  it('does not fall back to search after history planning is cancelled', async () => {
+  it('cancels the voxel search under the original delegation', async () => {
     const clock = new TestClock();
     const map = straightCorridor(3, { now: clock.now });
     const history = historyWith([straightFragment('frag', 3)]);
     const parts = makePlanParts({ map, clock });
     const controller = new AbortController();
-    let searchStarted = false;
-    const forbiddenSearch: RouteSearchSource = {
-      start: () => {
-        searchStarted = true;
-      },
-      advance: () => {
-        throw new Error('search must not start after cancellation');
-      },
-      snapshot: () => {
-        throw new Error('search must not start after cancellation');
-      },
-      cancel: () => {},
-    };
+    const search = searchSource(map, clock);
+    const cancel = vi.spyOn(search, 'cancel');
+    const readHistory = vi.spyOn(history, 'getFragment');
 
     const result = await planRoute(
       planRequest({ source: 'auto', pathId: 'frag' }),
       makePlanEnvironment(parts, {
         history,
-        search: forbiddenSearch,
+        search,
         signal: controller.signal,
         cancellationOrigin: 'user',
         budgetPerSlice: 1,
@@ -139,10 +134,11 @@ describe('planRoute — auto source', () => {
 
     expect(result.plan).toBeUndefined();
     expect(result.problem).toMatchObject({ kind: 'cancelled', by: 'user' });
-    expect(searchStarted).toBe(false);
+    expect(cancel).toHaveBeenCalledWith('caller stopped');
+    expect(readHistory).not.toHaveBeenCalled();
   });
 
-  it('reports the search conclusion when both history and search fail', async () => {
+  it('reports the voxel search conclusion independently of history', async () => {
     const clock = new TestClock();
     const map = openFloorMap([{ x: 0, z: 0 }], { now: clock.now });
     wallOffSingleCell(map);

@@ -3,9 +3,9 @@
  * Build current sources first: npm run build
  * Run: node benchmarks/observation-ingest.bench.mjs
  *
- * No database or game. Setup is excluded. Each timed round refreshes 256
- * observations in one resident Section, either through individual observe()
- * calls or one observeBatch(). Values are round durations, not individual-call
+ * No database or game. Setup is excluded. Each timed round applies 256
+ * observations in one resident Section: same-cell refresh, multiple-cell refresh,
+ * or actual state changes. Values are round durations, not individual-call
  * percentiles or measurements of a real host's event-loop delay.
  */
 import { performance } from 'node:perf_hooks';
@@ -15,6 +15,7 @@ const SIZES = [128, 512, 2048, 4096];
 const UPDATES = 256;
 const ROUNDS = 5;
 const WORLD = 'observation-ingest-probe';
+const WORKLOADS = ['same-cell-refresh', 'multi-cell-refresh', 'multi-cell-state-change'];
 
 function observation(index, time) {
   return {
@@ -31,15 +32,23 @@ function observation(index, time) {
   };
 }
 
-function probe(cells, manualResidency, delivery) {
+function probe(cells, manualResidency, delivery, workload) {
   const map = new VoxelMap(WORLD, { manualResidency });
   if (manualResidency) map.installDirectory([]);
   map.observeBatch({ observations: Array.from({ length: cells }, (_, i) => observation(i, i + 1)), unobserved: [] });
   let time = cells + 1;
+  let round = 0;
   const run = () => {
-    // Build input outside the measured region. Every update has a new acquisition
-    // time, but all updates target the same previously observed cell and state.
-    const observations = Array.from({ length: UPDATES }, () => observation(0, time++));
+    // Build input outside the measured region. Change rounds alternate two real
+    // block states, so each cell's first update in a round changes stored content.
+    round += 1;
+    const observations = Array.from({ length: UPDATES }, (_, index) => {
+      const value = observation(workload === 'same-cell-refresh' ? 0 : index % cells, time++);
+      if (workload === 'multi-cell-state-change' && round % 2 === 1) {
+        value.state = { name: 'minecraft:dirt', properties: {} };
+      }
+      return value;
+    });
     const start = performance.now();
     if (delivery === 'batch') {
       map.observeBatch({ observations, unobserved: [] });
@@ -56,6 +65,7 @@ function probe(cells, manualResidency, delivery) {
   }
   const median = elapsed[Math.floor(elapsed.length / 2)];
   return {
+    workload,
     cells,
     mode: manualResidency ? 'manual' : 'eager',
     delivery,
@@ -65,14 +75,15 @@ function probe(cells, manualResidency, delivery) {
   };
 }
 
-const rows = SIZES.flatMap((cells) =>
-  [false, true].flatMap((manual) => ['single', 'batch'].map((delivery) => probe(cells, manual, delivery))),
+const rows = WORKLOADS.flatMap((workload) => SIZES.flatMap((cells) =>
+  [false, true].flatMap((manual) => ['single', 'batch'].map((delivery) => probe(cells, manual, delivery, workload))),
+),
 );
 console.log(JSON.stringify({
   node: process.version,
   platform: process.platform,
   arch: process.arch,
-  workload: 'same-state refresh of one cell in a dense resident Section',
+  workloads: WORKLOADS,
   updatesPerRound: UPDATES,
   warmupRounds: 2,
   measuredRounds: ROUNDS,

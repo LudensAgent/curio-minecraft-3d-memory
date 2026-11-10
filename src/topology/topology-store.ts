@@ -33,7 +33,6 @@ import type {
   EdgeDependency,
   EdgeDirection,
   EdgeVerification,
-  EdgeVerificationStatus,
   GoneEvidence,
   LandmarkTag,
   NodeKind,
@@ -63,11 +62,8 @@ import type { MoveMode, Vec3Like } from '../types.js';
 import type { EdgeRuntimeView, EdgeVerificationInput } from './edge-runtime.js';
 import {
   cloneEdgeVerification,
-  directionState,
   directionUsability,
-  edgeDirectionModes,
   edgeVerificationsEqual,
-  modeState,
   resolveEdgeDirected,
   runtimeView,
   snapshotEdgeModes,

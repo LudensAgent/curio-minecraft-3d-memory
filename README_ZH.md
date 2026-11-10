@@ -17,6 +17,8 @@
 
 **状态：0.10.0（未发布）。** 观测/查询、`planRoute` + `walkPath` walk 导航、运行态 Store 组合、拓扑运行态、SQLite 持久化与 M6 重启/checkpoint 回归已实现并有离线测试覆盖；`memory`/`navigation` 子路径已由包 `exports` 暴露；`MemoryHostCapabilities.execute.walk`/`groundedArrival`/`invalidation`/`cancellation` 因运行时入口已实现而报告 `true`，`execute.swim`/`boat` 与 `persistence.*` 仍为 `false`（D-059）。真实 Minecraft / mineflayer / Curio 接入尚未验收（H-01）。
 
+**v0.11.0** 的推进状态见[实施计划](docs/v0.11.0-implementation-plan.md)。升级以已观察的体素地图作为普通导航来源：`planRoute({ source: 'auto', ... })` 直接使用提供的体素搜索，`pathId` 仅在显式 `source: 'history'` 请求中生效。已有历史 API 继续兼容保留；计划分别标明已实现改动、待接入宿主、待迁移与待游戏验证的部分。
+
 ## 功能
 
 - **带证据的观测地图**（`voxel/`、`observation/`）：稀疏、版本化的 Section，逐格证据、新鲜度与会话处理；有界 `ObservationQueue`；局部 `ChangeReport` 只失效真正依赖它的工作。
@@ -24,6 +26,8 @@
 - **有界历史查询**：`adjacency`、`reachable`、`route` 与 `historicalAnchorCandidates` 在有限工作预算内返回已记录事实——从不产生实时 `OPEN`、到达声明或可执行点列。
 - **拓扑运行态**（`topology/`）：按方向验证边、独立的门户边、锚点查询、瞬时占位，以及有证据的碎片连通/合并记录。派生状态可失效，但不删除历史。
 - **Walk 导航管线**（`navigation/`）：`planRoute` 基于有界搜索/历史证据发出单次使用 `routeId`；`walkPath` 通过调用方提供的单步身体端口执行该句柄，支持接地 `bodyArrival`、证据/会话失效的 `INVALIDATED` 停止与可选 `persistAction` 钩子。`navigateTo` 执行「实测起点 → 有界搜索 → 复验执行 → 实测到达」；`followKnownPath` 沿调用方显式指定的历史片段执行；`inspectRoute`、`inspectKnownRoute` 与 `frontierCandidates` 是只读投影。`recall_route` 未实现。
+- **体素三维候选规划**（`searchLandRoute` / `searchLandRouteAsync`，v0.11 开发中）：按已观察支撑面进行有界 walk/step/drop A*，支持精确/附近目标与显式历史几何模式。结果始终要求当前复验并标记 `executable: false`。这些函数尚未接入 `planRoute` 或宿主 Coordinator；本搜索尚不负责冷页加载、跳跃和梯子。
+- **有界派生缓存**：`TraversabilityCache` 默认最多 2048 项、最长复用年龄 60 秒。查询时有限清理过期项，宿主可显式调用 `pruneExpired()` / `clear()` 维护或释放；这些操作不删除地图观察。
 - **受控路线执行**（`execution/`）：`WalkRouteExecutor` 驱动注入的单步 `MoveExecutor`；每段开始前要求当前 `OPEN` 证据；仅接受实测精确位置作为到达；证据变化时撤销在途路段。
 - **陆地与水面验证**（`traversability/`、`water/`）：`evaluateLandTransition` / `LandRouteVerifier` 检查调用方声明的陆地转换与路线；`evaluateWaterRoute` / `checkWaterArrival` 检查水面游泳与已乘船几何。结果固定带 `assurance: 'geometry_only'` 与 `executable: false`。
 - **显式 SQLite 持久化**（`storage/`，`curio-minecraft-3d-memory/storage/sqlite`）：单个 Worker 独占连接与事务。`checkpoint()` 是唯一显式保存触发点并返回确认后的 `CheckpointResult`；包含体素增量 checkpoint、手动 Section 驻留、`WorkingSetManager`、放置/访问/门户账本、追加式 journal，以及离线旧账本迁移演练。
@@ -323,7 +327,7 @@ node acceptance/run.mjs
 - **感知由宿主负责。** 库不扫描客户端世界、不加载区块，也不把原始 `blockUpdate` 事件当作证据。它只记录宿主合法提供的观测。
 - **容器与库存仍归宿主账本。** 库关联位置与可达证据，不复制或维护物品数量。
 - **不包含飞行、鞘翅与水下三维导航。** 这些不在本库范围内。
-- **已知 Store 事实缺口。** `SpatialEdge` 只是 `TopologyStore` 的有损投影；门户边独立于步行图；`Frontier.historicalConnection` 无法表达未知。请使用 Store 文档中列出的详细读取与 inspection API。
+- **Store 投影限制。** `SpatialEdge` 只是 `TopologyStore` 的有损投影；门户边独立于步行图。未提供历史查询时，`Frontier.historicalConnection` 返回 `unknown`。请使用 Store 文档中列出的详细读取与 inspection API。
 
 ## License
 

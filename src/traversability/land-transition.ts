@@ -40,7 +40,7 @@
 import type { CellEvidence, Observation } from '../observation/types.js';
 import type { BlockState, Vec3Like } from '../types.js';
 import { blockToSection, cellIndex } from '../voxel/coordinates.js';
-import type { Section, SectionKey } from '../voxel/section.js';
+import type { SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { SectionResidency } from '../voxel/residency.js';
 import type { SectionRef, VoxelMap } from '../voxel/voxel-map.js';
@@ -346,6 +346,58 @@ export function evaluateLandTransition(
   now: number,
   limits: LandLimits,
 ): LandTransitionEvaluation {
+  return evaluateLandGeometry(map, query, rules, now, limits, false);
+}
+
+/** Historical geometry has no current passage status or execution guarantee. */
+export interface RememberedLandGeometry {
+  geometry: 'PASSABLE' | 'OBSTRUCTED' | 'UNKNOWN' | 'UNSUPPORTED' | 'INCOMPLETE';
+  assurance: 'historical_geometry';
+  executable: false;
+  from: Vec3Like;
+  to: Vec3Like;
+  reason?: LandTransitionReason;
+  hazards: HazardFact[];
+  obstacles: ObstacleEvidence[];
+  dependencies: LandSectionDependency[];
+  work: LandWorkReport;
+  limitGap?: LandLimitGap;
+}
+
+/** Internal planning boundary; source observations, sessions and times stay intact. */
+export function evaluateRememberedLandTransition(
+  map: VoxelMap,
+  query: LandTransitionQuery,
+  rules: LandRules,
+  now: number,
+  limits: LandLimits,
+): RememberedLandGeometry {
+  const result = evaluateLandGeometry(map, query, rules, now, limits, true);
+  return {
+    geometry: result.status === 'OPEN' ? 'PASSABLE'
+      : result.status === 'BLOCKED' ? 'OBSTRUCTED'
+      : result.status === 'STALE' ? 'UNKNOWN' : result.status,
+    assurance: 'historical_geometry',
+    executable: false,
+    from: result.from,
+    to: result.to,
+    ...(result.reason === undefined ? {} : { reason: result.reason }),
+    hazards: result.hazards,
+    obstacles: result.obstacles,
+    dependencies: result.dependencies,
+    work: result.work,
+    ...(result.limitGap === undefined ? {} : { limitGap: result.limitGap }),
+  };
+}
+
+function evaluateLandGeometry(
+  map: VoxelMap,
+  query: LandTransitionQuery,
+  rules: LandRules,
+  now: number,
+  limits: LandLimits,
+  remembered: boolean,
+): LandTransitionEvaluation {
   if (query.worldId !== map.worldId) {
     throw new Error(`query worldId "${query.worldId}" does not match map worldId "${map.worldId}"`);
   }
@@ -541,9 +593,9 @@ export function evaluateLandTransition(
     const dep = recordDependency(key, section.revision, 'resident', generation);
     const evidence = section.evidence.get(cellIndex(lx, ly, lz));
     if (evidence === undefined) return { kind: 'unobserved', key };
-    if (evidence.freshness === 'STALE') return { kind: 'stale', reason: 'stale', key };
-    if (evidence.observation.sessionId !== sessionId) return { kind: 'stale', reason: 'session', key };
-    if (now > evidence.validUntil) return { kind: 'stale', reason: 'expired', key };
+    if (!remembered && evidence.freshness === 'STALE') return { kind: 'stale', reason: 'stale', key };
+    if (!remembered && evidence.observation.sessionId !== sessionId) return { kind: 'stale', reason: 'session', key };
+    if (!remembered && now > evidence.validUntil) return { kind: 'stale', reason: 'expired', key };
     dep.validUntil = Math.min(dep.validUntil, evidence.validUntil);
     if (!evidence.observation.stateComplete) return { kind: 'incomplete', key };
     // The live SectionRef is not copied. Copy the evidence/observation that

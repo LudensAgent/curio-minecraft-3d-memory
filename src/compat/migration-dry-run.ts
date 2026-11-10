@@ -46,7 +46,6 @@ import { portalTraversalIdentity } from '../storage/sqlite/ledger.js';
 import type { PortalTraversalInput } from '../storage/sqlite/ledger.js';
 import type {
   ChunkVisitRecord,
-  LedgerSnapshot,
   PlacedBlockRecord,
   PortalTraversalRecord,
 } from '../storage/sqlite/types.js';
