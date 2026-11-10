@@ -225,6 +225,8 @@ export interface NodeQuery {
   source?: NodeSource;
   tag?: LandmarkTag;
   label?: string;
+  /** Exclude anchors whose object is marked gone. Default false (history stays readable). */
+  excludeGone?: boolean;
   /** Exclusive cursor: only ids sorting after this are returned. */
   after?: string;
   limit?: number;
@@ -1111,7 +1113,8 @@ export class TopologyStore {
       (query.dim === undefined ? 0 : 1) +
       (query.source === undefined ? 0 : 1) +
       (query.tag === undefined ? 0 : 1) +
-      (query.label === undefined ? 0 : 1);
+      (query.label === undefined ? 0 : 1) +
+      (query.excludeGone === true ? 1 : 0);
     // First existing bucket by this fixed priority; its ids are already ascending.
     const bucket =
       query.label !== undefined
@@ -1141,12 +1144,17 @@ export class TopologyStore {
         nextAfter,
       };
     }
-    const page = selectFilteredPage(bucket ?? [], query.after, limit, (id) => {
+    // `excludeGone` has no materialized bucket; when it is the only filter, scan
+    // the full id index. With an indexed filter and no bucket, the result is empty.
+    const candidates = bucket ?? (query.dim === undefined && query.source === undefined
+      && query.tag === undefined && query.label === undefined ? index.all : []);
+    const page = selectFilteredPage(candidates, query.after, limit, (id) => {
       const node = this.nodeMap.get(id)!;
       if (query.dim !== undefined && node.dim !== query.dim) return false;
       if (query.source !== undefined && node.source !== query.source) return false;
       if (query.tag !== undefined && node.tag !== query.tag) return false;
       if (query.label !== undefined && node.label !== query.label) return false;
+      if (query.excludeGone === true && node.gone === true) return false;
       return true;
     });
     return {

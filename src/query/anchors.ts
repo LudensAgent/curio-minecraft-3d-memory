@@ -56,6 +56,8 @@ function queryResourceAnchors(
         ...(request.dim === undefined ? {} : { dim: request.dim }),
         ...(request.tag === undefined ? {} : { tag: request.tag }),
         ...(request.label === undefined ? {} : { label: request.label }),
+        // Removed resources are revoked by default; historical callers can opt in.
+        ...(request.includeGone === true ? {} : { excludeGone: true }),
         ...(after === undefined ? {} : { after }),
         limit,
       }),

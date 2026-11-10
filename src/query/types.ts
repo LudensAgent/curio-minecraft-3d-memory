@@ -89,6 +89,8 @@ export type SpatialQueryRequest =
       dim?: string;
       tag?: LandmarkTag;
       label?: string;
+      /** Default false: anchors marked gone are excluded so a removed resource is revoked immediately. */
+      includeGone?: boolean;
       after?: string;
       limit?: number;
     }

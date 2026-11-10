@@ -96,6 +96,19 @@ function stringField(key: RequestFieldKey, required: boolean): FieldSpec {
   };
 }
 
+function booleanField(key: RequestFieldKey, required: boolean): FieldSpec {
+  return {
+    key,
+    validate: (value, what) => {
+      if (value === undefined && !required) return accept(undefined);
+      if (typeof value !== 'boolean') {
+        return fail(required ? `${what} is required and must be a boolean` : `${what} must be a boolean when present`);
+      }
+      return accept(value);
+    },
+  };
+}
+
 function enumField(
   key: RequestFieldKey,
   allowed: readonly string[],
@@ -246,6 +259,7 @@ const FIELD_SPECS: Record<SpatialQueryKind, readonly FieldSpec[]> = {
     stringField('dim', false),
     enumField('tag', LANDMARK_TAGS, false),
     stringField('label', false),
+    booleanField('includeGone', false),
     stringField('after', false),
     LIMIT_FIELD,
   ],

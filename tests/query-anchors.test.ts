@@ -95,6 +95,20 @@ describe('resourceAnchors', () => {
     expect(data.total).toBe(0);
     expect(data.nextAfter).toBeUndefined();
   });
+
+  it('excludes gone resources by default and only includes them on request', () => {
+    const parts = makeQueryParts();
+    parts.topology.saveNode(makeNode('a', A, { tag: 'resource', label: 'coal' }));
+    parts.topology.saveNode(goneNode('gone', { dim: DIM, tag: 'resource', label: 'coal' }));
+
+    expect(resourceAnchors(runQuery(parts, { kind: 'resourceAnchors', tag: 'resource' })).items.map((n) => n.id))
+      .toEqual(['a']);
+    const history = resourceAnchors(runQuery(parts, {
+      kind: 'resourceAnchors', tag: 'resource', includeGone: true,
+    }));
+    expect(history.items.map((n) => n.id)).toEqual(['a', 'gone']);
+    expect(history.items.find((n) => n.id === 'gone')?.gone).toBe(true);
+  });
 });
 
 describe('containerAnchors', () => {
