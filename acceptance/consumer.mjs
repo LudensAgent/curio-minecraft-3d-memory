@@ -8,21 +8,22 @@
  * by package name and public subpath:
  *
  *   curio-minecraft-3d-memory                 (root entry)
+ *   curio-minecraft-3d-memory/memory          (pure memory core)
  *   curio-minecraft-3d-memory/storage/sqlite  (SQLite persistence entry)
  *
  * Every check is a hard `node:assert` — a failure throws and exits non-zero, so
  * "success" is never a printed summary. It exercises the combined lifecycle that
  * the existing unit tests do not cover in isolation: install → worker startup →
- * save/restore → post-restore STALE passability boundary → fresh re-observation
- * isolation → pin protection independent of dirty (route + hanging walk) → final
- * persistence with a unique fact and exact checkpoint confirmation.
+ * bounded 3D land search → facts query + revocation → save/restore → restored
+ * STALE evidence is not a current route → fresh re-observation isolation → pin
+ * protection independent of dirty → final persistence with a unique fact.
  *
  * CLI mutation modes (each is a separate process run against a fresh temp dir;
  * a mutation makes a specific *positive* assertion fail so the orchestrator sees
  * a non-zero exit — it is never treated as success by this consumer itself):
  *
- *   --early-release-pin      release the pin lease before the in-flight free(),
- *                            so the "dependency is pinned" assertions fail.
+ *   --early-release-pin      release the pin lease before free(), so the
+ *                            "dependency is pinned" assertions fail.
  *   --skip-final-checkpoint  skip the final checkpoint, so the reopened unique
  *                            fact is absent and the final-fact assertions fail.
  */
@@ -34,13 +35,14 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import {
-  FragmentStore,
-  RouteVerifier,
+  CONTRACT_VERSION,
+  InMemoryFactStore,
   VoxelMap,
-  WalkRouteExecutor,
-  WalkRouteSearch,
-  startKnownWalkRoute,
+  createVoxelFactsQueryPort,
+  searchLandRoute,
+  searchLandRouteAsync,
 } from 'curio-minecraft-3d-memory';
+import * as memoryCore from 'curio-minecraft-3d-memory/memory';
 import {
   openSpatialSession,
   PersistenceError,
@@ -80,72 +82,6 @@ const shapeProvider = {
     };
   },
 };
-
-/**
- * A controllable single-step executor whose `move` never resolves on its own.
- * The test drives completion explicitly (deferred resolve) so the in-flight walk
- * is truly held while pin-protection assertions run, and can be finished or
- * cancelled at a chosen time.
- */
-class HangingExecutor {
-  constructor(observedAt = 2000) {
-    this.seq = 1;
-    this.observedAt = observedAt;
-    this.pending = [];
-    this.stoppedIds = [];
-  }
-
-  move(request) {
-    return new Promise((resolveMove) => {
-      this.pending.push({ request, resolveMove });
-    });
-  }
-
-  stop(executionId) {
-    this.stoppedIds.push(executionId);
-    // Deliberately no-op: the caller controls completion, so stop() must not
-    // resolve the pending move (that would defeat the hanging-body contract).
-  }
-
-  /** Resolve the oldest in-flight move with a confirming sample at `pos`. */
-  complete(pos) {
-    const entry = this.pending.shift();
-    if (!entry) throw new Error('no in-flight move to complete');
-    entry.resolveMove({
-      sample: {
-        worldId: entry.request.worldId,
-        dim: entry.request.dim,
-        sessionId: entry.request.sessionId,
-        executionId: entry.request.executionId,
-        sequence: ++this.seq,
-        pos: { ...pos },
-        observedAt: this.observedAt,
-        alive: true,
-        connected: true,
-        observationReady: true,
-        onGround: true,
-        inWater: false,
-      },
-    });
-  }
-}
-
-function sampleAt(executionId, pos, observedAt = 2000) {
-  return {
-    worldId: WORLD,
-    dim: DIM,
-    sessionId: 'live',
-    executionId,
-    sequence: 1,
-    pos: { ...pos },
-    observedAt,
-    alive: true,
-    connected: true,
-    observationReady: true,
-    onGround: true,
-    inWater: false,
-  };
-}
 
 function keyAt(cx, sy) {
   return { worldId: WORLD, dim: DIM, cx, cz: 0, sy };
@@ -196,21 +132,50 @@ function observeRoute(session, sessionId, observedAt) {
   }
 }
 
-const POINTS = [
-  { x: 0.5, y: 0, z: 0.5 },
-  { x: 1.5, y: 0, z: 0.5 },
-  { x: 2.5, y: 0, z: 0.5 },
-];
+const BODY = { feet: { x: 0.5, y: 0, z: 0.5 }, width: 0.6, height: 1.8, pose: 'standing' };
 
-function routeRequest(sessionId) {
+function searchRequest(sessionId = 'live') {
   return {
     worldId: WORLD,
     dim: DIM,
     sessionId,
-    mode: 'walk',
-    body: { feet: { x: 0.5, y: 0, z: 0.5 }, width: 0.6, height: 1.8, pose: 'standing' },
-    shapeProvider,
-    points: POINTS,
+    body: BODY,
+    to: { x: 2.5, y: 0, z: 0.5 },
+    arrival: { kind: 'exact' },
+    rules: { shapeProvider },
+    allowed: ['walk', 'step', 'drop'],
+    maxNodes: 256,
+    maxEdges: 1024,
+  };
+}
+
+function factPlace(id, overrides = {}) {
+  return {
+    id,
+    kind: 'place',
+    label: `place ${id}`,
+    worldId: WORLD,
+    dim: DIM,
+    location: { kind: 'exact', pos: { x: 0, y: 64, z: 0 } },
+    observedAt: 100,
+    source: { source: 'agent' },
+    gone: false,
+    ...overrides,
+  };
+}
+
+function factResource(id, overrides = {}) {
+  return {
+    id,
+    worldId: WORLD,
+    dim: DIM,
+    label: 'bench:stone',
+    sourceCell: { x: 5, y: 60, z: 0 },
+    sourceCellVersion: 3,
+    observedAt: 200,
+    source: { source: 'vision' },
+    revoked: false,
+    ...overrides,
   };
 }
 
@@ -339,22 +304,6 @@ function journalGapEvent() {
 /** Assert a synchronous public persistence error with an exact kind. */
 function assertPersistenceKind(fn, kind, message) {
   assert.throws(fn, (err) => err instanceof PersistenceError && err.kind === kind, message);
-}
-
-function collectDeps(status) {
-  const deps = [];
-  const seen = new Set();
-  for (const step of status.steps) {
-    if (step.kind !== 'verified') continue;
-    for (const d of step.result.dependencies) {
-      const s = `${d.key.dim}|${d.key.cx},${d.key.cz},${d.key.sy}`;
-      if (!seen.has(s)) {
-        seen.add(s);
-        deps.push({ ...d.key });
-      }
-    }
-  }
-  return deps;
 }
 
 /** True when `child` is a strict descendant of `parent` (both absolute paths). */
@@ -497,20 +446,23 @@ async function run() {
 
   let primaryError = null;
   try {
-    // ===== 1. Entry points + worker startup =====
-    assert.equal(typeof RouteVerifier, 'function', 'root entry exports RouteVerifier');
-    assert.equal(typeof WalkRouteExecutor, 'function', 'root entry exports WalkRouteExecutor');
+    // ===== 1. Entry points =====
+    assert.equal(typeof searchLandRoute, 'function', 'root entry exports searchLandRoute');
+    assert.equal(typeof searchLandRouteAsync, 'function', 'root entry exports searchLandRouteAsync');
+    assert.equal(typeof VoxelMap, 'function', 'root entry exports VoxelMap');
+    assert.equal(typeof createVoxelFactsQueryPort, 'function', 'root entry exports createVoxelFactsQueryPort');
+    assert.equal(typeof InMemoryFactStore, 'function', 'root entry exports InMemoryFactStore');
+    assert.equal(CONTRACT_VERSION, 'memory-host-contract/2', 'root entry publishes contract version 2');
     assert.equal(typeof openSpatialSession, 'function', 'storage/sqlite exports openSpatialSession');
     assert.equal(typeof WorkingSetManager, 'function', 'storage/sqlite exports WorkingSetManager');
-    assert.equal(typeof VoxelMap, 'function', 'root entry exports VoxelMap');
-    assert.equal(typeof FragmentStore, 'function', 'root entry exports FragmentStore');
-    assert.equal(typeof WalkRouteSearch, 'function', 'root entry exports WalkRouteSearch');
-    assert.equal(typeof startKnownWalkRoute, 'function', 'root entry exports startKnownWalkRoute');
+    for (const retired of ['FragmentStore', 'TopologyStore', 'WalkRouteExecutor', 'WalkRouteSearch', 'RouteVerifier', 'planRoute', 'navigateTo']) {
+      assert.equal(retired in memoryCore, false, `memory entry must not export retired ${retired}`);
+    }
+    assert.equal(typeof memoryCore.VoxelMap, 'function', 'memory entry exports VoxelMap');
+    assert.equal('searchLandRoute' in memoryCore, false, 'memory entry has no navigation runtime');
 
-    // ===== 1b. Root-entry followups: bounded search + explicit historical route =====
+    // ===== 1b. Observation + bounded 3D search + facts query =====
     {
-      // Fresh standalone map with the same typed fixture facts the route scenarios
-      // observe. No worker or database is involved in either API below.
       const map = new VoxelMap(WORLD);
       observeRoute({ voxel: map }, 'live', 2000);
       const mapBefore = {
@@ -519,134 +471,58 @@ async function run() {
         feet: map.cellAt(DIM, 1, 0, 0),
       };
 
-      const searchRequest = {
-        worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk',
-        body: routeRequest('live').body, target: POINTS[1],
-        arrival: { kind: 'exact' }, shapeProvider,
-      };
-      const search = new WalkRouteSearch(map, { now: () => 2000 });
-      let searchResult = search.start(searchRequest);
-      for (let round = 0; round < 8 && searchResult.state === 'PENDING'; round++) {
-        searchResult = search.advance(16);
-      }
+      const searchResult = searchLandRoute(map, searchRequest(), 2000);
+      assert.equal(searchResult.status, 'FOUND', 'bounded search finds the observed corridor');
+      assert.equal(searchResult.assurance, 'geometry_only', 'current search assurance is geometry_only');
+      assert.equal(searchResult.evidenceMode, 'current', 'current search uses current evidence');
+      assert.equal(searchResult.executable, false, 'a search candidate is never executable authorization');
+      assert.equal(searchResult.needsRevalidation, true, 'a candidate always needs current revalidation');
+      assert.ok(searchResult.points.length > 1, 'FOUND carries ordered points');
+      assert.deepEqual(searchResult.points.at(-1), { x: 2.5, y: 0, z: 0.5 }, 'candidate ends at the exact target');
+      assert.ok(searchResult.transitions.length > 0, 'FOUND carries evaluated transitions');
+      assert.equal('outcome' in searchResult, false, 'search result has no navigation arrival outcome');
 
-      assert.equal(searchResult.state, 'FOUND', 'bounded search finds the observed one-edge route');
-      assert.ok(searchResult.candidate, 'FOUND carries a candidate stance sequence');
-      assert.deepEqual(searchResult.candidate.points, [POINTS[0], POINTS[1]], 'candidate keeps the exact ordered polyline');
-      assert.deepEqual(searchResult.candidate.target, POINTS[1], 'candidate target is the exact requested point');
-      assert.equal(searchResult.candidate.edgeCount, 1, 'candidate is one walked edge');
-      // FOUND is a candidate, never a NavResult ARRIVED or a physical success claim.
-      assert.equal('outcome' in searchResult, false, 'search snapshot has no navigation outcome');
-      assert.equal('outcome' in searchResult.candidate, false, 'search candidate has no navigation outcome');
-      assert.notEqual(searchResult.state, 'ARRIVED', 'search state is not an arrival outcome');
-
-      // Read-only search: no save revision, observation time or cell fact moved.
       assert.equal(map.saveRevision, mapBefore.revision, 'read-only search did not advance saveRevision');
       assert.deepEqual(map.cellAt(DIM, 1, -1, 0), mapBefore.support, 'read-only search left support evidence unchanged');
       assert.deepEqual(map.cellAt(DIM, 1, 0, 0), mapBefore.feet, 'read-only search left feet evidence unchanged');
 
-      // Public negative: an empty map is unknown evidence, not a frontier or path.
-      const emptySearch = new WalkRouteSearch(new VoxelMap(WORLD), { now: () => 2000 });
-      emptySearch.start(searchRequest);
-      const emptyResult = emptySearch.advance(8);
-      assert.equal(emptyResult.state, 'INSUFFICIENT_EVIDENCE', 'empty map yields INSUFFICIENT_EVIDENCE');
-      assert.equal(emptyResult.frontiers.length, 0, 'empty map yields no OPEN frontier');
-      assert.equal(emptyResult.candidate, null, 'empty map yields no candidate');
+      const empty = searchLandRoute(new VoxelMap(WORLD), searchRequest(), 2000);
+      assert.notEqual(empty.status, 'FOUND', 'an empty map is not a found route');
+      assert.equal(empty.executable, false, 'an empty search is not executable authorization');
+      assert.deepEqual(empty.points, [], 'an empty map yields no candidate points');
 
-      // Actual historical geometry: one chosen two-point legacy/built polyline.
-      const history = new FragmentStore(WORLD);
-      const historyPoints = [POINTS[0], POINTS[1]];
-      history.saveFragment({
-        id: 'consumer-built-route', worldId: WORLD, dim: DIM,
-        kind: 'built', geometrySource: 'legacy',
-        entrances: [POINTS[0]], polyline: historyPoints, deepestY: 0,
-        createdAt: 1000, lastUsedAt: 1000, uses: 1,
-      });
-      const historyBefore = history.checkpointSnapshot();
-      const historyRevisionBefore = history.revision;
+      const facts = new InMemoryFactStore();
+      facts.upsertPlace(factPlace('base', { kind: 'base', label: 'home' }));
+      facts.upsertResource(factResource('ore'));
+      const port = createVoxelFactsQueryPort({ worldId: WORLD, voxel: map, facts });
 
-      const body = new HangingExecutor(2000);
-      const loop = new WalkRouteExecutor(map, body, { now: () => 2000 });
-      let knownStart;
-      let finalStatus = null;
-      try {
-        const { points: _routePoints, ...routeBase } = routeRequest('live');
-        knownStart = startKnownWalkRoute(history, loop, {
-          ...routeBase, arrival: { kind: 'exact' }, deadlineMs: 100_000, timeoutMs: 10_000,
-          fragmentId: 'consumer-built-route', parentActionId: 'consumer-parent-action',
-        });
-        assert.equal(knownStart.kind, 'STARTED', 'selected historical fragment starts');
-        const started = knownStart.status;
-        assert.equal(started.result, null, 'STARTED is an accepted delegation, not a result');
-        assert.deepEqual(knownStart.route.points, historyPoints, 'started route keeps the original ordered points');
-        assert.deepEqual(knownStart.route.target, POINTS[1], 'started route keeps the original target');
-        assert.equal(knownStart.route.parentActionId, 'consumer-parent-action', 'parentActionId metadata preserved');
-        assert.equal(knownStart.route.kind, 'built', 'historical kind is retained as metadata');
-        assert.equal(knownStart.route.geometrySource, 'legacy', 'geometry source is retained as metadata');
+      const places = port.query({ kind: 'places', dim: DIM });
+      assert.equal(places.status, 'ok', 'facts places query succeeds');
+      assert.deepEqual(places.data.items.map((item) => item.id), ['base'], 'places projection is facts-backed');
+      assert.equal(places.data.pageSource, 'memory', 'places page source states the in-memory authority');
+      const resources = port.query({ kind: 'resourceAnchors', dim: DIM });
+      assert.deepEqual(resources.data.items.map((item) => item.id), ['ore'], 'resource anchors query succeeds');
+      facts.revokeResource('ore', { observedAt: 300, source: { source: 'vision' } });
+      assert.equal(port.query({ kind: 'resourceAnchors', dim: DIM }).total, 0, 'revocation is visible before persistence');
+      assert.equal(port.query({ kind: 'resourceAnchors', dim: DIM, includeGone: true }).total, 1, 'revoked fact remains queryable');
 
-        // Pre-start rejections through the actual API leave the running delegation
-        // fully intact (same identity, still no terminal result).
-        const delegationId = started.delegationId;
-        const missing = startKnownWalkRoute(history, loop, {
-          ...routeBase, arrival: { kind: 'exact' }, deadlineMs: 100_000, timeoutMs: 10_000,
-          fragmentId: 'consumer-missing-fragment',
-        });
-        assert.equal(missing.kind, 'REJECTED', 'missing fragment is rejected');
-        assert.equal(missing.reason, 'missing_history', 'missing fragment reason is missing_history');
-        const wrongScope = startKnownWalkRoute(history, loop, {
-          ...routeBase, worldId: 'another-world', arrival: { kind: 'exact' },
-          deadlineMs: 100_000, timeoutMs: 10_000, fragmentId: 'consumer-built-route',
-        });
-        assert.equal(wrongScope.kind, 'REJECTED', 'wrong world scope is rejected');
-        assert.equal(wrongScope.reason, 'wrong_scope', 'wrong scope reason is wrong_scope');
-        const untouched = loop.status();
-        assert.equal(untouched.delegationId, delegationId, 'rejections did not replace the delegation');
-        assert.equal(untouched.result, null, 'rejections did not terminate the delegation');
+      const capabilities = port.query({ kind: 'capabilities' });
+      assert.equal(capabilities.data.capabilities.contract, CONTRACT_VERSION, 'query capability report uses contract v2');
+      assert.equal('plan' in capabilities.data.capabilities, false, 'capability report has no plan block');
+      assert.equal('execute' in capabilities.data.capabilities, false, 'capability report has no execute block');
+      assert.equal(capabilities.data.capabilities.query.containerContents, false, 'container contents stay host-led');
 
-        loop.onSample(sampleAt(delegationId, POINTS[0], 2000));
-        loop.advance(10);
-        await Promise.resolve();
-        const inFlight = loop.status();
-        assert.notEqual(inFlight.activeStepIndex, null, 'a step is in flight');
-        assert.equal(inFlight.result, null, 'no terminal result while in flight');
-        assert.equal(body.pending.length, 1, 'the hanging executor owns the in-flight move');
-
-        body.complete(POINTS[1]);
-        await Promise.resolve();
-        loop.advance(10);
-        await Promise.resolve();
-        finalStatus = loop.status();
-        assert.equal(finalStatus.result?.outcome, 'ARRIVED', 'historical walk finishes ARRIVED');
-        assert.equal(finalStatus.result?.confirmed, true, 'ARRIVED is confirmed');
-        assert.deepEqual(finalStatus.result?.lastPosition, POINTS[1], 'ARRIVED lastPosition is the measured point');
-      } finally {
-        const current = loop.status();
-        if (current !== null && current.result === null) {
-          loop.cancel('user', 'acceptance followups cleanup');
-        }
-      }
-
-      // Reading and executing history is not a traversal write and does not move it.
-      assert.deepEqual(history.checkpointSnapshot(), historyBefore, 'history snapshot unchanged');
-      assert.equal(history.revision, historyRevisionBefore, 'history revision unchanged');
-      assert.equal(history.traversals().total, 0, 'no traversal facts invented');
-
-      evidence('navigation.followups', {
-        body: 'fake',
-        api: 'library-only',
-        hostEnabled: false,
+      evidence('v011.followups', {
         search: {
-          state: searchResult.state,
-          points: searchResult.candidate?.points ?? null,
-          edgeCount: searchResult.candidate?.edgeCount ?? null,
+          status: searchResult.status,
+          executable: searchResult.executable,
+          points: searchResult.points.length,
+          transitions: searchResult.transitions.length,
         },
-        emptySearch: { state: emptyResult.state, frontiers: emptyResult.frontiers.length },
-        known: {
-          startKind: knownStart.kind,
-          result: finalStatus?.result?.outcome ?? null,
-          historyRevision: history.revision,
-          traversals: history.checkpointSnapshot().traversals.length,
-        },
+        emptySearch: { status: empty.status, points: empty.points.length },
+        places: places.data.items.length,
+        resources: resources.data.items.length,
+        contract: capabilities.data.capabilities.contract,
       });
     }
 
@@ -939,11 +815,10 @@ async function run() {
       assert.equal(stone.evidence.observation.state.name, 'minecraft:stone', 'restored state preserved');
       assert.equal(stone.evidence.observation.observedAt, 1000, 'original observedAt preserved');
 
-      // Restored STALE evidence must never read as a current OPEN passability.
-      const verifier = new RouteVerifier(s.voxel, { now: () => 2000 });
-      verifier.register(routeRequest('live'));
-      const status = verifier.advance(10);
-      assert.equal(status.verdict, 'STALE', 'restored STALE evidence is not OPEN');
+      // Restored STALE evidence must never be read as a current route proof.
+      const restoredSearch = searchLandRoute(s.voxel, searchRequest('live'), 2000);
+      assert.notEqual(restoredSearch.status, 'FOUND', 'restored STALE evidence is not a current route');
+      assert.equal(restoredSearch.executable, false, 'restored evidence grants no execution authorization');
 
       // A new observation session re-observes exactly one cell; only that cell
       // becomes FRESH — an untouched neighbour must not ride along.
@@ -966,14 +841,12 @@ async function run() {
         residencyLimits: { maxResidentSections: 6 },
       });
       const manager = new WorkingSetManager(s);
+      const deps = [keyAt(0, -1), keyAt(0, 0)];
 
-      // (Re)establish fresh + clean route facts at `t`: load the sections, observe
-      // at `t`, checkpoint (clean), verify OPEN, and collect the real dependency
-      // keys. Returns those keys. A later re-establish uses a newer `t` so the
-      // re-observation genuinely restores FRESH (same-timestamp re-observation is a
-      // no-op), which matters after a previous case evicted the sections.
+      // (Re)establish clean, committed route Sections at `t`. A newer `t` makes the
+      // re-observation genuinely FRESH after a previous case reclaimed the Sections.
       async function establishFreshCleanDeps(t) {
-        const load = await manager.prepare([keyAt(0, -1), keyAt(0, 0)]);
+        const load = await manager.prepare(deps);
         assert.equal(load.status, 'ready', 'route sections load');
         s.releasePins([load.lease.token]);
 
@@ -990,90 +863,34 @@ async function run() {
         assert.ok(cp.checkpointId, 'route facts checkpointed');
         assert.equal(ps.dirty, false, 'clean after route checkpoint');
 
-        const verifier = new RouteVerifier(s.voxel, { now: () => t });
-        verifier.register(routeRequest('live'));
-        const status = verifier.advance(10);
-        assert.equal(status.verdict, 'OPEN', 'route OPEN with fresh evidence');
-        const deps = collectDeps(status);
-        evidence('l3.deps', { t, deps: deps.map(fmtKey) });
-        assert.ok(deps.length > 0, 'route reports concrete section dependencies');
-
-        // Every dependency section is clean: global dirty is false and each section
-        // has a committed (on-disk) record, so nothing is pending/dirty at pin time.
         for (const key of deps) {
           const residency = s.sectionResidency(key);
           assert.equal(residency.residency, 'resident', `dependency ${fmtKey(key)} resident`);
           assert.ok(residency.committed !== undefined, `dependency ${fmtKey(key)} committed`);
         }
-        return deps;
       }
 
-      // One pin case: protect deps, run a hanging walk, free while active, finish
-      // (ARRIVED) or cancel, then release the pin and prove recyclability.
-      async function pinCase(deps, completion, earlyRelease, t) {
+      // One pin case: protect the caller-selected Sections, free while pinned,
+      // then release and prove reclamation. `earlyRelease` is the negative mode.
+      async function pinCase(earlyRelease) {
         const lease = await manager.prepare(deps);
         assert.equal(lease.status, 'ready', 'route dependencies prepared');
         assert.ok(lease.lease.token, 'prepare hands out a valid lease token');
 
-        const body = new HangingExecutor(t);
-        const loop = new WalkRouteExecutor(s.voxel, body, { now: () => t });
-        const started = loop.start({
-          ...routeRequest('live'),
-          arrival: { kind: 'exact' },
-          deadlineMs: 100_000,
-          timeoutMs: 10_000,
-        });
-        loop.onSample(sampleAt(started.delegationId, POINTS[0], t));
-        loop.advance(10);
-        await Promise.resolve();
-        const active = loop.status();
-        evidence('l3.inflight', {
-          completion,
-          delegationId: active.delegationId,
-          activeStepIndex: active.activeStepIndex,
-          result: active.result ? active.result.outcome : null,
-          nextPointIndex: active.nextPointIndex,
-        });
-        assert.notEqual(active.activeStepIndex, null, 'a step is in flight');
-        assert.equal(active.result, null, 'no terminal result while in flight');
-
-        if (earlyRelease) {
-          // NEGATIVE mutation: drop protection before the in-flight free so the
-          // "pinned" assertions below must fail (deps become evictable).
-          s.releasePins([lease.lease.token]);
-        }
+        if (earlyRelease) s.releasePins([lease.lease.token]);
 
         const freeActive = manager.free();
-        evidence('l3.freeActive', { completion, ...freeFacts(freeActive) });
+        evidence('l3.freeActive', freeFacts(freeActive));
         for (const key of deps) {
           const rejected = freeActive.evictionRejected.find((r) => sameKey(r.key, key));
-          assert.ok(rejected, `dependency ${fmtKey(key)} stays pinned during the active walk`);
+          assert.ok(rejected, `dependency ${fmtKey(key)} stays pinned while its lease is held`);
           assert.equal(rejected.reason, 'pinned', `dependency ${fmtKey(key)} rejection reason is exactly 'pinned'`);
         }
         assert.equal(freeActive.evicted.length, 0, 'nothing evicted while dependencies are pinned');
 
-        if (completion === 'finish') {
-          body.complete(POINTS[1]);
-          await Promise.resolve();
-          loop.advance(10);
-          await Promise.resolve();
-          body.complete(POINTS[2]);
-          await Promise.resolve();
-          loop.advance(10);
-          await Promise.resolve();
-          evidence('l3.finish', { outcome: loop.status().result?.outcome ?? null });
-          assert.equal(loop.status().result?.outcome, 'ARRIVED', 'walk finishes ARRIVED');
-        } else {
-          const cancelled = loop.cancel('user', 'acceptance cancellation');
-          evidence('l3.cancel', { outcome: cancelled.outcome });
-          assert.equal(cancelled.outcome, 'CANCELLED', 'walk cancels cleanly');
-        }
-
-        // Release the caller's pin: the deps must now be recyclable with no other
-        // pin and no new dirty (they were committed before pinning).
-        s.releasePins([lease.lease.token]);
+        if (!earlyRelease) s.releasePins([lease.lease.token]);
         const freeAfter = manager.free();
-        evidence('l3.reclaim', { completion, ...freeFacts(freeAfter) });
+        evidence('l3.reclaim', freeFacts(freeAfter));
         for (const key of deps) {
           const rejected = freeAfter.evictionRejected.find((r) => sameKey(r.key, key));
           assert.equal(rejected, undefined, `dependency ${fmtKey(key)} recycled after release`);
@@ -1081,15 +898,14 @@ async function run() {
         }
       }
 
-      const deps = await establishFreshCleanDeps(2000);
-      await pinCase(deps, 'finish', MUTATIONS.earlyReleasePin, 2000);
+      await establishFreshCleanDeps(2000);
+      await pinCase(MUTATIONS.earlyReleasePin);
 
       await establishFreshCleanDeps(3000);
-      await pinCase(deps, 'cancel', false, 3000);
+      await pinCase(false);
 
-      // Two overlapping leases over the same deps (now STALE-but-committed after the
-      // cancellation case reclaimed them): releasing the old token must leave the new
-      // lease protecting the deps; releasing the new token must allow real reclamation.
+      // Two overlapping leases: releasing the old token must leave the new lease
+      // protecting the deps; releasing the new token must allow real reclamation.
       {
         const lease1 = await manager.prepare(deps);
         assert.equal(lease1.status, 'ready', 'first overlapping lease ready');

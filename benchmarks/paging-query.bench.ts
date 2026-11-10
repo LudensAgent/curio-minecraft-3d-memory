@@ -1,57 +1,76 @@
 /**
- * M8.1 — bounded paging and read-only queries over 20 000 nodes / 20 000 edges
- * and 1000 fragments / 20 000 traversals.
+ * Bounded paging and read-only queries over semantic facts + voxel cells.
  *
- * Two surfaces are measured over the same in-memory stores:
- * - raw store pages (`TopologyStore.nodes`/`edges`, `FragmentStore.fragments`/
- *   `traversals`) with the default 100-item page clamp — the host must walk the
- *   cursor;
- * - the query port (`SpatialMemoryStoreImpl.query`) at limit 1000, which joins
- *   store pages internally and must not silently truncate.
- *
- * Also measured: `components` (a full paged recompute over the dimension) and
- * `adjacency` on the highest-degree node.
+ * Measures the current `createVoxelFactsQueryPort` surface: places/resources/
+ * containers and the merged `nodes` stream at bounded limits, plus a bounded
+ * cell query. No retired topology, fragment or route query is involved.
  *
  * Run: `npx tsx benchmarks/paging-query.bench.ts`
  */
 
-import { SpatialMemoryStoreImpl } from '../src/index.js';
-import { buildTopologyFixture, topologyPlan, WORLD, DIM, benchmark, build, Report, RUNS } from './fixtures.js';
+import { InMemoryFactStore, VoxelMap, createVoxelFactsQueryPort } from '../src/index.js';
+import { benchmark, build, Report, RUNS, WORLD } from './fixtures.js';
 
-const NODES = 20_000;
-const EDGES = 20_000;
-const FRAGMENTS = 1000;
-const SPINE = 1024;
+const FACTS = 20_000;
+const CELLS = 1_000;
 
 const report = new Report(
   'paging / read-only query benchmark',
-  'Real `TopologyStore` / `FragmentStore` pages and `SpatialMemoryStoreImpl.query` over in-memory stores (no server, no mineflayer).',
+  'In-memory facts store and voxel map projected through `createVoxelFactsQueryPort` (no server, no mineflayer).',
 );
 
-const fixture = await build('populate 20k nodes / 20k edges / 1000 fragments', {
-  nodes: NODES,
-  edges: EDGES,
-  fragments: FRAGMENTS,
-}, () => {
-  const { history, topology, written, topologySnapshot } = buildTopologyFixture(topologyPlan(NODES, EDGES, SPINE, FRAGMENTS));
-  const store = new SpatialMemoryStoreImpl({ worldId: WORLD, fragments: history, topology });
-
-  // Highest-degree node, measured from the recorded edge endpoints.
-  const degree = new Map<string, number>();
-  for (const edge of topologySnapshot.edges) {
-    degree.set(edge.from, (degree.get(edge.from) ?? 0) + 1);
-    degree.set(edge.to, (degree.get(edge.to) ?? 0) + 1);
+const fixture = await build('populate 20k places + 20k resources + 20k containers', { facts: FACTS * 3 }, async () => {
+  const facts = new InMemoryFactStore();
+  for (let i = 0; i < FACTS; i++) {
+    const id = String(i).padStart(6, '0');
+    facts.upsertPlace({
+      id: `bench:place:${id}`,
+      kind: 'place',
+      label: `place ${id}`,
+      worldId: WORLD,
+      dim: 'overworld',
+      location: { kind: 'exact', pos: { x: i, y: 64, z: 0 } },
+      observedAt: 100_000,
+      source: { source: 'agent' },
+      gone: false,
+    });
+    facts.upsertResource({
+      id: `bench:resource:${id}`,
+      worldId: WORLD,
+      dim: 'overworld',
+      label: 'bench:stone',
+      sourceCell: { x: i, y: 0, z: 64 },
+      observedAt: 100_000,
+      source: { source: 'vision' },
+      revoked: false,
+    });
+    facts.upsertContainer({
+      id: `bench:container:${id}`,
+      worldId: WORLD,
+      dim: 'overworld',
+      pos: { x: i, y: 64, z: 64 },
+      externalRef: `bench:chest:${id}`,
+      observedAt: 100_000,
+      source: { source: 'vision' },
+      gone: false,
+    });
   }
-  const hottest = [...degree.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]!;
-  // Cross-check the query-side recompute against the store's dim listing.
-  const nodes = topology.nodes({ dim: DIM, limit: 1 }).total;
-  return { history, topology, store, written, nodes, hottestNode: hottest[0], hottestDegree: hottest[1] };
+  const voxel = new VoxelMap(WORLD);
+  const port = createVoxelFactsQueryPort({ worldId: WORLD, voxel, facts });
+  return { facts, voxel, port };
 });
 report.add(fixture.setup);
-const { history, topology, store, written, nodes, hottestNode, hottestDegree } = fixture.value;
+const { port } = fixture.value;
 
-/** Walk every exclusive-cursor page at the store's clamped page size. */
-function drainPages<T extends { id: string }>(fetch: (after: string | undefined, limit: number) => { items: T[]; nextAfter?: string }): number {
+const scale = {
+  places: FACTS,
+  resources: FACTS,
+  containers: FACTS,
+};
+
+function drainPages<T extends { id: string }>(
+  fetch: (after: string | undefined, limit: number) => { items: T[]; nextAfter?: string },
+): number {
   let after: string | undefined;
   let seen = 0;
   for (;;) {
@@ -62,40 +81,51 @@ function drainPages<T extends { id: string }>(fetch: (after: string | undefined,
   }
 }
 
-const scale = {
-  nodes: written.nodes,
-  edges: written.edges,
-  fragments: FRAGMENTS,
-  traversals: written.traversals,
-};
-
 const results = [
-  await benchmark('store page: first page nodes limit=100', { ...scale, limit: 100 }, () => topology.nodes({ limit: 100 }), RUNS),
-  await benchmark('store pages: drain all nodes limit=100', { ...scale, limit: 100 }, () => drainPages((after, limit) => topology.nodes({ after, limit })), RUNS),
-  await benchmark('store pages: drain all edges limit=100', { ...scale, limit: 100 }, () => drainPages((after, limit) => topology.edges({ after, limit })), RUNS),
-  await benchmark('store pages: drain all fragments limit=100', { ...scale, limit: 100 }, () => drainPages((after, limit) => history.fragments({ after, limit })), RUNS),
-  await benchmark('store pages: drain all traversals limit=100', { ...scale, limit: 100 }, () => drainPages((after, limit) => history.traversals({ after, limit })), RUNS),
-  await benchmark('query nodes limit=1000 (joined pages)', { ...scale, limit: 1000 }, () => store.query({ kind: 'nodes', limit: 1000 }), RUNS),
-  await benchmark('query edges limit=1000 (joined pages)', { ...scale, limit: 1000 }, () => store.query({ kind: 'edges', limit: 1000 }), RUNS),
-  await benchmark('query fragments limit=1000 (joined pages)', { ...scale, limit: 1000 }, () => store.query({ kind: 'fragments', limit: 1000 }), RUNS),
-  await benchmark('query components (paged full recompute)', scale, () => {
-    const result = store.query({ kind: 'components', dim: DIM });
-    if (result.data?.kind !== 'components' || result.data.report.recomputedNodes !== nodes) {
-      throw new Error('components query did not recompute every dim node');
+  await benchmark('places first page limit=100', { ...scale, limit: 100 }, () => {
+    const result = port.query({ kind: 'places', dim: 'overworld', limit: 100 });
+    if (result.data?.kind !== 'places' || result.data.items.length !== 100) {
+      throw new Error('places page did not return the requested window');
     }
     return result;
   }, RUNS),
-  await benchmark('adjacency highest-degree node', { ...scale, degree: hottestDegree }, () => {
-    const adjacency = topology.adjacency(hottestNode);
-    if (adjacency.outEdges.length + adjacency.inEdges.length !== hottestDegree) {
-      throw new Error(`adjacency read ${adjacency.outEdges.length + adjacency.inEdges.length} edges, expected ${hottestDegree}`);
-    }
-    return adjacency;
+  await benchmark('places drain all pages limit=100', { ...scale, limit: 100 }, () => {
+    const seen = drainPages((after, limit) => {
+      const data = port.query({ kind: 'places', dim: 'overworld', after, limit }).data;
+      if (data?.kind !== 'places') throw new Error('expected places data');
+      return data;
+    });
+    if (seen !== FACTS) throw new Error(`drained ${seen} places, expected ${FACTS}`);
+    return seen;
   }, RUNS),
-  await benchmark('nodes listing (dim filter) limit=100', { ...scale, limit: 100 }, () => {
-    const page = topology.nodes({ dim: DIM, limit: 100 });
-    if (page.total !== nodes) throw new Error(`dim node total ${page.total}, expected ${nodes}`);
-    return page;
+  await benchmark('nodes merged page limit=1000', { ...scale, limit: 1000 }, () => {
+    const result = port.query({ kind: 'nodes', dim: 'overworld', limit: 1000 });
+    if (result.data?.kind !== 'nodes' || result.data.items.length !== 1000) {
+      throw new Error('nodes merge did not return the requested window');
+    }
+    return result;
+  }, RUNS),
+  await benchmark('resourceAnchors page limit=1000', { ...scale, limit: 1000 }, () => {
+    const result = port.query({ kind: 'resourceAnchors', dim: 'overworld', limit: 1000 });
+    if (result.data?.kind !== 'resourceAnchors' || result.data.items.length !== 1000) {
+      throw new Error('resource page did not return the requested window');
+    }
+    return result;
+  }, RUNS),
+  await benchmark('containerAnchors page limit=1000', { ...scale, limit: 1000 }, () => {
+    const result = port.query({ kind: 'containerAnchors', dim: 'overworld', limit: 1000 });
+    if (result.data?.kind !== 'containerAnchors' || result.data.items.length !== 1000) {
+      throw new Error('container page did not return the requested window');
+    }
+    return result;
+  }, RUNS),
+  await benchmark('cells unobserved window', { ...scale, cells: CELLS }, () => {
+    const positions = Array.from({ length: CELLS }, (_, i) => ({ x: i, y: 64, z: -64 }));
+    const result = port.query({ kind: 'cells', dim: 'overworld', positions });
+    if (result.data?.kind !== 'cells' || result.data.cells.length !== CELLS) {
+      throw new Error('cell query did not return every requested position');
+    }
+    return result;
   }, RUNS),
 ];
 

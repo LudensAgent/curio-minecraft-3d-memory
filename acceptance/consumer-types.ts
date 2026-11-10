@@ -1,17 +1,18 @@
 /**
  * Type-level consumer acceptance. Run by `run.mjs` with `tsc --noEmit` from the
  * consumer directory, so every import resolves through the installed package's
- * `dist/*.d.ts` (the `exports` `types` conditions), never the source tree. It
- * only needs to compile — nothing is executed.
+ * `dist/*.d.ts` (`exports` `types` conditions), never the source tree.
+ * It only needs to compile — nothing is executed.
  */
 
 import {
-  FragmentStore,
-  RouteVerifier,
+  CONTRACT_VERSION,
+  InMemoryFactStore,
+  LandRouteVerifier,
   VoxelMap,
-  WalkRouteExecutor,
-  WalkRouteSearch,
-  startKnownWalkRoute,
+  createVoxelFactsQueryPort,
+  searchLandRoute,
+  searchLandRouteAsync,
 } from 'curio-minecraft-3d-memory';
 import { openSpatialSession, WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
 import type {
@@ -19,30 +20,25 @@ import type {
   BlockState,
   BodyContext,
   CollisionShapeProvider,
-  KnownWalkRouteRejectionReason,
-  KnownWalkRouteRequest,
-  KnownWalkRouteSnapshot,
-  KnownWalkRouteStart,
-  MoveExecutor,
+  LandSearchKind,
+  LandSearchRequest,
+  LandSearchResult,
+  MemoryHostCapabilities,
   NavResult,
   Observation,
-  PathFragment,
   SectionKey,
+  SemanticPlaceView,
+  SpatialQueryPort,
+  SpatialQueryRequest,
+  SpatialQueryResult,
   Vec3Like,
-  WalkSearchArrival,
-  WalkSearchCandidate,
-  WalkSearchCounters,
-  WalkSearchDiagnostic,
-  WalkSearchFrontier,
-  WalkSearchLimits,
-  WalkSearchOptions,
-  WalkSearchProblem,
-  WalkSearchRequest,
-  WalkSearchSnapshot,
-  WalkSearchState,
-  WalkSearchUnavailableEvidence,
-  WalkSearchUnavailableResidency,
-  WalkSearchUnavailableSection,
+} from 'curio-minecraft-3d-memory';
+import type {
+  ContainerAnchorFact,
+  FactCheckpointSnapshot,
+  FactStore,
+  PlaceFact,
+  ResourceAnchorFact,
 } from 'curio-minecraft-3d-memory';
 import type {
   JournalAcceptResult,
@@ -93,14 +89,6 @@ export async function prepare(manager: WorkingSetManager, key: SectionKey): Prom
   return manager.prepare([key]);
 }
 
-export function makeVerifier(map: VoxelMap): RouteVerifier {
-  return new RouteVerifier(map, { now: () => 0 });
-}
-
-export function makeExecutor(map: VoxelMap, move: MoveExecutor): WalkRouteExecutor {
-  return new WalkRouteExecutor(map, move, { now: () => 0 });
-}
-
 export const provider: CollisionShapeProvider = {
   version: 'types-1',
   resolve(state: BlockState) {
@@ -122,70 +110,94 @@ export const body: BodyContext = {
   pose: 'standing',
 };
 
+export const kinds: readonly LandSearchKind[] = ['walk', 'step', 'drop'];
+
+export const searchRequest: LandSearchRequest = {
+  worldId: 'world',
+  dim: 'overworld',
+  sessionId: 'types',
+  body,
+  to: { x: 1.5, y: 0, z: 0.5 },
+  arrival: { kind: 'exact' },
+  rules: { shapeProvider: provider },
+  allowed: kinds,
+  maxNodes: 16,
+  maxEdges: 64,
+};
+
+export function runSearch(map: VoxelMap): LandSearchResult {
+  return searchLandRoute(map, searchRequest, 0);
+}
+
+export async function runSearchAsync(map: VoxelMap): Promise<LandSearchResult> {
+  return searchLandRouteAsync(map, searchRequest, 0);
+}
+
+export function makeLandVerifier(map: VoxelMap): LandRouteVerifier {
+  return new LandRouteVerifier(map, { now: () => 0 });
+}
+
+// Facts + read-only query port through the installed root declarations.
+export function makeFacts(): {
+  store: InMemoryFactStore;
+  port: SpatialQueryPort;
+  request: SpatialQueryRequest;
+} {
+  const store = new InMemoryFactStore();
+  const port = createVoxelFactsQueryPort({ worldId: 'world', voxel: new VoxelMap('world'), facts: store });
+  return { store, port, request: { kind: 'places', dim: 'overworld', limit: 10 } };
+}
+
+export const placeFact: PlaceFact = {
+  id: 'types-place',
+  kind: 'base',
+  label: 'home',
+  worldId: 'world',
+  dim: 'overworld',
+  location: { kind: 'exact', pos: { x: 0, y: 64, z: 0 } },
+  observedAt: 100,
+  source: { source: 'agent' },
+  gone: false,
+};
+
+export const resourceFact: ResourceAnchorFact = {
+  id: 'types-resource',
+  worldId: 'world',
+  dim: 'overworld',
+  label: 'minecraft:iron_ore',
+  sourceCell: { x: 1, y: 60, z: 0 },
+  sourceCellVersion: 2,
+  observedAt: 100,
+  source: { source: 'vision' },
+  revoked: false,
+};
+
+export const containerFact: ContainerAnchorFact = {
+  id: 'types-container',
+  worldId: 'world',
+  dim: 'overworld',
+  pos: { x: 2, y: 64, z: 0 },
+  externalRef: 'chest:types',
+  observedAt: 100,
+  source: { source: 'vision' },
+  gone: false,
+};
+
+export function readFacts(store: FactStore): FactCheckpointSnapshot {
+  return store.checkpointSnapshot();
+}
+
+export function readPlaceView(result: SpatialQueryResult): SemanticPlaceView | null {
+  return result.data?.kind === 'places' ? (result.data.items[0] ?? null) : null;
+}
+
+// The capability contract has exactly three domains and contract version 2.
+export function capabilityShape(cap: MemoryHostCapabilities): boolean {
+  return cap.contract === CONTRACT_VERSION && !('plan' in cap) && !('execute' in cap);
+}
+
 // `openSpatialSession` is a value export from the SQLite subpath: assert its type.
 export const opener: (options: OpenSpatialSessionOptions) => Promise<SpatialSession> = openSpatialSession;
-
-// New root-entry followups: bounded read-only search and explicit historical
-// route start, constructed and called through the installed dist types only.
-export const legacyFragment: PathFragment = {
-  id: 'types-legacy',
-  worldId: 'world',
-  dim: 'overworld',
-  kind: 'built',
-  entrances: [{ x: 0.5, y: 0, z: 0.5 }],
-  polyline: [
-    { x: 0.5, y: 0, z: 0.5 },
-    { x: 1.5, y: 0, z: 0.5 },
-  ],
-  geometrySource: 'legacy',
-  deepestY: 0,
-  createdAt: 0,
-  lastUsedAt: 0,
-  uses: 1,
-};
-
-export const searchOptions: WalkSearchOptions = { now: () => 0, maxNodes: 16 };
-
-export const searchRequest: WalkSearchRequest = {
-  worldId: 'world',
-  dim: 'overworld',
-  sessionId: 'types',
-  mode: 'walk',
-  body,
-  target: { x: 1.5, y: 0, z: 0.5 },
-  arrival: { kind: 'exact' },
-  shapeProvider: provider,
-};
-
-export const knownRequest: KnownWalkRouteRequest = {
-  worldId: 'world',
-  dim: 'overworld',
-  sessionId: 'types',
-  mode: 'walk',
-  body,
-  arrival: { kind: 'exact' },
-  shapeProvider: provider,
-  deadlineMs: 1_000,
-  timeoutMs: 1_000,
-  fragmentId: 'types-legacy',
-  parentActionId: 'types-parent',
-};
-
-export function makeSearch(map: VoxelMap): WalkRouteSearch {
-  return new WalkRouteSearch(map, searchOptions);
-}
-
-export function runSearch(search: WalkRouteSearch): WalkSearchSnapshot {
-  return search.start(searchRequest);
-}
-
-export function recordFragment(history: FragmentStore): void {
-  history.saveFragment(legacyFragment);
-}
-
-export function startKnownOn(history: FragmentStore, map: VoxelMap, move: MoveExecutor): KnownWalkRouteStart {
-  return startKnownWalkRoute(history, new WalkRouteExecutor(map, move, { now: () => 0 }), knownRequest);
-}
 
 // Public journal types: Fake library-only fixtures and calls resolved from the
 // installed root + storage/sqlite declarations (no relative src import, no `any`).
@@ -342,24 +354,14 @@ export function journalStateFields(s: SpatialSession): {
 // Barrel regression protection: every added public type must remain re-exported
 // from the package root entry.
 export type {
-  KnownWalkRouteRejectionReason,
-  KnownWalkRouteRequest,
-  KnownWalkRouteSnapshot,
-  KnownWalkRouteStart,
-  WalkSearchArrival,
-  WalkSearchCandidate,
-  WalkSearchCounters,
-  WalkSearchDiagnostic,
-  WalkSearchFrontier,
-  WalkSearchLimits,
-  WalkSearchOptions,
-  WalkSearchProblem,
-  WalkSearchRequest,
-  WalkSearchSnapshot,
-  WalkSearchState,
-  WalkSearchUnavailableEvidence,
-  WalkSearchUnavailableResidency,
-  WalkSearchUnavailableSection,
+  LandSearchKind,
+  LandSearchRequest,
+  LandSearchResult,
+  SemanticPlaceView,
+  SpatialQueryPort,
+  SpatialQueryRequest,
+  SpatialQueryResult,
+  MemoryHostCapabilities,
 } from 'curio-minecraft-3d-memory';
 
 export {};

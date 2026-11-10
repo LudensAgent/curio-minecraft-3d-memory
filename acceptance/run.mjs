@@ -46,7 +46,7 @@ const EXPECTED_NON_DIST_PACK = ['package.json', 'README.md'];
 // substring the negative mode must hit.
 const SCENARIOS = [
   { id: 'positive', flags: [], expectExit: 0, expectStdout: 'PASS (all assertions held)' },
-  { id: 'early-release-pin', flags: ['--early-release-pin'], expectExit: 1, expectStderr: 'stays pinned during the active walk' },
+  { id: 'early-release-pin', flags: ['--early-release-pin'], expectExit: 1, expectStderr: 'stays pinned while its lease is held' },
   { id: 'skip-final-checkpoint', flags: ['--skip-final-checkpoint'], expectExit: 1, expectStderr: 'reopen has the unique final fact' },
 ];
 

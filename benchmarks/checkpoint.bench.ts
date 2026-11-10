@@ -1,65 +1,47 @@
 /**
- * M8.1 — SQLite checkpoint cost (plan M8.1 "checkpoint 分域/全量").
+ * SQLite checkpoint cost for the current voxel + facts runtime.
  *
- * Per-round shape: open a fresh `mkdtemp` database, open the session,
- * **populate it in the prepare step**, then time only `checkpoint()` (a real
- * first-baseline commit), and close/remove. `benchmarkStaged` keeps the
- * population of BOTH domains outside the measured window.
+ * Each round opens a fresh `mkdtemp` database, populates the domain in the
+ * unmeasured prepare step, times only `checkpoint()`, then closes and removes
+ * the directory. No history/topology domain is involved.
  *
- * Rows:
- * - history + topology: `openHistorySession` — 20 000 nodes / 20 000 edges /
- *   1000 fragments / the traversals backing the edges.
- * - voxel: `openSpatialSession` — 10 000 Sections (one observed cell each),
- *   replayed with `beginSession` + `observeBatch` in prepare.
- *
- * Capability probe (not a timed row): there is no voxel-only checkpoint entry
- * point in `src/storage/sqlite` (`openHistorySession` is history+topology;
- * `openSpatialSession.checkpoint()` captures voxel+history+topology together),
- * and the combined requested scale exceeds the default snapshot `maxBytes`.
- * The probe prints the verified outcome; `baseline.md` records it.
- *
- * Run: `npx tsx benchmarks/checkpoint.bench.ts`
+ * Run: `npx tsx benchmarks/checkpoint.bench.ts` (build `dist` first)
  */
 
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openHistorySession, openSpatialSession, PersistenceError } from '../dist/storage/sqlite/index.js';
-import type { HistorySession, SpatialSession } from '../dist/storage/sqlite/index.js';
+import { openSpatialSession } from '../dist/storage/sqlite/index.js';
+import type { SpatialSession } from '../dist/storage/sqlite/index.js';
 import {
   benchmarkStaged,
   build,
+  buildFacts,
   buildSparseSections,
-  buildTopologyFixture,
   Report,
   SESSION,
-  topologyPlan,
   WORLD,
 } from './fixtures.js';
 
-const NODES = 20_000;
-const EDGES = 20_000;
-const FRAGMENTS = 1000;
-const SPINE = 1024;
 const SECTIONS = 10_000;
+const FACTS = 20_000;
 
 const report = new Report(
   'checkpoint benchmark',
-  'Real SQLite persistence worker over `mkdtemp` databases (removed after each round); history/topology and voxel are separate sessions; populate runs in prepare, only checkpoint() is timed.',
+  'Real SQLite persistence worker over `mkdtemp` databases (removed after each round); populate runs in prepare, only checkpoint() is timed.',
 );
 
 interface Round {
   dir: string;
   databasePath: string;
-  session: HistorySession | SpatialSession;
+  session: SpatialSession;
 }
 
 function newDatabase(): { dir: string; databasePath: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'm81-checkpoint-'));
+  const dir = mkdtempSync(join(tmpdir(), 'v011-checkpoint-'));
   return { dir, databasePath: join(dir, 'bench.db') };
 }
 
-/** A database's size including its WAL/SHM siblings (0 when absent). */
 function dbBytes(path: string): number {
   const size = (p: string): number => {
     try {
@@ -76,50 +58,6 @@ function removeRound(round: Round): void {
 }
 
 // ---------------------------------------------------------------------------
-// history + topology domain
-// ---------------------------------------------------------------------------
-
-const historyFixture = await build('populate 20k nodes / 20k edges / 1000 fragments', {
-  nodes: NODES,
-  edges: EDGES,
-  fragments: FRAGMENTS,
-}, () => buildTopologyFixture(topologyPlan(NODES, EDGES, SPINE, FRAGMENTS)));
-report.add(historyFixture.setup);
-const history = historyFixture.value;
-
-const historyBench = await benchmarkStaged(
-  'history+topology checkpoint (domain-separated)',
-  {
-    nodes: history.written.nodes,
-    edges: history.written.edges,
-    fragments: history.fragments.length,
-    traversals: history.traversals.length,
-    measuredJsonBytes: history.measureBytes,
-  },
-  async (): Promise<Round> => {
-    const { dir, databasePath } = newDatabase();
-    const session = await openHistorySession({
-      databasePath,
-      worldId: WORLD,
-      fragmentOptions: { maxTraversals: EDGES },
-    });
-    session.history.restoreSnapshot({ worldId: WORLD, fragments: history.fragments, traversals: history.traversals });
-    session.topology.restoreSnapshot(history.topologySnapshot);
-    return { dir, databasePath, session };
-  },
-  async (round) => {
-    const session = round.session as HistorySession;
-    await session.checkpoint();
-    if (dbBytes(round.databasePath) <= 0) throw new Error('history checkpoint left no database file');
-  },
-  async (round) => {
-    await round.session.close();
-    removeRound(round);
-  },
-);
-report.add(historyBench);
-
-// ---------------------------------------------------------------------------
 // voxel domain
 // ---------------------------------------------------------------------------
 
@@ -131,7 +69,7 @@ report.add(voxelFixture.setup);
 const voxel = voxelFixture.value;
 
 const voxelBench = await benchmarkStaged(
-  'voxel checkpoint (domain-separated)',
+  'voxel checkpoint',
   {
     sections: voxel.sections,
     observedCells: voxel.measure.observedCells,
@@ -140,14 +78,12 @@ const voxelBench = await benchmarkStaged(
   async (): Promise<Round> => {
     const { dir, databasePath } = newDatabase();
     const session = await openSpatialSession({ databasePath, worldId: WORLD });
-    // Population is prepare work: only checkpoint() is measured.
     session.voxel.beginSession(SESSION);
     session.voxel.observeBatch({ observations: voxel.observations, unobserved: [] });
     return { dir, databasePath, session };
   },
   async (round) => {
-    const session = round.session as SpatialSession;
-    await session.checkpoint();
+    await round.session.checkpoint();
     if (dbBytes(round.databasePath) <= 0) throw new Error('voxel checkpoint left no database file');
   },
   async (round) => {
@@ -158,38 +94,45 @@ const voxelBench = await benchmarkStaged(
 report.add(voxelBench);
 
 // ---------------------------------------------------------------------------
-// capability probe: combined all-domain checkpoint at the requested scale
+// facts domain
 // ---------------------------------------------------------------------------
 
-async function probeCombinedCheckpoint(): Promise<string> {
-  const { dir, databasePath } = newDatabase();
-  const session = await openSpatialSession({
-    databasePath,
-    worldId: WORLD,
-    fragmentOptions: { maxTraversals: EDGES },
-  });
-  try {
-    session.history.restoreSnapshot({ worldId: WORLD, fragments: history.fragments, traversals: history.traversals });
-    session.topology.restoreSnapshot(history.topologySnapshot);
-    session.voxel.beginSession(SESSION);
-    session.voxel.observeBatch({ observations: voxel.observations, unobserved: [] });
-    try {
-      await session.checkpoint();
-      return `committed (db ${dbBytes(databasePath)} bytes)`;
-    } catch (error) {
-      if (error instanceof PersistenceError && error.kind === 'capacity') return `rejected capacity: ${error.message}`;
-      return `rejected ${error instanceof PersistenceError ? error.kind : 'error'}: ${(error as Error).message}`;
-    }
-  } finally {
-    await session.close();
-    removeRound({ dir, databasePath, session });
-  }
-}
+const factsFixture = await build('populate 20k places + 20k resources + 20k containers', { facts: FACTS * 3 }, () => {
+  const { store, plan } = buildFacts(FACTS);
+  const captured = store.captureSnapshot();
+  const snapshot = { worldId: WORLD, revision: store.revision, ...captured };
+  return { snapshot, plan, count: snapshot.places.length + snapshot.resources.length + snapshot.containers.length };
+});
+report.add(factsFixture.setup);
+const facts = factsFixture.value;
 
-const combined = await probeCombinedCheckpoint();
+const factsBench = await benchmarkStaged(
+  'facts checkpoint',
+  {
+    places: facts.plan.places,
+    resources: facts.plan.resources,
+    containers: facts.plan.containers,
+  },
+  async (): Promise<Round> => {
+    const { dir, databasePath } = newDatabase();
+    const session = await openSpatialSession({ databasePath, worldId: WORLD });
+    session.facts.installSnapshot(facts.snapshot);
+    return { dir, databasePath, session };
+  },
+  async (round) => {
+    const result = await round.session.checkpoint();
+    if (!result.factsCommitted) throw new Error('facts checkpoint did not commit the facts domain');
+    if (dbBytes(round.databasePath) <= 0) throw new Error('facts checkpoint left no database file');
+  },
+  async (round) => {
+    await round.session.close();
+    removeRound(round);
+  },
+);
+report.add(factsBench);
+
 process.stdout.write(
-  `capability note: voxel-only checkpoint entry point: none (history-only = openHistorySession; all-domain = openSpatialSession). ` +
-  `combined requested scale (${SECTIONS} Sections + ${NODES} nodes / ${EDGES} edges): ${combined}\n\n`,
+  `note: checkpoint measures voxel and facts domains independently; the retired history/topology tables are neither created nor written.\n\n`,
 );
 
 report.flush();
