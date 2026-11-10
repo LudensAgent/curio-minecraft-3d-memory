@@ -87,6 +87,8 @@ export type {
   VoxelCheckpointSnapshot,
   VoxelDirectory,
   VoxelDirectoryEntry,
+  VoxelDirtyBatch,
+  VoxelDirtyBatchMeasure,
   VoxelDirtyMeasure,
   VoxelMapOptions,
   VoxelSectionSnapshot,

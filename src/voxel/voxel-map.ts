@@ -267,6 +267,21 @@ type AppliedCell = { section: Section; kind: CellChangeKind; x: number; y: numbe
 
 type ObservationChangeKind = 'inserted' | 'changed' | 'refreshed' | 'restored' | 'staled';
 
+/** One bounded dirty batch; only `keys` and `removedSections` may be confirmed by its ACK. */
+export interface VoxelDirtyBatch {
+  sections: VoxelSectionSnapshot[];
+  keys: SectionKey[];
+  removedSections: SectionKey[];
+  capturedRevision: number;
+}
+
+/** Preflight measure for a bounded dirty batch. */
+export interface VoxelDirtyBatchMeasure {
+  count: number;
+  bytes: number;
+  capturedRevision: number;
+}
+
 export class VoxelMap {
   readonly worldId: string;
   private readonly sections = new Map<string, Map<string, Section>>();
@@ -739,6 +754,92 @@ export class VoxelMap {
    */
   captureDirtySections(): VoxelSectionSnapshot[] {
     return [...this.pendingSections.keys()].map(snapshotVoxelSection);
+  }
+
+  /**
+   * Bounded version of `checkpointDirtyMeasure`: select a first-dirty prefix whose
+   * estimated bytes stay within `maxBytes` (at least one section when any is
+   * pending), plus all removed keys. The returned revision covers only this batch;
+   * unselected sections remain pending and must be confirmed by key, not by a
+   * global revision threshold.
+   */
+  checkpointDirtyMeasureBounded(maxBytes: number): VoxelDirtyBatchMeasure {
+    const selected = this.selectDirtySections(maxBytes);
+    return { count: selected.sections.length, bytes: selected.bytes, capturedRevision: selected.capturedRevision };
+  }
+
+  /**
+   * Deep-copied snapshots for one bounded dirty batch. `keys` identifies exactly
+   * the sections this batch may confirm; `capturedRevision` never implies that
+   * unselected pending sections are saved.
+   */
+  captureDirtySectionsBounded(maxBytes: number): VoxelDirtyBatch {
+    const selected = this.selectDirtySections(maxBytes);
+    return {
+      sections: selected.sections.map(snapshotVoxelSection),
+      keys: selected.keys.map((key) => ({ ...key })),
+      removedSections: selected.removed.map((entry) => ({ worldId: this.worldId, ...entry.key })),
+      capturedRevision: selected.capturedRevision,
+    };
+  }
+
+  /** True when any section or removal is waiting for a confirmed save. */
+  hasPendingChanges(): boolean {
+    return this.pendingSections.size > 0 || this.removedSections.size > 0;
+  }
+
+  /**
+   * Confirm exactly the captured section keys at `capturedRevision`. A section
+   * re-dirtied after capture keeps its newer revision and stays pending; this is
+   * the per-batch ACK that makes split saves safe.
+   */
+  confirmCapturedSections(
+    keys: readonly SectionKey[],
+    removedKeys: readonly SectionKey[],
+    capturedRevision: number,
+  ): void {
+    const captured = new Set(keys.map((key) => dirKey(key.dim, key.cx, key.cz, key.sy)));
+    for (const [section, revision] of this.pendingSections) {
+      const key = section.key;
+      if (captured.has(dirKey(key.dim, key.cx, key.cz, key.sy)) && revision <= capturedRevision) {
+        this.pendingSections.delete(section);
+      }
+    }
+    const removed = new Set(removedKeys.map((key) => dirKey(key.dim, key.cx, key.cz, key.sy)));
+    for (const [key, entry] of this.removedSections) {
+      if (removed.has(key) && entry.revision <= capturedRevision) this.removedSections.delete(key);
+    }
+  }
+
+  private selectDirtySections(maxBytes: number): {
+    sections: Section[];
+    keys: SectionKey[];
+    removed: { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }[];
+    capturedRevision: number;
+    bytes: number;
+  } {
+    if (!Number.isFinite(maxBytes) || maxBytes < 0) {
+      throw new Error(`dirty batch maxBytes must be a finite nonnegative number: ${maxBytes}`);
+    }
+    const sections: Section[] = [];
+    const keys: SectionKey[] = [];
+    let bytes = 0;
+    let capturedRevision = 0;
+    for (const [section, revision] of this.pendingSections) {
+      const sectionBytes = estimateVoxelSectionBytes(section);
+      if (sections.length > 0 && bytes + sectionBytes > maxBytes) break;
+      sections.push(section);
+      keys.push({ ...section.key });
+      bytes += sectionBytes;
+      capturedRevision = Math.max(capturedRevision, revision);
+    }
+    const removed = [...this.removedSections.values()].map((entry) => ({
+      key: { ...entry.key },
+      revision: entry.revision,
+    }));
+    for (const entry of removed) capturedRevision = Math.max(capturedRevision, entry.revision);
+    if (sections.length === 0 && removed.length === 0) capturedRevision = this.saveRevisionCount;
+    return { sections, keys, removed, capturedRevision, bytes };
   }
 
   /**

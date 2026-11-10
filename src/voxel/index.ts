@@ -59,5 +59,7 @@ export type {
   ChangeReportSubscriptionOptions,
   SectionChange,
   StaleReason,
+  VoxelDirtyBatch,
+  VoxelDirtyBatchMeasure,
   VoxelMapOptions,
 } from './voxel-map.js';

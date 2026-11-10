@@ -694,6 +694,13 @@ export interface OpenSpatialSessionOptions {
   fragmentOptions?: FragmentStoreOptions;
   topologyOptions?: TopologyStoreOptions;
   snapshotLimits?: SnapshotLimits;
+  /**
+   * Per-checkpoint voxel dirty-batch byte cap. Defaults to `snapshotLimits.maxBytes`
+   * (one batch, preserving the previous behavior). A smaller value makes each
+   * checkpoint commit a bounded dirty prefix; remaining dirty sections stay pending
+   * and require a later checkpoint. The ACK confirms only the captured section keys.
+   */
+  voxelBatchMaxBytes?: number;
   /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
   journalLimits?: JournalLimits;
   /** Bounded placement/visit/portal ledger capacities. Defaults are in `DEFAULT_LEDGER_LIMITS`. */

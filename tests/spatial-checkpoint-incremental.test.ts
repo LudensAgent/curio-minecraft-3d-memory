@@ -132,6 +132,56 @@ describe('VoxelMap pending-section tracking', () => {
     expect(map.checkpointDirtyMeasure().count).toBe(0);
   });
 
+  it('bounded capture selects a dirty prefix and confirms only its keys', () => {
+    const map = new VoxelMap(WORLD);
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } }));
+    map.observe(obs({ state: air, pos: { x: 40, y: 0, z: 0 } }));
+
+    const measure = map.checkpointDirtyMeasureBounded(1);
+    expect(measure.count).toBe(1); // the cap forces a one-section prefix
+    expect(measure.capturedRevision).toBeLessThan(map.saveRevision);
+    expect(map.hasPendingChanges()).toBe(true);
+
+    const batch = map.captureDirtySectionsBounded(1);
+    expect(batch.sections).toHaveLength(1);
+    expect(batch.keys).toHaveLength(1);
+    map.confirmCapturedSections(batch.keys, batch.removedSections, batch.capturedRevision);
+    expect(map.captureDirtySections()).toHaveLength(2); // unselected tail stays pending
+
+    const second = map.captureDirtySectionsBounded(1);
+    map.confirmCapturedSections(second.keys, second.removedSections, second.capturedRevision);
+    const third = map.captureDirtySectionsBounded(1);
+    map.confirmCapturedSections(third.keys, third.removedSections, third.capturedRevision);
+    expect(map.hasPendingChanges()).toBe(false);
+    expect(map.captureDirtySections()).toHaveLength(0);
+  });
+
+  it('a per-key ACK does not clear a captured section re-dirtied after capture', () => {
+    const map = new VoxelMap(WORLD);
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } }));
+    const batch = map.captureDirtySectionsBounded(1);
+    const capturedRevision = batch.capturedRevision;
+
+    map.observe(obs({ state: air, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
+    map.confirmCapturedSections(batch.keys, batch.removedSections, capturedRevision);
+    expect(map.hasPendingChanges()).toBe(true);
+    expect(map.captureDirtySections().some((section) => section.cx === 0)).toBe(true);
+  });
+
+  it('bounded capture includes removed keys and confirms them', () => {
+    const map = new VoxelMap(WORLD);
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } }));
+    map.retainNewestObservedCells(0);
+    expect(map.hasPendingChanges()).toBe(true);
+    const batch = map.captureDirtySectionsBounded(1);
+    expect(batch.removedSections.length).toBe(2);
+    map.confirmCapturedSections(batch.keys, batch.removedSections, batch.capturedRevision);
+    expect(map.hasPendingChanges()).toBe(false);
+  });
+
   it('a stale ACK does not clear a section re-dirtied after capture', () => {
     const map = new VoxelMap(WORLD);
     map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
@@ -422,6 +472,40 @@ describe('SQLite incremental voxel checkpoint', () => {
     await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'busy' });
     await first;
     await session.close();
+  });
+
+  it('splits a dirty set into bounded batches and confirms only each batch', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s1.voxel.beginSession('s1');
+    s1.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })); // baseline
+    await s1.checkpoint();
+    await s1.close();
+
+    const s2 = await openSpatialSession({
+      databasePath: dbPath, worldId: WORLD,
+      snapshotLimits: { maxBytes: 4 * 1024 * 1024 }, voxelBatchMaxBytes: 1,
+    });
+    s2.voxel.beginSession('s2');
+    s2.voxel.observe(obs({ sessionId: 's2', state: dirt, pos: { x: 20, y: 0, z: 0 }, observedAt: 2000, sequence: 1 }));
+    s2.voxel.observe(obs({ sessionId: 's2', state: air, pos: { x: 40, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
+
+    const first = await s2.checkpoint();
+    expect(s2.voxel.hasPendingChanges()).toBe(true);
+    expect(s2.getPersistenceState().dirty).toBe(true);
+    expect(first.voxelRevision).toBeLessThan(s2.voxel.saveRevision);
+
+    const second = await s2.checkpoint();
+    expect(s2.voxel.hasPendingChanges()).toBe(false);
+    expect(s2.getPersistenceState().dirty).toBe(false);
+    expect(second.voxelRevision).toBeGreaterThan(first.voxelRevision);
+    await s2.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(evidence(reopened.voxel, 0, 0, 0).observation.state).toEqual(stone);
+    expect(evidence(reopened.voxel, 20, 0, 0).observation.state).toEqual(dirt);
+    expect(evidence(reopened.voxel, 40, 0, 0).observation.state).toEqual(air);
+    await reopened.close();
   });
 
   it('rejects an over-capacity incremental batch before copying', async () => {

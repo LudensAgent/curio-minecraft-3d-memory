@@ -93,6 +93,9 @@ interface PendingRequest {
   voxelMode?: VoxelSaveMode;
   /** The captured (committed) voxel sections, for the directory update on ACK. */
   voxelSections?: VoxelSectionSnapshot[];
+  /** Exactly the voxel sections this batch may confirm; unselected dirty stays pending. */
+  voxelKeys?: SectionKey[];
+  removedVoxelKeys?: SectionKey[];
   /** The captured journal batch, for the ACK-time pending clear. */
   journalCapture?: JournalCapture;
   /**
@@ -106,6 +109,9 @@ interface PendingRequest {
 interface InFlightCheckpoint {
   checkpointId: string;
   promise: Promise<SpatialCheckpointResult>;
+  /** Exactly the voxel sections captured by this batch; the ACK confirms only these. */
+  voxelKeys: SectionKey[];
+  removedVoxelKeys: SectionKey[];
 }
 
 interface JournalQueryMessage {
@@ -195,6 +201,8 @@ class SpatialSessionImpl implements SpatialSession {
   private workingSetLock = false;
   private readonly voxelLoadingField: VoxelLoading;
   private readonly residencyLimitsField: ResolvedResidencyLimits;
+  /** Per-checkpoint voxel dirty batch cap; defaults to the full snapshot limit. */
+  private readonly voxelBatchMaxBytes: number;
   /** Explicit caller-supplied game version (`undefined` records `'unknown'`). */
   private readonly gameVersionField: string | undefined;
   /** Game version of the voxel baseline this session restored/established. */
@@ -236,6 +244,13 @@ class SpatialSessionImpl implements SpatialSession {
     this.databasePath = options.databasePath;
     this.timeoutMs = resolveTimeoutMs(options.timeoutMs);
     this.limits = resolveSnapshotLimits(options.snapshotLimits);
+    const batchMaxBytes = options.voxelBatchMaxBytes ?? this.limits.maxBytes;
+    if (!Number.isSafeInteger(batchMaxBytes) || batchMaxBytes < 1) {
+      throw new PersistenceError('invalid_argument', `voxelBatchMaxBytes must be a positive safe integer: ${String(batchMaxBytes)}`);
+    }
+    // A batch cannot exceed the total snapshot byte limit; clamp instead of letting
+    // the worker reject an otherwise valid batch after the copy.
+    this.voxelBatchMaxBytes = Math.min(batchMaxBytes, this.limits.maxBytes);
     this.journalLimitsField = resolveJournalLimits(options.journalLimits);
     this.journalQueue = new JournalQueue(this.worldId, this.journalLimitsField);
     this.ledgerLimitsField = resolveLedgerLimits(options.ledgerLimits);
@@ -355,7 +370,7 @@ class SpatialSessionImpl implements SpatialSession {
       throw new PersistenceError('busy', 'a persistence request is already in flight');
     }
 
-    const voxelRevision = this.voxel.saveRevision;
+    let voxelRevision = this.voxel.saveRevision;
     const fragmentRevision = this.history.revision;
     const topologyRevision = this.topology.revision;
 
@@ -430,7 +445,9 @@ class SpatialSessionImpl implements SpatialSession {
       // Full-set counts (not just resident) so a partial-resident map does not
       // under-count the committed fact set against the voxel capacity limits.
       const counts = this.voxel.checkpointFullCounts();
-      const dirtyMeasure = this.voxel.checkpointDirtyMeasure(Math.max(0, afterTopology));
+      const dirtyMeasure = this.voxel.checkpointDirtyMeasureBounded(
+        Math.min(this.voxelBatchMaxBytes, Math.max(0, afterTopology)),
+      );
       totalBytes =
         historyEnvelope +
         voxelEnvelope +
@@ -475,10 +492,32 @@ class SpatialSessionImpl implements SpatialSession {
       fragmentMerges: topologySnapshot?.fragmentMerges ?? [],
     };
     // Deep copy only after the bounded pre-flight passed (before copy/postMessage).
-    const voxelSnapshot: VoxelCheckpointSnapshot =
-      voxelMode === 'full'
-        ? this.voxel.checkpointSnapshot()
-        : { worldId: this.worldId, sections: this.voxel.captureDirtySections(), removedSections: this.voxel.captureRemovedSections() };
+    let voxelSnapshot: VoxelCheckpointSnapshot;
+    let voxelKeys: SectionKey[];
+    let removedVoxelKeys: SectionKey[];
+    if (voxelMode === 'full') {
+      voxelSnapshot = this.voxel.checkpointSnapshot();
+      voxelKeys = voxelSnapshot.sections.map((section) => ({
+        worldId: this.worldId, dim: section.dim, cx: section.cx, cz: section.cz, sy: section.sy,
+      }));
+      removedVoxelKeys = (voxelSnapshot.removedSections ?? []).map((section) => ({
+        worldId: this.worldId, ...section,
+      }));
+    } else {
+      const batch = this.voxel.captureDirtySectionsBounded(
+        Math.min(this.voxelBatchMaxBytes, Math.max(0, afterTopology)),
+      );
+      voxelSnapshot = {
+        worldId: this.worldId,
+        sections: batch.sections,
+        removedSections: batch.removedSections.map(({ dim, cx, cz, sy }) => ({ dim, cx, cz, sy })),
+      };
+      voxelKeys = batch.keys;
+      removedVoxelKeys = batch.removedSections;
+      // A split batch acknowledges only this prefix; unselected sections keep
+      // higher pending entries and the next checkpoint saves them.
+      voxelRevision = batch.capturedRevision;
+    }
 
     // Capture the exact pending batch/revision now. Records accepted after this
     // line keep a higher local revision and survive this ACK.
@@ -544,6 +583,8 @@ class SpatialSessionImpl implements SpatialSession {
         topologyRevision,
         voxelMode,
         voxelSections: voxelSnapshot.sections,
+        voxelKeys,
+        removedVoxelKeys,
         journalCapture,
         ledgerCapture,
         resolve: resolve as (value: unknown) => void,
@@ -573,7 +614,7 @@ class SpatialSessionImpl implements SpatialSession {
         gameVersion: this.gameVersionField,
       } satisfies WorkerRequest);
     });
-    this.inFlight = { checkpointId, promise };
+    this.inFlight = { checkpointId, promise, voxelKeys, removedVoxelKeys };
     return promise;
   }
 
@@ -1010,6 +1051,7 @@ class SpatialSessionImpl implements SpatialSession {
   private isDirty(): boolean {
     return (
       this.voxel.saveRevision !== this.confirmedVoxelRevision ||
+      this.voxel.hasPendingChanges() ||
       this.history.revision !== this.confirmedFragmentRevision ||
       this.topology.revision !== this.confirmedTopologyRevision ||
       this.journalQueue.revision !== this.confirmedJournalRevision ||
@@ -1148,9 +1190,14 @@ class SpatialSessionImpl implements SpatialSession {
     } else if (entry.kind === 'checkpoint') {
       const okMsg = msg as WorkerResponse & { type: 'checkpoint_ok' };
       this.inFlight = null;
-      // Clear only pending sections captured at (or before) this revision; a
-      // section re-dirtied during the save keeps its newer pending entry.
-      this.voxel.confirmSections(entry.voxelRevision!);
+      // Clear exactly the captured section keys at (or before) this revision; a
+      // section re-dirtied during the save keeps its newer pending entry, and a
+      // split batch never clears an unselected tail.
+      this.voxel.confirmCapturedSections(
+        entry.voxelKeys ?? [],
+        entry.removedVoxelKeys ?? [],
+        entry.voxelRevision!,
+      );
       // Update the committed directory from the *captured* snapshot (not the
       // ACK-time memory state), so a confirmed save is reflected as committed and
       // its committed metadata matches what the worker actually wrote.
@@ -1162,7 +1209,9 @@ class SpatialSessionImpl implements SpatialSession {
         this.restoredGameVersion = this.gameVersionField ?? UNKNOWN_GAME_VERSION;
       }
       this.voxelBaselineEstablished = true;
-      this.confirmedVoxelRevision = entry.voxelRevision!;
+      // A split batch may confirm an older revision after a newer one; the
+      // confirmed marker only advances, while per-key pending state decides dirty.
+      this.confirmedVoxelRevision = Math.max(this.confirmedVoxelRevision, entry.voxelRevision!);
       this.confirmedFragmentRevision = entry.fragmentRevision!;
       this.confirmedTopologyRevision = entry.topologyRevision!;
       if (entry.ledgerCapture !== undefined) {
