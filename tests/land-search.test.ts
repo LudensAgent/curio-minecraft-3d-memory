@@ -1027,3 +1027,51 @@ describe('prefix consistency', () => {
     expect(sync.prefix!.atStart).toBe(false);
   });
 });
+
+describe('horizontal directional goals', () => {
+  it.each([-1, 1])('reaches an observed slope column without imposing the target height (slope=%s)', (slope) => {
+    const map = terrain(Array.from({ length: 7 }, (_, x) => ({ x, z: 0, height: 2 + slope * x })));
+    const query = request({ body: bodyAt(0.5, 2, 0.5), to: { x: 6.5, y: 2, z: 0.5 } });
+    const exact = searchLandRoute(map, query, 2000);
+    expect(exact.status).not.toBe('FOUND');
+    const directional = searchLandRoute(map, { ...query, goalMetric: 'horizontal' }, 2000);
+    expect(directional.status).toBe('FOUND');
+    expect(directional.goalMetric).toBe('horizontal');
+    expect(directional.target).toEqual(query.to);
+    expect(directional.points.at(-1)).toEqual({ x: 6.5, y: 2 + slope * 6, z: 0.5 });
+    expect(directional.transitions).toHaveLength(6);
+    expect(directional.executable).toBe(false);
+  });
+
+  it.each([-1, 1])('takes the whole known slope prefix toward an unknown target column (slope=%s)', async (slope) => {
+    const map = terrain(Array.from({ length: 7 }, (_, x) => ({ x, z: 0, height: 2 + slope * x })));
+    const query = request({ body: bodyAt(0.5, 2, 0.5), to: { x: 8.5, y: 2, z: 0.5 } });
+    const exact = searchLandRoute(map, query, 2000);
+    expect(exact.prefix?.endpoint.x).toBeLessThan(6.5);
+    const directional = await searchLandRouteAsync(map, { ...query, goalMetric: 'horizontal' }, 2000);
+    expect(directional.status).toBe('INSUFFICIENT_EVIDENCE');
+    expect(directional.prefix?.endpoint).toEqual({ x: 6.5, y: 2 + slope * 6, z: 0.5 });
+    expect(directional.prefix?.distanceToTarget).toBe(2);
+    expect(directional.prefix?.transitions).toHaveLength(6);
+    expect(directional.prefix?.atTarget).toBe(false);
+  });
+
+  it('keeps geometry and allowed detours when only the goal distance is horizontal', () => {
+    const map = terrain(Array.from({ length: 7 }, (_, x) => [-1, 0, 1].map((z) => ({
+      x, z, height: x === 3 && z === 0 ? 5 : Math.min(x, 2),
+    }))).flat());
+    const result = searchLandRoute(map, request({ to: { x: 6.5, y: 0, z: 0.5 }, goalMetric: 'horizontal' }), 2000);
+    expect(result.status).toBe('FOUND');
+    expect(result.points.some((point) => point.z !== 0.5)).toBe(true);
+    expect(result.points.at(-1)).toEqual({ x: 6.5, y: 2, z: 0.5 });
+    expect(result.transitions.length).toBeGreaterThan(6);
+  });
+
+  it('uses horizontal distance for an explicitly selected near goal and rejects unknown metrics', () => {
+    const map = terrain(flat());
+    const query = request({ to: { x: 2.8, y: 10, z: 0.5 }, arrival: { kind: 'near', radius: 0.31 } });
+    expect(searchLandRoute(map, query, 2000).status).not.toBe('FOUND');
+    expect(searchLandRoute(map, { ...query, goalMetric: 'horizontal' }, 2000).status).toBe('FOUND');
+    expect(() => searchLandRoute(map, { ...query, goalMetric: 'other' as 'horizontal' }, 2000)).toThrow(/goal metric/);
+  });
+});

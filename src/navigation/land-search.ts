@@ -53,6 +53,12 @@ export interface LandSearchRequest {
   /** Original continuous feet target. Neither target nor start is centered or snapped. */
   to: Vec3Like;
   arrival?: LandSearchArrival;
+  /**
+   * Distance used by arrival and prefix ranking. Default 3d preserves the
+   * caller's feet height; horizontal selects an observed standable height in
+   * the target XZ column/radius without relaxing any transition geometry.
+   */
+  goalMetric?: '3d' | 'horizontal';
   rules: LandRules;
   /** Historical candidates use recorded geometry; they never become current OPEN proofs. */
   evidenceMode?: 'current' | 'remembered';
@@ -168,14 +174,14 @@ export interface LandSearchBoundary {
 /**
  * Best current-evidence prefix reached before a non-FOUND stop. Every included
  * transition was evaluated `OPEN`; the endpoint is the closest actually reached
- * node by 3D remaining distance. `atTarget` never means physical arrival.
+ * node by the requested goal metric. `atTarget` never means physical arrival.
  */
 export interface LandSearchPrefix {
   endpoint: Vec3Like;
   /** Original start first; `points.length === transitions.length + 1`. */
   points: Vec3Like[];
   transitions: LandSearchTransition[];
-  /** 3D Euclidean distance from `endpoint` to the original target. */
+  /** Distance from `endpoint` to the original target under `goalMetric`. */
   distanceToTarget: number;
   /** The original exact/near completion predicate held at the endpoint. */
   atTarget: boolean;
@@ -195,6 +201,7 @@ export interface LandSearchResult {
   from: Vec3Like;
   target: Vec3Like;
   arrival: LandSearchArrival;
+  goalMetric: '3d' | 'horizontal';
   points: Vec3Like[];
   transitions: LandSearchTransition[];
   /** Sum of transition costs, including caller edge-policy surcharges. */
@@ -342,6 +349,8 @@ function* searchChunks(
   if (arrival.kind !== 'exact' && (arrival.kind !== 'near' || !Number.isFinite(arrival.radius) || arrival.radius < 0)) {
     throw new Error('land search arrival must be exact or near with a finite nonnegative radius');
   }
+  const goalMetric = request.goalMetric ?? '3d';
+  if (goalMetric !== '3d' && goalMetric !== 'horizontal') throw new Error('unsupported land search goal metric');
   const evidenceMode = request.evidenceMode ?? 'current';
   if (evidenceMode !== 'current' && evidenceMode !== 'remembered') throw new Error('unsupported land search evidence mode');
   const heuristicMode = request.heuristic ?? 'horizontal';
@@ -428,15 +437,15 @@ function* searchChunks(
   const corridorContains = (point: Vec3Like): boolean => corridor === undefined
     || Math.abs((point.x - corridor.origin.x) * corridor.bearing.z
       - (point.z - corridor.origin.z) * corridor.bearing.x) <= corridor.maxLateral + EPS;
-  // Prefix selection deliberately ignores the admissible A* heuristic: it uses
-  // the actual 3D remaining distance (near targets subtract the arrival radius).
+  // Prefix selection uses the caller's goal distance, independently of the A*
+  // heuristic. Directional goals do not impose an unobserved waypoint height.
   let closest: SearchNode | null = null;
   let closestMetric = Number.POSITIVE_INFINITY;
-  const distance3 = (point: Vec3Like): number =>
-    Math.hypot(point.x - target.x, point.y - target.y, point.z - target.z);
+  const targetDistance = (point: Vec3Like): number =>
+    Math.hypot(point.x - target.x, goalMetric === 'horizontal' ? 0 : point.y - target.y, point.z - target.z);
   const remainingMetric = (point: Vec3Like): number => arrival.kind === 'near'
-    ? Math.max(0, distance3(point) - arrival.radius)
-    : distance3(point);
+    ? Math.max(0, targetDistance(point) - arrival.radius)
+    : targetDistance(point);
   /**
    * Keep at most one real terrain/capability blocker per bounded node. Unknown,
    * stale, incomplete and corridor-skipped candidates are deliberately absent.
@@ -710,7 +719,7 @@ function* searchChunks(
         endpoint,
         points: prefixPoints,
         transitions: prefixTransitions,
-        distanceToTarget: distance3(endpoint),
+        distanceToTarget: targetDistance(endpoint),
         atTarget: reached(endpoint),
         atStart: prefixTransitions.length === 0,
         ...(blocker === undefined ? {} : {
@@ -740,7 +749,7 @@ function* searchChunks(
     return {
       status, assurance: evidenceMode === 'remembered' ? 'historical_geometry' : 'geometry_only',
       evidenceMode, executable: false, needsRevalidation: true,
-      from: start, target, arrival, points, transitions, cost, boundaries,
+      from: start, target, arrival, goalMetric, points, transitions, cost, boundaries,
       ...(publishedPrefix === undefined ? {} : { prefix: publishedPrefix }),
       ...(edgePolicy === undefined ? {} : {
         policy: {
@@ -762,8 +771,9 @@ function* searchChunks(
     };
   };
   const reached = (point: Vec3Like): boolean => arrival.kind === 'exact'
-    ? Math.abs(point.x - target.x) <= EPS && Math.abs(point.y - target.y) <= EPS && Math.abs(point.z - target.z) <= EPS
-    : Math.hypot(point.x - target.x, point.y - target.y, point.z - target.z) <= arrival.radius + EPS;
+    ? Math.abs(point.x - target.x) <= EPS && (goalMetric === 'horizontal' || Math.abs(point.y - target.y) <= EPS)
+      && Math.abs(point.z - target.z) <= EPS
+    : targetDistance(point) <= arrival.radius + EPS;
   // Without jumps, each edge changes horizontal L1 distance by at most one and costs >= 1.
   // Caller policy surcharges are nonnegative, so this remains a lower bound.
   // Subtracting sqrt(2)*radius is an admissible L1 lower bound for a near sphere.
