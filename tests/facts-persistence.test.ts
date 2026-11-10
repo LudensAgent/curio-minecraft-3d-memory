@@ -13,6 +13,7 @@ import {
 import type {
   ContainerAnchorFact,
   FactCheckpointSnapshot,
+  Observation,
   PathFragment,
   PlaceFact,
   ResourceAnchorFact,
@@ -56,6 +57,22 @@ function resource(id: string, overrides: Partial<ResourceAnchorFact> = {}): Reso
     observedAt: 1_700_000_001_000,
     source: { ...SOURCE },
     revoked: false,
+    ...overrides,
+  };
+}
+
+function observation(overrides: Partial<Observation> = {}): Observation {
+  return {
+    worldId: WORLD,
+    dim: DIM,
+    sessionId: 's1',
+    observedAt: 1_700_000_001_000,
+    sequence: 1,
+    source: 'vision',
+    evidence: 'seen',
+    stateComplete: true,
+    state: { name: 'minecraft:iron_ore', properties: {} },
+    pos: resource('ore').sourceCell,
     ...overrides,
   };
 }
@@ -572,24 +589,126 @@ describe('resource source-cell version persistence', () => {
   it('round-trips the source cell version and a late ACK leaves it unchanged', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    session.facts.upsertResource(resource('ore', { sourceCellVersion: 7 }));
-    const first = session.facts.checkpointSnapshot();
-    await session.checkpoint();
-    expect(session.facts.resources().items[0]?.sourceCellVersion).toBe(7);
+    session.voxel.beginSession('s1');
+    session.voxel.observe(observation());
+    const initial = session.voxel.cellAt(DIM, -3, 32, -7);
+    if (!initial.observed) throw new Error('expected the observed source cell');
+    session.facts.upsertResource(resource('ore', { sourceCellVersion: initial.evidence.revision }));
+    const firstRevision = session.facts.revision;
+    const first = session.checkpoint();
 
     // A newer observation after the capture is not cleared by the old ACK.
+    session.voxel.observe(observation({
+      observedAt: 1_700_000_002_000,
+      sequence: 2,
+      state: { name: 'minecraft:diamond_ore', properties: {} },
+    }));
+    const updated = session.voxel.cellAt(DIM, -3, 32, -7);
+    if (!updated.observed) throw new Error('expected the updated source cell');
     session.facts.upsertResource(
-      resource('ore', { observedAt: 1_700_000_002_000, sourceCellVersion: 9 }),
+      resource('ore', { label: 'diamond_ore', observedAt: 1_700_000_002_000, sourceCellVersion: updated.evidence.revision }),
     );
-    session.facts.confirmRevision(first.revision);
-    expect(session.facts.resources().items[0]?.sourceCellVersion).toBe(9);
+    expect(await first).toMatchObject({ factsCommitted: true, factsRevision: firstRevision });
+    expect(session.facts.resources().items[0]?.sourceCellVersion).toBe(updated.evidence.revision);
     expect(session.facts.hasPendingChanges()).toBe(true);
 
-    await session.checkpoint();
+    expect(await session.checkpoint()).toMatchObject({ factsCommitted: true });
     await session.close();
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.facts.resources().items[0]?.sourceCellVersion).toBe(9);
+    expect(reopened.facts.resources().items[0]?.sourceCellVersion).toBe(updated.evidence.revision);
     expect(reopened.facts.resources().items[0]?.observedAt).toBe(1_700_000_002_000);
     await reopened.close();
+  });
+
+  it('defers facts until their source section is saved without waiting for unrelated dirty sections', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelBatchMaxBytes: 1 });
+    session.voxel.beginSession('s1');
+    session.voxel.observe(observation({ pos: { x: 32, y: 32, z: 0 } }));
+    session.voxel.observe(observation());
+    const source = session.voxel.cellAt(DIM, -3, 32, -7);
+    if (!source.observed) throw new Error('expected the source cell');
+    session.facts.upsertResource(resource('ore', { sourceCellVersion: source.evidence.revision }));
+
+    const first = await session.checkpoint();
+    expect(first).toMatchObject({
+      factsCommitted: false,
+      factsRevision: 0,
+      factsDeferred: { resourceId: 'ore', reason: 'source_unobserved', expectedVersion: source.evidence.revision },
+    });
+    expect(session.facts.hasPendingChanges()).toBe(true);
+    const db = new Database(dbPath, { readonly: true });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM spatial_sections').get()).toEqual({ n: 1 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM fact_resources').get()).toEqual({ n: 0 });
+
+    // Re-dirty the already-saved head: the rotating next batch still saves the
+    // source, and facts do not wait for this unrelated refresh to be flushed.
+    session.voxel.observe(observation({ pos: { x: 32, y: 32, z: 0 }, observedAt: 1_700_000_002_000, sequence: 2 }));
+    const second = await session.checkpoint();
+    expect(second).toMatchObject({ factsCommitted: true, factsRevision: 1 });
+    expect(second.factsDeferred).toBeUndefined();
+    expect(session.voxel.hasPendingChanges()).toBe(true);
+    expect(session.facts.hasPendingChanges()).toBe(false);
+
+    // A same-state refresh leaves the source version already confirmed on disk.
+    session.voxel.observe(observation({ observedAt: 1_700_000_003_000, sequence: 3 }));
+    session.facts.upsertResource(resource('ore', {
+      observedAt: 1_700_000_003_000,
+      sourceCellVersion: source.evidence.revision,
+    }));
+    expect(await session.checkpoint()).toMatchObject({ factsCommitted: true, factsRevision: 2 });
+    expect(session.voxel.hasPendingChanges()).toBe(true);
+    db.close();
+    await session.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const restored = reopened.voxel.cellAt(DIM, -3, 32, -7);
+    if (!restored.observed) throw new Error('expected the persisted source cell');
+    expect(reopened.facts.resources().items[0]?.sourceCellVersion).toBe(restored.evidence.revision);
+    await reopened.close();
+  });
+
+  it('reports a source-version mismatch without confirming facts or completing migration', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    session.voxel.beginSession('s1');
+    session.voxel.observe(observation());
+    const source = session.voxel.cellAt(DIM, -3, 32, -7);
+    if (!source.observed) throw new Error('expected the source cell');
+    session.facts.upsertResource(resource('ore', { sourceCellVersion: source.evidence.revision + 1 }));
+    session.facts.upsertPlace(place('base'));
+
+    const checkpoint = await session.checkpoint({ completeLegacyFactsMigration: true });
+    expect(checkpoint).toMatchObject({
+      factsCommitted: false,
+      factsRevision: 0,
+      factsDeferred: {
+        resourceId: 'ore', reason: 'source_version_mismatch',
+        expectedVersion: source.evidence.revision + 1, actualVersion: source.evidence.revision,
+      },
+    });
+    expect(session.voxel.hasPendingChanges()).toBe(false);
+    expect(session.facts.hasPendingChanges()).toBe(true);
+    const db = new Database(dbPath, { readonly: true });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM spatial_sections').get()).toEqual({ n: 1 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM fact_domain').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM fact_places').get()).toEqual({ n: 0 });
+    expect(schemaMeta(db, 'curio_semantic_migration_v1:' + WORLD)).toBeUndefined();
+
+    // Correct the active reference; revoked and unversioned historical facts do
+    // not require a surviving source cell, and remain compatible with migration.
+    session.facts.upsertResource(resource('ore', {
+      observedAt: 1_700_000_002_000,
+      sourceCellVersion: source.evidence.revision,
+    }));
+    session.facts.upsertResource(resource('legacy', { sourceCell: { x: 64, y: 32, z: 0 } }));
+    session.facts.upsertResource(resource('removed', {
+      sourceCell: { x: 96, y: 32, z: 0 }, sourceCellVersion: 9, revoked: true,
+    }));
+    expect(await session.checkpoint({ completeLegacyFactsMigration: true })).toMatchObject({ factsCommitted: true });
+    expect(schemaMeta(db, 'curio_semantic_migration_v1:' + WORLD)).toBe('1');
+    expect(session.facts.hasPendingChanges()).toBe(false);
+    db.close();
+    await session.close();
   });
 });

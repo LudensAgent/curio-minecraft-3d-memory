@@ -63,6 +63,7 @@ export type {
   ChunkVisitRecord,
   CloseResult,
   EventJournalQuery,
+  FactSourceGap,
   FlushResult,
   HistorySession,
   HistorySnapshot,

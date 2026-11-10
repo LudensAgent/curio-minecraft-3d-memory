@@ -1410,7 +1410,7 @@ class SpatialSessionImpl implements SpatialSession {
         this.confirmedLedgerRevision = entry.ledgerCapture.revision;
         this.ledgerBaselineCheckpointId = okMsg.checkpointId;
       }
-      if (entry.factsCaptured === true && entry.factsRevision !== undefined) {
+      if (entry.factsCaptured === true && okMsg.factsCommitted && entry.factsRevision !== undefined) {
         // Confirm exactly the captured revision. A write after capture keeps a
         // newer revision pending, and a delayed ACK cannot lower the marker.
         this.facts.confirmRevision(entry.factsRevision);
@@ -1442,9 +1442,11 @@ class SpatialSessionImpl implements SpatialSession {
         // revision. A truncated capture reports only its confirmed prefix.
         journalRevision: entry.journalCapture?.revision ?? this.confirmedJournalRevision,
         ledgerRevision: entry.ledgerCapture?.revision ?? this.confirmedLedgerRevision,
-        factsRevision: entry.factsCaptured === true
+        factsRevision: entry.factsCaptured === true && okMsg.factsCommitted
           ? entry.factsRevision ?? this.confirmedFactsRevision
           : this.confirmedFactsRevision,
+        factsCommitted: okMsg.factsCommitted,
+        ...(okMsg.factsDeferred === undefined ? {} : { factsDeferred: okMsg.factsDeferred }),
       });
     } else {
       entry.resolve(true);

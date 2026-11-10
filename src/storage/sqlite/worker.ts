@@ -16,6 +16,7 @@ import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from './types.js';
 import type { ActionRecord } from '../../navigation/types.js';
 import { JournalConflictError, canonicalizeJournalRecord } from './journal.js';
 import type {
+  FactSourceGap,
   HistorySnapshot,
   LegacyStoreSummary,
   ResolvedJournalLimits,
@@ -28,6 +29,7 @@ import type {
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { SectionKey } from '../../voxel/section.js';
 import type { VoxelDirectorySummary } from '../../voxel/residency.js';
+import { blockToSection, cellIndex } from '../../voxel/coordinates.js';
 import {
   FACT_MIGRATION_TARGET,
   FACT_MIGRATION_VERSION,
@@ -1483,11 +1485,15 @@ function writeCheckpoint(
   ledgerStats: LedgerStats | null;
   voxelStats: VoxelCommittedStats;
   journalStats: { records: number; bytes: number };
+  factsCommitted: boolean;
+  factsDeferred?: FactSourceGap;
 } {
   const tx = connection.transaction((): {
     ledgerStats: LedgerStats | null;
     voxelStats: VoxelCommittedStats;
     journalStats: { records: number; bytes: number };
+    factsCommitted: boolean;
+    factsDeferred?: FactSourceGap;
   } => {
     const nextSeqRow = connection
       .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM checkpoints WHERE world_id = ?')
@@ -1653,12 +1659,52 @@ function writeCheckpoint(
     // `none` never touches fact rows or the domain record. `full` replaces this
     // world's complete capture (including gone/revoked records) and records the
     // exact captured revision in the same transaction.
+    let factsCommitted = false;
+    let factsDeferred: FactSourceGap | undefined;
     if (facts.mode === 'full') {
       if (facts.prepared === null) throw new Error('facts save mode requires a prepared facts set');
-      writeFacts(connection, wId, checkpointId, facts.prepared);
-      if (facts.completeLegacyMigration === true) {
-        connection.prepare('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-          .run('curio_semantic_migration_v1:' + wId, '1');
+      // Check the post-write transaction state, not Section/global save revisions.
+      // One bounded voxel batch may omit a resource's dirty source section. Keep
+      // facts pending in that case while allowing this voxel batch to make progress.
+      const sources = new Map<string, { id: string; index: number; expectedVersion: number }[]>();
+      for (const resource of facts.prepared.resources) {
+        if (resource.revoked !== 0 || resource.sourceCellVersion === undefined) continue;
+        const { cx, cz, sy, lx, ly, lz } = blockToSection(resource.sourceX, resource.sourceY, resource.sourceZ);
+        const key = JSON.stringify([resource.dim, cx, cz, sy]);
+        const entries = sources.get(key) ?? [];
+        entries.push({
+          id: resource.id,
+          index: [resource.sourceX, resource.sourceY, resource.sourceZ].every(Number.isInteger)
+            ? cellIndex(lx, ly, lz)
+            : -1,
+          expectedVersion: resource.sourceCellVersion,
+        });
+        sources.set(key, entries);
+      }
+      const readSource = connection.prepare('SELECT payload FROM spatial_sections WHERE world_id = ? AND id = ?');
+      for (const [key, entries] of sources) {
+        const row = readSource.get(wId, key) as { payload: string } | undefined;
+        // Decode each referenced page once; do not retain a second decoded map.
+        const versions = new Map(row === undefined ? [] : decodeVoxelSection(row.payload).evidence
+          .map((cell) => [cell.index, cell.evidence.revision]));
+        const mismatch = entries.find((entry) => versions.get(entry.index) !== entry.expectedVersion);
+        if (mismatch === undefined) continue;
+        const actualVersion = versions.get(mismatch.index);
+        factsDeferred = {
+          resourceId: mismatch.id,
+          reason: actualVersion === undefined ? 'source_unobserved' : 'source_version_mismatch',
+          expectedVersion: mismatch.expectedVersion,
+          ...(actualVersion === undefined ? {} : { actualVersion }),
+        };
+        break;
+      }
+      if (factsDeferred === undefined) {
+        writeFacts(connection, wId, checkpointId, facts.prepared);
+        factsCommitted = true;
+        if (facts.completeLegacyMigration === true) {
+          connection.prepare('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+            .run('curio_semantic_migration_v1:' + wId, '1');
+        }
       }
     }
 
@@ -1691,7 +1737,13 @@ function writeCheckpoint(
         gameVersion,
         nextSeq,
       );
-    return { ledgerStats, voxelStats: nextVoxelStats, journalStats: nextJournalStats };
+    return {
+      ledgerStats,
+      voxelStats: nextVoxelStats,
+      journalStats: nextJournalStats,
+      factsCommitted,
+      ...(factsDeferred === undefined ? {} : { factsDeferred }),
+    };
   });
   return tx();
 }
@@ -1902,6 +1954,7 @@ interface PreparedFactResource {
   sourceX: number;
   sourceY: number;
   sourceZ: number;
+  sourceCellVersion?: number;
   observedAt: number;
   revoked: number;
   revokedAt: number | null;
@@ -2390,6 +2443,7 @@ function prepareFactsSnapshot(
       sourceX: record.sourceCell.x,
       sourceY: record.sourceCell.y,
       sourceZ: record.sourceCell.z,
+      ...(record.sourceCellVersion === undefined ? {} : { sourceCellVersion: record.sourceCellVersion }),
       observedAt: record.observedAt,
       revoked: record.revoked ? 1 : 0,
       revokedAt: record.revokedAt ?? null,
@@ -3313,6 +3367,8 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     return;
   }
   let committedLedger: LedgerStats | null = null;
+  let factsCommitted = false;
+  let factsDeferred: FactSourceGap | undefined;
   try {
     const committed = writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, {
       history: historyMode,
@@ -3338,6 +3394,8 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     committedLedger = committed.ledgerStats;
     voxelStats = committed.voxelStats;
     journalStats = committed.journalStats;
+    factsCommitted = committed.factsCommitted;
+    factsDeferred = committed.factsDeferred;
   } catch (err) {
     // Capacity/conflict rejections raised inside the transaction roll the whole
     // batch back; a conflict is never reported as a generic SQL fault.
@@ -3358,6 +3416,8 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     voxelBytes,
     journalRecordCount: journalStats?.records ?? 0,
     journalRecordBytes: journalStats?.bytes ?? 0,
+    factsCommitted,
+    ...(factsDeferred === undefined ? {} : { factsDeferred }),
     ...(committedLedger === null
       ? {}
       : {

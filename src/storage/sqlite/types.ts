@@ -776,6 +776,14 @@ export interface LoadSectionsResult {
   missing: SectionKey[];
 }
 
+/** First resource whose source-cell version could not be confirmed on disk. */
+export interface FactSourceGap {
+  resourceId: string;
+  reason: 'source_unobserved' | 'source_version_mismatch';
+  expectedVersion: number;
+  actualVersion?: number;
+}
+
 /** Result of a successful combined spatial checkpoint. */
 export interface SpatialCheckpointResult {
   checkpointId: string;
@@ -791,8 +799,12 @@ export interface SpatialCheckpointResult {
   journalRevision: number;
   /** Ledger revision captured and committed with this checkpoint. */
   ledgerRevision: number;
-  /** Facts revision captured and committed with this checkpoint. */
+  /** Latest confirmed facts revision; unchanged when this batch defers facts. */
   factsRevision: number;
+  /** Whether this checkpoint actually committed a captured facts domain. */
+  factsCommitted: boolean;
+  /** Facts remain pending when a referenced source version is not yet committed. */
+  factsDeferred?: FactSourceGap;
 }
 
 /**
@@ -1172,6 +1184,8 @@ export type WorkerResponse =
       /** Committed journal row count/bytes for this world after the transaction. */
       journalRecordCount: number;
       journalRecordBytes: number;
+      factsCommitted: boolean;
+      factsDeferred?: FactSourceGap;
       /**
        * Committed ledger row count/bytes for this world after the transaction, when
        * this checkpoint wrote the ledger. Computed by the worker from the committed
