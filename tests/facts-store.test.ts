@@ -52,6 +52,7 @@ function container(
     externalRef: 'chest:base:1',
     observedAt: 100,
     source: { ...SOURCE },
+    gone: false,
     ...overrides,
   };
 }
@@ -322,5 +323,53 @@ describe('InMemoryFactStore containers', () => {
     const page = store.containers({ worldId: WORLD, dim: DIM });
     expect(page.items[0]?.pos).toEqual({ x: -101, y: 12, z: -203 });
     expect(page.items[0]?.ledgerRef).toBe('ledger:7');
+  });
+
+  it('marks a container gone while retaining its identity and history', () => {
+    const store = new InMemoryFactStore();
+    store.upsertContainer(container('c1', { ledgerRef: 'ledger:7' }));
+
+    expect(
+      store.markContainerGone('c1', {
+        observedAt: 200,
+        source: { source: 'vision_scan', sessionId: 's2' },
+      }).outcome,
+    ).toBe('updated');
+    expect(store.containers().total).toBe(0);
+    const withGone = store.containers({ includeGone: true });
+    expect(withGone.total).toBe(1);
+    expect(withGone.items[0]).toMatchObject({
+      id: 'c1',
+      externalRef: 'chest:base:1',
+      ledgerRef: 'ledger:7',
+      observedAt: 100,
+      gone: true,
+      goneAt: 200,
+      goneSource: { source: 'vision_scan', sessionId: 's2' },
+    });
+
+    expect(
+      store.markContainerGone('c1', { observedAt: 300, source: SOURCE }).outcome,
+    ).toBe('duplicate');
+    // Gone evidence older than the observed shell is a conflict, not a write.
+    store.upsertContainer(container('c2', {
+      externalRef: 'chest:base:2',
+      observedAt: 500,
+      gone: false,
+    }));
+    expect(
+      store.markContainerGone('c2', { observedAt: 400, source: SOURCE }).outcome,
+    ).toBe('conflict');
+    expect(() => store.markContainerGone('missing', { observedAt: 1, source: SOURCE })).toThrow(
+      /unknown container id/,
+    );
+
+    // A newer shell observation resurrects the anchor under the same id.
+    expect(
+      store.upsertContainer(container('c1', { observedAt: 600, gone: false })).outcome,
+    ).toBe('updated');
+    // c1 is present again; c2 (observed at 500) remains a visible anchor.
+    expect(store.containers().total).toBe(2);
+    expect(store.containers().items.find((item) => item.id === 'c1')?.gone).toBe(false);
   });
 });

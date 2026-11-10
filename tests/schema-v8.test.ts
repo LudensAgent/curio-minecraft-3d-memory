@@ -171,7 +171,7 @@ describe('schema v8 game version records', () => {
     await session.close();
 
     const db = new Database(dbPath, { readonly: true });
-    expect(schemaVersion(db)).toBe('8');
+    expect(schemaVersion(db)).toBe('9');
     const sectionRows = db
       .prepare('SELECT payload, game_version FROM spatial_sections WHERE world_id = ?')
       .all(WORLD) as { payload: string; game_version: string }[];
@@ -384,6 +384,11 @@ describe('schema v8 game version records', () => {
     legacy.exec(`
       ALTER TABLE spatial_sections DROP COLUMN game_version;
       ALTER TABLE checkpoints DROP COLUMN game_version;
+      DROP TABLE IF EXISTS fact_places;
+      DROP TABLE IF EXISTS fact_resources;
+      DROP TABLE IF EXISTS fact_containers;
+      DROP TABLE IF EXISTS fact_domain;
+      DELETE FROM schema_meta WHERE key IN ('fact_migration_version', 'fact_migration_target');
       UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';
     `);
     const legacyRows = legacy.prepare('SELECT rowid, payload FROM spatial_sections').all() as {
@@ -403,7 +408,7 @@ describe('schema v8 game version records', () => {
     await reopened.close();
 
     const db = new Database(dbPath, { readonly: true });
-    expect(schemaVersion(db)).toBe('8');
+    expect(schemaVersion(db)).toBe('9');
     const sectionRow = db.prepare('SELECT payload, game_version FROM spatial_sections').get() as {
       payload: string;
       game_version: string;

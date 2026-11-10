@@ -82,6 +82,11 @@ function downgradeToV4(db: Database.Database): void {
   db.exec('ALTER TABLE spatial_sections DROP COLUMN cx');
   db.exec('ALTER TABLE spatial_sections DROP COLUMN cz');
   db.exec('ALTER TABLE spatial_sections DROP COLUMN sy');
+  db.exec('DROP TABLE IF EXISTS fact_places');
+  db.exec('DROP TABLE IF EXISTS fact_resources');
+  db.exec('DROP TABLE IF EXISTS fact_containers');
+  db.exec('DROP TABLE IF EXISTS fact_domain');
+  db.exec("DELETE FROM schema_meta WHERE key IN ('fact_migration_version', 'fact_migration_target')");
   db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
 }
 
@@ -332,7 +337,7 @@ describe('v4 → v5 schema migration and section payload compatibility', () => {
     expect(schemaVersion(dbPath)).toBe('4');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('8');
+    expect(schemaVersion(dbPath)).toBe('9');
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
     // The ledger was not part of v4, so the upgraded database starts with no
     // ledger baseline rather than a synthesized placement.

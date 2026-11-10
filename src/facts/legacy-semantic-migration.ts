@@ -400,6 +400,7 @@ function containerFromLegacyNode(
     externalRef,
     observedAt,
     source,
+    gone: false,
     ...(ledgerRef === undefined ? {} : { ledgerRef }),
     legacyId,
   };

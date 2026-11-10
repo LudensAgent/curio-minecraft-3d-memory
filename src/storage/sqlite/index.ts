@@ -53,6 +53,11 @@ export {
 } from './ledger.js';
 export type { PortalTraversalInput } from './ledger.js';
 export type {
+  FactCheckpointSnapshot,
+  FactMigrationState,
+  FactStore,
+} from '../../facts/types.js';
+export type {
   ActionJournalQuery,
   CheckpointResult,
   ChunkVisitRecord,

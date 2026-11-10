@@ -1215,6 +1215,11 @@ function downgradeToV3(db: Database.Database): void {
   db.exec('DROP TABLE IF EXISTS spatial_events');
   db.exec('ALTER TABLE checkpoints DROP COLUMN journal_revision');
   db.exec('ALTER TABLE checkpoints DROP COLUMN has_journal');
+  db.exec('DROP TABLE IF EXISTS fact_places');
+  db.exec('DROP TABLE IF EXISTS fact_resources');
+  db.exec('DROP TABLE IF EXISTS fact_containers');
+  db.exec('DROP TABLE IF EXISTS fact_domain');
+  db.exec("DELETE FROM schema_meta WHERE key IN ('fact_migration_version', 'fact_migration_target')");
   db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
 }
 
@@ -1246,7 +1251,7 @@ describe('v3 → v4 journal migration', () => {
     expect(schemaVersion(dbPath)).toBe('3');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('8');
+    expect(schemaVersion(dbPath)).toBe('9');
     expect(checkpointColumns(dbPath)).toEqual(
       expect.arrayContaining(['journal_revision', 'has_journal', 'topology_extras']),
     );

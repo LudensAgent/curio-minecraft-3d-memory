@@ -7,6 +7,8 @@
  */
 
 export { InMemoryFactStore } from './in-memory-facts-store.js';
+export { PersistentFactStore } from './persistent-fact-store.js';
+export { validateFactCheckpointSnapshot } from './validation.js';
 export {
   applyLegacySemanticMigration,
   runLegacySemanticMigrationDryRun,
@@ -25,6 +27,8 @@ export type {
 } from './legacy-semantic-migration.js';
 export {
   DEFAULT_FACT_PAGE_LIMIT,
+  FACT_MIGRATION_TARGET,
+  FACT_MIGRATION_VERSION,
   MAX_FACT_PAGE_LIMIT,
   isContainerFact,
   isPlaceFact,
@@ -33,14 +37,18 @@ export {
 } from './types.js';
 export type {
   ContainerAnchorFact,
+  FactCheckpointSnapshot,
   FactGoneEvidence,
   FactLocation,
+  FactMigrationState,
   FactPage,
   FactProvenance,
   FactQuery,
+  FactStore,
   FactWriteOutcome,
   FactWriteResult,
   InMemoryFactStoreOptions,
+  PersistentFactStoreOptions,
   PlaceFact,
   PlaceKind,
   ResourceAnchorFact,

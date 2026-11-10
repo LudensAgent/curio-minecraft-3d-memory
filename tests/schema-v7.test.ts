@@ -104,6 +104,11 @@ describe('schema v7 and metadata persistence', () => {
       DROP TABLE placed_blocks;
       ALTER TABLE placed_blocks_v6 RENAME TO placed_blocks;
       CREATE INDEX placed_blocks_world_lru ON placed_blocks (world_id, dim, lru_at);
+      DROP TABLE IF EXISTS fact_places;
+      DROP TABLE IF EXISTS fact_resources;
+      DROP TABLE IF EXISTS fact_containers;
+      DROP TABLE IF EXISTS fact_domain;
+      DELETE FROM schema_meta WHERE key IN ('fact_migration_version', 'fact_migration_target');
       UPDATE schema_meta SET value = '6' WHERE key = 'schema_version';
     `);
     db.close();
@@ -116,7 +121,7 @@ describe('schema v7 and metadata persistence', () => {
     await upgraded.close();
 
     const check = new Database(dbPath, { readonly: true });
-    expect((check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('8');
+    expect((check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('9');
     expect(check.prepare('SELECT count(*) AS n FROM placed_blocks WHERE dim IS NULL').get()).toEqual({ n: 1 });
     check.close();
   });

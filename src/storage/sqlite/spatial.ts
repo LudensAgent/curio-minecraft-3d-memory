@@ -75,6 +75,14 @@ import type {
 import { LedgerStore } from './ledger.js';
 import type { LedgerDelta, LedgerDeltaCapture } from './ledger.js';
 import type { ActionRecord } from '../../navigation/types.js';
+import { PersistentFactStore } from '../../facts/persistent-fact-store.js';
+import {
+  FACT_MIGRATION_TARGET,
+  FACT_MIGRATION_VERSION,
+  type FactCheckpointSnapshot,
+  type FactMigrationState,
+  type FactStore,
+} from '../../facts/types.js';
 import { JournalQueue } from './journal.js';
 import type { JournalCapture } from './journal.js';
 import type { HistorySnapshot } from './types.js';
@@ -98,6 +106,10 @@ interface PendingRequest {
   /** Exactly the voxel sections this batch may confirm; unselected dirty stays pending. */
   voxelKeys?: SectionKey[];
   removedVoxelKeys?: SectionKey[];
+  /** Exact facts revision captured by this checkpoint (confirmed only on ACK). */
+  factsRevision?: number;
+  /** Whether this checkpoint captured the facts domain. */
+  factsCaptured?: boolean;
   /** The captured journal batch, for the ACK-time pending clear. */
   journalCapture?: JournalCapture;
   /**
@@ -163,6 +175,11 @@ class SpatialSessionImpl implements SpatialSession {
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
   readonly ledger: LedgerStore;
+  readonly facts: FactStore;
+
+  get factsMigration(): FactMigrationState {
+    return this.factsMigrationField;
+  }
 
   get voxelLoading(): VoxelLoading {
     return this.voxelLoadingField;
@@ -218,10 +235,17 @@ class SpatialSessionImpl implements SpatialSession {
   private confirmedTopologyRevision = 0;
   private confirmedJournalRevision = 0;
   private confirmedLedgerRevision = 0;
+  private confirmedFactsRevision = 0;
   private baselineCheckpointId: string | null = null;
   private voxelBaselineCheckpointId: string | null = null;
   private journalBaselineCheckpointId: string | null = null;
   private ledgerBaselineCheckpointId: string | null = null;
+  private factsBaselineCheckpointId: string | null = null;
+  private factsMigrationField: FactMigrationState = {
+    version: 0,
+    target: null,
+    committed: false,
+  };
   private committedJournalRecords = 0;
   private committedJournalBytes = 0;
   /** Whether a voxel save baseline exists (restored, or established this session). */
@@ -268,6 +292,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.journalQueue = new JournalQueue(this.worldId, this.journalLimitsField);
     this.ledgerLimitsField = resolveLedgerLimits(options.ledgerLimits);
     this.ledger = new LedgerStore(this.worldId, this.ledgerLimitsField);
+    this.facts = new PersistentFactStore({ worldId: this.worldId });
     this.journal = {
       recordAction: (record: ActionRecord): JournalAcceptResult => {
         this.assertJournalAccepting();
@@ -329,6 +354,9 @@ class SpatialSessionImpl implements SpatialSession {
       journalRecordBytes: number;
       ledgerBaselineCheckpointId: string | null;
       ledgerSnapshot: LedgerSnapshot | null;
+      factsBaselineCheckpointId: string | null;
+      factsSnapshot: FactCheckpointSnapshot | null;
+      factsMigration: FactMigrationState;
       gameVersion: string | null;
     };
     try {
@@ -354,6 +382,9 @@ class SpatialSessionImpl implements SpatialSession {
       if (result.ledgerSnapshot !== null) {
         this.ledger.restoreSnapshot(result.ledgerSnapshot);
       }
+      if (result.factsSnapshot !== null) {
+        this.facts.installSnapshot(result.factsSnapshot);
+      }
     } catch (err) {
       this.lifecycleField = 'closed';
       await this.terminateWorker();
@@ -366,12 +397,15 @@ class SpatialSessionImpl implements SpatialSession {
       || result.voxelDirectorySummary.sections > 0;
     this.journalBaselineCheckpointId = result.journalBaselineCheckpointId;
     this.ledgerBaselineCheckpointId = result.ledgerBaselineCheckpointId;
+    this.factsBaselineCheckpointId = result.factsBaselineCheckpointId;
+    this.factsMigrationField = result.factsMigration;
     this.restoredGameVersion = result.gameVersion;
     this.committedJournalRecords = result.journalRecordCount;
     this.committedJournalBytes = result.journalRecordBytes;
     this.journalQueue.resetRevisionForRestore(result.journalRevision);
     this.confirmedJournalRevision = result.journalRevision;
     this.confirmedLedgerRevision = this.ledger.revision;
+    this.confirmedFactsRevision = this.facts.confirmedRevision;
     this.confirmedFragmentRevision = this.history.revision;
     this.confirmedTopologyRevision = this.topology.revision;
     this.confirmedVoxelRevision = this.voxel.saveRevision;
@@ -611,6 +645,26 @@ class SpatialSessionImpl implements SpatialSession {
     }
     const ledgerRevision = ledgerCapture?.revision ?? this.confirmedLedgerRevision;
 
+    // Facts: only a domain that actually changed since its confirmed revision is
+    // captured and replaced. Capture is synchronous and takes the exact revision
+    // an ACK must confirm; later writes keep a newer revision pending.
+    const factsCaptured = this.facts.revision !== this.confirmedFactsRevision;
+    const factsSnapshot: FactCheckpointSnapshot | undefined = factsCaptured
+      ? this.facts.checkpointSnapshot()
+      : undefined;
+    const factsRevision = factsSnapshot?.revision ?? this.confirmedFactsRevision;
+    if (factsSnapshot !== undefined) {
+      const count =
+        factsSnapshot.places.length + factsSnapshot.resources.length + factsSnapshot.containers.length;
+      if (count > this.limits.maxFacts) {
+        throw new PersistenceError('capacity', `facts exceed maxFacts (${count})`);
+      }
+      const factBytes = Buffer.byteLength(JSON.stringify(factsSnapshot), 'utf8');
+      if (factBytes > this.limits.maxFactBytes) {
+        throw new PersistenceError('capacity', `facts exceed maxFactBytes (${factBytes})`);
+      }
+    }
+
     if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
       throw new PersistenceError('timeout', 'checkpoint deadline expired before the worker commit');
     }
@@ -633,6 +687,8 @@ class SpatialSessionImpl implements SpatialSession {
         removedVoxelKeys,
         journalCapture,
         ledgerCapture,
+        factsRevision,
+        factsCaptured,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -657,6 +713,9 @@ class SpatialSessionImpl implements SpatialSession {
         ledgerRevision,
         ...(ledgerSnapshot === undefined ? {} : { ledgerSnapshot }),
         ...(ledgerDelta === undefined ? {} : { ledgerDelta }),
+        factsMode: factsCaptured ? 'full' : 'none',
+        factsRevision,
+        ...(factsSnapshot === undefined ? {} : { factsSnapshot }),
         gameVersion: this.gameVersionField,
       } satisfies WorkerRequest);
     });
@@ -857,6 +916,10 @@ class SpatialSessionImpl implements SpatialSession {
       ledgerRevision: this.ledger.revision,
       confirmedLedgerRevision: this.confirmedLedgerRevision,
       ledgerBaselineCheckpointId: this.ledgerBaselineCheckpointId,
+      factsRevision: this.facts.revision,
+      confirmedFactsRevision: this.confirmedFactsRevision,
+      factsBaselineCheckpointId: this.factsBaselineCheckpointId,
+      factsMigration: this.factsMigrationField,
       restoredGameVersion: this.restoredGameVersion,
       pendingJournalRecords: this.journalQueue.pendingRecords,
       pendingJournalBytes: this.journalQueue.pendingBytes,
@@ -1135,7 +1198,8 @@ class SpatialSessionImpl implements SpatialSession {
       this.history.revision !== this.confirmedFragmentRevision ||
       this.topology.revision !== this.confirmedTopologyRevision ||
       this.journalQueue.revision !== this.confirmedJournalRevision ||
-      this.ledger.revision !== this.confirmedLedgerRevision
+      this.ledger.revision !== this.confirmedLedgerRevision ||
+      this.facts.hasPendingChanges()
     );
   }
 
@@ -1152,6 +1216,9 @@ class SpatialSessionImpl implements SpatialSession {
     journalRecordBytes: number;
     ledgerBaselineCheckpointId: string | null;
     ledgerSnapshot: LedgerSnapshot | null;
+    factsBaselineCheckpointId: string | null;
+    factsSnapshot: FactCheckpointSnapshot | null;
+    factsMigration: FactMigrationState;
     gameVersion: string | null;
   }> {
     const requestId = this.nextRequestId++;
@@ -1255,6 +1322,9 @@ class SpatialSessionImpl implements SpatialSession {
         journalRecordBytes: openMsg.journalRecordBytes,
         ledgerBaselineCheckpointId: openMsg.ledgerBaselineCheckpointId,
         ledgerSnapshot: openMsg.ledgerSnapshot,
+        factsBaselineCheckpointId: openMsg.factsBaselineCheckpointId,
+        factsSnapshot: openMsg.factsSnapshot,
+        factsMigration: openMsg.factsMigration,
         gameVersion: openMsg.gameVersion,
       });
     } else if (entry.kind === 'load') {
@@ -1315,6 +1385,18 @@ class SpatialSessionImpl implements SpatialSession {
         this.confirmedLedgerRevision = entry.ledgerCapture.revision;
         this.ledgerBaselineCheckpointId = okMsg.checkpointId;
       }
+      if (entry.factsCaptured === true && entry.factsRevision !== undefined) {
+        // Confirm exactly the captured revision. A write after capture keeps a
+        // newer revision pending, and a delayed ACK cannot lower the marker.
+        this.facts.confirmRevision(entry.factsRevision);
+        this.confirmedFactsRevision = Math.max(this.confirmedFactsRevision, entry.factsRevision);
+        this.factsBaselineCheckpointId = okMsg.checkpointId;
+        this.factsMigrationField = {
+          version: FACT_MIGRATION_VERSION,
+          target: FACT_MIGRATION_TARGET,
+          committed: true,
+        };
+      }
       // Clear only the captured journal entries; newer acceptances stay pending.
       if (entry.journalCapture !== undefined) {
         this.journalQueue.confirm(entry.journalCapture.keys, entry.journalCapture.revision);
@@ -1334,6 +1416,9 @@ class SpatialSessionImpl implements SpatialSession {
         // revision. A truncated capture reports only its confirmed prefix.
         journalRevision: entry.journalCapture?.revision ?? this.confirmedJournalRevision,
         ledgerRevision: entry.ledgerCapture?.revision ?? this.confirmedLedgerRevision,
+        factsRevision: entry.factsCaptured === true
+          ? entry.factsRevision ?? this.confirmedFactsRevision
+          : this.confirmedFactsRevision,
       });
     } else {
       entry.resolve(true);

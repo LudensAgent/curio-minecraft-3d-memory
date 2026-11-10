@@ -101,6 +101,15 @@ export interface ContainerAnchorFact {
   /** Real observation time of the shell in milliseconds. */
   observedAt: number;
   source: FactProvenance;
+  /**
+   * The container shell was observed no longer present. The record is retained;
+   * queries exclude it by default and `includeGone` asks for it explicitly.
+   */
+  gone: boolean;
+  /** Real disappearance observation time; absent when legacy data lacked one. */
+  goneAt?: number;
+  /** Provenance of the disappearance observation, separate from `source`. */
+  goneSource?: FactProvenance;
   /** Opaque reference into the host precise container ledger. */
   ledgerRef?: string;
   /** Compatibility-source id, preserved verbatim during a migration. */
@@ -198,3 +207,79 @@ export const DEFAULT_FACT_PAGE_LIMIT = 100;
 
 /** Hard ceiling for one query page. */
 export const MAX_FACT_PAGE_LIMIT = 1000;
+
+/**
+ * The semantic-facts model version recorded with the persistent facts domain.
+ * It is a storage/migration version, not a world or observation time.
+ */
+export const FACT_MIGRATION_VERSION = 1;
+
+/** Human-readable migration target recorded next to `FACT_MIGRATION_VERSION`. */
+export const FACT_MIGRATION_TARGET = 'semantic-facts-v1';
+
+/**
+ * Complete facts-domain capture committed by one checkpoint. `revision` is the
+ * exact captured local revision; it is what an ACK confirms.
+ */
+export interface FactCheckpointSnapshot {
+  worldId: string;
+  /** Captured local facts revision, not a save confirmation by itself. */
+  revision: number;
+  /** Every place, including gone records (gone is retained state). */
+  places: PlaceFact[];
+  /** Every resource anchor, including revoked records. */
+  resources: ResourceAnchorFact[];
+  /** Every container anchor, including gone records; never container contents. */
+  containers: ContainerAnchorFact[];
+}
+
+/** Facts-domain migration/version record read from the same persistence authority. */
+export interface FactMigrationState {
+  /** Facts model version recorded for this world/database. */
+  version: number;
+  /** Migration target label recorded with the version. */
+  target: string | null;
+  /** Whether this world has a committed facts-domain record (even an empty one). */
+  committed: boolean;
+}
+
+/** Options for `PersistentFactStore`. */
+export interface PersistentFactStoreOptions extends InMemoryFactStoreOptions {
+  /** The world this store persists and restores. Required and non-empty. */
+  worldId: string;
+}
+
+/**
+ * Synchronous facts authority with an explicit persistence lifecycle.
+ *
+ * Writes and reads are the hot path and are visible immediately. A caller
+ * captures `checkpointSnapshot()` and persists it; `confirmRevision(revision)`
+ * acknowledges only that captured revision. Confirming an old revision never
+ * clears or rewrites newer facts — it only advances the confirmed marker.
+ */
+export interface FactStore {
+  upsertPlace(fact: PlaceFact): FactWriteResult<PlaceFact>;
+  upsertResource(fact: ResourceAnchorFact): FactWriteResult<ResourceAnchorFact>;
+  upsertContainer(fact: ContainerAnchorFact): FactWriteResult<ContainerAnchorFact>;
+  markPlaceGone(id: string, evidence: FactGoneEvidence): FactWriteResult<PlaceFact>;
+  revokeResource(id: string, evidence: FactGoneEvidence): FactWriteResult<ResourceAnchorFact>;
+  markContainerGone(id: string, evidence: FactGoneEvidence): FactWriteResult<ContainerAnchorFact>;
+  updateResourceSource(id: string, update: ResourceSourceUpdate): FactWriteResult<ResourceAnchorFact>;
+
+  places(query?: FactQuery): FactPage<PlaceFact>;
+  resources(query?: ResourceFactQuery): FactPage<ResourceAnchorFact>;
+  containers(query?: FactQuery): FactPage<ContainerAnchorFact>;
+
+  /** Local facts revision; advanced only by a write that actually changed memory. */
+  readonly revision: number;
+  /** Revision last acknowledged by a committed checkpoint. */
+  readonly confirmedRevision: number;
+  /** Capture the complete domain (including gone/revoked) at the current revision. */
+  checkpointSnapshot(): FactCheckpointSnapshot;
+  /** Replace memory with a committed capture; restore-only, preserves ids/times/state. */
+  installSnapshot(snapshot: FactCheckpointSnapshot): void;
+  /** Acknowledge the exact captured revision. Never decreases the confirmed marker. */
+  confirmRevision(revision: number): void;
+  /** True when a write has occurred after the last confirmed revision. */
+  hasPendingChanges(): boolean;
+}

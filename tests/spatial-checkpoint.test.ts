@@ -149,6 +149,11 @@ function downgradeToV2(db: Database.Database): void {
   db.exec('ALTER TABLE spatial_sections DROP COLUMN observed_cells');
   db.exec('ALTER TABLE spatial_sections DROP COLUMN palette_entries');
   db.exec('ALTER TABLE spatial_sections DROP COLUMN revision');
+  db.exec('DROP TABLE IF EXISTS fact_places');
+  db.exec('DROP TABLE IF EXISTS fact_resources');
+  db.exec('DROP TABLE IF EXISTS fact_containers');
+  db.exec('DROP TABLE IF EXISTS fact_domain');
+  db.exec("DELETE FROM schema_meta WHERE key IN ('fact_migration_version', 'fact_migration_target')");
   db.prepare("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'").run();
 }
 
@@ -1312,7 +1317,7 @@ describe('v1 → latest schema upgrade', () => {
     const check = new Database(dbPath);
     const version = (check.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string })
       .value;
-    expect(version).toBe('8');
+    expect(version).toBe('9');
     const sectionTable = check
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'spatial_sections'")
       .get();

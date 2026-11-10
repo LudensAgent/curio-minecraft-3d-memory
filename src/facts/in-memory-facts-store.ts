@@ -15,7 +15,6 @@
  *   the collection or changing the id order.
  */
 
-import type { Vec3Like } from '../types.js';
 import {
   containerCanonicalKey,
   locationsEqual,
@@ -36,12 +35,21 @@ import {
   type FactWriteResult,
   type InMemoryFactStoreOptions,
   type PlaceFact,
-  type PlaceKind,
   type ResourceAnchorFact,
   type ResourceFactQuery,
   type ResourceSourceRef,
   type ResourceSourceUpdate,
 } from './types.js';
+import {
+  assertContainer,
+  assertFiniteNumber,
+  assertGoneEvidence,
+  assertNonEmptyString,
+  assertPlace,
+  assertPoint,
+  assertProvenance,
+  assertResource,
+} from './validation.js';
 
 export class InMemoryFactStore {
   private readonly maxQueryLimit: number;
@@ -155,10 +163,12 @@ export class InMemoryFactStore {
     if (existing.id !== container.id) {
       return { outcome: 'conflict', record: snapshotContainer(existing) };
     }
-    if (container.observedAt < existing.observedAt) {
+    const incomingTime = containerLastObserved(container);
+    const existingTime = containerLastObserved(existing);
+    if (incomingTime < existingTime) {
       return { outcome: 'duplicate', record: snapshotContainer(existing) };
     }
-    if (container.observedAt === existing.observedAt) {
+    if (incomingTime === existingTime) {
       return sameContainer(existing, container)
         ? { outcome: 'duplicate', record: snapshotContainer(existing) }
         : { outcome: 'conflict', record: snapshotContainer(existing) };
@@ -191,6 +201,31 @@ export class InMemoryFactStore {
     };
     this.placesByKey.set(key, record);
     return { outcome: 'updated', record: snapshotPlace(record) };
+  }
+
+  /**
+   * Mark a container anchor gone from concrete disappearance evidence. The
+   * anchor (identity, position, ledger link) is retained; only presence changes.
+   */
+  markContainerGone(id: string, evidence: FactGoneEvidence): FactWriteResult<ContainerAnchorFact> {
+    assertGoneEvidence(evidence);
+    const key = this.containerKeysById.get(id);
+    if (key === undefined) throw new Error(`unknown container id: ${id}`);
+    const existing = this.requireContainer(key);
+    if (existing.gone) {
+      return { outcome: 'duplicate', record: snapshotContainer(existing) };
+    }
+    if (evidence.observedAt < existing.observedAt) {
+      return { outcome: 'conflict', record: snapshotContainer(existing) };
+    }
+    const record: ContainerAnchorFact = {
+      ...existing,
+      gone: true,
+      goneAt: evidence.observedAt,
+      goneSource: snapshotProvenance(evidence.source),
+    };
+    this.containersByKey.set(key, record);
+    return { outcome: 'updated', record: snapshotContainer(record) };
   }
 
   /** Revoke a resource found by durable id. */
@@ -309,14 +344,119 @@ export class InMemoryFactStore {
 
   /** Bounded, id-ordered page of container anchors (no contents). */
   containers(query: FactQuery = {}): FactPage<ContainerAnchorFact> {
+    const includeGone = query.includeGone ?? false;
     return this.page(
       this.containerOrder,
       this.containerKeysById,
       this.containersByKey,
       query,
-      (record) => matchesScope(record, query),
+      (record) => matchesScope(record, query) && (includeGone || !record.gone),
       snapshotContainer,
     );
+  }
+
+  /**
+   * Capture every record of this store, including gone/revoked state, in stable
+   * id order. This is the persistence capture, not a bounded query projection.
+   */
+  captureSnapshot(): {
+    places: PlaceFact[];
+    resources: ResourceAnchorFact[];
+    containers: ContainerAnchorFact[];
+  } {
+    return {
+      places: this.placeOrder.map((id) => {
+        const key = this.placeKeysById.get(id);
+        if (key === undefined) throw new Error('facts store place index is inconsistent');
+        return snapshotPlace(this.requirePlace(key));
+      }),
+      resources: this.resourceOrder.map((id) => {
+        const key = this.resourceKeysById.get(id);
+        if (key === undefined) throw new Error('facts store resource index is inconsistent');
+        return snapshotResource(this.requireResource(key));
+      }),
+      containers: this.containerOrder.map((id) => {
+        const key = this.containerKeysById.get(id);
+        if (key === undefined) throw new Error('facts store container index is inconsistent');
+        return snapshotContainer(this.requireContainer(key));
+      }),
+    };
+  }
+
+  /**
+   * Replace this store with a complete capture. Restore-only: the caller is
+   * responsible for the snapshot's provenance/time; it is validated here and
+   * inserted without re-dating or projecting.
+   */
+  restoreSnapshot(snapshot: {
+    places: PlaceFact[];
+    resources: ResourceAnchorFact[];
+    containers: ContainerAnchorFact[];
+  }): void {
+    const placesByKey = new Map<string, PlaceFact>();
+    const placeKeysById = new Map<string, string>();
+    const placeOrder: string[] = [];
+    for (const raw of snapshot.places) {
+      assertPlace(raw);
+      const record = snapshotPlace(raw);
+      const key = placeCanonicalKey(record);
+      if (placeKeysById.has(record.id) || placesByKey.has(key)) {
+        throw new Error(`duplicate place id or identity "${record.id}"`);
+      }
+      placesByKey.set(key, record);
+      placeKeysById.set(record.id, key);
+      insertSorted(placeOrder, record.id);
+    }
+
+    const resourcesByKey = new Map<string, ResourceAnchorFact>();
+    const resourceKeysById = new Map<string, string>();
+    const resourceOrder: string[] = [];
+    for (const raw of snapshot.resources) {
+      assertResource(raw);
+      const record = snapshotResource(raw);
+      const key = resourceCanonicalKey(record);
+      if (resourceKeysById.has(record.id) || resourcesByKey.has(key)) {
+        throw new Error(`duplicate resource id or source cell + label "${record.id}"`);
+      }
+      resourcesByKey.set(key, record);
+      resourceKeysById.set(record.id, key);
+      insertSorted(resourceOrder, record.id);
+    }
+
+    const containersByKey = new Map<string, ContainerAnchorFact>();
+    const containerKeysById = new Map<string, string>();
+    const containerOrder: string[] = [];
+    for (const raw of snapshot.containers) {
+      assertContainer(raw);
+      const record = snapshotContainer(raw);
+      const key = containerCanonicalKey(record);
+      if (containerKeysById.has(record.id) || containersByKey.has(key)) {
+        throw new Error(`duplicate container id or identity "${record.id}"`);
+      }
+      containersByKey.set(key, record);
+      containerKeysById.set(record.id, key);
+      insertSorted(containerOrder, record.id);
+    }
+
+    this.placesByKey.clear();
+    this.placeKeysById.clear();
+    this.placeOrder.length = 0;
+    this.resourcesByKey.clear();
+    this.resourceKeysById.clear();
+    this.resourceOrder.length = 0;
+    this.containersByKey.clear();
+    this.containerKeysById.clear();
+    this.containerOrder.length = 0;
+
+    for (const [key, record] of placesByKey) this.placesByKey.set(key, record);
+    for (const [id, key] of placeKeysById) this.placeKeysById.set(id, key);
+    this.placeOrder.push(...placeOrder);
+    for (const [key, record] of resourcesByKey) this.resourcesByKey.set(key, record);
+    for (const [id, key] of resourceKeysById) this.resourceKeysById.set(id, key);
+    this.resourceOrder.push(...resourceOrder);
+    for (const [key, record] of containersByKey) this.containersByKey.set(key, record);
+    for (const [id, key] of containerKeysById) this.containerKeysById.set(id, key);
+    this.containerOrder.push(...containerOrder);
   }
 
   private applyPlaceObservation(
@@ -461,6 +601,10 @@ function resourceLastObserved(resource: ResourceAnchorFact): number {
   return Math.max(resource.observedAt, resource.revokedAt ?? resource.observedAt);
 }
 
+function containerLastObserved(container: ContainerAnchorFact): number {
+  return Math.max(container.observedAt, container.goneAt ?? container.observedAt);
+}
+
 function samePlace(a: PlaceFact, b: PlaceFact): boolean {
   return (
     a.id === b.id &&
@@ -494,7 +638,9 @@ function sameContainer(a: ContainerAnchorFact, b: ContainerAnchorFact): boolean 
     a.dim === b.dim &&
     pointsEqual(a.pos, b.pos) &&
     a.externalRef === b.externalRef &&
-    a.ledgerRef === b.ledgerRef
+    a.ledgerRef === b.ledgerRef &&
+    a.gone === b.gone &&
+    a.goneAt === b.goneAt
   );
 }
 
@@ -550,6 +696,9 @@ function snapshotContainer(container: ContainerAnchorFact): ContainerAnchorFact 
     ...container,
     pos: { ...container.pos },
     source: snapshotProvenance(container.source),
+    ...(container.goneSource === undefined
+      ? {}
+      : { goneSource: snapshotProvenance(container.goneSource) }),
   };
 }
 
@@ -567,109 +716,4 @@ function snapshotProvenance(source: FactProvenance): FactProvenance {
       ? {}
       : { observationIds: [...source.observationIds] }),
   };
-}
-
-function assertPlace(place: PlaceFact): void {
-  assertNonEmptyString(place.id, 'place id');
-  assertNonEmptyString(place.worldId, 'place worldId');
-  assertNonEmptyString(place.dim, 'place dim');
-  assertNonEmptyString(place.label, 'place label');
-  if (!isPlaceKind(place.kind)) throw new Error(`place kind is not supported: ${place.kind}`);
-  assertFiniteNumber(place.observedAt, 'place observedAt');
-  assertLocation(place.location, 'place location');
-  assertProvenance(place.source);
-  if (typeof place.gone !== 'boolean') throw new Error('place gone must be a boolean');
-  if (place.goneAt !== undefined) assertFiniteNumber(place.goneAt, 'place goneAt');
-  if (place.goneSource !== undefined) assertProvenance(place.goneSource);
-  if (place.legacyId !== undefined) assertNonEmptyString(place.legacyId, 'place legacyId');
-}
-
-function assertResource(resource: ResourceAnchorFact): void {
-  assertNonEmptyString(resource.id, 'resource id');
-  assertNonEmptyString(resource.worldId, 'resource worldId');
-  assertNonEmptyString(resource.dim, 'resource dim');
-  assertNonEmptyString(resource.label, 'resource label');
-  if (resource.resourceType !== undefined) {
-    assertNonEmptyString(resource.resourceType, 'resource resourceType');
-  }
-  assertPoint(resource.sourceCell, 'resource sourceCell');
-  assertFiniteNumber(resource.observedAt, 'resource observedAt');
-  assertProvenance(resource.source);
-  if (typeof resource.revoked !== 'boolean') throw new Error('resource revoked must be a boolean');
-  if (resource.revokedAt !== undefined) assertFiniteNumber(resource.revokedAt, 'resource revokedAt');
-  if (resource.revokedSource !== undefined) assertProvenance(resource.revokedSource);
-  if (resource.legacyId !== undefined) {
-    assertNonEmptyString(resource.legacyId, 'resource legacyId');
-  }
-}
-
-function assertContainer(container: ContainerAnchorFact): void {
-  assertNonEmptyString(container.id, 'container id');
-  assertNonEmptyString(container.worldId, 'container worldId');
-  assertNonEmptyString(container.dim, 'container dim');
-  assertPoint(container.pos, 'container pos');
-  assertNonEmptyString(container.externalRef, 'container externalRef');
-  assertFiniteNumber(container.observedAt, 'container observedAt');
-  assertProvenance(container.source);
-  if (container.ledgerRef !== undefined) {
-    assertNonEmptyString(container.ledgerRef, 'container ledgerRef');
-  }
-  if (container.legacyId !== undefined) {
-    assertNonEmptyString(container.legacyId, 'container legacyId');
-  }
-}
-
-function assertGoneEvidence(evidence: FactGoneEvidence): void {
-  assertFiniteNumber(evidence.observedAt, 'gone observedAt');
-  assertProvenance(evidence.source);
-}
-
-function assertLocation(location: FactLocation, label: string): void {
-  if (location.kind === 'exact') {
-    assertPoint(location.pos, `${label} pos`);
-    return;
-  }
-  if (location.kind === 'area') {
-    assertPoint(location.center, `${label} center`);
-    assertFiniteNumber(location.radius, `${label} radius`);
-    if (location.radius < 0) throw new Error(`${label} radius must be non-negative`);
-    return;
-  }
-  throw new Error(`${label} kind is not supported`);
-}
-
-function assertPoint(point: Vec3Like, label: string): void {
-  assertFiniteNumber(point.x, `${label}.x`);
-  assertFiniteNumber(point.y, `${label}.y`);
-  assertFiniteNumber(point.z, `${label}.z`);
-}
-
-function assertProvenance(source: FactProvenance): void {
-  assertNonEmptyString(source.source, 'fact source');
-  if (source.sessionId !== undefined) assertNonEmptyString(source.sessionId, 'fact sessionId');
-  if (source.observationIds === undefined) return;
-  for (const observationId of source.observationIds) {
-    assertNonEmptyString(observationId, 'fact observationId');
-  }
-}
-
-function assertNonEmptyString(value: string, label: string): void {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`${label} must be a non-empty string`);
-  }
-}
-
-function assertFiniteNumber(value: number, label: string): void {
-  if (!Number.isFinite(value)) throw new Error(`${label} must be a finite number`);
-}
-
-function isPlaceKind(value: string): value is PlaceKind {
-  return (
-    value === 'place' ||
-    value === 'base' ||
-    value === 'death' ||
-    value === 'portal' ||
-    value === 'station' ||
-    value === 'hazard'
-  );
 }

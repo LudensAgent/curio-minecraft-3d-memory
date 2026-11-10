@@ -11,6 +11,11 @@
 
 import type { ActionRecord } from '../../navigation/types.js';
 import type { Observation, ObservationGap } from '../../observation/types.js';
+import type {
+  FactCheckpointSnapshot,
+  FactMigrationState,
+  FactStore,
+} from '../../facts/types.js';
 import type { LedgerDelta, LedgerStore } from './ledger.js';
 import type { FragmentStore, FragmentStoreOptions } from '../../topology/fragment-store.js';
 import type { TopologyStore, TopologyStoreOptions } from '../../topology/topology-store.js';
@@ -92,6 +97,10 @@ export interface SnapshotLimits {
   maxPaletteEntries?: number;
   /** Maximum total serialized snapshot size in bytes (string + nested data). Default 64 MiB. */
   maxBytes?: number;
+  /** Maximum place + resource + container records in the facts domain. Default 200_000. */
+  maxFacts?: number;
+  /** Maximum canonical JSON bytes of the facts-domain capture. Default 32 MiB. */
+  maxFactBytes?: number;
 }
 
 /** `SnapshotLimits` with every default resolved. Shared with the worker for load/write bounds. */
@@ -108,6 +117,8 @@ export interface ResolvedSnapshotLimits {
   maxObservedCells: number;
   maxPaletteEntries: number;
   maxBytes: number;
+  maxFacts: number;
+  maxFactBytes: number;
 }
 
 export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
@@ -123,6 +134,8 @@ export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
   maxObservedCells: 1_000_000,
   maxPaletteEntries: 200_000,
   maxBytes: 64 * 1024 * 1024,
+  maxFacts: 200_000,
+  maxFactBytes: 32 * 1024 * 1024,
 };
 
 /**
@@ -768,6 +781,8 @@ export interface SpatialCheckpointResult {
   journalRevision: number;
   /** Ledger revision captured and committed with this checkpoint. */
   ledgerRevision: number;
+  /** Facts revision captured and committed with this checkpoint. */
+  factsRevision: number;
 }
 
 /**
@@ -808,6 +823,17 @@ export interface SpatialPersistenceState {
   confirmedLedgerRevision: number;
   /** Ledger restore baseline checkpoint id (null when no ledger baseline exists). */
   ledgerBaselineCheckpointId: string | null;
+  /** Local semantic-facts revision (not a save confirmation). */
+  factsRevision: number;
+  /** Facts revision confirmed by the last committed checkpoint. */
+  confirmedFactsRevision: number;
+  /** Facts-domain restore baseline checkpoint id (null when never saved). */
+  factsBaselineCheckpointId: string | null;
+  /**
+   * Facts-domain migration/version record from the same persistence authority.
+   * `committed` is false when this world has never written the facts domain.
+   */
+  factsMigration: FactMigrationState;
   /**
    * Accepted but not yet ACK-confirmed journal records (a timed-out checkpoint may
    * already have committed).
@@ -835,6 +861,13 @@ export interface SpatialSession {
   readonly topology: TopologyStore;
   /** World-scoped placement, chunk-visit and portal-crossing ledger. */
   readonly ledger: LedgerStore;
+  /**
+   * Semantic place/resource/container facts. Synchronous reads and writes are
+   * authoritative immediately; `checkpoint()` persists the captured revision.
+   */
+  readonly facts: FactStore;
+  /** Facts-domain migration/version record restored from the same database. */
+  readonly factsMigration: FactMigrationState;
   /** How voxel sections are loaded at open (`eager` or `manual`). */
   readonly voxelLoading: VoxelLoading;
   /** The resolved working-set bounds used by the manual residency mode. */
@@ -994,6 +1027,16 @@ export type WorkerRequest =
       /** Changed placed/visit rows plus new portal crossings for `delta`. */
       ledgerDelta?: LedgerDelta;
       /**
+       * Facts persistence mode. `none` (default) never touches the facts domain;
+       * `full` replaces this world's place/resource/container rows in the same
+       * transaction. An empty capture is a valid explicit empty domain.
+       */
+      factsMode?: 'none' | 'full';
+      /** Captured local facts revision. */
+      factsRevision?: number;
+      /** Complete world-scoped facts capture for `full`. */
+      factsSnapshot?: FactCheckpointSnapshot;
+      /**
        * Explicit Minecraft game version this checkpoint's voxel rows were written
        * under, supplied by the caller (never guessed by the worker). When absent,
        * the checkpoint and its section rows record `'unknown'`.
@@ -1056,6 +1099,16 @@ export type WorkerResponse =
       ledgerBaselineCheckpointId: string | null;
       /** Restored world-scoped ledger (spatial sessions only). */
       ledgerSnapshot: LedgerSnapshot | null;
+      /** Facts baseline checkpoint id (null when the facts domain was never saved). */
+      factsBaselineCheckpointId: string | null;
+      /**
+       * Restored facts-domain capture (including gone/revoked records), or null
+       * when this world has no committed facts domain. Never derived from the
+       * legacy topology/fragment/JSON domains.
+       */
+      factsSnapshot: FactCheckpointSnapshot | null;
+      /** Migration/version record read from the same persistence authority. */
+      factsMigration: FactMigrationState;
       /**
        * Minecraft game version recorded on the voxel baseline this open restores
        * from (the latest checkpoint with `has_voxel = 1`), or `'unknown'` when its
@@ -1129,6 +1182,8 @@ export function resolveSnapshotLimits(options: SnapshotLimits | undefined): Reso
     'maxObservedCells',
     'maxPaletteEntries',
     'maxBytes',
+    'maxFacts',
+    'maxFactBytes',
   ] as const;
   for (const key of keys) {
     const value = options[key];

@@ -521,20 +521,27 @@ export type { PersistenceWorker, SaveBatch, SaveConfirmation } from './storage/i
 // Deliberately separate from topology nodes: flat, bounded, queryable facts
 // with gone/revocation retained, plus a pure legacy-node migration dry run.
 export {
+  FACT_MIGRATION_TARGET,
+  FACT_MIGRATION_VERSION,
   InMemoryFactStore,
+  PersistentFactStore,
   applyLegacySemanticMigration,
   runLegacySemanticMigrationDryRun,
 } from './facts/index.js';
 export type {
   ContainerAnchorFact,
+  FactCheckpointSnapshot,
   FactGoneEvidence,
   FactLocation,
+  FactMigrationState,
   FactPage,
   FactProvenance,
   FactQuery,
+  FactStore,
   FactWriteOutcome,
   FactWriteResult,
   InMemoryFactStoreOptions,
+  PersistentFactStoreOptions,
   LegacyRouteRecord,
   LegacySemanticExactLocation,
   LegacySemanticLocation,

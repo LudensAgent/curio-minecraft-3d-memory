@@ -28,6 +28,16 @@ import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/
 import type { SectionKey } from '../../voxel/section.js';
 import type { VoxelDirectorySummary } from '../../voxel/residency.js';
 import {
+  FACT_MIGRATION_TARGET,
+  FACT_MIGRATION_VERSION,
+  type ContainerAnchorFact,
+  type FactCheckpointSnapshot,
+  type FactMigrationState,
+  type PlaceFact,
+  type ResourceAnchorFact,
+} from '../../facts/types.js';
+import { validateFactCheckpointSnapshot } from '../../facts/validation.js';
+import {
   decodeVoxelSectionPayload,
   encodeVoxelSectionPayload,
   UNKNOWN_GAME_VERSION,
@@ -51,7 +61,7 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 const KNOWN_TABLES_V1 = new Set([
   'schema_meta',
@@ -79,6 +89,10 @@ const KNOWN_TABLES_V6 = new Set(KNOWN_TABLES_V5);
 
 /** v8 adds columns only; the table set is unchanged from v7. */
 const KNOWN_TABLES_V8 = new Set(KNOWN_TABLES_V6);
+
+/** v9 adds the semantic-facts domain. No legacy table is removed or rewritten. */
+const FACT_TABLES = ['fact_places', 'fact_resources', 'fact_containers', 'fact_domain'] as const;
+const KNOWN_TABLES_V9 = new Set([...KNOWN_TABLES_V8, ...FACT_TABLES]);
 
 /** Required columns + the SQLite type affinity the read/write logic relies on (v1). */
 const REQUIRED_COLUMNS_V1: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
@@ -259,6 +273,58 @@ const REQUIRED_COLUMNS_V8: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
   },
 };
 
+/**
+ * Required columns for the v9 schema: the three semantic-fact tables plus the
+ * per-world facts-domain metadata. Indexed columns are the query identity; the
+ * full record (including stable ids, original times and gone/revoked state) is
+ * preserved in `payload`.
+ */
+const REQUIRED_COLUMNS_V9: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  ...REQUIRED_COLUMNS_V8,
+  fact_places: {
+    world_id: 'TEXT',
+    id: 'TEXT',
+    dim: 'TEXT',
+    observed_at: 'INTEGER',
+    gone: 'INTEGER',
+    gone_at: 'INTEGER',
+    payload: 'TEXT',
+  },
+  fact_resources: {
+    world_id: 'TEXT',
+    id: 'TEXT',
+    dim: 'TEXT',
+    label: 'TEXT',
+    source_x: 'INTEGER',
+    source_y: 'INTEGER',
+    source_z: 'INTEGER',
+    observed_at: 'INTEGER',
+    revoked: 'INTEGER',
+    revoked_at: 'INTEGER',
+    payload: 'TEXT',
+  },
+  fact_containers: {
+    world_id: 'TEXT',
+    id: 'TEXT',
+    dim: 'TEXT',
+    external_ref: 'TEXT',
+    x: 'INTEGER',
+    y: 'INTEGER',
+    z: 'INTEGER',
+    observed_at: 'INTEGER',
+    gone: 'INTEGER',
+    gone_at: 'INTEGER',
+    payload: 'TEXT',
+  },
+  fact_domain: {
+    world_id: 'TEXT',
+    checkpoint_id: 'TEXT',
+    revision: 'INTEGER',
+    migration_version: 'INTEGER',
+    migration_target: 'TEXT',
+  },
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -408,6 +474,61 @@ CREATE TABLE portal_traversals (
   UNIQUE (kind, from_id, to_id, ts, from_session, to_session, from_observation, to_observation)
 );
 CREATE INDEX portal_traversals_world_ts ON portal_traversals (world_id, ts);
+
+CREATE TABLE fact_places (
+  world_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  dim TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  gone INTEGER NOT NULL DEFAULT 0,
+  gone_at INTEGER,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (world_id, id)
+);
+CREATE INDEX fact_places_world_observed ON fact_places (world_id, observed_at);
+
+CREATE TABLE fact_resources (
+  world_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  dim TEXT NOT NULL,
+  label TEXT NOT NULL,
+  source_x INTEGER NOT NULL,
+  source_y INTEGER NOT NULL,
+  source_z INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL,
+  revoked INTEGER NOT NULL DEFAULT 0,
+  revoked_at INTEGER,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (world_id, id)
+);
+CREATE INDEX fact_resources_world_cell ON fact_resources (world_id, dim, source_x, source_y, source_z);
+
+CREATE TABLE fact_containers (
+  world_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  dim TEXT NOT NULL,
+  external_ref TEXT NOT NULL,
+  x INTEGER NOT NULL,
+  y INTEGER NOT NULL,
+  z INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL,
+  gone INTEGER NOT NULL DEFAULT 0,
+  gone_at INTEGER,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (world_id, id)
+);
+CREATE UNIQUE INDEX fact_containers_identity ON fact_containers (world_id, dim, external_ref);
+
+-- One row per world that has ever committed a facts domain, even an empty one.
+-- It records the exact committed revision and the facts-model migration target;
+-- fact rows absent from the new tables are never reconstructed from old domains.
+CREATE TABLE fact_domain (
+  world_id TEXT PRIMARY KEY,
+  checkpoint_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  migration_version INTEGER NOT NULL,
+  migration_target TEXT NOT NULL
+);
 `;
 
 interface PreparedSnapshot {
@@ -500,6 +621,7 @@ function openDatabase(databasePath: string): Database.Database {
     connection
       .prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)")
       .run(String(SCHEMA_VERSION));
+    writeFactMigrationMeta(connection);
     return connection;
   }
 
@@ -528,6 +650,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
@@ -542,6 +665,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
@@ -555,6 +679,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
@@ -567,6 +692,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
@@ -578,6 +704,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV5ToV6(connection, databasePath);
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
@@ -588,6 +715,7 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
@@ -597,14 +725,25 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV7ToV8(connection, databasePath);
+    upgradeV8ToV9(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (8).
-  validateKnownTables(connection, names, KNOWN_TABLES_V8);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V8)) {
+  if (version === 8) {
+    validateKnownTables(connection, names, KNOWN_TABLES_V8);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V8)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV8ToV9(connection, databasePath);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (9).
+  validateKnownTables(connection, names, KNOWN_TABLES_V9);
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V9)) {
     assertRequiredColumns(connection, table, columns);
   }
+  assertFactMigrationMeta(connection);
   return connection;
 }
 
@@ -930,6 +1069,124 @@ function upgradeV7ToV8(connection: Database.Database, databasePath: string): voi
   tx();
 }
 
+/**
+ * Upgrade a validated v8 database in place: write a consistent backup first,
+ * then add the semantic-facts tables and the facts migration-version record.
+ * Existing topology/fragment/voxel rows are neither read nor rewritten — the
+ * facts domain starts explicitly empty, never synthesized from old domains.
+ */
+function upgradeV8ToV9(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v9-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.exec(`
+      CREATE TABLE IF NOT EXISTS fact_places (
+        world_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        gone INTEGER NOT NULL DEFAULT 0,
+        gone_at INTEGER,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (world_id, id)
+      );
+      CREATE INDEX IF NOT EXISTS fact_places_world_observed ON fact_places (world_id, observed_at);
+
+      CREATE TABLE IF NOT EXISTS fact_resources (
+        world_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        label TEXT NOT NULL,
+        source_x INTEGER NOT NULL,
+        source_y INTEGER NOT NULL,
+        source_z INTEGER NOT NULL,
+        observed_at INTEGER NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        revoked_at INTEGER,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (world_id, id)
+      );
+      CREATE INDEX IF NOT EXISTS fact_resources_world_cell ON fact_resources (world_id, dim, source_x, source_y, source_z);
+
+      CREATE TABLE IF NOT EXISTS fact_containers (
+        world_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        dim TEXT NOT NULL,
+        external_ref TEXT NOT NULL,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        z INTEGER NOT NULL,
+        observed_at INTEGER NOT NULL,
+        gone INTEGER NOT NULL DEFAULT 0,
+        gone_at INTEGER,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (world_id, id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS fact_containers_identity ON fact_containers (world_id, dim, external_ref);
+
+      CREATE TABLE IF NOT EXISTS fact_domain (
+        world_id TEXT PRIMARY KEY,
+        checkpoint_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        migration_version INTEGER NOT NULL,
+        migration_target TEXT NOT NULL
+      );
+    `);
+    writeFactMigrationMeta(connection);
+    connection.prepare("UPDATE schema_meta SET value = '9' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
+/** Record the facts-model migration version/target in the same schema authority. */
+function writeFactMigrationMeta(connection: Database.Database): void {
+  const write = connection.prepare(
+    'INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+  );
+  write.run('fact_migration_version', String(FACT_MIGRATION_VERSION));
+  write.run('fact_migration_target', FACT_MIGRATION_TARGET);
+}
+
+function readSchemaMeta(connection: Database.Database, key: string): string | undefined {
+  const row = connection.prepare('SELECT value FROM schema_meta WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
+  return row?.value;
+}
+
+/**
+ * The facts migration record is required for a v9 database. Its absence is
+ * corruption/partial migration, never a reason to consult old domains.
+ */
+function assertFactMigrationMeta(connection: Database.Database): void {
+  let meta: { version: number; target: string };
+  try {
+    meta = readFactMigrationMeta(connection);
+  } catch (err) {
+    connection.close();
+    throw err;
+  }
+  if (meta.version !== FACT_MIGRATION_VERSION || meta.target !== FACT_MIGRATION_TARGET) {
+    connection.close();
+    throw new Error(
+      `unsupported facts migration record: version ${meta.version}, target "${meta.target}"`,
+    );
+  }
+}
+
+function readFactMigrationMeta(connection: Database.Database): { version: number; target: string } {
+  const rawVersion = readSchemaMeta(connection, 'fact_migration_version');
+  const rawTarget = readSchemaMeta(connection, 'fact_migration_target');
+  if (rawVersion === undefined || rawTarget === undefined) {
+    throw new Error('database is missing the facts migration-version record');
+  }
+  const version = Number(rawVersion);
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw new Error(`invalid facts migration version "${rawVersion}"`);
+  }
+  return { version, target: rawTarget };
+}
+
 /** Reject a table missing a required column, or whose column has the wrong type affinity. */
 function assertRequiredColumns(
   connection: Database.Database,
@@ -1218,6 +1475,7 @@ function writeCheckpoint(
   voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections']; removedIds?: string[] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
   ledger: { mode: 'none' | 'full' | 'delta'; revision: number; prepared: PreparedLedgerWrite | null },
+  facts: { mode: 'none' | 'full'; prepared: PreparedFacts | null },
   resolved: ResolvedSnapshotLimits,
   resolvedJournal: ResolvedJournalLimits,
 ): {
@@ -1389,6 +1647,14 @@ function writeCheckpoint(
               traversals: preparedLedger.traversals.length,
               bytes: preparedLedger.bytes,
             };
+    }
+
+    // `none` never touches fact rows or the domain record. `full` replaces this
+    // world's complete capture (including gone/revoked records) and records the
+    // exact captured revision in the same transaction.
+    if (facts.mode === 'full') {
+      if (facts.prepared === null) throw new Error('facts save mode requires a prepared facts set');
+      writeFacts(connection, wId, checkpointId, facts.prepared);
     }
 
     // A `none` topology write leaves the committed extras untouched, so the new
@@ -1612,6 +1878,50 @@ interface LedgerStats {
   placed: number;
   visits: number;
   traversals: number;
+  bytes: number;
+}
+
+interface PreparedFactPlace {
+  id: string;
+  dim: string;
+  observedAt: number;
+  gone: number;
+  goneAt: number | null;
+  payload: string;
+}
+
+interface PreparedFactResource {
+  id: string;
+  dim: string;
+  label: string;
+  sourceX: number;
+  sourceY: number;
+  sourceZ: number;
+  observedAt: number;
+  revoked: number;
+  revokedAt: number | null;
+  payload: string;
+}
+
+interface PreparedFactContainer {
+  id: string;
+  dim: string;
+  externalRef: string;
+  x: number;
+  y: number;
+  z: number;
+  observedAt: number;
+  gone: number;
+  goneAt: number | null;
+  payload: string;
+}
+
+/** A validated facts-domain capture ready to write inside the checkpoint transaction. */
+interface PreparedFacts {
+  revision: number;
+  places: PreparedFactPlace[];
+  resources: PreparedFactResource[];
+  containers: PreparedFactContainer[];
   bytes: number;
 }
 
@@ -2032,6 +2342,342 @@ function loadLedger(
   return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes: prepared.bytes };
 }
 
+// --- semantic facts domain ---------------------------------------------------
+
+function factBytes(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/**
+ * Re-validate and bound a facts-domain capture at the process/DB boundary. The
+ * worker never trusts the session's capture: a checkpoint either commits a fully
+ * valid, world-scoped facts domain or rolls back with the rest of the batch.
+ */
+function prepareFactsSnapshot(
+  snapshot: FactCheckpointSnapshot,
+  wId: string,
+  resolved: ResolvedSnapshotLimits,
+): PreparedFacts {
+  const validated = validateFactCheckpointSnapshot(snapshot, wId);
+  const total = validated.places.length + validated.resources.length + validated.containers.length;
+  if (total > resolved.maxFacts) throw new Error(`facts exceed maxFacts (${total})`);
+
+  let bytes = 0;
+  const places = validated.places.map((record): PreparedFactPlace => {
+    const payload = stringifyRecord(record);
+    bytes += factBytes(payload);
+    return {
+      id: record.id,
+      dim: record.dim,
+      observedAt: record.observedAt,
+      gone: record.gone ? 1 : 0,
+      goneAt: record.goneAt ?? null,
+      payload,
+    };
+  });
+  const resources = validated.resources.map((record): PreparedFactResource => {
+    const payload = stringifyRecord(record);
+    bytes += factBytes(payload);
+    return {
+      id: record.id,
+      dim: record.dim,
+      label: record.label,
+      sourceX: record.sourceCell.x,
+      sourceY: record.sourceCell.y,
+      sourceZ: record.sourceCell.z,
+      observedAt: record.observedAt,
+      revoked: record.revoked ? 1 : 0,
+      revokedAt: record.revokedAt ?? null,
+      payload,
+    };
+  });
+  const containers = validated.containers.map((record): PreparedFactContainer => {
+    const payload = stringifyRecord(record);
+    bytes += factBytes(payload);
+    return {
+      id: record.id,
+      dim: record.dim,
+      externalRef: record.externalRef,
+      x: record.pos.x,
+      y: record.pos.y,
+      z: record.pos.z,
+      observedAt: record.observedAt,
+      gone: record.gone ? 1 : 0,
+      goneAt: record.goneAt ?? null,
+      payload,
+    };
+  });
+  if (bytes > resolved.maxFactBytes) {
+    throw new Error(`facts exceed maxFactBytes (${bytes})`);
+  }
+  return { revision: validated.revision, places, resources, containers, bytes };
+}
+
+/**
+ * Replace this world's facts rows and record the exact committed revision in the
+ * same checkpoint transaction. Gone/revoked records are written, not deleted:
+ * the default query projection is the only thing that hides them.
+ */
+function writeFacts(
+  connection: Database.Database,
+  wId: string,
+  checkpointId: string,
+  prepared: PreparedFacts,
+): void {
+  connection.prepare('DELETE FROM fact_places WHERE world_id = ?').run(wId);
+  connection.prepare('DELETE FROM fact_resources WHERE world_id = ?').run(wId);
+  connection.prepare('DELETE FROM fact_containers WHERE world_id = ?').run(wId);
+
+  const insertPlace = connection.prepare(
+    'INSERT INTO fact_places (world_id, id, dim, observed_at, gone, gone_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const record of prepared.places) {
+    insertPlace.run(
+      wId,
+      record.id,
+      record.dim,
+      record.observedAt,
+      record.gone,
+      record.goneAt,
+      record.payload,
+    );
+  }
+
+  const insertResource = connection.prepare(
+    'INSERT INTO fact_resources (world_id, id, dim, label, source_x, source_y, source_z, observed_at, revoked, revoked_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const record of prepared.resources) {
+    insertResource.run(
+      wId,
+      record.id,
+      record.dim,
+      record.label,
+      record.sourceX,
+      record.sourceY,
+      record.sourceZ,
+      record.observedAt,
+      record.revoked,
+      record.revokedAt,
+      record.payload,
+    );
+  }
+
+  const insertContainer = connection.prepare(
+    'INSERT INTO fact_containers (world_id, id, dim, external_ref, x, y, z, observed_at, gone, gone_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  for (const record of prepared.containers) {
+    insertContainer.run(
+      wId,
+      record.id,
+      record.dim,
+      record.externalRef,
+      record.x,
+      record.y,
+      record.z,
+      record.observedAt,
+      record.gone,
+      record.goneAt,
+      record.payload,
+    );
+  }
+
+  connection
+    .prepare(
+      'INSERT INTO fact_domain (world_id, checkpoint_id, revision, migration_version, migration_target) VALUES (?, ?, ?, ?, ?) '
+        + 'ON CONFLICT(world_id) DO UPDATE SET checkpoint_id = excluded.checkpoint_id, revision = excluded.revision, '
+        + 'migration_version = excluded.migration_version, migration_target = excluded.migration_target',
+    )
+    .run(wId, checkpointId, prepared.revision, FACT_MIGRATION_VERSION, FACT_MIGRATION_TARGET);
+}
+
+function parseFactPayload<T>(payload: string, what: string): T {
+  const parsed = JSON.parse(payload) as unknown;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`corrupt ${what} payload`);
+  }
+  return parsed as T;
+}
+
+function sameStoredBoolean(value: number, expected: boolean, what: string): void {
+  if (value !== (expected ? 1 : 0)) throw new Error(`corrupt ${what} state column`);
+}
+
+/**
+ * Read this world's committed facts domain. Payloads are bounded before decode;
+ * a world with fact rows but no domain record is corruption, never an empty
+ * domain. A missing facts domain is returned as empty/null — this function never
+ * reads topology, fragments or legacy JSON as a fallback.
+ */
+function loadFacts(
+  connection: Database.Database,
+  wId: string,
+  resolved: ResolvedSnapshotLimits,
+): {
+  factsBaselineCheckpointId: string | null;
+  factsSnapshot: FactCheckpointSnapshot | null;
+  factsMigration: FactMigrationState;
+} {
+  const meta = readFactMigrationMeta(connection);
+  const domain = connection
+    .prepare(
+      'SELECT checkpoint_id, revision, migration_version, migration_target FROM fact_domain WHERE world_id = ?',
+    )
+    .get(wId) as
+    | {
+        checkpoint_id: string;
+        revision: number;
+        migration_version: number;
+        migration_target: string;
+      }
+    | undefined;
+
+  const placeRows = countRows(connection, 'fact_places', wId);
+  const resourceRows = countRows(connection, 'fact_resources', wId);
+  const containerRows = countRows(connection, 'fact_containers', wId);
+  const total = placeRows + resourceRows + containerRows;
+
+  if (domain === undefined) {
+    if (total > 0) throw new Error('world has fact rows but no facts domain metadata');
+    return {
+      factsBaselineCheckpointId: null,
+      factsSnapshot: null,
+      factsMigration: { version: meta.version, target: meta.target, committed: false },
+    };
+  }
+  if (
+    typeof domain.checkpoint_id !== 'string' ||
+    domain.checkpoint_id.length === 0 ||
+    !Number.isSafeInteger(domain.revision) ||
+    domain.revision < 0 ||
+    domain.migration_version !== meta.version ||
+    domain.migration_target !== meta.target
+  ) {
+    throw new Error('corrupt facts domain metadata');
+  }
+  if (total > resolved.maxFacts) throw new Error(`facts exceed maxFacts (${total})`);
+
+  const bytes =
+    sumPayloadBytes(connection, 'fact_places', wId) +
+    sumPayloadBytes(connection, 'fact_resources', wId) +
+    sumPayloadBytes(connection, 'fact_containers', wId);
+  if (bytes > resolved.maxFactBytes) throw new Error(`facts exceed maxFactBytes (${bytes})`);
+
+  const places = (connection
+    .prepare(
+      'SELECT id, dim, observed_at, gone, gone_at, payload FROM fact_places WHERE world_id = ? ORDER BY id',
+    )
+    .all(wId) as {
+    id: string;
+    dim: string;
+    observed_at: number;
+    gone: number;
+    gone_at: number | null;
+    payload: string;
+  }[]).map((row) => {
+    const record = parseFactPayload<PlaceFact>(row.payload, 'fact place');
+    if (
+      record.id !== row.id ||
+      record.worldId !== wId ||
+      record.dim !== row.dim ||
+      record.observedAt !== row.observed_at ||
+      (record.goneAt ?? null) !== row.gone_at
+    ) {
+      throw new Error('corrupt fact place identity: payload disagrees with row columns');
+    }
+    sameStoredBoolean(row.gone, record.gone, 'fact place gone');
+    return record;
+  });
+
+  const resources = (connection
+    .prepare(
+      'SELECT id, dim, label, source_x, source_y, source_z, observed_at, revoked, revoked_at, payload '
+        + 'FROM fact_resources WHERE world_id = ? ORDER BY id',
+    )
+    .all(wId) as {
+    id: string;
+    dim: string;
+    label: string;
+    source_x: number;
+    source_y: number;
+    source_z: number;
+    observed_at: number;
+    revoked: number;
+    revoked_at: number | null;
+    payload: string;
+  }[]).map((row) => {
+    const record = parseFactPayload<ResourceAnchorFact>(row.payload, 'fact resource');
+    if (
+      record.id !== row.id ||
+      record.worldId !== wId ||
+      record.dim !== row.dim ||
+      record.label !== row.label ||
+      record.sourceCell.x !== row.source_x ||
+      record.sourceCell.y !== row.source_y ||
+      record.sourceCell.z !== row.source_z ||
+      record.observedAt !== row.observed_at ||
+      (record.revokedAt ?? null) !== row.revoked_at
+    ) {
+      throw new Error('corrupt fact resource identity: payload disagrees with row columns');
+    }
+    sameStoredBoolean(row.revoked, record.revoked, 'fact resource revoked');
+    return record;
+  });
+
+  const containers = (connection
+    .prepare(
+      'SELECT id, dim, external_ref, x, y, z, observed_at, gone, gone_at, payload '
+        + 'FROM fact_containers WHERE world_id = ? ORDER BY id',
+    )
+    .all(wId) as {
+    id: string;
+    dim: string;
+    external_ref: string;
+    x: number;
+    y: number;
+    z: number;
+    observed_at: number;
+    gone: number;
+    gone_at: number | null;
+    payload: string;
+  }[]).map((row) => {
+    const record = parseFactPayload<ContainerAnchorFact>(row.payload, 'fact container');
+    if (
+      record.id !== row.id ||
+      record.worldId !== wId ||
+      record.dim !== row.dim ||
+      record.externalRef !== row.external_ref ||
+      record.pos.x !== row.x ||
+      record.pos.y !== row.y ||
+      record.pos.z !== row.z ||
+      record.observedAt !== row.observed_at ||
+      (record.goneAt ?? null) !== row.gone_at
+    ) {
+      throw new Error('corrupt fact container identity: payload disagrees with row columns');
+    }
+    sameStoredBoolean(row.gone, record.gone, 'fact container gone');
+    return record;
+  });
+
+  const factsSnapshot: FactCheckpointSnapshot = {
+    worldId: wId,
+    revision: domain.revision,
+    places,
+    resources,
+    containers,
+  };
+  // Re-validate the reconstructed capture through the same boundary as a write.
+  validateFactCheckpointSnapshot(factsSnapshot, wId);
+  return {
+    factsBaselineCheckpointId: domain.checkpoint_id,
+    factsSnapshot,
+    factsMigration: {
+      version: domain.migration_version,
+      target: domain.migration_target,
+      committed: true,
+    },
+  };
+}
+
 function computeDerivedCounts(snapshot: HistorySnapshot): {
   polylinePoints: number;
   entrancePoints: number;
@@ -2436,6 +3082,9 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
     };
     let ledgerBaselineCheckpointId: string | null = null;
     let ledgerSnapshot: LedgerSnapshot | null = null;
+    // The facts domain is independent of history/topology loading: a missing
+    // facts domain stays empty and is never reconstructed from old tables.
+    const facts = loadFacts(connection, msg.worldId, msg.limits);
     if (msg.kind === 'spatial') {
       // Hand the voxel loader the budget left after history, so the shared combined
       // budget is checked against `octet_length` *before* any voxel payload is read
@@ -2469,6 +3118,9 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       journalRecordBytes: journal.recordBytes,
       ledgerBaselineCheckpointId,
       ledgerSnapshot,
+      factsBaselineCheckpointId: msg.kind === 'spatial' ? facts.factsBaselineCheckpointId : null,
+      factsSnapshot: msg.kind === 'spatial' ? facts.factsSnapshot : null,
+      factsMigration: facts.factsMigration,
       gameVersion: voxelBaselineCheckpoint?.game_version ?? null,
     });
   } catch (err) {
@@ -2559,6 +3211,24 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode delta requires a delta' });
     return;
   }
+  const factsMode = msg.factsMode ?? 'none';
+  if (factsMode !== 'none' && factsMode !== 'full') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid facts save mode' });
+    return;
+  }
+  const factsRevision = msg.factsRevision ?? 0;
+  if (!Number.isSafeInteger(factsRevision) || factsRevision < 0) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'facts revision must be a non-negative safe integer' });
+    return;
+  }
+  if (factsMode === 'none' && msg.factsSnapshot !== undefined) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'facts mode none must not carry a snapshot' });
+    return;
+  }
+  if (factsMode === 'full' && msg.factsSnapshot === undefined) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'facts mode full requires a snapshot' });
+    return;
+  }
   const gameVersion = msg.gameVersion === undefined ? UNKNOWN_GAME_VERSION : msg.gameVersion;
   if (typeof gameVersion !== 'string' || gameVersion.length === 0) {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'game version must be a non-empty string' });
@@ -2568,6 +3238,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   let preparedVoxel: PreparedVoxelSnapshot | null = null;
   let preparedJournal: PreparedJournal;
   let preparedLedger: PreparedLedgerWrite | null = null;
+  let preparedFacts: PreparedFacts | null = null;
   try {
     prepared = prepareSnapshot(msg.snapshot);
     assertWithinLimits(prepared, limits);
@@ -2598,6 +3269,12 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     } else if (ledgerMode === 'delta') {
       preparedLedger = prepareLedgerDelta(msg.ledgerDelta!, worldId, ledgerLimits);
     }
+    if (factsMode === 'full') {
+      preparedFacts = prepareFactsSnapshot(msg.factsSnapshot!, worldId, limits);
+      if (preparedFacts.revision !== factsRevision) {
+        throw new Error('facts revision does not match the captured snapshot revision');
+      }
+    }
   } catch (err) {
     respond({
       type: 'error',
@@ -2625,6 +3302,9 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       mode: ledgerMode,
       revision: ledgerRevision,
       prepared: preparedLedger,
+    }, {
+      mode: factsMode,
+      prepared: preparedFacts,
     }, limits, journalLimits);
     committedLedger = committed.ledgerStats;
     voxelStats = committed.voxelStats;
