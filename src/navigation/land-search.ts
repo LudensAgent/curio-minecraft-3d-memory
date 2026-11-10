@@ -32,6 +32,19 @@ export type LandSearchStatus =
 export type LandSearchBoundaryStatus = 'BLOCKED' | 'UNKNOWN' | 'STALE' | 'UNSUPPORTED' | 'INCOMPLETE';
 export type LandSearchBudget = 'nodes' | 'edges' | 'reads' | 'sections' | 'points' | 'time' | 'geometry';
 
+/**
+ * Finite-width delegation limit around an observed start/corridor line. It is
+ * not terrain evidence and never authorizes a move back into the corridor from
+ * an out-of-corridor actual start.
+ */
+export interface LandSearchCorridor {
+  origin: Vec3Like;
+  /** Nonzero horizontal direction; copied and normalized at the request boundary. */
+  bearing: { x: number; z: number };
+  /** Maximum lateral distance from the infinite origin/bearing line, inclusive. */
+  maxLateral: number;
+}
+
 export interface LandSearchRequest {
   worldId: string;
   dim: string;
@@ -44,6 +57,8 @@ export interface LandSearchRequest {
   /** Historical candidates use recorded geometry; they never become current OPEN proofs. */
   evidenceMode?: 'current' | 'remembered';
   allowed?: readonly LandSearchKind[];
+  /** Candidate columns/actions outside this finite-width strip are not expanded. */
+  corridor?: LandSearchCorridor;
   /** Search range only, not a claim that a drop is safe or physically executable. Default 4. */
   maxDrop?: number;
   maxNodes?: number;
@@ -82,6 +97,26 @@ export interface LandSearchBoundary {
   reason: string;
 }
 
+/**
+ * Best current-evidence prefix reached before a non-FOUND stop. Every included
+ * transition was evaluated `OPEN`; the endpoint is the closest actually reached
+ * node by 3D remaining distance. `atTarget` never means physical arrival.
+ */
+export interface LandSearchPrefix {
+  endpoint: Vec3Like;
+  /** Original start first; `points.length === transitions.length + 1`. */
+  points: Vec3Like[];
+  transitions: LandSearchTransition[];
+  /** 3D Euclidean distance from `endpoint` to the original target. */
+  distanceToTarget: number;
+  /** The original exact/near completion predicate held at the endpoint. */
+  atTarget: boolean;
+  /** The endpoint is the untouched original start (zero transitions). */
+  atStart: boolean;
+  /** One real BLOCKED/UNSUPPORTED out-edge from the endpoint toward the target. */
+  knownBlockerAhead?: LandSearchBoundary;
+}
+
 export interface LandSearchResult {
   status: LandSearchStatus;
   assurance: 'geometry_only' | 'historical_geometry';
@@ -96,6 +131,14 @@ export interface LandSearchResult {
   transitions: LandSearchTransition[];
   cost: number;
   boundaries: LandSearchBoundary[];
+  /**
+   * Current-mode only. Present for non-FOUND results once a current start chain
+   * is available; omitted for remembered searches, CANCELLED/INVALIDATED
+   * results and stops that occur before any start node can be recorded.
+   */
+  prefix?: LandSearchPrefix;
+  /** Candidates were excluded by `corridor`; it does not claim a route outside it. */
+  corridorLimited?: true;
   /** Saved pages were not loaded implicitly; the caller can prepare them and retry. */
   unavailableSections: SectionKey[];
   reason: string;
@@ -109,6 +152,8 @@ export interface LandSearchResult {
     surfaceReads: number;
     sectionsRead: number;
     staleReads: number;
+    /** Candidate columns excluded before any map read by the corridor filter. */
+    corridorSkipped: number;
     boundariesTruncated: boolean;
     durationMs: number;
     yieldCount: number;
@@ -163,6 +208,11 @@ interface SearchNode {
   g: number;
   parent: SearchNode | null;
   via: LandSearchTransition | null;
+  /**
+   * At most one real BLOCKED/UNSUPPORTED out-edge toward the target. Kept on
+   * the bounded node so a truncated global boundary list cannot hide it.
+   */
+  blocker?: LandSearchBoundary;
 }
 
 function positive(value: number | undefined, fallback: number, label: string, integer = true): number {
@@ -206,6 +256,25 @@ function* searchChunks(
   if ([...allowed].some((kind) => kind !== 'walk' && kind !== 'step' && kind !== 'drop')) {
     throw new Error('land search supports walk, step and drop geometry only');
   }
+  // Validate, copy and normalize the corridor exactly once at the request
+  // boundary so the hot expansion loop only compares finite numbers.
+  let corridor: { origin: Vec3Like; bearing: { x: number; z: number }; maxLateral: number } | undefined;
+  if (request.corridor !== undefined) {
+    const { origin, bearing, maxLateral } = request.corridor;
+    if (![origin?.x, origin?.y, origin?.z, bearing?.x, bearing?.z, maxLateral].every(Number.isFinite)) {
+      throw new Error('land search corridor origin, bearing and maxLateral must be finite numbers');
+    }
+    if (maxLateral < 0) {
+      throw new Error('land search corridor maxLateral must be nonnegative');
+    }
+    const length = Math.hypot(bearing.x, bearing.z);
+    if (length === 0) throw new Error('land search corridor bearing must be nonzero');
+    corridor = {
+      origin: { x: origin.x, y: origin.y, z: origin.z },
+      bearing: { x: bearing.x / length, z: bearing.z / length },
+      maxLateral,
+    };
+  }
   const maxDrop = request.maxDrop ?? 4;
   if (!Number.isFinite(maxDrop) || maxDrop < 0) throw new Error('maxDrop must be finite and nonnegative');
   const maxNodes = positive(request.maxNodes, 2048, 'maxNodes');
@@ -229,7 +298,7 @@ function* searchChunks(
   let sliceWork = 0;
   const stats = {
     nodesReached: 1, nodesExpanded: 0, edgesEvaluated: 0, surfaceReads: 0,
-    sectionsRead: 0, staleReads: 0, boundariesTruncated: false,
+    sectionsRead: 0, staleReads: 0, corridorSkipped: 0, boundariesTruncated: false,
     durationMs: 0, yieldCount: 0, maxSyncSliceMs: 0,
   };
   const dependencies = new Map<string, { key: SectionKey; generation: number }>();
@@ -238,6 +307,35 @@ function* searchChunks(
   const counts = { UNKNOWN: 0, STALE: 0, BLOCKED: 0, UNSUPPORTED: 0, INCOMPLETE: 0 };
   let invalidated = false;
   let budget: LandSearchBudget | undefined;
+  // Continuous feet XZ, never centered block coordinates. The origin/bearing
+  // were validated and normalized once at the request boundary.
+  const corridorContains = (point: Vec3Like): boolean => corridor === undefined
+    || Math.abs((point.x - corridor.origin.x) * corridor.bearing.z
+      - (point.z - corridor.origin.z) * corridor.bearing.x) <= corridor.maxLateral + EPS;
+  // Prefix selection deliberately ignores the admissible A* heuristic: it uses
+  // the actual 3D remaining distance (near targets subtract the arrival radius).
+  let closest: SearchNode | null = null;
+  let closestMetric = Number.POSITIVE_INFINITY;
+  const distance3 = (point: Vec3Like): number =>
+    Math.hypot(point.x - target.x, point.y - target.y, point.z - target.z);
+  const remainingMetric = (point: Vec3Like): number => arrival.kind === 'near'
+    ? Math.max(0, distance3(point) - arrival.radius)
+    : distance3(point);
+  /**
+   * Keep at most one real terrain/capability blocker per bounded node. Unknown,
+   * stale, incomplete and corridor-skipped candidates are deliberately absent.
+   */
+  const noteBlocker = (
+    node: SearchNode,
+    to: Vec3Like,
+    status: LandSearchBoundaryStatus,
+    reason: string,
+  ): void => {
+    if (node.blocker !== undefined) return;
+    if (status !== 'BLOCKED' && status !== 'UNSUPPORTED') return;
+    if (!(remainingMetric(to) < remainingMetric(node.point))) return;
+    node.blocker = { from: { ...node.point }, to: { ...to }, status, reason };
+  };
   const stopped = (): LandSearchStatus | null => {
     if (request.signal?.aborted) return 'CANCELLED';
     if (invalidated) return 'INVALIDATED';
@@ -331,12 +429,70 @@ function* searchChunks(
       transitions = [];
       cost = 0;
     }
-    stats.durationMs = Math.max(0, at - startedAt);
-    stats.maxSyncSliceMs = Math.max(stats.maxSyncSliceMs, at - sliceStart);
+    // A prefix is a current-evidence delegation aid only. It is never derived
+    // from remembered geometry, cancellation or invalidation, and it never
+    // extends the original deadline. One linear reconstruction collects the
+    // existing parent chain; no per-node route copies were kept during search.
+    const buildPrefix = (finalStatus: LandSearchStatus): LandSearchPrefix | undefined => {
+      if (evidenceMode !== 'current' || closest === null) return undefined;
+      if (finalStatus === 'FOUND' || finalStatus === 'CANCELLED' || finalStatus === 'INVALIDATED') return undefined;
+      if (request.signal?.aborted || invalidated) return undefined;
+      if (clock() >= deadline) return undefined;
+      const chain: SearchNode[] = [];
+      let cursor: SearchNode | null = closest;
+      while (cursor !== null) {
+        chain.push(cursor);
+        // Respect the output limit instead of publishing a partial chain that
+        // no longer starts at the original start.
+        if (chain.length > maxRoutePoints) return undefined;
+        if (request.signal?.aborted || invalidated || clock() >= deadline) return undefined;
+        cursor = cursor.parent;
+      }
+      chain.reverse();
+      const endpoint = { ...chain[chain.length - 1]!.point };
+      const prefixPoints = chain.map((node) => ({ ...node.point }));
+      const prefixTransitions: LandSearchTransition[] = [];
+      for (const node of chain) {
+        if (node.via !== null) prefixTransitions.push(node.via);
+      }
+      const blocker = chain[chain.length - 1]!.blocker;
+      const candidate: LandSearchPrefix = {
+        endpoint,
+        points: prefixPoints,
+        transitions: prefixTransitions,
+        distanceToTarget: distance3(endpoint),
+        atTarget: reached(endpoint),
+        atStart: prefixTransitions.length === 0,
+        ...(blocker === undefined ? {} : {
+          knownBlockerAhead: {
+            ...blocker,
+            from: { ...blocker.from },
+            to: { ...blocker.to },
+          },
+        }),
+      };
+      // Final check after the complete reverse/map/transition assembly. The
+      // publication clock read in `finish` happens after this, so both checks
+      // and the recorded duration include all prefix work.
+      if (request.signal?.aborted || invalidated || clock() >= deadline) return undefined;
+      return candidate;
+    };
+    const prefix = buildPrefix(status);
+    const finishedAt = clock();
+    const publishedPrefix = prefix !== undefined
+      && !request.signal?.aborted
+      && !invalidated
+      && finishedAt < deadline
+      ? prefix
+      : undefined;
+    stats.durationMs = Math.max(0, finishedAt - startedAt);
+    stats.maxSyncSliceMs = Math.max(stats.maxSyncSliceMs, finishedAt - sliceStart);
     return {
       status, assurance: evidenceMode === 'remembered' ? 'historical_geometry' : 'geometry_only',
       evidenceMode, executable: false, needsRevalidation: true,
       from: start, target, arrival, points, transitions, cost, boundaries,
+      ...(publishedPrefix === undefined ? {} : { prefix: publishedPrefix }),
+      ...(status !== 'FOUND' && stats.corridorSkipped > 0 ? { corridorLimited: true as const } : {}),
       unavailableSections: [...unavailable.values()], reason,
       ...(budget === undefined ? {} : { budget }), evaluatedAt: now, stats,
     };
@@ -369,6 +525,8 @@ function* searchChunks(
   const nodes = new Map<string, SearchNode>([[keyOf(start), startNode]]);
   const open = new MinHeap();
   open.push({ key: keyOf(start), g: 0, f: heuristic(start) });
+  closest = startNode;
+  closestMetric = remainingMetric(start);
   let found: SearchNode | null = null;
   const unsubscribe = map.subscribeChanges((report) => {
     if (report.sections.some((section) => dependencies.has(sectionKeyString(section.key))
@@ -382,9 +540,18 @@ function* searchChunks(
       if (head.g !== node.g) continue;
       if (reached(node.point)) { found = node; break; }
       stats.nodesExpanded += 1;
+      // Both action endpoints must be inside the corridor. An actual start that
+      // is already outside never authorizes a "return to corridor" move because
+      // the from-endpoint remains outside, so every candidate here is skipped.
+      const fromInCorridor = corridor === undefined || corridorContains(node.point);
       for (const [dx, dz] of DIRECTIONS) {
         const x = node.point.x + dx;
         const z = node.point.z + dz;
+        if (!fromInCorridor || !corridorContains({ x, y: node.point.y, z })) {
+          // Delegation limit only: no boundary, no map read, no terrain claim.
+          stats.corridorSkipped += 1;
+          continue;
+        }
         const half = body.width / 2;
         const surfaces = new Set<number>();
         const columnGaps = new Set<LandSearchBoundaryStatus>();
@@ -422,9 +589,12 @@ function* searchChunks(
         if (surfaces.size === 0) {
           const columnStatus = columnGaps.has('UNKNOWN') ? 'UNKNOWN' : columnGaps.has('STALE') ? 'STALE'
             : columnGaps.has('UNSUPPORTED') ? 'UNSUPPORTED' : 'BLOCKED';
-          boundary(node.point, { x, y: node.point.y, z }, columnStatus, columnStatus === 'BLOCKED'
+          const columnReason = columnStatus === 'BLOCKED'
             ? 'fully observed column has no support within the requested step/drop range'
-            : 'support-surface coverage or shape rules are incomplete in the bounded column');
+            : 'support-surface coverage or shape rules are incomplete in the bounded column';
+          const candidate = { x, y: node.point.y, z };
+          boundary(node.point, candidate, columnStatus, columnReason);
+          noteBlocker(node, candidate, columnStatus, columnReason);
         }
         for (const y of surfaces) {
           if (stopped() !== null) break search;
@@ -432,6 +602,9 @@ function* searchChunks(
           const kind: LandSearchKind = Math.abs(dy) <= EPS ? 'walk' : dy > 0 ? 'step' : 'drop';
           const to = { x, y, z };
           if (!allowed.has(kind)) {
+            // Keep the diagnostic boundary, but never turn an authorization /
+            // movement-kind restriction into an observed terrain blocker: no
+            // geometry was evaluated for this candidate.
             boundary(node.point, to, 'UNSUPPORTED', `${kind} is outside the requested movement kinds`);
             continue;
           }
@@ -486,8 +659,10 @@ function* searchChunks(
               : evaluation.geometry === 'OBSTRUCTED' ? 'BLOCKED' : evaluation.geometry
             : evaluation.status;
           if (status !== 'OPEN') {
-            boundary(node.point, to, status, typeof evaluation.reason === 'string'
-              ? evaluation.reason : evaluation.reason?.detail ?? 'transition geometry is not available');
+            const reason = typeof evaluation.reason === 'string'
+              ? evaluation.reason : evaluation.reason?.detail ?? 'transition geometry is not available';
+            boundary(node.point, to, status, reason);
+            noteBlocker(node, to, status, reason);
           } else {
             const cost = kind === 'walk' ? 1 : 2 + Math.abs(dy);
             const g = node.g + cost;
@@ -496,8 +671,21 @@ function* searchChunks(
             if (previous === undefined || g < previous.g) {
               if (previous === undefined && nodes.size >= maxNodes) { budget = 'nodes'; break search; }
               const via = { kind, from: { ...node.point }, to: { ...to }, cost, hazards: evaluation.hazards ?? [] };
-              nodes.set(key, { point: to, g, parent: node, via });
+              const next: SearchNode = { point: to, g, parent: node, via };
+              // A point can be reached again with a lower g. Carry the bounded
+              // node blocker forward, and re-point `closest` when it still
+              // referenced the superseded object so the prefix follows the new
+              // (cheaper, already evaluated) parent chain.
+              if (previous !== undefined && previous.blocker !== undefined) next.blocker = previous.blocker;
+              nodes.set(key, next);
               stats.nodesReached = nodes.size;
+              // Track the closest actually reached node on insertion, not on
+              // pop: a goal queued just before a budget stop still counts.
+              const metric = remainingMetric(to);
+              if (closest === previous || metric < closestMetric) {
+                closest = next;
+                closestMetric = metric;
+              }
               open.push({ key, g, f: g + heuristic(to) });
             }
           }
@@ -512,7 +700,9 @@ function* searchChunks(
     if (found === null) {
       const status = counts.UNKNOWN > 0 || counts.STALE > 0 || counts.INCOMPLETE > 0 ? 'INSUFFICIENT_EVIDENCE'
         : counts.UNSUPPORTED > 0 ? 'UNSUPPORTED' : 'NO_PATH_IN_MEMORY';
-      return finish(status, 'no candidate was found within the available remembered geometry and requested movement kinds');
+      return finish(status, stats.corridorSkipped > 0
+        ? 'no candidate was found within the available geometry, requested movement kinds and requested corridor; candidates outside the corridor were not expanded'
+        : 'no candidate was found within the available remembered geometry and requested movement kinds');
     }
     const points: Vec3Like[] = [];
     const transitions: LandSearchTransition[] = [];
