@@ -26,7 +26,7 @@
 - **有界历史查询**：`adjacency`、`reachable`、`route` 与 `historicalAnchorCandidates` 在有限工作预算内返回已记录事实——从不产生实时 `OPEN`、到达声明或可执行点列。
 - **拓扑运行态**（`topology/`）：按方向验证边、独立的门户边、锚点查询、瞬时占位，以及有证据的碎片连通/合并记录。派生状态可失效，但不删除历史。
 - **Walk 导航管线**（`navigation/`）：`planRoute` 基于有界搜索/历史证据发出单次使用 `routeId`；`walkPath` 通过调用方提供的单步身体端口执行该句柄，支持接地 `bodyArrival`、证据/会话失效的 `INVALIDATED` 停止与可选 `persistAction` 钩子。`navigateTo` 执行「实测起点 → 有界搜索 → 复验执行 → 实测到达」；`followKnownPath` 沿调用方显式指定的历史片段执行；`inspectRoute`、`inspectKnownRoute` 与 `frontierCandidates` 是只读投影。`recall_route` 未实现。
-- **体素三维候选规划**（`searchLandRoute` / `searchLandRouteAsync`，v0.11 开发中）：按已观察支撑面进行有界 walk/step/drop A*；调用方显式允许且提供 `climbProvider` 时，也生成同 XZ 的上下梯子边。支持精确/附近目标与显式历史几何模式。结果始终要求当前复验并标记 `executable: false`。库内 `planRoute` 不自动选择这些候选，由宿主显式接线；本搜索尚不负责冷页加载和独立水平跳跃边。
+- **体素三维候选规划**（`searchLandRoute` / `searchLandRouteAsync`，v0.11 开发中）：按已观察支撑面进行有界 walk/step/drop A*；调用方显式允许且提供 `LandMotionModel` 时生成同脚高的水平 `jump` 边；调用方显式允许且提供 `ClimbRegionProvider` 时生成 `ladder` 边，包括同 XZ 的上下攀爬，以及从相邻地面进入悬挂梯、从梯子同高侧向退出到平台。支持精确/附近目标与显式历史几何模式。结果始终要求当前复验并标记 `executable: false`。库内 `planRoute` 不自动选择这些候选，由宿主显式接线；本搜索尚不负责冷页加载。
 - **有界派生缓存**：`TraversabilityCache` 默认最多 2048 项、最长复用年龄 60 秒。查询时有限清理过期项，宿主可显式调用 `pruneExpired()` / `clear()` 维护或释放；这些操作不删除地图观察。
 - **受控路线执行**（`execution/`）：`WalkRouteExecutor` 驱动注入的单步 `MoveExecutor`；每段开始前要求当前 `OPEN` 证据；仅接受实测精确位置作为到达；证据变化时撤销在途路段。
 - **陆地与水面验证**（`traversability/`、`water/`）：`evaluateLandTransition` / `LandRouteVerifier` 检查调用方声明的陆地转换与路线；`evaluateWaterRoute` / `checkWaterArrival` 检查水面游泳与已乘船几何。结果固定带 `assurance: 'geometry_only'` 与 `executable: false`。
@@ -155,7 +155,7 @@ const route = evaluateWaterRoute(
 const arrival = checkWaterArrival({ goal, scope, map, samples, now, maxSampleAgeMs });
 ```
 
-陆地验证支持 `step`、`drop`、`jump` 与 `ladder`；`jump` 必须注入版本化 `LandMotionModel`，`ladder` 必须注入版本化 `ClimbRegionProvider`。水面路线必须等高且姿态固定为 90° 的整数倍。两个验证器都不搜索路线、不移动身体、不挖掘、不放置、不上下船，也不接管救援策略。
+陆地验证支持 `step`、`drop`、`jump` 与 `ladder`；`jump` 必须注入版本化 `LandMotionModel`，`ladder` 必须注入版本化 `ClimbRegionProvider`。梯子验证覆盖同列上下攀爬，以及相邻地面平台与攀爬源之间同脚高的进入/退出。水面路线必须等高且姿态固定为 90° 的整数倍。两个验证器都不搜索路线、不移动身体、不挖掘、不放置、不上下船，也不接管救援策略。
 
 ### 保存历史与拓扑
 
