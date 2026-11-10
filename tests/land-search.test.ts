@@ -219,6 +219,21 @@ describe('bounded voxel land search', () => {
     expect(tooHigh.status).not.toBe('FOUND');
   });
 
+  it('reports stale support evidence as STALE even when the same column also has never-observed cells', () => {
+    const map = new VoxelMap('world', { now: () => 100_000, validityWindowMs: 1000 });
+    // Current column is fresh; the next column has stale support/air evidence and
+    // never-observed upper cells. Stale geometry is a more specific fact than a
+    // plain evidence gap, so the boundary must stay distinguishable from UNKNOWN.
+    for (const [x, observedAt] of [[0, 100_000], [1, 1000]] as const) {
+      map.observe(obs(STONE, { x, y: -1, z: 0 }, { observedAt }));
+      map.observe(obs(AIR, { x, y: 0, z: 0 }, { observedAt }));
+      map.observe(obs(AIR, { x, y: 1, z: 0 }, { observedAt }));
+    }
+    const result = searchLandRoute(map, request({ to: { x: 1.5, y: 0, z: 0.5 } }), 100_000);
+    expect(result.status).toBe('INSUFFICIENT_EVIDENCE');
+    expect(result.boundaries.some((entry) => entry.status === 'STALE' && entry.to.x === 1.5)).toBe(true);
+  });
+
   it('plans remembered geometry across sessions without refreshing or changing any source evidence', () => {
     const map = terrain(flat());
     map.beginSession('s2');

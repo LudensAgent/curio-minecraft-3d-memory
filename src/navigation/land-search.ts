@@ -958,11 +958,16 @@ function* searchChunks(
           const { surfaces, gaps: columnGaps } = yield* columnSurfaces(x, z, node.point.y);
           if (stopped() !== null) break search;
           if (surfaces.size === 0) {
-            const columnStatus = columnGaps.has('UNKNOWN') ? 'UNKNOWN' : columnGaps.has('STALE') ? 'STALE'
+            // Stale support evidence is a more specific fact than cells that were
+            // never observed: the column did have recorded geometry, it is no longer
+            // current. Keep it distinguishable from a plain evidence gap.
+            const columnStatus = columnGaps.has('STALE') ? 'STALE' : columnGaps.has('UNKNOWN') ? 'UNKNOWN'
               : columnGaps.has('UNSUPPORTED') ? 'UNSUPPORTED' : 'BLOCKED';
             const columnReason = columnStatus === 'BLOCKED'
               ? 'fully observed column has no support within the requested step/drop range'
-              : 'support-surface coverage or shape rules are incomplete in the bounded column';
+              : columnStatus === 'STALE'
+                ? 'support-surface evidence in the bounded column is stale and is not treated as current geometry'
+                : 'support-surface coverage or shape rules are incomplete in the bounded column';
             const candidate = { x, y: node.point.y, z };
             boundary(node.point, candidate, columnStatus, columnReason);
             noteBlocker(node, candidate, columnStatus, columnReason);
