@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 
 import { VoxelMap } from '../src/index.js';
-import type { CellView, Observation, PathFragment } from '../src/index.js';
-import { openHistorySession, openSpatialSession } from '../dist/storage/sqlite/index.js';
-import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from '../src/storage/sqlite/types.js';
+import type { CellView, Observation } from '../src/index.js';
+import { openSpatialSession } from '../dist/storage/sqlite/index.js';
+import { VOXEL_FRAME_BYTES } from '../src/storage/sqlite/types.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -33,25 +33,6 @@ function obs(overrides: Partial<Observation> = {}): Observation {
   };
 }
 
-function frag(overrides: Partial<PathFragment> = {}): PathFragment {
-  return {
-    id: 'f1',
-    worldId: WORLD,
-    dim: DIM,
-    kind: 'walked',
-    entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-    polyline: [
-      { x: 0.5, y: 64, z: 0.5 },
-      { x: 1.5, y: 64, z: 0.5 },
-    ],
-    geometrySource: 'traversal',
-    deepestY: 12,
-    createdAt: 1000,
-    lastUsedAt: 1000,
-    uses: 1,
-    ...overrides,
-  };
-}
 
 function evidence(
   map: { cellAt(dim: string, x: number, y: number, z: number): CellView },
@@ -146,13 +127,13 @@ describe('VoxelMap pending-section tracking', () => {
     const batch = map.captureDirtySectionsBounded(1);
     expect(batch.sections).toHaveLength(1);
     expect(batch.keys).toHaveLength(1);
-    map.confirmCapturedSections(batch.keys, batch.removedSections, batch.capturedRevision);
+    map.confirmCapturedSections(batch.keys, batch.capturedRevision);
     expect(map.captureDirtySections()).toHaveLength(2); // unselected tail stays pending
 
     const second = map.captureDirtySectionsBounded(1);
-    map.confirmCapturedSections(second.keys, second.removedSections, second.capturedRevision);
+    map.confirmCapturedSections(second.keys, second.capturedRevision);
     const third = map.captureDirtySectionsBounded(1);
-    map.confirmCapturedSections(third.keys, third.removedSections, third.capturedRevision);
+    map.confirmCapturedSections(third.keys, third.capturedRevision);
     expect(map.hasPendingChanges()).toBe(false);
     expect(map.captureDirtySections()).toHaveLength(0);
   });
@@ -165,21 +146,9 @@ describe('VoxelMap pending-section tracking', () => {
     const capturedRevision = batch.capturedRevision;
 
     map.observe(obs({ state: air, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
-    map.confirmCapturedSections(batch.keys, batch.removedSections, capturedRevision);
+    map.confirmCapturedSections(batch.keys, capturedRevision);
     expect(map.hasPendingChanges()).toBe(true);
     expect(map.captureDirtySections().some((section) => section.cx === 0)).toBe(true);
-  });
-
-  it('bounded capture includes removed keys and confirms them', () => {
-    const map = new VoxelMap(WORLD);
-    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
-    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } }));
-    map.retainNewestObservedCells(0);
-    expect(map.hasPendingChanges()).toBe(true);
-    const batch = map.captureDirtySectionsBounded(1);
-    expect(batch.removedSections.length).toBe(2);
-    map.confirmCapturedSections(batch.keys, batch.removedSections, batch.capturedRevision);
-    expect(map.hasPendingChanges()).toBe(false);
   });
 
   it('a stale ACK does not clear a section re-dirtied after capture', () => {
@@ -420,29 +389,6 @@ describe('SQLite incremental voxel checkpoint', () => {
     expect(after.get(sectionId(DIM, 0, 0, 0))).toBe(before.get(sectionId(DIM, 0, 0, 0)));
   });
 
-  it('a history-only checkpoint never touches voxel rows', async () => {
-    const dbPath = makeDbPath();
-    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    s1.voxel.beginSession('s1');
-    s1.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
-    s1.history.saveFragment(frag());
-    await s1.checkpoint();
-    await s1.close();
-
-    const voxelBefore = sectionRows(dbPath);
-
-    const h = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
-    h.history.saveFragment(frag({ id: 'f2', kind: 'dug' }));
-    await h.checkpoint();
-    await h.close();
-
-    expect(sectionRows(dbPath)).toEqual(voxelBefore); // voxel rows untouched
-
-    const s2 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(s2.history.getFragment('f2')).not.toBeNull(); // history still committed
-    expect(evidence(s2.voxel, 0, 0, 0).freshness).toBe('STALE'); // voxel baseline intact
-    await s2.close();
-  });
 
   it('rolls back the whole batch on a SQL failure, preserving memory facts and dirty', async () => {
     const dbPath = makeDbPath();
@@ -597,8 +543,7 @@ describe('SQLite incremental voxel checkpoint', () => {
 
     const escapedWorldId = Buffer.byteLength(JSON.stringify(WORLD), 'utf8');
     const oneSectionBytes = octetLength(dbPath, 'spatial_sections');
-    const historyBytes = SNAPSHOT_FRAME_BYTES + escapedWorldId; // empty history
-    const oneSectionTotal = historyBytes + oneSectionBytes + VOXEL_FRAME_BYTES + escapedWorldId + 0;
+    const oneSectionTotal = oneSectionBytes + VOXEL_FRAME_BYTES + escapedWorldId;
     // Fits one section comfortably but cannot fit two of the same size.
     const maxBytes = oneSectionTotal + Math.floor(oneSectionBytes / 2);
 

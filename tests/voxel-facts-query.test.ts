@@ -69,19 +69,11 @@ describe('voxel+facts production query composition', () => {
     expect(nodes.status).toBe('ok');
     expect(nodes.total).toBe(0);
 
-    const retired = [
-      port.query({ kind: 'fragments', dim: DIM }),
-      port.query({ kind: 'traversals', dim: DIM, fragmentId: 'f1' }),
-      port.query({ kind: 'edges', dim: DIM }),
-      port.query({ kind: 'portals' }),
-      port.query({ kind: 'historyRoute', dim: DIM, from: { x: 0, y: 64, z: 0 }, to: { x: 1, y: 64, z: 0 } }),
-      port.query({ kind: 'anchor', dim: DIM, here: { x: 0, y: 64, z: 0 }, order: 'surface' }),
-      port.query({ kind: 'components', dim: DIM }),
-      port.query({ kind: 'segments', fragmentId: 'f1' }),
-    ];
-    for (const result of retired) {
-      expect(result.status).toBe('unsupported');
-      expect(result.problem?.kind).toBe('unsupported');
+    // Retired route kinds are rejected at the request boundary, not answered by
+    // a compatibility store.
+    for (const kind of ['fragments', 'traversals', 'edges', 'portals', 'historyRoute', 'anchor', 'components', 'segments']) {
+      const result = port.query({ kind } as never);
+      expect(result.status).toBe('invalid_request');
       expect(result.data).toBeUndefined();
     }
   });
@@ -92,23 +84,21 @@ describe('voxel+facts production query composition', () => {
     if (result.data?.kind !== 'capabilities') throw new Error('expected capabilities');
     const capabilities = result.data.capabilities;
 
-    expect(capabilities.query.cells).toBe(true);
-    expect(capabilities.query.nodes).toBe(true);
-    expect(capabilities.query.resourceAnchors).toBe(true);
-    expect(capabilities.query.containerAnchors).toBe(true);
-    expect(capabilities.query.fragments).toBe(false);
-    expect(capabilities.query.historyRoute).toBe(false);
-    expect(capabilities.query.portals).toBe(false);
-    expect(capabilities.query.containerContents).toBe(false);
+    expect(capabilities.query).toEqual({
+      cells: true,
+      nodes: true,
+      places: true,
+      resourceAnchors: true,
+      containerAnchors: true,
+      containerContents: false,
+      snapshot: true,
+      capabilities: true,
+    });
 
     expect(capabilities.memory.beginSession).toBe(true);
     expect(capabilities.memory.markStale).toBe(true);
-    expect(capabilities.memory.saveFragment).toBe(false);
-    expect(capabilities.memory.addTraversal).toBe(false);
-    expect(capabilities.memory.recordNode).toBe(false);
-    expect(capabilities.memory.upsertEdge).toBe(false);
-
-    expect(Object.values(capabilities.plan).some(Boolean)).toBe(false);
+    expect(capabilities).not.toHaveProperty('plan');
+    expect(capabilities).not.toHaveProperty('execute');
   });
 
   it('snapshot reports voxel and facts, never fabricated empty legacy domains', () => {
@@ -120,8 +110,8 @@ describe('voxel+facts production query composition', () => {
     const snapshot = result.data.snapshot;
     expect(snapshot.worldId).toBe(WORLD);
     expect(snapshot.facts).toEqual({ revision: facts.revision, places: 1, resources: 1, containers: 0 });
-    expect(snapshot.fragments).toBeUndefined();
-    expect(snapshot.topology).toBeUndefined();
+    expect(snapshot).not.toHaveProperty('fragments');
+    expect(snapshot).not.toHaveProperty('topology');
   });
 
   it('keeps gone/revoked history queryable and the query read-only', () => {

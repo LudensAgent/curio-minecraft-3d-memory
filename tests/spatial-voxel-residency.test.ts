@@ -5,14 +5,13 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 
 import {
-  RouteVerifier,
   TraversabilityCache,
   VoxelMap,
   VoxelResidencyError,
 } from '../src/index.js';
 import type { CellView, Observation, SectionKey } from '../src/index.js';
 import { openSpatialSession } from '../dist/storage/sqlite/index.js';
-import { AIR, STONE, bodyAt, fakeProvider, obs, stepQuery } from './fakes.js';
+import { AIR, STONE, fakeProvider, obs, stepQuery } from './fakes.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -346,31 +345,6 @@ describe('residency invalidation of derived conclusions', () => {
     expect(cache.size).toBe(0); // dependent entry dropped
   });
 
-  it('RouteVerifier.invalidateSections drops dependent step results only', () => {
-    const map = openMap();
-    const verifier = new RouteVerifier(map, { now: () => 2000 });
-    verifier.register({
-      worldId: 'world',
-      dim: 'overworld',
-      sessionId: 's1',
-      mode: 'walk',
-      body: bodyAt(0.5, 0, 0.5),
-      shapeProvider: fakeProvider,
-      points: [
-        { x: 0.5, y: 0, z: 0.5 },
-        { x: 1.5, y: 0, z: 0.5 },
-      ],
-    });
-    verifier.advance(2);
-    expect(verifier.status()!.steps[0]!.kind).toBe('verified');
-
-    verifier.invalidateSections([unrelatedKey]);
-    expect(verifier.status()!.steps[0]!.kind).toBe('verified');
-
-    verifier.invalidateSections([supportKey]);
-    expect(verifier.status()!.steps[0]!.kind).toBe('pending');
-  });
-
   // A manual-residency map whose +X step from (0.5,0,0.5) is OPEN: the support
   // section (sy=-1) is committed + clean, the swept air (sy=0) is resident FRESH.
   function openManualMap() {
@@ -414,50 +388,9 @@ describe('residency invalidation of derived conclusions', () => {
     expect(cache.get(stepQuery(), fakeProvider).status).toBe('STALE');
   });
 
-  it('RouteVerifier auto-invalidates a verified step when its section is unloaded', () => {
+  it('pins an explicitly selected dependency section and releases it', () => {
     const { map, supportKey } = openManualMap();
-    const verifier = new RouteVerifier(map, { now: () => 2000 });
-    verifier.register({
-      worldId: 'world',
-      dim: 'overworld',
-      sessionId: 's1',
-      mode: 'walk',
-      body: bodyAt(0.5, 0, 0.5),
-      shapeProvider: fakeProvider,
-      points: [
-        { x: 0.5, y: 0, z: 0.5 },
-        { x: 1.5, y: 0, z: 0.5 },
-      ],
-    });
-    verifier.advance(2);
-    expect(verifier.status()!.steps[0]!.kind).toBe('verified');
-
-    map.unloadSections([supportKey]);
-    expect(verifier.status()!.steps[0]!.kind).toBe('pending');
-  });
-
-  it('pins a route\'s actual dependency sections and releases them', () => {
-    const { map, supportKey } = openManualMap();
-    const verifier = new RouteVerifier(map, { now: () => 2000 });
-    verifier.register({
-      worldId: 'world',
-      dim: 'overworld',
-      sessionId: 's1',
-      mode: 'walk',
-      body: bodyAt(0.5, 0, 0.5),
-      shapeProvider: fakeProvider,
-      points: [
-        { x: 0.5, y: 0, z: 0.5 },
-        { x: 1.5, y: 0, z: 0.5 },
-      ],
-    });
-    verifier.advance(2);
-    const step = verifier.status()!.steps[0]!;
-    expect(step.kind).toBe('verified');
-    const deps = step.kind === 'verified' ? step.result.dependencies.map((d) => ({ ...d.key })) : [];
-    expect(deps).toContainEqual(supportKey); // the support section is a real dependency
-
-    const lease = map.pinSections(deps);
+    const lease = map.pinSections([supportKey]);
     expect(map.unloadSections([supportKey]).rejected).toContainEqual(expect.objectContaining({ reason: 'pinned' }));
     map.releasePins([lease.token]);
     expect(map.unloadSections([supportKey]).unloaded).toEqual([supportKey]);

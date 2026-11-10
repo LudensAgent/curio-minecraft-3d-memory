@@ -1,6 +1,5 @@
 import type { Observation } from '../src/observation/types.js';
 import { serializeBlockState } from '../src/index.js';
-import type { PathFragment, TraversalEvidence } from '../src/topology/index.js';
 import type { BlockState, Vec3Like } from '../src/types.js';
 import type { CollisionShape, CollisionShapeProvider } from '../src/traversability/collision-shape.js';
 import type { BodyContext, StepQuery } from '../src/traversability/step.js';
@@ -77,45 +76,3 @@ export function stepQuery(overrides: Partial<StepQuery> = {}): StepQuery {
   };
 }
 
-/** Minimal valid `PathFragment` bound to the default fake world/dimension. */
-export function pathFragment(id: string, overrides: Partial<PathFragment> = {}): PathFragment {
-  return {
-    id,
-    worldId: 'world',
-    dim: 'overworld',
-    kind: 'walked',
-    entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-    polyline: [
-      { x: 0.5, y: 64, z: 0.5 },
-      { x: 1.5, y: 64, z: 0.5 },
-    ],
-    geometrySource: 'traversal',
-    deepestY: 64,
-    createdAt: 1000,
-    lastUsedAt: 1000,
-    uses: 1,
-    ...overrides,
-  };
-}
-
-/** Minimal valid `TraversalEvidence` bound to the default fake world/dimension. */
-export function traversalEvidence(
-  id: string,
-  fragmentId: string,
-  from: Vec3Like,
-  to: Vec3Like,
-  overrides: Partial<TraversalEvidence> = {},
-): TraversalEvidence {
-  return {
-    id,
-    fragmentId,
-    from: { ...from },
-    to: { ...to },
-    worldId: 'world',
-    dim: 'overworld',
-    sessionId: 's1',
-    observedAt: 1000,
-    source: 'confirmed_walk',
-    ...overrides,
-  };
-}

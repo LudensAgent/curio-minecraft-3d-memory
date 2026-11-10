@@ -10,16 +10,11 @@ import * as navigation from '../src/navigation/index.js';
 import * as root from '../src/index.js';
 import type {
   MemoryHostCapabilities,
-  MemoryIngest,
   Observation,
   ObservationBatch,
-  RoutePlanCapabilities,
-  RoutePlanCapabilityName,
-  SpatialMemoryStore,
   SpatialQueryPort,
   VoxelMap as VoxelMapType,
 } from '../src/memory/index.js';
-import { makeQueryParts, runQuery } from './query-fixtures.js';
 
 const SRC_ROOT = fileURLToPath(new URL('../src/', import.meta.url));
 const MEMORY_ENTRY = fileURLToPath(new URL('../src/memory/index.ts', import.meta.url));
@@ -40,21 +35,27 @@ const L1_ACTION_NAMES = [
   'useItem',
 ] as const;
 
-const FORBIDDEN_ENTRY_NAMES = [
+/** Retired names that must not return through any new package entry. */
+const RETIRED_ENTRY_NAMES = [
   'planRoute',
-  'searchLandRoute',
-  'searchLandRouteAsync',
   'createWalkPath',
   'createWalkPathExecution',
   'navigateTo',
+  'WalkRouteSearch',
+  'RoutePlanRegistryImpl',
+  'ROUTE_PLAN_CAPABILITIES',
   'WalkRouteExecutor',
-  ...L1_ACTION_NAMES,
+  'RouteVerifier',
+  'SpatialMemoryStoreImpl',
+  'FragmentStore',
+  'TopologyStore',
+  'openHistorySession',
 ] as const;
 
 /**
  * Follow only imports that survive emit. Under `verbatimModuleSyntax`,
  * type-only declarations are erased, so a purely type-level cross-layer
- * reference (e.g. `export type { SpatialMemoryStore }`) is not a runtime edge.
+ * reference is not a runtime edge.
  */
 function isRuntimeImport(node: ts.ImportDeclaration): boolean {
   const clause = node.importClause;
@@ -64,7 +65,6 @@ function isRuntimeImport(node: ts.ImportDeclaration): boolean {
   const bindings = clause.namedBindings;
   if (bindings === undefined) return false;
   if (ts.isNamespaceImport(bindings)) return true;
-  // `import {} from 'x'` still evaluates `x`; only explicit `type` skips it.
   return (
     bindings.elements.length === 0 ||
     bindings.elements.some((element) => !element.isTypeOnly)
@@ -75,7 +75,6 @@ function isRuntimeExport(node: ts.ExportDeclaration): boolean {
   if (node.isTypeOnly) return false;
   if (node.exportClause === undefined) return true; // `export *`
   if (ts.isNamespaceExport(node.exportClause)) return true;
-  // `export {} from 'x'` still evaluates `x`; only explicit `type` skips it.
   return (
     node.exportClause.elements.length === 0 ||
     node.exportClause.elements.some((element) => !element.isTypeOnly)
@@ -102,8 +101,6 @@ function runtimeDependencyClosure(entry: string): string[] {
       }
       if (specifier === undefined || !ts.isStringLiteral(specifier)) continue;
       if (!specifier.text.startsWith('.')) continue;
-      // The source closure only uses relative TS modules; an unresolved edge
-      // would silently hide a forbidden dependency, so `readFileSync` fails.
       visit(resolve(dirname(file), specifier.text.replace(/\.js$/, '.ts')));
     }
   };
@@ -136,15 +133,10 @@ describe('package subpath exports', () => {
   });
 
   it('loads the built subpath targets at runtime', async () => {
-    // Vitest may not resolve package self-references; fall back to resolving
-    // the exported dist target from the package root. Both paths exercise the
-    // built entry that `pretypecheck`/`pretest` produce.
     const importSubpath = async (subpath: string): Promise<Record<string, unknown>> => {
       try {
         return (await import(/* @vite-ignore */ subpath)) as Record<string, unknown>;
       } catch {
-        // The package-name form (`<name>/memory`) maps to an exports key
-        // (`./memory`); use that key for the fallback target lookup.
         const key = subpath.startsWith(`${PACKAGE.name}/`)
           ? `.${subpath.slice(PACKAGE.name.length)}`
           : subpath;
@@ -162,31 +154,24 @@ describe('package subpath exports', () => {
     const publishedNavigation = await importSubpath(`${PACKAGE.name}/navigation`);
 
     expect(typeof publishedMemory.VoxelMap).toBe('function');
-    expect(publishedMemory.CONTRACT_VERSION).toBe('memory-host-contract/1');
-    expect(publishedMemory.ROUTE_PLAN_CAPABILITIES).toEqual(
-      memory.ROUTE_PLAN_CAPABILITIES,
-    );
+    expect(publishedMemory.CONTRACT_VERSION).toBe('memory-host-contract/2');
     expect('planRoute' in publishedMemory).toBe(false);
     expect('createWalkPath' in publishedMemory).toBe(false);
 
-    expect(typeof publishedNavigation.planRoute).toBe('function');
     expect(typeof publishedNavigation.searchLandRoute).toBe('function');
     expect(typeof publishedNavigation.searchLandRouteAsync).toBe('function');
-    expect(typeof publishedNavigation.createWalkPath).toBe('function');
-    expect(typeof publishedNavigation.createWalkPathExecution).toBe('function');
-    expect(typeof publishedNavigation.RoutePlanRegistryImpl).toBe('function');
-    expect(publishedNavigation.ROUTE_PLAN_CAPABILITIES).toEqual(
-      navigation.ROUTE_PLAN_CAPABILITIES,
-    );
+    expect('planRoute' in publishedNavigation).toBe(false);
+    expect('createWalkPath' in publishedNavigation).toBe(false);
+    expect('WalkRouteSearch' in publishedNavigation).toBe(false);
   });
 });
 
 describe('memory entry', () => {
-  it('exports the pure memory core and no navigation or body entries', () => {
+  it('exports the pure memory core and no navigation or retired entries', () => {
     expect(typeof memory.VoxelMap).toBe('function');
-    expect(memory.CONTRACT_VERSION).toBe('memory-host-contract/1');
-    expect(memory.ROUTE_PLAN_CAPABILITIES).toBeDefined();
-    for (const name of FORBIDDEN_ENTRY_NAMES) {
+    expect(memory.CONTRACT_VERSION).toBe('memory-host-contract/2');
+    expect('ROUTE_PLAN_CAPABILITIES' in memory).toBe(false);
+    for (const name of [...RETIRED_ENTRY_NAMES, ...L1_ACTION_NAMES]) {
       expect(name in memory, `memory entry must not export ${name}`).toBe(false);
     }
   });
@@ -206,59 +191,35 @@ describe('memory entry', () => {
     expect(forbidden).toEqual([]);
   });
 
-  it('exposes the memory contracts as types', () => {
-    expectTypeOf<MemoryIngest>().toHaveProperty('observeBatch');
+  it('exposes the current memory contracts as types', () => {
     expectTypeOf<SpatialQueryPort>().toHaveProperty('query');
     expectTypeOf<Observation>().toHaveProperty('pos');
     expectTypeOf<ObservationBatch>().toHaveProperty('observations');
     expectTypeOf<VoxelMapType>().toHaveProperty('cellAt');
-    expectTypeOf<SpatialMemoryStore>().toHaveProperty('observe');
-    expectTypeOf<MemoryHostCapabilities['plan']>().toEqualTypeOf<RoutePlanCapabilities>();
-    expectTypeOf<RoutePlanCapabilityName>().toEqualTypeOf<keyof RoutePlanCapabilities>();
+    expectTypeOf<MemoryHostCapabilities>().not.toHaveProperty('plan');
   });
 });
 
 describe('navigation entry', () => {
-  it('exports the navigation layer without L1 actions', () => {
-    expect(typeof navigation.planRoute).toBe('function');
+  it('exports the voxel land search without retired planning entries', () => {
     expect(typeof navigation.searchLandRoute).toBe('function');
     expect(typeof navigation.searchLandRouteAsync).toBe('function');
-    expect(typeof navigation.createWalkPath).toBe('function');
-    expect(typeof navigation.createWalkPathExecution).toBe('function');
-    expect(typeof navigation.RoutePlanRegistryImpl).toBe('function');
-    expect(navigation.ROUTE_PLAN_CAPABILITIES).toBeDefined();
-    for (const name of L1_ACTION_NAMES) {
+    for (const name of [...RETIRED_ENTRY_NAMES, ...L1_ACTION_NAMES]) {
       expect(name in navigation, `navigation entry must not export ${name}`).toBe(false);
     }
   });
 });
 
-describe('capability single source (D-010)', () => {
-  it('shares the plan capability object between memory and navigation', () => {
-    expect(memory.ROUTE_PLAN_CAPABILITIES).toBe(navigation.ROUTE_PLAN_CAPABILITIES);
-  });
-
-  it('reports the same plan block from the query capability kind', () => {
-    const parts = makeQueryParts();
-    const result = runQuery(parts, { kind: 'capabilities' });
-
-    expect(result.status).toBe('ok');
-    if (result.data?.kind !== 'capabilities') throw new Error('expected capabilities data');
-    expect(result.data.capabilities.plan).toBe(memory.ROUTE_PLAN_CAPABILITIES);
-  });
-});
-
-describe('root entry compatibility', () => {
-  it('keeps the old public names and shares the subpath bindings', () => {
+describe('root entry', () => {
+  it('shares the current subpath bindings and exposes the preserved executor', () => {
     expect(root.CONTRACT_VERSION).toBe(memory.CONTRACT_VERSION);
-    expect(root.ROUTE_PLAN_CAPABILITIES).toBe(navigation.ROUTE_PLAN_CAPABILITIES);
-    expect(root.planRoute).toBe(navigation.planRoute);
     expect(root.searchLandRoute).toBe(navigation.searchLandRoute);
     expect(root.searchLandRouteAsync).toBe(navigation.searchLandRouteAsync);
-    expect(root.createWalkPath).toBe(navigation.createWalkPath);
-    expect(root.createWalkPathExecution).toBe(navigation.createWalkPathExecution);
     expect(root.VoxelMap).toBe(memory.VoxelMap);
-    expect(typeof root.SpatialMemoryStoreImpl).toBe('function');
-    expect(typeof root.navigateTo).toBe('function');
+    expect(typeof root.LandRouteVerifier).toBe('function');
+    expect(typeof root.PersistenceError).toBe('function');
+    for (const name of RETIRED_ENTRY_NAMES) {
+      expect(name in root, `root entry must not export ${name}`).toBe(false);
+    }
   });
 });

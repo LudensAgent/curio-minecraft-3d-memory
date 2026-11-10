@@ -252,73 +252,6 @@ describe('bounded palette reclamation', () => {
     }
   });
 
-  it('rebuilds palette references after eager observation retention forgets cells', () => {
-    const map = new VoxelMap(WORLD);
-    map.observe(obs({ pos: { x: 0, y: 0, z: 0 }, state: stone, observedAt: 1_000, sequence: 1 }));
-    map.observe(obs({ pos: { x: 1, y: 0, z: 0 }, state: dirt, observedAt: 2_000, sequence: 2 }));
-
-    expect(map.retainNewestObservedCells(1)).toMatchObject({ forgottenCells: 1, removedSections: 0 });
-    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
-    expect(evidenceAt(map, 1, 0, 0).observation.state).toEqual(dirt);
-
-    for (let index = 0; index < 50; index++) {
-      map.observe(
-        obs({
-          pos: { x: 1, y: 0, z: 0 },
-          observedAt: 3_000 + index,
-          sequence: 10 + index,
-          state: { name: 'minecraft:stone', properties: { afterRetain: String(index) } },
-        }),
-      );
-    }
-    expect(sectionOf(map).palette.length).toBeLessThanOrEqual(2);
-    expect(sectionOf(map).palette[0]).toBe('minecraft:air');
-    expect(sectionOf(map).bits).toBe(1);
-
-    // Re-observing the previously forgotten cell gets a valid slot again.
-    map.observe(obs({ pos: { x: 0, y: 0, z: 0 }, state: dirt, observedAt: 9_000, sequence: 1_000 }));
-    expect(evidenceAt(map, 0, 0, 0).observation.state).toEqual(dirt);
-    expect(sectionOf(map).palette.length).toBeLessThanOrEqual(3);
-    expect(evidenceAt(map, 1, 0, 0).observation.state.properties.afterRetain).toBe('49');
-
-    // Forgetting everything removes the section; eager working-set counters do
-    // not turn negative and no palette facts survive the removal.
-    expect(map.retainNewestObservedCells(0)).toMatchObject({ forgottenCells: 2, removedSections: 1 });
-    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
-    expect(map.cellAt(DIM, 1, 0, 0)).toEqual({ observed: false });
-    expect(map.residentSize()).toEqual({ sections: 0, bytes: 0 });
-  });
-
-  it('keeps a same-state refresh scan-free even when reclamation is pending', () => {
-    const map = new VoxelMap(WORLD);
-    const states = Array.from({ length: 40 }, (_, index) => ({
-      name: 'minecraft:stone',
-      properties: { cell: String(index) },
-    }));
-    states.forEach((state, index) => {
-      const pos = cellPos(index);
-      map.observe(obs({ pos, state, observedAt: 1_000 + index, sequence: 1 + index }));
-    });
-
-    // Forget 39 cells without compacting: the palette stays wide and now has
-    // many unreferenced entries, which a real state change would reclaim.
-    map.retainNewestObservedCells(1);
-    expect(sectionOf(map).palette.length).toBe(41);
-    expect(sectionOf(map).bits).toBe(bitsRequired(41));
-
-    const kept = cellPos(39);
-    // A same-state refresh must not rebuild references or scan the Section.
-    map.observe(obs({ pos: kept, state: states[39], observedAt: 5_000, sequence: 100 }));
-    expect(sectionOf(map).palette.length).toBe(41);
-    expect(sectionOf(map).bits).toBe(bitsRequired(41));
-    expect(evidenceAt(map, kept.x, kept.y, kept.z).observation.observedAt).toBe(5_000);
-
-    // The next real state change does reclaim and shrink the packing.
-    map.observe(obs({ pos: kept, state: dirt, observedAt: 6_000, sequence: 101 }));
-    expect(sectionOf(map).palette).toEqual(['minecraft:air', 'minecraft:dirt']);
-    expect(sectionOf(map).bits).toBe(1);
-  });
-
   it('does not copy a dense palette for a manual same-state refresh', () => {
     // Build the dense fixture eagerly, then install it into a manual map so the
     // refresh exercises the pre-flight path without paying 4096 inserts.
@@ -504,40 +437,6 @@ describe('palette reference sharing and remapping', () => {
     });
   });
 
-  it('keeps a history-only Section after eager evidence retention and accepts new evidence', () => {
-    const map = new VoxelMap(WORLD);
-    map.observe(obs({ pos: { x: 0, y: 0, z: 0 }, state: stone, observedAt: 1_000, sequence: 1 }));
-    map.markTraversed(DIM, { x: 5, y: 0, z: 5 });
-    map.markModified(DIM, { x: 6, y: 0, z: 6 }, 'dig-1');
-
-    expect(map.retainNewestObservedCells(0)).toMatchObject({ forgottenCells: 1, removedSections: 0 });
-    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
-    expect(map.historyAt(DIM, 5, 0, 5)).toMatchObject({ explored: false, traversed: true, modified: false });
-    expect(map.historyAt(DIM, 6, 0, 6)).toMatchObject({ explored: false, traversed: false, modified: true });
-
-    map.observe(
-      obs({
-        pos: { x: 7, y: 0, z: 7 },
-        state: dirt,
-        observedAt: 2_000,
-        sequence: 2,
-        originObservationId: 1_234,
-        observedWorldTick: 77,
-      }),
-    );
-    const evidence = evidenceAt(map, 7, 0, 7);
-    expect(evidence.observation.state).toEqual(dirt);
-    expect(evidence.observation.observedAt).toBe(2_000);
-    expect(evidence.observation.originObservationId).toBe(1_234);
-    expect(evidence.observation.observedWorldTick).toBe(77);
-
-    expect(map.historyAt(DIM, 5, 0, 5).traversed).toBe(true);
-    expect(map.historyAt(DIM, 6, 0, 6).modified).toBe(true);
-    expect(map.cellAt(DIM, 0, 0, 0)).toEqual({ observed: false });
-    expect(sectionOf(map).palette).toEqual(['minecraft:air', 'minecraft:dirt']);
-    expect(sectionOf(map).bits).toBe(1);
-    expect(map.residentSize()).toEqual({ sections: 0, bytes: 0 }); // eager counters
-  });
 });
 
 describe('capacity pre-flight uses the same reclamation rules', () => {

@@ -14,10 +14,8 @@ import type {
   ContainerAnchorFact,
   FactCheckpointSnapshot,
   Observation,
-  PathFragment,
   PlaceFact,
   ResourceAnchorFact,
-  SpatialNode,
 } from '../src/index.js';
 import { openSpatialSession } from '../dist/storage/sqlite/index.js';
 import {
@@ -144,7 +142,6 @@ function spatialOpen(dbPath: string, requestId: number): WorkerRequest {
     worldId: WORLD,
     limits: resolveSnapshotLimits(undefined),
     journalLimits: resolveJournalLimits(undefined),
-    kind: 'spatial',
     voxelLoading: 'eager',
     ledgerLimits: DEFAULT_LEDGER_LIMITS,
   };
@@ -322,7 +319,7 @@ describe('SQLite facts persistence', () => {
     await session.close();
 
     const db = new Database(dbPath, { readonly: true });
-    expect(schemaMeta(db, 'schema_version')).toBe('9');
+    expect(schemaMeta(db, 'schema_version')).toBe('10');
     expect(schemaMeta(db, 'fact_migration_version')).toBe(String(FACT_MIGRATION_VERSION));
     expect(schemaMeta(db, 'fact_migration_target')).toBe(FACT_MIGRATION_TARGET);
     expect(
@@ -405,54 +402,38 @@ describe('SQLite facts persistence', () => {
     await reopened.close();
   });
 
-  it('never falls back to topology or fragments when the facts domain is absent', async () => {
-    const fragment: PathFragment = {
-      id: 'f1',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'walked',
-      entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-      polyline: [{ x: 0.5, y: 64, z: 0.5 }],
-      geometrySource: 'traversal',
-      deepestY: 64,
-      createdAt: 1,
-      lastUsedAt: 2,
-      uses: 3,
-    };
-    const node: SpatialNode = {
-      id: 'n1',
-      kind: 'place',
-      source: 'program',
-      tag: 'resource',
-      label: 'chest',
-      worldId: WORLD,
-      dim: DIM,
-      location: { kind: 'exact', pos: { x: 1, y: 64, z: 1 } },
-      externalRef: `${WORLD}:${DIM}:1,64,1`,
-      durable: true,
-      metadata: { curio: { v: 1, type: 'chest' } },
-    };
-
+  it('never derives facts from retired route rows', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    session.history.saveFragment(fragment);
-    session.topology.saveNode(node);
     await session.checkpoint();
     await session.close();
+
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE IF NOT EXISTS path_fragments (
+        world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
+        PRIMARY KEY (world_id, id)
+      );
+      CREATE TABLE IF NOT EXISTS spatial_nodes (
+        world_id TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
+        PRIMARY KEY (world_id, id)
+      );
+    `);
+    legacy.prepare('INSERT INTO path_fragments (world_id, seq, id, payload) VALUES (?, ?, ?, ?)')
+      .run(WORLD, 0, 'f1', JSON.stringify({ id: 'f1' }));
+    legacy.prepare('INSERT INTO spatial_nodes (world_id, seq, id, payload) VALUES (?, ?, ?, ?)')
+      .run(WORLD, 0, 'n1', JSON.stringify({ id: 'n1', tag: 'resource' }));
+    legacy.close();
 
     const db = new Database(dbPath, { readonly: true });
     expect(db.prepare('SELECT COUNT(*) AS n FROM fact_places').get()).toEqual({ n: 0 });
     expect(db.prepare('SELECT COUNT(*) AS n FROM fact_resources').get()).toEqual({ n: 0 });
     expect(db.prepare('SELECT COUNT(*) AS n FROM fact_containers').get()).toEqual({ n: 0 });
     expect(db.prepare('SELECT COUNT(*) AS n FROM fact_domain').get()).toEqual({ n: 0 });
-    expect(db.prepare('SELECT COUNT(*) AS n FROM path_fragments').get()).toEqual({ n: 1 });
-    expect(db.prepare('SELECT COUNT(*) AS n FROM spatial_nodes').get()).toEqual({ n: 1 });
     db.close();
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.history.getFragment('f1')).not.toBeNull();
-    expect(reopened.topology.getNode('n1')).not.toBeNull();
-    // Old topology is restored as history, never projected into the fact domain.
+    expect(reopened.legacyStoreSummary).toMatchObject({ fragments: 1, nodes: 1 });
     expect(reopened.facts.places({ includeGone: true }).total).toBe(0);
     expect(reopened.facts.resources({ includeGone: true }).total).toBe(0);
     expect(reopened.facts.containers({ includeGone: true }).total).toBe(0);
@@ -484,11 +465,6 @@ describe('SQLite facts persistence', () => {
       requestId: 2,
       checkpointId: 'cp-empty-facts',
       worldId: WORLD,
-      fragmentRevision: 0,
-      topologyRevision: 0,
-      snapshot: { worldId: WORLD, fragments: [], traversals: [], nodes: [], edges: [] },
-      historyMode: 'none',
-      topologyMode: 'none',
       voxelMode: 'none',
       voxelRevision: 0,
       voxelSnapshot: { worldId: WORLD, sections: [] },
@@ -527,22 +503,11 @@ describe('SQLite facts persistence', () => {
     await reopened.close();
   });
 
-  it('upgrades a v8 database to v9 and starts an explicit empty facts domain', async () => {
+  it('upgrades a v8 database to the current schema and starts an explicit empty facts domain', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    session.history.saveFragment({
-      id: 'f1',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'walked',
-      entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-      polyline: [{ x: 0.5, y: 64, z: 0.5 }],
-      geometrySource: 'traversal',
-      deepestY: 64,
-      createdAt: 1,
-      lastUsedAt: 2,
-      uses: 3,
-    });
+    session.voxel.beginSession('s1');
+    session.voxel.observe(observation());
     await session.checkpoint();
     await session.close();
 
@@ -554,12 +519,13 @@ describe('SQLite facts persistence', () => {
       DROP TABLE fact_containers;
       DROP TABLE fact_domain;
       DELETE FROM schema_meta WHERE key IN ('fact_migration_version', 'fact_migration_target');
+      ALTER TABLE checkpoints ADD COLUMN topology_extras TEXT NOT NULL DEFAULT '{}';
       UPDATE schema_meta SET value = '8' WHERE key = 'schema_version';
     `);
     v8.close();
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.history.getFragment('f1')).not.toBeNull();
+    expect(reopened.voxel.cellAt(DIM, -3, 32, -7)).toMatchObject({ observed: true });
     expect(reopened.facts.places({ includeGone: true }).total).toBe(0);
     expect(reopened.getPersistenceState()).toMatchObject({
       factsBaselineCheckpointId: null,
@@ -572,15 +538,13 @@ describe('SQLite facts persistence', () => {
     await reopened.close();
 
     const db = new Database(dbPath, { readonly: true });
-    expect(schemaMeta(db, 'schema_version')).toBe('9');
+    expect(schemaMeta(db, 'schema_version')).toBe('10');
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
       .all() as { name: string }[];
     expect(tables.map((table) => table.name)).toEqual(
       expect.arrayContaining(['fact_places', 'fact_resources', 'fact_containers', 'fact_domain']),
     );
-    // Old domains are physically retained, not deleted by the migration.
-    expect(db.prepare('SELECT COUNT(*) AS n FROM path_fragments').get()).toEqual({ n: 1 });
     db.close();
   });
 });

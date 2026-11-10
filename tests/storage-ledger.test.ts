@@ -337,7 +337,7 @@ describe('v4 → v5 schema migration and section payload compatibility', () => {
     expect(schemaVersion(dbPath)).toBe('4');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('9');
+    expect(schemaVersion(dbPath)).toBe('10');
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
     // The ledger was not part of v4, so the upgraded database starts with no
     // ledger baseline rather than a synthesized placement.

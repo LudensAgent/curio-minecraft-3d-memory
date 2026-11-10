@@ -6,24 +6,14 @@ import Database from 'better-sqlite3';
 
 import {
   LruOrder,
-  RouteVerifier,
-  WalkRouteExecutor,
   estimateVoxelSectionResidentBytesFromCommitted,
 } from '../dist/index.js';
 import type {
-  BodySample,
-  CollisionShapeProvider,
-  ExecutableMove,
-  ExecutableMoveResult,
-  MoveExecutor,
   Observation,
   SectionKey,
-  Vec3Like,
-  WalkRouteRequest,
 } from '../dist/index.js';
 import { openSpatialSession, WorkingSetManager } from '../dist/storage/sqlite/index.js';
 import type { OpenSpatialSessionOptions, WorkingSetLimits } from '../dist/storage/sqlite/index.js';
-import { bodyAt } from './fakes.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -768,76 +758,6 @@ describe('WorkingSetManager', () => {
 // Working set + Fake route lifecycle (walk-route composition layer)
 // ==============================================================================
 
-/** Fake single-step executor whose move() resolves immediately at the target. */
-class FakeMoveExecutor implements MoveExecutor {
-  private seq = 1;
-  move(request: ExecutableMove): Promise<ExecutableMoveResult> {
-    return Promise.resolve({ sample: sampleAt(request.worldId, request.dim, request.sessionId, request.executionId, request.to, ++this.seq) });
-  }
-  stop(): void {}
-}
-
-/** Fake single-step executor whose move() hangs until the host resolves it — for mid-execution tests. */
-class HangingExecutor implements MoveExecutor {
-  private resolveMove: ((r: ExecutableMoveResult) => void) | null = null;
-  private last: ExecutableMove | null = null;
-  readonly stopped: string[] = [];
-
-  move(request: ExecutableMove): Promise<ExecutableMoveResult> {
-    this.last = request;
-    return new Promise((resolve) => {
-      this.resolveMove = resolve;
-    });
-  }
-
-  resolve(pos: Vec3Like): void {
-    if (this.last === null || this.resolveMove === null) return;
-    const request = this.last;
-    this.last = null;
-    this.resolveMove({ sample: sampleAt(request.worldId, request.dim, request.sessionId, request.executionId, pos, 999) });
-    this.resolveMove = null;
-  }
-
-  stop(executionId: string): void {
-    this.stopped.push(executionId);
-  }
-}
-
-function sampleAt(
-  worldId: string,
-  dim: string,
-  sessionId: string,
-  executionId: string,
-  pos: Vec3Like,
-  sequence: number,
-): BodySample {
-  return {
-    worldId,
-    dim,
-    sessionId,
-    executionId,
-    sequence,
-    pos: { ...pos },
-    observedAt: 2000,
-    alive: true,
-    connected: true,
-    observationReady: true,
-    onGround: true,
-    inWater: false,
-  };
-}
-
-const provider: CollisionShapeProvider = {
-  version: 'fake-1',
-  resolve(state) {
-    if (state.name === 'minecraft:air') return { kind: 'shape', shape: { boxes: [], supportFaces: [] } };
-    if (state.name === 'minecraft:stone' || state.name === 'minecraft:dirt') {
-      return { kind: 'shape', shape: { boxes: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }], supportFaces: [{ top: 1, minX: 0, minZ: 0, maxX: 1, maxZ: 1 }] } };
-    }
-    return { kind: 'unsupported_shape', block: state.name, detail: `no rule for ${state.name}` };
-  },
-};
-
 /** Seed support (sy=-1) and swept air (sy=0) for a short +X walk in one eager session. */
 async function seedWalk(dbPath: string): Promise<void> {
   const s = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
@@ -871,61 +791,16 @@ describe('working-set + Fake walk-route lifecycle', () => {
       session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 3, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 1, z: 0 } });
     }
 
-    // 2. Verify the route and collect its actual dependency sections.
-    const points: Vec3Like[] = [
-      { x: 0.5, y: 0, z: 0.5 },
-      { x: 1.5, y: 0, z: 0.5 },
-      { x: 2.5, y: 0, z: 0.5 },
-    ];
-    const verifier = new RouteVerifier(session.voxel, { now: () => 2000 });
-    verifier.register({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), shapeProvider: provider, points });
-    const verified = verifier.advance(10);
-    expect(verified.verdict).toBe('OPEN');
-    const deps: SectionKey[] = [];
-    const seen = new Set<string>();
-    for (const step of verified.steps) {
-      if (step.kind !== 'verified') continue;
-      for (const d of step.result.dependencies) {
-        const s = `${d.key.dim}|${d.key.cx},${d.key.cz},${d.key.sy}`;
-        if (!seen.has(s)) {
-          seen.add(s);
-          deps.push({ ...d.key });
-        }
-      }
-    }
-    expect(deps).toContainEqual(supportKey);
-
-    // 3. Protect the actual dependencies (already resident) and execute.
-    const lease = await manager.prepare(deps);
+    // 2. Protect the actual dependency sections (already resident).
+    const lease = await manager.prepare([supportKey, airKey]);
     expect(lease.lease.token).not.toBe('');
-    const executor = new FakeMoveExecutor();
-    const loop = new WalkRouteExecutor(session.voxel, executor, { now: () => 2000 });
-    const request: WalkRouteRequest = {
-      worldId: WORLD,
-      dim: DIM,
-      sessionId: 'live',
-      mode: 'walk',
-      body: bodyAt(0.5, 0, 0.5),
-      points,
-      arrival: { kind: 'exact' },
-      shapeProvider: provider,
-      deadlineMs: 100_000,
-      timeoutMs: 10_000,
-    };
-    const started = loop.start(request);
-    loop.onSample(sampleAt(WORLD, DIM, 'live', started.delegationId, points[0]!, 1));
-    loop.advance(10);
-    await Promise.resolve();
-    loop.advance(10);
-    await Promise.resolve();
-    expect(loop.status()!.result?.outcome).toBe('ARRIVED');
 
-    // 4. Checkpoint first so the dependencies are CLEAN (committed): now the pin —
+    // 3. Checkpoint first so the dependencies are CLEAN (committed): now the pin —
     // not the dirty state — is what blocks eviction.
     await session.checkpoint();
     expect(manager.free().evicted).toEqual([]); // clean but pinned → pin blocks
 
-    // 5. Release → clean + unpinned → the dependencies are evictable.
+    // 4. Release → clean + unpinned → the dependencies are evictable.
     session.releasePins([lease.lease.token]);
     const freed = manager.free();
     expect(freed.evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
@@ -987,118 +862,6 @@ describe('working-set + Fake walk-route lifecycle', () => {
     await session.close();
   });
 
-  it('protects clean deps under cache pressure during execution, then releases on cancel', async () => {
-    const dbPath = makeDbPath();
-    await seedWalk(dbPath);
-    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    const manager = new WorkingSetManager(session);
-
-    const supportKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: -1 };
-    const airKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 0 };
-
-    const initial = await manager.prepare([supportKey, airKey]);
-    session.releasePins([initial.lease.token]);
-    session.voxel.beginSession('live');
-    for (let x = 0; x <= 1; x++) {
-      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x, y: -1, z: 0 } });
-      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 2, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 0, z: 0 } });
-      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 3, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 1, z: 0 } });
-    }
-    await session.checkpoint(); // clean (committed) deps
-
-    const points: Vec3Like[] = [
-      { x: 0.5, y: 0, z: 0.5 },
-      { x: 1.5, y: 0, z: 0.5 },
-    ];
-    const verifier = new RouteVerifier(session.voxel, { now: () => 2000 });
-    verifier.register({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), shapeProvider: provider, points });
-    const verified = verifier.advance(10);
-    expect(verified.verdict).toBe('OPEN');
-    const deps: SectionKey[] = [];
-    const seenDeps = new Set<string>();
-    for (const step of verified.steps) {
-      if (step.kind !== 'verified') continue;
-      for (const d of step.result.dependencies) {
-        const s = `${d.key.dim}|${d.key.cx},${d.key.cz},${d.key.sy}`;
-        if (!seenDeps.has(s)) {
-          seenDeps.add(s);
-          deps.push({ ...d.key });
-        }
-      }
-    }
-
-    const lease = await manager.prepare(deps); // pin the clean deps
-
-    const executor = new HangingExecutor();
-    const loop = new WalkRouteExecutor(session.voxel, executor, { now: () => 2000 });
-    const started = loop.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
-    loop.onSample(sampleAt(WORLD, DIM, 'live', started.delegationId, points[0]!, 1));
-    loop.advance(10);
-    expect(loop.status()!.activeStepIndex).toBe(0); // move is in flight (hanging)
-
-    // Cache pressure DURING execution: clean + pinned deps are not evicted.
-    expect(manager.free().evicted).toEqual([]);
-
-    // Cancel mid-execution.
-    const cancelled = loop.cancel('user', 'test');
-    expect(cancelled.outcome).toBe('CANCELLED');
-
-    // Release → clean + unpinned deps become evictable.
-    session.releasePins([lease.lease.token]);
-    expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
-    await session.close();
-  });
-
-  it('a replaced task whose lease is released late does not drop the newer task protection', async () => {
-    const dbPath = makeDbPath();
-    await seedWalk(dbPath);
-    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    const manager = new WorkingSetManager(session);
-
-    const supportKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: -1 };
-    const airKey: SectionKey = { worldId: WORLD, dim: DIM, cx: 0, cz: 0, sy: 0 };
-
-    const initial = await manager.prepare([supportKey, airKey]);
-    session.releasePins([initial.lease.token]);
-    session.voxel.beginSession('live');
-    for (let x = 0; x <= 1; x++) {
-      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 1, source: 'vision', evidence: 'seen', stateComplete: true, state: stone, pos: { x, y: -1, z: 0 } });
-      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 2, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 0, z: 0 } });
-      session.voxel.observe({ worldId: WORLD, dim: DIM, sessionId: 'live', observedAt: 2000, sequence: x * 3 + 3, source: 'vision', evidence: 'seen', stateComplete: true, state: { name: 'minecraft:air', properties: {} }, pos: { x, y: 1, z: 0 } });
-    }
-    await session.checkpoint();
-
-    const points: Vec3Like[] = [
-      { x: 0.5, y: 0, z: 0.5 },
-      { x: 1.5, y: 0, z: 0.5 },
-    ];
-
-    // Task 1 pins the deps and starts a hanging execution on ONE loop.
-    const first = await manager.prepare([supportKey, airKey]);
-    const executor = new HangingExecutor();
-    const loop = new WalkRouteExecutor(session.voxel, executor, { now: () => 2000 });
-    const s1 = loop.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
-    loop.onSample(sampleAt(WORLD, DIM, 'live', s1.delegationId, points[0]!, 1));
-    loop.advance(10);
-    expect(loop.status()!.activeStepIndex).toBe(0); // task 1's move is actually in flight
-
-    // Task 2 pins the same deps and replaces task 1 on the SAME loop.
-    const second = await manager.prepare([supportKey, airKey]);
-    const s2 = loop.start({ worldId: WORLD, dim: DIM, sessionId: 'live', mode: 'walk', body: bodyAt(0.5, 0, 0.5), points, arrival: { kind: 'exact' }, shapeProvider: provider, deadlineMs: 100_000, timeoutMs: 10_000 });
-    // Replacement stops task 1's in-flight move and starts task 2's.
-    expect(executor.stopped).toContain(`${s1.delegationId}-step-0`);
-    loop.onSample(sampleAt(WORLD, DIM, 'live', s2.delegationId, points[0]!, 2));
-    loop.advance(10);
-    expect(loop.status()!.activeStepIndex).toBe(0); // task 2's move is now in flight
-
-    // Task 1's late release must not drop task 2's protection.
-    session.releasePins([first.lease.token]);
-    expect(manager.free().evicted).toEqual([]);
-
-    session.releasePins([second.lease.token]);
-    expect(manager.free().evicted).toEqual(expect.arrayContaining([supportKey, airKey]));
-    await session.close();
-  });
 });
 
 // ==============================================================================
@@ -1178,7 +941,7 @@ describe('v2 → latest migration (real SQLite)', () => {
     makeV2Db(dbPath, payloads);
 
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
-    expect(schemaVersion(dbPath)).toBe('9');
+    expect(schemaVersion(dbPath)).toBe('10');
     expect(spatialColumns(dbPath)).toEqual(
       expect.arrayContaining(['observed_cells', 'palette_entries', 'revision', 'dimension', 'cx', 'cz', 'sy']),
     );

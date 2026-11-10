@@ -1,20 +1,9 @@
 /**
- * Published type-surface snapshot (plan M9.2).
+ * Published type-surface snapshot for the voxel-first library.
  *
  * The build emits declarations under `dist/`; these assertions read that
- * emitted surface (not `src/`) so a change in visibility, re-export or
- * `stripInternal` shows up here even when runtime tests still pass.
- *
- * Baseline decisions recorded for B23:
- * - D-086: `VoxelMap.sectionRef` stays; `SectionRef` is not entry-exported.
- * - D-093: `RouteVerifier.stepAt`/`advanceVerification`/`currentRuleVersion`
- *   remain in `.d.ts` because `stripInternal` stays off.
- * - D-060: `MemoryHostCapabilities.plan` stays `RoutePlanCapabilities`.
- * - D-075: `UNKNOWN_GAME_VERSION`/`readVoxelSectionGameVersion` stay internal.
- * - D-085: `listAll` stays an internal implementation detail.
- *
- * Run `npm run build` first (the package scripts already do this via
- * `pretest`/`pretypecheck`); a missing `dist` fails with an explicit message.
+ * emitted surface (not `src/`) so a change in visibility or a retired name
+ * leaking back into an entry shows up here.
  */
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
@@ -41,41 +30,39 @@ const ENTRY_NAMES = ['.', './memory', './navigation', './storage/sqlite', './wat
 type EntryName = (typeof ENTRY_NAMES)[number];
 
 const ROOT_ALLOWED_NAMES = [
-  'planRoute',
-  'createWalkPath',
-  'createWalkPathExecution',
-  'RoutePlanRegistryImpl',
-  'ROUTE_PLAN_CAPABILITIES',
+  'searchLandRoute',
+  'searchLandRouteAsync',
+  'LandRouteVerifier',
   'VoxelMap',
   'CONTRACT_VERSION',
+  'PersistenceError',
 ] as const;
 
 const MEMORY_ALLOWED_NAMES = [
   'VoxelMap',
   'CONTRACT_VERSION',
-  'ROUTE_PLAN_CAPABILITIES',
   'MemoryHostCapabilities',
-  'RoutePlanCapabilities',
-  'RoutePlanCapabilityName',
   'SpatialQueryPort',
+  'SpatialQueryRequest',
+] as const;
+
+const NAVIGATION_ALLOWED_NAMES = ['searchLandRoute', 'searchLandRouteAsync'] as const;
+
+const RETIRED_NAMES = [
+  'FragmentStore',
+  'TopologyStore',
+  'SpatialMemoryStoreImpl',
   'SpatialMemoryStore',
-] as const;
-
-const NAVIGATION_ALLOWED_NAMES = [
-  'planRoute',
-  'createWalkPath',
-  'createWalkPathExecution',
-  'RoutePlanRegistryImpl',
-  'ROUTE_PLAN_CAPABILITIES',
-  'RoutePlanCapabilities',
+  'LegacyRouteIngest',
+  'MemoryIngest',
+  'WalkRouteSearch',
+  'WalkRouteExecutor',
+  'RouteVerifier',
   'WalkPath',
-  'RoutePlanRegistry',
-] as const;
-
-const INTERNAL_ROUTE_VERIFIER_METHODS = [
-  'stepAt',
-  'advanceVerification',
-  'currentRuleVersion',
+  'RoutePlanRegistryImpl',
+  'planRoute',
+  'navigateTo',
+  'ROUTE_PLAN_CAPABILITIES',
 ] as const;
 
 const UNPUBLISHED_NAMES = ['UNKNOWN_GAME_VERSION', 'readVoxelSectionGameVersion'] as const;
@@ -175,105 +162,63 @@ beforeAll(() => {
 });
 
 describe('allowed public surface', () => {
-  it('root entry still exports the navigation, voxel and contract names', () => {
+  it('root entry keeps the current land search, voxel and persistence names', () => {
     const names = entryExports.get('.');
     expect(names).toBeDefined();
     for (const name of ROOT_ALLOWED_NAMES) {
-      expect(names?.has(name), `root entry (dist/index.d.ts) dropped public name ${name}`).toBe(
-        true,
-      );
+      expect(names?.has(name), `root entry dropped public name ${name}`).toBe(true);
     }
   });
 
-  it('memory and navigation subpaths exist and keep their documented names', () => {
+  it('memory and navigation subpaths keep their documented names', () => {
     for (const entry of ['./memory', './navigation'] as const) {
-      expect(existsSync(declaredTypesPath(entry)), `${entry} declaration file is missing`).toBe(
-        true,
-      );
+      expect(existsSync(declaredTypesPath(entry)), `${entry} declaration file is missing`).toBe(true);
     }
 
     const memoryNames = entryExports.get('./memory');
     for (const name of MEMORY_ALLOWED_NAMES) {
-      expect(memoryNames?.has(name), `dist/memory/index.d.ts dropped public name ${name}`).toBe(
-        true,
-      );
+      expect(memoryNames?.has(name), `dist/memory/index.d.ts dropped public name ${name}`).toBe(true);
     }
 
     const navigationNames = entryExports.get('./navigation');
     for (const name of NAVIGATION_ALLOWED_NAMES) {
-      expect(
-        navigationNames?.has(name),
-        `dist/navigation/index.d.ts dropped public name ${name}`,
-      ).toBe(true);
+      expect(navigationNames?.has(name), `dist/navigation/index.d.ts dropped public name ${name}`).toBe(true);
     }
   });
 
-  it('keeps VoxelMap.sectionRef on the published class (D-086 current state)', () => {
+  it('keeps VoxelMap.sectionRef on the published class', () => {
     const voxelMap = exportedSymbol('./memory', 'VoxelMap');
-    const methods = classMethods(voxelMap, 'VoxelMap');
-    expect(
-      methods.has('sectionRef'),
-      'VoxelMap.sectionRef disappeared from dist/voxel/voxel-map.d.ts; D-086 requires an explicit decision, not a silent removal',
-    ).toBe(true);
+    expect(classMethods(voxelMap, 'VoxelMap').has('sectionRef')).toBe(true);
   });
 
-  it('keeps the @internal RouteVerifier methods in the emitted declarations (D-093 current state)', () => {
-    const routeVerifier = exportedSymbol('.', 'RouteVerifier');
-    const methods = classMethods(routeVerifier, 'RouteVerifier');
-    for (const name of INTERNAL_ROUTE_VERIFIER_METHODS) {
-      expect(
-        methods.has(name),
-        `RouteVerifier.${name} disappeared from dist/traversability/route.d.ts; stripInternal or a visibility change would shrink the emitted surface (D-093)`,
-      ).toBe(true);
-    }
-  });
-
-  it('keeps MemoryHostCapabilities.plan declared as RoutePlanCapabilities (D-060 current state)', () => {
-    const capabilities = exportedSymbol('./memory', 'MemoryHostCapabilities');
-    const declaration = capabilities.declarations?.find(ts.isInterfaceDeclaration);
-    expect(
-      declaration,
-      'MemoryHostCapabilities is no longer published as an interface',
-    ).toBeDefined();
-    const plan = declaration?.members.find(
-      (member): member is ts.PropertySignature =>
-        ts.isPropertySignature(member) && member.name.getText() === 'plan',
-    );
-    expect(
-      plan,
-      'MemoryHostCapabilities.plan disappeared from dist/memory/capabilities.d.ts',
-    ).toBeDefined();
-    expect(plan?.type?.getText()).toBe('RoutePlanCapabilities');
-  });
 });
 
-describe('forbidden names stay off the public surface', () => {
-  it('does not export SectionRef from any package entry (D-086 current state)', () => {
+describe('retired names stay off the public surface', () => {
+  it('does not export any retired store, route or history API', () => {
     for (const entry of ENTRY_NAMES) {
-      expect(
-        entryExports.get(entry)?.has('SectionRef'),
-        `${entry} now exports SectionRef, which D-086 keeps off every entry`,
-      ).toBe(false);
+      for (const name of RETIRED_NAMES) {
+        expect(
+          entryExports.get(entry)?.has(name),
+          `${entry} exports retired name ${name}`,
+        ).toBe(false);
+      }
     }
   });
 
-  it('does not emit listAll into any declaration (D-085 current state)', () => {
-    const hits = collectDtsFiles(DIST_ROOT).filter((file) =>
-      declarationIdentifiers(file).has('listAll'),
+  it('does not emit the removed store or topology modules into declarations', () => {
+    const identifiers = new Set(
+      collectDtsFiles(DIST_ROOT).flatMap((file) => [...declarationIdentifiers(file)]),
     );
-    expect(
-      hits,
-      'listAll appeared in emitted declarations; D-085 keeps it internal',
-    ).toEqual([]);
+    for (const name of ['SpatialMemoryStoreImpl', 'FragmentStore', 'WalkRouteSearch']) {
+      expect(identifiers.has(name), `${name} appeared in emitted declarations`).toBe(false);
+    }
   });
 
-  it('does not export the internal game-version helpers from any entry (D-075 current state)', () => {
+  it('does not export SectionRef or internal game-version helpers', () => {
     for (const entry of ENTRY_NAMES) {
+      expect(entryExports.get(entry)?.has('SectionRef')).toBe(false);
       for (const name of UNPUBLISHED_NAMES) {
-        expect(
-          entryExports.get(entry)?.has(name),
-          `${entry} now exports internal name ${name}; D-075 keeps it out of the entry surface`,
-        ).toBe(false);
+        expect(entryExports.get(entry)?.has(name), `${entry} exports internal name ${name}`).toBe(false);
       }
     }
   });

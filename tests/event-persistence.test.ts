@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 
 import type { ActionRecord, NavResult, Observation } from '../src/index.js';
 import type { SpatialEvent } from '../src/storage/sqlite/types.js';
-import { openHistorySession, openSpatialSession, PersistenceError } from '../dist/storage/sqlite/index.js';
+import { openSpatialSession, PersistenceError } from '../dist/storage/sqlite/index.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -546,22 +546,6 @@ describe('journal conflicts and capacity', () => {
     const first = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     first.voxel.beginSession('s1');
     first.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
-    first.history.saveFragment({
-      id: 'f1',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'walked',
-      entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-      polyline: [
-        { x: 0.5, y: 64, z: 0.5 },
-        { x: 1.5, y: 64, z: 0.5 },
-      ],
-      geometrySource: 'traversal',
-      deepestY: 12,
-      createdAt: 1000,
-      lastUsedAt: 1000,
-      uses: 1,
-    });
     const committedAction = action({ id: 'a1', ts: 1111 });
     first.journal.recordAction(committedAction);
     const firstCheckpoint = await first.checkpoint();
@@ -571,19 +555,6 @@ describe('journal conflicts and capacity', () => {
     second.voxel.beginSession('s1');
     // New facts in every domain, including a conflicting action replay.
     second.voxel.observe(obs({ state: dirt, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
-    second.history.saveFragment({
-      id: 'f2',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'dug',
-      entrances: [{ x: 2.5, y: 64, z: 0.5 }],
-      polyline: [{ x: 2.5, y: 64, z: 0.5 }],
-      geometrySource: 'traversal',
-      deepestY: 12,
-      createdAt: 2000,
-      lastUsedAt: 2000,
-      uses: 1,
-    });
     second.journal.recordAction(action({ id: 'a1', ts: 9999 })); // different canonical content
     second.journal.recordEvent(gapEvent('gap-new'));
 
@@ -609,7 +580,6 @@ describe('journal conflicts and capacity', () => {
     const third = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     expect((await third.queryActions({ actionId: 'a1' })).records[0]!.ts).toBe(1111);
     expect((await third.queryEvents()).records.map((e) => e.id)).toEqual(['gap-new']);
-    expect(third.history.getFragment('f2')).not.toBeNull();
     const cell = third.voxel.cellAt(DIM, 0, 0, 0);
     expect(cell.observed).toBe(true);
     if (!cell.observed) throw new Error('expected observed cell');
@@ -736,33 +706,22 @@ describe('journal conflicts and capacity', () => {
     await session.checkpoint();
     expect(session.getPersistenceState()).toMatchObject({ committedJournalRecords: 1, dirty: false });
 
-    session.history.saveFragment({
-      id: 'f-cap',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'walked',
-      entrances: [],
-      polyline: [{ x: 0, y: 64, z: 0 }],
-      geometrySource: 'traversal',
-      deepestY: 64,
-      createdAt: 1,
-      lastUsedAt: 1,
-      uses: 1,
-    });
+    session.voxel.beginSession('s1');
+    session.voxel.observe(obs({ state: stone, pos: { x: 5, y: 64, z: 0 } }));
     session.journal.recordAction(action({ id: 'a2' }));
     await expect(session.checkpoint()).rejects.toMatchObject({ kind: 'capacity' });
     expect(session.journal.readPending().actions.map((a) => a.id)).toEqual(['a2']);
     expect(session.getPersistenceState().dirty).toBe(true);
     await session.close();
 
-    // The rejected checkpoint rolled back the new history fact too.
+    // The rejected checkpoint rolled back the new voxel fact too.
     const reopened = await openSpatialSession({
       databasePath: dbPath,
       worldId: WORLD,
       journalLimits: { maxCommittedRecords: 1 },
     });
     expect((await reopened.queryActions()).records.map((a) => a.id)).toEqual(['a1']);
-    expect(reopened.history.getFragment('f-cap')).toBeNull();
+    expect(reopened.voxel.cellAt(DIM, 5, 64, 0).observed).toBe(false);
     await reopened.close();
   });
 
@@ -980,7 +939,7 @@ describe('journal restart and cross-domain checkpoint behavior', () => {
     await reopened.close();
   });
 
-  it('history-only and empty journal checkpoints never delete or duplicate prior journal facts', async () => {
+  it('empty journal checkpoints never delete or duplicate prior journal facts', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     session.journal.recordAction(action({ id: 'a1' }));
@@ -989,12 +948,14 @@ describe('journal restart and cross-domain checkpoint behavior', () => {
     const baseline = session.getPersistenceState().journalBaselineCheckpointId;
     await session.close();
 
-    const history = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
-    await history.checkpoint();
-    await history.close();
+    const empty = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    await empty.checkpoint();
+    await empty.close();
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.getPersistenceState().journalBaselineCheckpointId).toBe(baseline);
+    // A combined checkpoint always records its own journal baseline even with an
+    // empty batch; the guarantee is that no committed row is deleted or duplicated.
+    expect(reopened.getPersistenceState().journalBaselineCheckpointId).not.toBe(baseline);
     expect((await reopened.queryActions()).records.map((a) => a.id)).toEqual(['a1']);
     expect((await reopened.queryEvents()).records.map((e) => e.id)).toEqual(['e1']);
 
@@ -1040,19 +1001,6 @@ describe('journal lifecycle and recovery', () => {
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     session.voxel.beginSession('s1');
     session.voxel.observe(obs({ state: stone, pos: { x: 3, y: 0, z: 0 } }));
-    session.history.saveFragment({
-      id: 'f-abort',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'walked',
-      entrances: [],
-      polyline: [{ x: 0, y: 64, z: 0 }],
-      geometrySource: 'traversal',
-      deepestY: 64,
-      createdAt: 1,
-      lastUsedAt: 1,
-      uses: 1,
-    });
     session.journal.recordBatch({
       actions: [action({ id: 'abort-me' })],
       events: [gapEvent('abort-gap')],
@@ -1075,12 +1023,11 @@ describe('journal lifecycle and recovery', () => {
     const count = (table: string): number =>
       (admin.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
     expect({
-      fragments: count('path_fragments'),
       sections: count('spatial_sections'),
       actions: count('action_records'),
       events: count('spatial_events'),
       checkpoints: count('checkpoints'),
-    }).toEqual({ fragments: 0, sections: 0, actions: 0, events: 0, checkpoints: 0 });
+    }).toEqual({ sections: 0, actions: 0, events: 0, checkpoints: 0 });
 
     admin.exec('DROP TRIGGER abort_journal');
     admin.close();
@@ -1091,7 +1038,6 @@ describe('journal lifecycle and recovery', () => {
     await session.close();
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.history.getFragment('f-abort')).not.toBeNull();
     expect(reopened.voxel.cellAt(DIM, 3, 0, 0)).toMatchObject({ observed: true });
     expect((await reopened.queryActions()).records.map((a) => a.id)).toEqual(['abort-me']);
     expect((await reopened.queryEvents()).records.map((e) => e.id)).toEqual(['abort-gap']);
@@ -1229,19 +1175,6 @@ describe('v3 → v4 journal migration', () => {
     const save = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     save.voxel.beginSession('s1');
     save.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
-    save.history.saveFragment({
-      id: 'f-v3',
-      worldId: WORLD,
-      dim: DIM,
-      kind: 'walked',
-      entrances: [],
-      polyline: [{ x: 0, y: 64, z: 0 }],
-      geometrySource: 'traversal',
-      deepestY: 64,
-      createdAt: 1,
-      lastUsedAt: 1,
-      uses: 1,
-    });
     await save.checkpoint();
     await save.close();
 
@@ -1251,11 +1184,10 @@ describe('v3 → v4 journal migration', () => {
     expect(schemaVersion(dbPath)).toBe('3');
 
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(schemaVersion(dbPath)).toBe('9');
+    expect(schemaVersion(dbPath)).toBe('10');
     expect(checkpointColumns(dbPath)).toEqual(
       expect.arrayContaining(['journal_revision', 'has_journal', 'topology_extras']),
     );
-    expect(reopened.history.getFragment('f-v3')).not.toBeNull();
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
     expect(reopened.getPersistenceState()).toMatchObject({
       journalBaselineCheckpointId: null,

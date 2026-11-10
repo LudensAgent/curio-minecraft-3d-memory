@@ -60,39 +60,35 @@ function mixedFactsSources(facts: InMemoryFactStore): SpatialQuerySources {
 }
 
 describe('capability report matches facts dispatch', () => {
-  it('does not advertise legacy route reads when a facts store retires them', () => {
+  it('advertises exactly the facts-backed semantic kinds', () => {
     const facts = new InMemoryFactStore();
     const sources = mixedFactsSources(facts);
     const capabilities = runSpatialQuery(sources, { kind: 'capabilities' });
     expect(capabilities.status).toBe('ok');
     if (capabilities.data?.kind !== 'capabilities') throw new Error('expected capabilities');
-    expect(capabilities.data.capabilities.query).toMatchObject({
-      fragments: false,
-      traversals: false,
-      edges: false,
-      historyRoute: false,
-      anchors: false,
-      components: false,
-      segments: false,
-      portals: false,
+    expect(capabilities.data.capabilities.query).toEqual({
+      cells: true,
       nodes: true,
       places: true,
       resourceAnchors: true,
       containerAnchors: true,
+      containerContents: false,
+      snapshot: false,
+      capabilities: true,
     });
-    // The report and the dispatcher must agree for the same request.
-    const history = runSpatialQuery(sources, {
-      kind: 'historyRoute', dim: DIM, from: { x: 0, y: 64, z: 0 }, to: { x: 1, y: 64, z: 0 },
-    });
-    expect(history.status).toBe('unsupported');
-    expect(capabilities.data.capabilities.plan.walkSearch).toBe(false);
+    expect(capabilities.data.capabilities).not.toHaveProperty('plan');
+    // Retired kinds are rejected by the request boundary, not reported at all.
+    expect(runSpatialQuery(sources, { kind: 'fragments', dim: DIM }).status).toBe('invalid_request');
   });
 
-  it('keeps the full compatibility composition report when facts are absent', () => {
-    const capabilities = runSpatialQuery(makeQuerySources(makeQueryParts()), { kind: 'capabilities' });
+  it('reports no semantic kinds when facts are absent', () => {
+    const capabilities = runSpatialQuery(
+      { ...makeQuerySources(makeQueryParts()), facts: undefined },
+      { kind: 'capabilities' },
+    );
     if (capabilities.data?.kind !== 'capabilities') throw new Error('expected capabilities');
-    expect(capabilities.data.capabilities.query.fragments).toBe(true);
-    expect(capabilities.data.capabilities.plan.walkSearch).toBe(true);
+    expect(capabilities.data.capabilities.query.nodes).toBe(false);
+    expect(capabilities.data.capabilities.query.places).toBe(false);
   });
 });
 

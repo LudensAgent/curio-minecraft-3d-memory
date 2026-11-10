@@ -108,7 +108,7 @@ describe('VoxelMap bounded batch late ACK (pure core)', () => {
     map.observe(obs({ state: doorClosed, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
     map.observe(obs({ state: stone, pos: { x: 60, y: 0, z: 0 }, observedAt: 2000, sequence: 3 })); // cx 3
 
-    map.confirmCapturedSections(batch.keys, batch.removedSections, batch.capturedRevision);
+    map.confirmCapturedSections(batch.keys, batch.capturedRevision);
 
     // Captured-but-re-dirtied (cx 0), the untouched tail (cx 1, cx 2) and the new
     // section (cx 3) all remain pending; only the exact captured revision cleared.
@@ -126,7 +126,7 @@ describe('VoxelMap bounded batch late ACK (pure core)', () => {
     // Snapshot cells carry evidence metadata, not a duplicated blockstate: assert
     // the newest observation time (the state lives in palette + packed cells).
     expect(latestCell?.evidence.map((cell) => cell.evidence.observedAt)).toEqual([2000]);
-    map.confirmCapturedSections(later.keys, later.removedSections, later.capturedRevision);
+    map.confirmCapturedSections(later.keys, later.capturedRevision);
 
     expect(map.hasPendingChanges()).toBe(false);
     expect(pendingCount(map)).toBe(0);
@@ -142,18 +142,18 @@ describe('VoxelMap bounded batch late ACK (pure core)', () => {
 
     // Re-dirty the captured head before the ACK; it stays pending.
     map.observe(obs({ state: air, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
-    map.confirmCapturedSections(first.keys, first.removedSections, first.capturedRevision);
+    map.confirmCapturedSections(first.keys, first.capturedRevision);
     expect(pendingCount(map)).toBe(2);
 
     // The next cap-1 batch must rotate to cx1; the re-dirtied head must not starve it.
     const second = map.captureDirtySectionsBounded(1);
     expect(second.keys[0]).toMatchObject({ cx: 1 });
-    map.confirmCapturedSections(second.keys, second.removedSections, second.capturedRevision);
+    map.confirmCapturedSections(second.keys, second.capturedRevision);
     expect(pendingCount(map)).toBe(1);
 
     const third = map.captureDirtySectionsBounded(1);
     expect(third.keys[0]).toMatchObject({ cx: 0 });
-    map.confirmCapturedSections(third.keys, third.removedSections, third.capturedRevision);
+    map.confirmCapturedSections(third.keys, third.capturedRevision);
     expect(map.hasPendingChanges()).toBe(false);
   });
 
@@ -166,7 +166,7 @@ describe('VoxelMap bounded batch late ACK (pure core)', () => {
     // Move the cursor to cx1 with a first cap-1 capture.
     const first = map.captureDirtySectionsBounded(1);
     expect(first.keys[0]).toMatchObject({ cx: 0 });
-    map.confirmCapturedSections(first.keys, first.removedSections, first.capturedRevision);
+    map.confirmCapturedSections(first.keys, first.capturedRevision);
 
     const measureA = map.checkpointDirtyMeasureBounded(1);
     const measureB = map.checkpointDirtyMeasureBounded(1);

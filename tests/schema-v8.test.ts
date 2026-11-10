@@ -20,7 +20,7 @@ import {
 } from '../src/storage/sqlite/types.js';
 import { PersistenceError } from '../src/storage/sqlite/types.js';
 import type { WorkerRequest } from '../src/storage/sqlite/types.js';
-import { openHistorySession, openSpatialSession } from '../dist/storage/sqlite/index.js';
+import { openSpatialSession } from '../dist/storage/sqlite/index.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -116,7 +116,6 @@ function spatialOpen(dbPath: string, requestId: number): WorkerRequest {
     worldId: WORLD,
     limits: resolveSnapshotLimits(undefined),
     journalLimits: resolveJournalLimits(undefined),
-    kind: 'spatial',
     voxelLoading: 'eager',
     ledgerLimits: DEFAULT_LEDGER_LIMITS,
   };
@@ -171,7 +170,7 @@ describe('schema v8 game version records', () => {
     await session.close();
 
     const db = new Database(dbPath, { readonly: true });
-    expect(schemaVersion(db)).toBe('9');
+    expect(schemaVersion(db)).toBe('10');
     const sectionRows = db
       .prepare('SELECT payload, game_version FROM spatial_sections WHERE world_id = ?')
       .all(WORLD) as { payload: string; game_version: string }[];
@@ -202,9 +201,6 @@ describe('schema v8 game version records', () => {
       requestId: 2,
       checkpointId: 'cp-explicit-version',
       worldId: WORLD,
-      fragmentRevision: 0,
-      topologyRevision: 0,
-      snapshot: { worldId: WORLD, fragments: [], traversals: [], nodes: [], edges: [] },
       voxelMode: 'full',
       voxelRevision: 1,
       voxelSnapshot: { worldId: WORLD, sections: [section] },
@@ -265,37 +261,6 @@ describe('schema v8 game version records', () => {
     await reopenedUnversioned.close();
   });
 
-  it('keeps the voxel baseline version when a newer history-only checkpoint is written', async () => {
-    const dbPath = makeDbPath();
-    const spatial = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, gameVersion: '1.20.1' });
-    spatial.voxel.beginSession('s1');
-    spatial.voxel.observe(obs());
-    await spatial.checkpoint();
-    expect(spatial.getPersistenceState().restoredGameVersion).toBe('1.20.1');
-    await spatial.close();
-
-    // The history-only entry always checkpoints with `voxelMode: 'none'`, so its
-    // checkpoint row records `'unknown'` while writing no voxel rows.
-    const history = await openHistorySession({ databasePath: dbPath, worldId: WORLD });
-    history.history.saveFragment(fragment());
-    await history.checkpoint();
-    await history.close();
-
-    const db = new Database(dbPath, { readonly: true });
-    const rows = db
-      .prepare('SELECT has_voxel, game_version FROM checkpoints WHERE world_id = ? ORDER BY seq')
-      .all(WORLD) as { has_voxel: number; game_version: string }[];
-    expect(rows.map((row) => row.has_voxel)).toEqual([1, 0]);
-    expect(rows.map((row) => row.game_version)).toEqual(['1.20.1', UNKNOWN_GAME_VERSION]);
-    db.close();
-
-    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
-    expect(reopened.getPersistenceState().restoredGameVersion).toBe('1.20.1');
-    expect(reopened.history.getFragment('f-history')).not.toBeNull();
-    expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({ observed: true });
-    await reopened.close();
-  });
-
   it('keeps the voxel baseline version across a second incremental checkpoint', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, gameVersion: '1.20.1' });
@@ -328,9 +293,6 @@ describe('schema v8 game version records', () => {
         requestId: 2,
         checkpointId: 'cp-empty-version',
         worldId: WORLD,
-        fragmentRevision: 0,
-        topologyRevision: 0,
-        snapshot: { worldId: WORLD, fragments: [], traversals: [], nodes: [], edges: [] },
         voxelMode: 'incremental',
         voxelRevision: 1,
         voxelSnapshot: { worldId: WORLD, sections: [] },
@@ -358,7 +320,7 @@ describe('schema v8 game version records', () => {
     // `'unknown'`) while an explicitly empty string is rejected before any write.
     const omitted = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     expect(omitted.getPersistenceState().restoredGameVersion).toBe('1.20.1');
-    expect(omitted.getPersistenceState().baselineCheckpointId).toBe(baselineCheckpoint.checkpointId);
+    expect(omitted.getPersistenceState().voxelBaselineCheckpointId).toBe(baselineCheckpoint.checkpointId);
     await omitted.close();
 
     const empty = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, gameVersion: '' }).then(
@@ -384,6 +346,7 @@ describe('schema v8 game version records', () => {
     legacy.exec(`
       ALTER TABLE spatial_sections DROP COLUMN game_version;
       ALTER TABLE checkpoints DROP COLUMN game_version;
+      ALTER TABLE checkpoints ADD COLUMN topology_extras TEXT NOT NULL DEFAULT '{}';
       DROP TABLE IF EXISTS fact_places;
       DROP TABLE IF EXISTS fact_resources;
       DROP TABLE IF EXISTS fact_containers;
@@ -408,7 +371,7 @@ describe('schema v8 game version records', () => {
     await reopened.close();
 
     const db = new Database(dbPath, { readonly: true });
-    expect(schemaVersion(db)).toBe('9');
+    expect(schemaVersion(db)).toBe('10');
     const sectionRow = db.prepare('SELECT payload, game_version FROM spatial_sections').get() as {
       payload: string;
       game_version: string;

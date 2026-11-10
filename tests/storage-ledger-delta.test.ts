@@ -5,8 +5,6 @@ import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 
-import type { PathFragment } from '../src/index.js';
-import type { TopologyPortalEdgeSnapshot } from '../src/topology/topology-store.js';
 import type { ChunkVisitRecord, PlacedBlockRecord, PortalTraversalRecord } from '../src/storage/sqlite/types.js';
 import { DEFAULT_LEDGER_LIMITS, resolveJournalLimits, resolveSnapshotLimits } from '../src/storage/sqlite/types.js';
 import type { WorkerRequest } from '../src/storage/sqlite/types.js';
@@ -112,7 +110,6 @@ function openMessage(dbPath: string, requestId: number, maxPlacedBlocks = DEFAUL
     worldId: WORLD,
     limits: resolveSnapshotLimits(undefined),
     journalLimits: resolveJournalLimits(undefined),
-    kind: 'spatial',
     voxelLoading: 'eager',
     ledgerLimits: { ...DEFAULT_LEDGER_LIMITS, maxPlacedBlocks },
   };
@@ -126,33 +123,15 @@ interface CheckpointOverrides {
   ledgerUpserts?: PlacedBlockRecord[];
   ledgerRemovals?: string[];
   ledgerTraversals?: PortalTraversalRecord[];
-  historyMode?: 'full' | 'none';
-  topologyMode?: 'full' | 'none';
-  fragments?: PathFragment[];
-  portalEdges?: TopologyPortalEdgeSnapshot[];
 }
 
 function checkpointMessage(requestId: number, overrides: CheckpointOverrides): WorkerRequest {
   const mode = overrides.ledgerMode ?? 'none';
-  const snapshot = {
-    worldId: WORLD,
-    fragments: overrides.fragments ?? [],
-    traversals: [],
-    nodes: [],
-    edges: [],
-    portalEdges: overrides.portalEdges ?? [],
-    fragmentMerges: [],
-  };
   return {
     type: 'checkpoint',
     requestId,
     checkpointId: overrides.checkpointId,
     worldId: WORLD,
-    fragmentRevision: 1,
-    topologyRevision: 1,
-    snapshot,
-    historyMode: overrides.historyMode,
-    topologyMode: overrides.topologyMode,
     voxelMode: 'none',
     voxelRevision: 0,
     voxelSnapshot: { worldId: WORLD, sections: [] },
@@ -373,75 +352,5 @@ describe('worker ledger delta persistence', () => {
     const committed = await readCommittedLedger(dbPath);
     expect(committed.placed).toEqual([placed(0).key, placed(1).key]);
     expect(committed.checkpoints).toBe(1);
-  });
-});
-
-describe('worker domain modes', () => {
-  const fragment: PathFragment = {
-    id: 'f-1',
-    worldId: WORLD,
-    dim: DIM,
-    kind: 'walked',
-    entrances: [{ x: 0.5, y: 64, z: 0.5 }],
-    polyline: [
-      { x: 0.5, y: 64, z: 0.5 },
-      { x: 1.5, y: 64, z: 0.5 },
-    ],
-    geometrySource: 'traversal',
-    deepestY: 64,
-    createdAt: 1,
-    lastUsedAt: 2,
-    uses: 1,
-  };
-  const portalEdge: TopologyPortalEdgeSnapshot = { id: 'pe-1', from: 'n-o', to: 'n-n', directed: true, traversals: [] };
-
-  it('keeps committed history/topology rows and topology extras when that domain is `none`', async () => {
-    const dbPath = makeDbPath();
-    const worker = startWorker(dbPath);
-    const opened = await worker.send(openMessage(dbPath, 1));
-    expect(opened.type).toBe('open_ok');
-
-    await worker.send(
-      checkpointMessage(2, {
-        checkpointId: 'cp-history',
-        fragments: [fragment],
-        portalEdges: [portalEdge],
-        historyMode: 'full',
-        topologyMode: 'full',
-      }),
-    );
-    // A later checkpoint that writes no history/topology rows at all must leave
-    // both the rows and the previous checkpoint's extras in place.
-    await worker.send(
-      checkpointMessage(3, { checkpointId: 'cp-none', historyMode: 'none', topologyMode: 'none' }),
-    );
-    await worker.close(4);
-
-    const reopened = startWorker(dbPath);
-    const reply = await reopened.send(openMessage(dbPath, 1));
-    expect(reply.type).toBe('open_ok');
-    const snapshot = reply.snapshot as {
-      fragments: { id: string }[];
-      portalEdges: { id: string }[];
-    };
-    expect(snapshot.fragments.map((entry) => entry.id)).toEqual(['f-1']);
-    expect(snapshot.portalEdges.map((entry) => entry.id)).toEqual(['pe-1']);
-    await reopened.close(2);
-  });
-
-  it('rejects a `none` domain that still carries rows instead of silently dropping them', async () => {
-    const dbPath = makeDbPath();
-    const worker = startWorker(dbPath);
-    await worker.send(openMessage(dbPath, 1));
-
-    await expect(
-      worker.send(
-        checkpointMessage(2, { checkpointId: 'cp-bad', fragments: [fragment], historyMode: 'none' }),
-      ),
-    ).rejects.toMatchObject({ kind: 'invalid_argument' });
-    await worker.close(3);
-
-    const committed = await readCommittedLedger(dbPath);
-    expect(committed.checkpoints).toBe(0);
   });
 });

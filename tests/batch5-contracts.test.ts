@@ -7,11 +7,8 @@ import {
   CapabilityContractError,
   CapabilityUnavailableError,
   composeCapabilities,
-  FragmentStore,
   hasCapability,
   requireCapability,
-  TopologyStore,
-  VoxelMap,
 } from '../dist/index.js';
 import type {
   MemoryHostCapabilities,
@@ -23,7 +20,6 @@ import {
   WorkingSetManager,
 } from '../dist/storage/sqlite/index.js';
 import { ObservationQueue } from '../dist/observation/index.js';
-import { SpatialMemoryStoreImpl, SpatialMemoryUnsupportedError } from '../dist/store/index.js';
 
 const WORLD = 'world';
 const DIM = 'overworld';
@@ -187,56 +183,26 @@ describe('ObservationQueue — queue_full keeps stable refused identities', () =
 describe('Capability composition — library and host are separate facts', () => {
   function libraryReport(): MemoryHostCapabilities {
     return {
-      contract: 'memory-host-contract/1',
+      contract: 'memory-host-contract/2',
       memory: {
         observeBatch: true,
         beginSession: true,
         markStale: true,
         markTraversed: true,
         markModified: true,
-        saveFragment: true,
-        addTraversal: true,
-        recordNode: true,
-        upsertEdge: true,
-        savePortalEdge: true,
         checkpoint: false,
         flush: false,
         close: false,
       },
       query: {
         cells: true,
-        fragments: true,
-        traversals: true,
         nodes: true,
-        edges: true,
-        historyRoute: true,
-        anchors: true,
-        components: true,
-        segments: true,
-        portals: true,
         places: true,
         resourceAnchors: true,
-        containerAnchors: false,
-        frontiers: false,
+        containerAnchors: true,
         containerContents: false,
-      },
-      plan: {
-        walkSearch: true,
-        walkHistory: true,
-        walkAuto: true,
-        nearArrival: false,
-        reachBlockArrival: false,
-        digPlaceTower: false,
-        swim: false,
-        boat: false,
-      },
-      execute: {
-        walk: true,
-        groundedArrival: true,
-        invalidation: true,
-        cancellation: true,
-        swim: false,
-        boat: false,
+        snapshot: true,
+        capabilities: true,
       },
       persistence: {
         sqlite: false,
@@ -250,18 +216,19 @@ describe('Capability composition — library and host are separate facts', () =>
   it('takes the intersection and reports overclaims without widening the library', () => {
     const library = libraryReport();
     const composed = composeCapabilities(library, {
-      execute: { walk: true, swim: true },
-      persistence: { sqlite: true, checkpoint: true } as never,
+      query: { places: false },
+      persistence: { sqlite: true },
+      // A retired key is not part of the library report and is an overclaim.
+      memory: { saveFragment: true } as never,
     });
 
     expect(composed.owner).toBe('host_composed');
-    expect(composed.effective.execute.walk).toBe(true);
-    expect(composed.effective.execute.swim).toBe(false);
+    expect(composed.effective.query.places).toBe(false);
+    expect(composed.effective.query.nodes).toBe(true);
     expect(composed.effective.persistence.sqlite).toBe(false);
     expect(composed.library).toEqual(library);
     expect(composed.overclaims.map((entry) => `${entry.domain}.${entry.name}`).sort()).toEqual([
-      'execute.swim',
-      'persistence.checkpoint',
+      'memory.saveFragment',
       'persistence.sqlite',
     ]);
   });
@@ -273,46 +240,23 @@ describe('Capability composition — library and host are separate facts', () =>
   });
 
   it('requireCapability throws a structured unsupported error for false bits', () => {
-    const composed = composeCapabilities(libraryReport(), { execute: { invalidation: false } });
-    expect(hasCapability(composed, 'execute', 'walk')).toBe(true);
-    expect(hasCapability(composed, 'execute', 'invalidation')).toBe(false);
+    const composed = composeCapabilities(libraryReport(), { query: { places: false } });
+    expect(hasCapability(composed, 'query', 'nodes')).toBe(true);
+    expect(hasCapability(composed, 'query', 'places')).toBe(false);
 
     try {
-      requireCapability(composed, 'execute', 'invalidation');
+      requireCapability(composed, 'query', 'places');
       throw new Error('expected requireCapability to throw');
     } catch (error) {
       expect(error).toBeInstanceOf(CapabilityUnavailableError);
       expect(error).toMatchObject({
         code: 'unsupported',
-        domain: 'execute',
-        capability: 'invalidation',
+        domain: 'query',
+        capability: 'places',
       });
     }
-    expect(() => requireCapability(composed, 'plan', 'nearArrival')).toThrow(
+    expect(() => requireCapability(composed, 'persistence', 'sqlite')).toThrow(
       CapabilityUnavailableError,
-    );
-  });
-});
-
-describe('SpatialMemoryStoreImpl — false optional capability is structured', () => {
-  it('throws SpatialMemoryUnsupportedError instead of a native TypeError', () => {
-    const map = new VoxelMap(WORLD);
-    // Simulate a caller-supplied map that predates the optional marker API.
-    (map as unknown as { markTraversed?: unknown }).markTraversed = undefined;
-    (map as unknown as { markModified?: unknown }).markModified = undefined;
-    const fragments = new FragmentStore(WORLD);
-    const store = new SpatialMemoryStoreImpl({
-      worldId: WORLD,
-      map,
-      fragments,
-      topology: new TopologyStore(fragments),
-    });
-
-    expect(() => store.markTraversed(DIM, { x: 0, y: 64, z: 0 })).toThrow(
-      SpatialMemoryUnsupportedError,
-    );
-    expect(() => store.markModified(DIM, { x: 0, y: 64, z: 0 }, 'action-1')).toThrow(
-      SpatialMemoryUnsupportedError,
     );
   });
 });
