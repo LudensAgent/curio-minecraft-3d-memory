@@ -164,6 +164,12 @@ export function isContainerFact(fact: SemanticFact): fact is ContainerAnchorFact
 export interface FactQuery {
   worldId?: string;
   dim?: string;
+  /** Exact label; container anchors use their externalRef as the query label. */
+  label?: string;
+  /** `agent` provenance, or `program` for every other provenance label. */
+  sourceKind?: 'agent' | 'program';
+  /** Restrict to these place kinds. Other fact kinds do not match. */
+  placeKinds?: readonly PlaceKind[];
   /** Include gone/revoked records. Defaults to false. */
   includeGone?: boolean;
   /** Exclusive cursor: only ids sorting after this id are returned. */

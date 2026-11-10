@@ -401,7 +401,7 @@ export class InMemoryFactStore {
       this.placeKeysById,
       this.placesByKey,
       query,
-      (record) => matchesScope(record, query) && (includeGone || !record.gone),
+      (record) => matchesQuery(record, query) && (includeGone || !record.gone),
       snapshotPlace,
     );
   }
@@ -417,7 +417,7 @@ export class InMemoryFactStore {
       this.resourcesByKey,
       query,
       (record) =>
-        matchesScope(record, query) &&
+        matchesQuery(record, query) &&
         (includeGone || !record.revoked) &&
         (cell === undefined || pointsEqual(record.sourceCell, cell)),
       snapshotResource,
@@ -432,7 +432,7 @@ export class InMemoryFactStore {
       this.containerKeysById,
       this.containersByKey,
       query,
-      (record) => matchesScope(record, query) && (includeGone || !record.gone),
+      (record) => matchesQuery(record, query) && (includeGone || !record.gone),
       snapshotContainer,
     );
   }
@@ -671,9 +671,15 @@ export class InMemoryFactStore {
   }
 }
 
-function matchesScope(record: { worldId: string; dim: string }, query: FactQuery): boolean {
+function matchesQuery(record: SemanticFact, query: FactQuery): boolean {
   if (query.worldId !== undefined && record.worldId !== query.worldId) return false;
   if (query.dim !== undefined && record.dim !== query.dim) return false;
+  if (query.label !== undefined
+    && ('externalRef' in record ? record.externalRef : record.label) !== query.label) return false;
+  if (query.sourceKind !== undefined
+    && (record.source.source === 'agent' ? 'agent' : 'program') !== query.sourceKind) return false;
+  if (query.placeKinds !== undefined
+    && (!('kind' in record) || !query.placeKinds.includes(record.kind))) return false;
   return true;
 }
 

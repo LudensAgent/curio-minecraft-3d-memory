@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { InMemoryFactStore, VoxelMap, createVoxelFactsQueryPort } from '../src/index.js';
 import type { ContainerAnchorFact, PlaceFact, ResourceAnchorFact } from '../src/index.js';
@@ -171,6 +171,34 @@ describe('bounded places paging', () => {
     expect(secondPage.total).toBe(2);
     expect(ids(secondPage)).toEqual(['base2']);
     expect(secondPage.nextAfter).toBeUndefined();
+
+    facts.upsertResource(resource('ore', { label: 'home' }));
+    facts.upsertContainer(container('chest', { externalRef: 'home' }));
+    const mixed = port.query({ kind: 'nodes', label: 'home', source: 'program' });
+    expect(mixed.total).toBe(3);
+    expect(ids(mixed)).toEqual(['chest', 'ore', 'way']);
+  });
+
+  it('filters a large collection in one store read and copies only the requested page', () => {
+    const facts = new InMemoryFactStore();
+    for (let index = 0; index < 2500; index += 1) {
+      facts.upsertPlace(place(String(index).padStart(4, '0'), {
+        kind: 'base',
+        label: index % 1000 === 0 ? 'home' : 'other',
+        source: { source: 'vision' },
+      }));
+    }
+    facts.upsertPlace(place('gone', { kind: 'base', label: 'home', source: { source: 'program' }, gone: true }));
+    facts.upsertPlace(place('other-world', { worldId: 'other', kind: 'base', label: 'home', source: { source: 'program' } }));
+    const read = vi.spyOn(facts, 'places');
+    const page = portWithFacts(facts).query({
+      kind: 'places', tag: 'base', label: 'home', source: 'program', after: '0000', limit: 1,
+    });
+    expect(ids(page)).toEqual(['1000']);
+    expect(page.total).toBe(3);
+    expect(page.nextAfter).toBe('1000');
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read.mock.results[0]!.value.items).toHaveLength(1);
   });
 
   it('hides gone places by default and reveals them only when asked', () => {
@@ -207,6 +235,39 @@ describe('bounded places paging', () => {
       after = page.nextAfter;
     } while (after !== undefined);
     expect(collected).toEqual(['a-place', 'b-ore', 'c-place', 'd-chest', 'e-ore']);
+  });
+
+  it.each([1, 2])('keeps equal ids from all three kinds across pages of %i', (limit) => {
+    const facts = new InMemoryFactStore();
+    facts.upsertPlace(place('same'));
+    facts.upsertResource(resource('same'));
+    facts.upsertContainer(container('same'));
+    facts.upsertPlace(place('tail'));
+    facts.upsertResource(resource('tail', { sourceCell: { x: 6, y: 60, z: 0 } }));
+    facts.upsertContainer(container('tail'));
+    const port = portWithFacts(facts);
+    const collected: string[] = [];
+    let after: string | undefined;
+    for (let pageNumber = 0; pageNumber < 6; pageNumber += 1) {
+      const page = port.query({ kind: 'nodes', limit, ...(after === undefined ? {} : { after }) });
+      if (page.data?.kind !== 'nodes') throw new Error('expected nodes');
+      expect(page.total).toBe(6);
+      expect(page.data.items.length).toBeLessThanOrEqual(limit);
+      collected.push(...page.data.items.map(item => `${item.id}:${item.metadata?.factKind}`));
+      after = page.nextAfter;
+      if (after === undefined) break;
+    }
+    expect(after).toBeUndefined();
+    expect(collected).toEqual([
+      'same:place', 'same:resource', 'same:container',
+      'tail:place', 'tail:resource', 'tail:container',
+    ]);
+
+    // Existing callers may still supply an exclusive bare-id cursor.
+    const legacy = port.query({ kind: 'nodes', after: 'same', limit: 3 });
+    expect(ids(legacy)).toEqual(['tail', 'tail', 'tail']);
+    expect(legacy.total).toBe(6);
+    expect(legacy.nextAfter).toBeUndefined();
   });
 
   it('rejects unknown fields for the places kind', () => {

@@ -1,6 +1,6 @@
-import type { SemanticFact, FactPage, FactQuery } from '../facts/types.js';
+import type { SemanticFact, SemanticFactKind, FactPage, FactQuery } from '../facts/types.js';
 import type { SpatialNode } from '../topology/graph.js';
-import { makeQueryResult, unsupportedQueryResult } from './envelope.js';
+import { invalidQueryResult, makeQueryResult, unsupportedQueryResult } from './envelope.js';
 import { resolveLimit } from './paging.js';
 import type { QueryPage } from './paging.js';
 import { pagedQueryResult } from './topology.js';
@@ -11,7 +11,7 @@ type FactsQuery = Extract<
   { kind: 'places' | 'nodes' | 'resourceAnchors' | 'containerAnchors' }
 >;
 
-const FACT_SCAN_PAGE_SIZE = 1000;
+const NODES_CURSOR_PREFIX = 'facts:nodes:v1:';
 
 /**
  * Read-only compatibility projection; it does not create topology nodes.
@@ -31,6 +31,7 @@ export function queryFacts(
   switch (request.kind) {
     case 'places': {
       const page = pageOneStream(
+        'place',
         query => facts.places(query),
         fact => factToNode(fact),
         context.worldId,
@@ -52,6 +53,7 @@ export function queryFacts(
     }
     case 'resourceAnchors': {
       const page = pageOneStream(
+        'resource',
         query => facts.resources(query),
         fact => factToNode(fact),
         context.worldId,
@@ -67,6 +69,7 @@ export function queryFacts(
     }
     case 'containerAnchors': {
       const page = pageOneStream(
+        'container',
         query => facts.containers(query),
         fact => factToNode(fact),
         context.worldId,
@@ -82,25 +85,41 @@ export function queryFacts(
     }
     case 'nodes': {
       const limit = resolveLimit(request.limit);
+      // Each kind owns its ids. Keep a cursor for each stream so a page ending
+      // on a place cannot skip a resource/container with the same id.
+      let afters = [request.after, request.after, request.after];
+      if (request.after?.startsWith(NODES_CURSOR_PREFIX)) {
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(request.after.slice(NODES_CURSOR_PREFIX.length));
+        } catch {
+          return invalidQueryResult(context, 'invalid facts nodes cursor');
+        }
+        if (!Array.isArray(decoded) || decoded.length !== 3
+          || !decoded.every((value: unknown) => value === null || typeof value === 'string')) {
+          return invalidQueryResult(context, 'invalid facts nodes cursor');
+        }
+        afters = (decoded as (string | null)[]).map(value => value ?? undefined);
+      }
       const streams = [
-        pageOneStream(query => facts.places(query), fact => factToNode(fact), context.worldId, request.dim, false, request.after, limit, request.tag, request.label, request.source),
-        pageOneStream(query => facts.resources(query), fact => factToNode(fact), context.worldId, request.dim, false, request.after, limit, request.tag, request.label, request.source),
-        pageOneStream(query => facts.containers(query), fact => factToNode(fact), context.worldId, request.dim, false, request.after, limit, request.tag, request.label, request.source),
+        pageOneStream('place', query => facts.places(query), fact => factToNode(fact), context.worldId, request.dim, false, afters[0], limit, request.tag, request.label, request.source),
+        pageOneStream('resource', query => facts.resources(query), fact => factToNode(fact), context.worldId, request.dim, false, afters[1], limit, request.tag, request.label, request.source),
+        pageOneStream('container', query => facts.containers(query), fact => factToNode(fact), context.worldId, request.dim, false, afters[2], limit, request.tag, request.label, request.source),
       ];
-      return pagedQueryResult(context, 'nodes', mergeIdPages(streams, limit), request.dim);
+      return pagedQueryResult(context, 'nodes', mergeIdPages(streams, limit, afters), request.dim);
     }
   }
 }
 
 /**
- * One bounded, id-ordered page over one fact collection.
+ * One id-ordered page over one fact collection, with bounded output.
  *
- * Without tag/label/source filters the store's own `total` and `nextAfter` are
- * exact. With filters, the store cannot count them without projecting every
- * record; the scan still reads one bounded page at a time and keeps only the
- * requested window in memory. It never materializes and sorts the collection.
+ * The store applies filters and computes the exact total in one O(N) scan.
+ * Only the requested page is cloned/projected; this is not a fixed work budget
+ * or a cold-page query, but it avoids rescanning N records for every source page.
  */
 function pageOneStream(
+  kind: SemanticFactKind,
   read: (query: FactQuery) => FactPage<SemanticFact>,
   project: (fact: SemanticFact) => SpatialNode,
   worldId: string,
@@ -112,60 +131,43 @@ function pageOneStream(
   label: string | undefined,
   source: SpatialNode['source'] | undefined,
 ): QueryPage<SpatialNode> {
-  const filtered = tag !== undefined || label !== undefined || source !== undefined;
-  const base: FactQuery = {
+  let placeKinds: FactQuery['placeKinds'];
+  if (tag !== undefined) {
+    if (kind === 'place') {
+      placeKinds = tag === 'base' || tag === 'death' || tag === 'portal' ? [tag]
+        : tag === 'danger' ? ['hazard']
+          : tag === 'discovery' ? ['place', 'station'] : [];
+      if (placeKinds.length === 0) return { items: [], total: 0 };
+    } else if (tag !== (kind === 'resource' ? 'resource' : 'discovery')) {
+      return { items: [], total: 0 };
+    }
+  }
+  const page = read({
     worldId,
     includeGone,
     ...(dim === undefined ? {} : { dim }),
+    ...(after === undefined ? {} : { after }),
+    ...(label === undefined ? {} : { label }),
+    ...(source === undefined ? {} : { sourceKind: source }),
+    ...(placeKinds === undefined ? {} : { placeKinds }),
+    limit,
+  });
+  return {
+    items: page.items.map(project),
+    total: page.total,
+    ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
   };
-
-  if (!filtered) {
-    const page = read({ ...base, ...(after === undefined ? {} : { after }), limit });
-    return {
-      items: page.items.map(project),
-      total: page.total,
-      ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
-    };
-  }
-
-  const matches = (node: SpatialNode): boolean =>
-    (tag === undefined || node.tag === tag)
-    && (label === undefined || node.label === label)
-    && (source === undefined || node.source === source);
-
-  const items: SpatialNode[] = [];
-  let total = 0;
-  let more = false;
-  let cursor: string | undefined;
-  for (;;) {
-    const page = read({
-      ...base,
-      ...(cursor === undefined ? {} : { after: cursor }),
-      limit: FACT_SCAN_PAGE_SIZE,
-      // The scan needs a cursor-stable view of the whole collection; hiding
-      // gone records here would also hide them from the exact filter count.
-      includeGone: true,
-    });
-    for (const fact of page.items) {
-      const node = project(fact);
-      if (!includeGone && node.gone) continue;
-      if (!matches(node)) continue;
-      total += 1;
-      if (after !== undefined && node.id <= after) continue;
-      if (items.length < limit) items.push(node);
-      else more = true;
-    }
-    if (page.nextAfter === undefined) break;
-    cursor = page.nextAfter;
-  }
-  const last = items.at(-1);
-  return { items, total, ...(more && last !== undefined ? { nextAfter: last.id } : {}) };
 }
 
 /** Merge already id-sorted, cursor-limited stream pages into one page window. */
-function mergeIdPages(pages: readonly QueryPage<SpatialNode>[], limit: number): QueryPage<SpatialNode> {
+function mergeIdPages(
+  pages: readonly QueryPage<SpatialNode>[],
+  limit: number,
+  afters: readonly (string | undefined)[],
+): QueryPage<SpatialNode> {
   const items: SpatialNode[] = [];
   const cursors = pages.map(() => 0);
+  const nextAfters = [...afters];
   for (;;) {
     let smallest = -1;
     for (let index = 0; index < pages.length; index += 1) {
@@ -175,16 +177,19 @@ function mergeIdPages(pages: readonly QueryPage<SpatialNode>[], limit: number): 
       if (current === undefined || candidate.id < current.id) smallest = index;
     }
     if (smallest === -1) break;
-    items.push(pages[smallest]!.items[cursors[smallest]!]!);
+    const item = pages[smallest]!.items[cursors[smallest]!]!;
+    items.push(item);
+    nextAfters[smallest] = item.id;
     cursors[smallest] = cursors[smallest]! + 1;
     if (items.length === limit) break;
   }
   const more = pages.some((page, index) => page.nextAfter !== undefined || cursors[index]! < page.items.length);
-  const last = items.at(-1);
   return {
     items,
     total: pages.reduce((sum, page) => sum + page.total, 0),
-    ...(more && last !== undefined ? { nextAfter: last.id } : {}),
+    ...(more && items.length > 0
+      ? { nextAfter: NODES_CURSOR_PREFIX + JSON.stringify(nextAfters.map(after => after ?? null)) }
+      : {}),
   };
 }
 
