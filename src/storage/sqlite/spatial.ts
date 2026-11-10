@@ -221,6 +221,8 @@ class SpatialSessionImpl implements SpatialSession {
   private committedJournalBytes = 0;
   /** Whether a voxel save baseline exists (restored, or established this session). */
   private voxelBaselineEstablished = false;
+  /** Whether the opened database already had committed voxel rows without a baseline. */
+  private voxelRowsPresent = false;
   private lastConfirmedCheckpointId: string | null = null;
   private lastError: PersistenceError | null = null;
   private unconfirmedCheckpointId: string | null = null;
@@ -343,6 +345,8 @@ class SpatialSessionImpl implements SpatialSession {
     this.baselineCheckpointId = result.baselineCheckpointId;
     this.voxelBaselineCheckpointId = result.voxelBaselineCheckpointId;
     this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
+    this.voxelRowsPresent = (result.voxelSnapshot?.sections.length ?? 0) > 0
+      || (result.voxelDirectory?.length ?? 0) > 0;
     this.journalBaselineCheckpointId = result.journalBaselineCheckpointId;
     this.ledgerBaselineCheckpointId = result.ledgerBaselineCheckpointId;
     this.restoredGameVersion = result.gameVersion;
@@ -417,9 +421,12 @@ class SpatialSessionImpl implements SpatialSession {
       topologyMeasure.edges,
     );
 
-    // First save (no voxel baseline yet) replaces the whole set; once a baseline
-    // exists, only the pending sections are copied, encoded and written.
-    const voxelMode: VoxelSaveMode = this.voxelBaselineEstablished ? 'incremental' : 'full';
+    // The first save on an empty database can use incremental upserts, so a large
+    // initial map is also split by voxelBatchMaxBytes. A database that already has
+    // voxel rows without a baseline keeps the replacing full mode.
+    const voxelMode: VoxelSaveMode = this.voxelBaselineEstablished || !this.voxelRowsPresent
+      ? 'incremental'
+      : 'full';
 
     // Bounded pre-flight: full-set counts (cheap) + the batch actually being sent.
     // `bytes` is the *batch* size — the worker still re-checks the post-increment

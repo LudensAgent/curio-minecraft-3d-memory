@@ -508,6 +508,32 @@ describe('SQLite incremental voxel checkpoint', () => {
     await reopened.close();
   });
 
+  it('splits the first save on an empty database instead of sending one full snapshot', async () => {
+    const dbPath = makeDbPath();
+    const s = await openSpatialSession({
+      databasePath: dbPath, worldId: WORLD,
+      snapshotLimits: { maxBytes: 4 * 1024 * 1024 }, voxelBatchMaxBytes: 1,
+    });
+    s.voxel.beginSession('s1');
+    s.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    s.voxel.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } }));
+    s.voxel.observe(obs({ state: air, pos: { x: 40, y: 0, z: 0 } }));
+
+    const first = await s.checkpoint();
+    expect(s.voxel.hasPendingChanges()).toBe(true);
+    expect(s.getPersistenceState().dirty).toBe(true);
+    expect(first.voxelRevision).toBeLessThan(s.voxel.saveRevision);
+    for (let i = 0; i < 4 && s.getPersistenceState().dirty; i++) await s.checkpoint();
+    expect(s.getPersistenceState().dirty).toBe(false);
+    await s.close();
+
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(evidence(reopened.voxel, 0, 0, 0).observation.state).toEqual(stone);
+    expect(evidence(reopened.voxel, 20, 0, 0).observation.state).toEqual(dirt);
+    expect(evidence(reopened.voxel, 40, 0, 0).observation.state).toEqual(air);
+    await reopened.close();
+  });
+
   it('rejects an over-capacity incremental batch before copying', async () => {
     const dbPath = makeDbPath();
     const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, snapshotLimits: { maxBytes: 8192 } });
