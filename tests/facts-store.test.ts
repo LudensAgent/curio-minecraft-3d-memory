@@ -422,3 +422,85 @@ describe('InMemoryFactStore containers', () => {
     expect(store.containers().items.find((item) => item.id === 'c1')?.gone).toBe(false);
   });
 });
+
+describe('resource source-cell versions', () => {
+  it('stores, updates and projects the source voxel cell revision', () => {
+    const store = new InMemoryFactStore();
+    const inserted = store.upsertResource(resource('ore', { sourceCellVersion: 7 }));
+    expect(inserted.outcome).toBe('inserted');
+    expect(inserted.record.sourceCellVersion).toBe(7);
+
+    // A newer observation at the same cell/label updates the anchor and version.
+    const updated = store.upsertResource(
+      resource('ore', { observedAt: 200, sourceCellVersion: 9 }),
+    );
+    expect(updated.outcome).toBe('updated');
+    expect(store.resources().items[0]?.sourceCellVersion).toBe(9);
+  });
+
+  it('treats a same-time observation with a different version as a conflict', () => {
+    const store = new InMemoryFactStore();
+    store.upsertResource(resource('ore', { observedAt: 100, sourceCellVersion: 7 }));
+    const result = store.upsertResource(
+      resource('ore', { observedAt: 100, sourceCellVersion: 8 }),
+    );
+    expect(result.outcome).toBe('conflict');
+    expect(result.record.sourceCellVersion).toBe(7);
+
+    const replay = store.upsertResource(
+      resource('ore', { observedAt: 100, sourceCellVersion: 7 }),
+    );
+    expect(replay.outcome).toBe('duplicate');
+  });
+
+  it('re-anchors with a new version and retains the previous one when omitted', () => {
+    const store = new InMemoryFactStore();
+    store.upsertResource(resource('ore', { sourceCellVersion: 7 }));
+    const moved = store.updateResourceSource('ore', {
+      sourceCell: { x: 1, y: 2, z: 3 },
+      observedAt: 200,
+      source: SOURCE,
+      sourceCellVersion: 11,
+    });
+    expect(moved.outcome).toBe('updated');
+    expect(moved.record.sourceCellVersion).toBe(11);
+
+    const movedWithoutVersion = store.updateResourceSource('ore', {
+      sourceCell: { x: 2, y: 3, z: 4 },
+      observedAt: 300,
+      source: SOURCE,
+    });
+    expect(movedWithoutVersion.outcome).toBe('updated');
+    expect(movedWithoutVersion.record.sourceCellVersion).toBe(11);
+  });
+
+  it('keeps the version on revocation and hides the anchor by default', () => {
+    const store = new InMemoryFactStore();
+    store.upsertResource(resource('ore', { sourceCellVersion: 7 }));
+    store.revokeResource('ore', { observedAt: 300, source: SOURCE });
+    expect(store.resources().total).toBe(0);
+    expect(store.resources({ includeGone: true }).items[0]).toMatchObject({
+      revoked: true,
+      sourceCellVersion: 7,
+    });
+  });
+
+  it('restores an older record without inventing a version', () => {
+    const store = new InMemoryFactStore();
+    store.restoreSnapshot({
+      places: [],
+      resources: [resource('legacy')],
+      containers: [],
+    });
+    expect(store.resources().items[0]?.sourceCellVersion).toBeUndefined();
+  });
+
+  it('rejects a version that is not a non-negative safe integer', () => {
+    const store = new InMemoryFactStore();
+    for (const sourceCellVersion of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => store.upsertResource(resource('ore', { sourceCellVersion }))).toThrow(
+        /sourceCellVersion must be a non-negative safe integer/,
+      );
+    }
+  });
+});

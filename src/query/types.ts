@@ -70,6 +70,17 @@ export type SpatialQueryRequest =
       limit?: number;
     }
   | {
+      kind: 'places';
+      dim?: string;
+      tag?: LandmarkTag;
+      label?: string;
+      source?: NodeSource;
+      /** Default false: gone places are hidden. */
+      includeGone?: boolean;
+      after?: string;
+      limit?: number;
+    }
+  | {
       kind: 'edges';
       dim?: string;
       from?: string;
@@ -389,6 +400,14 @@ export type SpatialQueryData =
   | ({ kind: 'fragments' } & QueryPage<PathFragment>)
   | ({ kind: 'traversals' } & QueryPage<TraversalEvidence>)
   | ({ kind: 'nodes' } & QueryPage<SpatialNode>)
+  | ({
+      kind: 'places';
+      /**
+       * `memory` states the actual authority: the in-memory facts store, not a
+       * persisted cold-page read. There is no page-per-read cold place index.
+       */
+      pageSource: 'memory';
+    } & QueryPage<SpatialNode>)
   | ({ kind: 'edges' } & QueryPage<EdgeView>)
   | { kind: 'historyRoute'; inspection: HistoricalRouteInspection }
   | { kind: 'anchor'; anchor: AnchorResult | null }

@@ -50,6 +50,9 @@ export function assertResource(resource: ResourceAnchorFact): void {
     assertNonEmptyString(resource.resourceType, 'resource resourceType');
   }
   assertPoint(resource.sourceCell, 'resource sourceCell');
+  if (resource.sourceCellVersion !== undefined) {
+    assertCellVersion(resource.sourceCellVersion, 'resource sourceCellVersion');
+  }
   assertFiniteNumber(resource.observedAt, 'resource observedAt');
   assertProvenance(resource.source);
   if (typeof resource.revoked !== 'boolean') throw new Error('resource revoked must be a boolean');
@@ -210,6 +213,13 @@ export function assertNonEmptyString(value: string, label: string): void {
 export function assertFiniteNumber(value: number, label: string): void {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw new Error(`${label} must be a finite number`);
+  }
+}
+
+/** A source-cell evidence revision: a non-negative safe integer, never a timestamp. */
+export function assertCellVersion(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
   }
 }
 
