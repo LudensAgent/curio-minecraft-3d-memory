@@ -113,6 +113,7 @@ export type {
   FreeResult,
   PrepareResult,
   ResolvedWorkingSetLimits,
+  WorkingSetCounters,
   WorkingSetLimits,
   WorkingSetRejection,
   WorkingSetRejectionKind,
