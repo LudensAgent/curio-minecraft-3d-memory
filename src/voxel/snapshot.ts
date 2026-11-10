@@ -561,7 +561,7 @@ export function estimateVoxelSectionResidentBytes(section: Section): number {
   bytes += 3 * BYTES_PER_NUMBER;
   bytes += BYTES_PER_NUMBER; // bits
   bytes += BYTES_PER_NUMBER; // revision
-  bytes += paletteBytes(section.palette, jsonEscapedByteLength);
+  bytes += estimatePaletteResidentBytes(section.palette);
   bytes += STRING_QUOTES + base64Length(section.cells.length);
   bytes += bitmapBytes();
   let evidenceBytes = Math.max(0, section.evidence.size - 1);
@@ -580,6 +580,15 @@ export function estimateCellEvidenceResidentBytes(evidence: CellEvidence): numbe
 /** Resident palette-entry cost, excluding the separator between entries. */
 export function estimatePaletteEntryResidentBytes(serialized: string): number {
   return jsonEscapedByteLength(serialized) + STRING_QUOTES;
+}
+
+/**
+ * Resident cost of a whole palette array (entries plus the one separator per
+ * extra entry). Shared by incremental accounting and compaction deltas so both
+ * use exactly the same formula as `estimateVoxelSectionResidentBytes`.
+ */
+export function estimatePaletteResidentBytes(palette: readonly string[]): number {
+  return paletteBytes(palette, jsonEscapedByteLength);
 }
 
 /** Resident cost of the packed cell stream at one palette width. */

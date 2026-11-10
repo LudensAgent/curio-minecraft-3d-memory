@@ -61,6 +61,251 @@ export function repack(cells: Uint8Array, oldBits: number, newBits: number): Uin
   return next;
 }
 
+/**
+ * Re-pack a cell stream through a palette-slot mapping. Every local cell is
+ * read at `oldBits` and written at `newBits`; slots the mapping does not cover
+ * (including values outside the old palette) become palette index 0. The
+ * `explored` bits are untouched, so an unmapped unknown cell stays unknown.
+ */
+export function remapCells(
+  cells: Uint8Array,
+  oldBits: number,
+  newBits: number,
+  mapping: readonly number[],
+): Uint8Array {
+  const next = new Uint8Array(Math.ceil((SECTION_CELL_COUNT * newBits) / 8));
+  for (let i = 0; i < SECTION_CELL_COUNT; i++) {
+    writeCell(next, newBits, i, mapping[readCell(cells, oldBits, i)] ?? 0);
+  }
+  return next;
+}
+
+/** Resident-byte costs the allocator uses to report its incremental deltas. */
+export interface PaletteByteCosts {
+  entryBytes: (state: string) => number;
+  packedCellsBytes: (bits: number) => number;
+}
+
+export interface PaletteRetainResult {
+  slot: number;
+  /** Bit width after this change (grows when the palette crosses a width boundary). */
+  bits: number;
+  /** Byte delta from palette entry and packing changes only. */
+  growth: number;
+}
+
+/** A bounded palette compaction of one Section, computed but not yet applied. */
+export interface PaletteCompactionPlan {
+  /** Old slot → new slot; unreferenced slots map to 0. */
+  mapping: number[];
+  palette: string[];
+  bits: number;
+}
+
+/**
+ * Amortization thresholds for a compaction that would not shrink the packing
+ * width. One full 4096-cell remap is only paid once enough unreferenced slots
+ * or dead-entry bytes have accumulated to justify it. This keeps the dead
+ * palette footprint per Section below the byte threshold (or below the slot
+ * threshold when entries are tiny) instead of retaining a single huge string
+ * forever at minimum width.
+ */
+const COMPACTION_DEAD_SLOT_THRESHOLD = 32;
+const COMPACTION_DEAD_BYTE_THRESHOLD = 4_096;
+
+/**
+ * Per-Section palette reference accounting: which slots observed cells point
+ * at, which entries are unreferenced, and which can be reused.
+ *
+ * Slot 0 is permanently reserved for air. A live state change releases its old
+ * slot and reuses an unreferenced one when possible, so fixed-space churn does
+ * not append a new string per observed state. Completely unreferenced entries
+ * are dropped by `compactionPlan`/`commitCompaction`, which always shrink the
+ * packing width when possible and otherwise run once the dead-slot or dead-byte
+ * thresholds amortize the remap. That path scans one Section's cell stream and
+ * is therefore called at most once per accepted batch, never per refresh.
+ *
+ * The live map caches one instance per resident Section. `fromSection` aliases
+ * `section.palette` so in-place allocation is immediately visible; callers that
+ * only simulate (capacity pre-flight) must use `clone()`.
+ */
+export class PaletteRetention {
+  /** Slot 0 is air; this is the live array backing `Section.palette` in the write path. */
+  palette: string[];
+  private indices: Map<string, number>;
+  private refs: number[];
+  private readonly freeSlots = new Set<number>();
+  /** Running sum of referenced-by-nothing entry costs, used for amortization. */
+  private deadBytes = 0;
+
+  private constructor(
+    palette: string[],
+    indices: Map<string, number>,
+    refs: number[],
+    freeSlots: Iterable<number>,
+    deadBytes: number,
+  ) {
+    this.palette = palette;
+    this.indices = indices;
+    this.refs = refs;
+    this.deadBytes = deadBytes;
+    for (const slot of freeSlots) this.freeSlots.add(slot);
+  }
+
+  /** A fresh Section's palette state: air at slot 0, nothing referenced. */
+  static empty(): PaletteRetention {
+    return new PaletteRetention([AIR_BLOCK_NAME], new Map([[AIR_BLOCK_NAME, 0]]), [0], [], 0);
+  }
+
+  /**
+   * Count references from the cells that actually carry evidence. Unexplored
+   * cells are unknown, not observed air, so their packed values never keep a
+   * string alive. Aliases `section.palette` for the live write path.
+   */
+  static fromSection(section: Section, costs: PaletteByteCosts): PaletteRetention {
+    const refs = new Array<number>(section.palette.length).fill(0);
+    for (const index of section.evidence.keys()) {
+      const slot = readCell(section.cells, section.bits, index);
+      if (slot < refs.length) refs[slot] = (refs[slot] ?? 0) + 1;
+    }
+    const freeSlots: number[] = [];
+    let deadBytes = 0;
+    for (let slot = 1; slot < refs.length; slot++) {
+      if (refs[slot] === 0) {
+        freeSlots.push(slot);
+        deadBytes += costs.entryBytes(section.palette[slot]!);
+      }
+    }
+    return new PaletteRetention(
+      section.palette,
+      new Map(section.palette.map((state, index) => [state, index])),
+      refs,
+      freeSlots,
+      deadBytes,
+    );
+  }
+
+  /** Independent copy for capacity simulation; never shares the live arrays. */
+  clone(): PaletteRetention {
+    return new PaletteRetention(
+      [...this.palette],
+      new Map(this.indices),
+      [...this.refs],
+      this.freeSlots,
+      this.deadBytes,
+    );
+  }
+
+  /**
+   * Release the slot an observed cell used to point at, then retain `state`.
+   * Reuses an unreferenced slot when the state is not already present, so the
+   * palette length is bounded by the peak number of simultaneously referenced
+   * states rather than by the total number of states ever observed.
+   */
+  retainState(
+    state: string,
+    bits: number,
+    releaseSlot: number | undefined,
+    costs: PaletteByteCosts,
+  ): PaletteRetainResult {
+    if (releaseSlot !== undefined) {
+      if (releaseSlot === 0) {
+        this.refs[0] = Math.max(0, (this.refs[0] ?? 0) - 1);
+      } else {
+        const count = this.refs[releaseSlot];
+        if (count !== undefined && count > 0) {
+          this.refs[releaseSlot] = count - 1;
+          if (count === 1) {
+            this.freeSlots.add(releaseSlot);
+            this.deadBytes += costs.entryBytes(this.palette[releaseSlot]!);
+          }
+        }
+      }
+    }
+
+    let growth = 0;
+    const existing = this.indices.get(state);
+    let slot: number;
+    if (existing !== undefined) {
+      // A state that was released earlier in this batch can still be indexed;
+      // it must leave the free set before its reference count rises again.
+      if (this.freeSlots.delete(existing)) {
+        this.deadBytes -= costs.entryBytes(this.palette[existing]!);
+      }
+      this.refs[existing] = (this.refs[existing] ?? 0) + 1;
+      slot = existing;
+    } else if (this.freeSlots.size > 0) {
+      const reusable = this.freeSlots.values().next().value!;
+      this.freeSlots.delete(reusable);
+      const evicted = this.palette[reusable]!;
+      this.deadBytes -= costs.entryBytes(evicted);
+      this.indices.delete(evicted);
+      this.palette[reusable] = state;
+      this.indices.set(state, reusable);
+      this.refs[reusable] = 1;
+      slot = reusable;
+      growth = costs.entryBytes(state) - costs.entryBytes(evicted);
+    } else {
+      slot = this.palette.length;
+      this.palette.push(state);
+      this.refs.push(1);
+      this.indices.set(state, slot);
+      growth = costs.entryBytes(state) + 1;
+    }
+
+    const nextBits = bitsRequired(this.palette.length);
+    if (nextBits !== bits) {
+      growth += costs.packedCellsBytes(nextBits) - costs.packedCellsBytes(bits);
+    }
+    return { slot, bits: nextBits, growth };
+  }
+
+  /**
+   * Plan dropping every unreferenced slot. A packing-width reduction is always
+   * taken; at minimum width a compaction requires either enough dead slots or
+   * enough dead-entry bytes to amortize one 4096-cell remap. After a checked
+   * write the retained dead footprint is therefore bounded by those thresholds.
+   */
+  compactionPlan(bits: number): PaletteCompactionPlan | null {
+    if (this.freeSlots.size === 0) return null;
+    // Every unreferenced non-zero slot is in `freeSlots`, so this is live+1.
+    const paletteLength = this.palette.length - this.freeSlots.size;
+    const nextBits = bitsRequired(paletteLength);
+    const shrinksPacking = nextBits < bits;
+    if (
+      !shrinksPacking &&
+      this.freeSlots.size < COMPACTION_DEAD_SLOT_THRESHOLD &&
+      this.deadBytes < COMPACTION_DEAD_BYTE_THRESHOLD
+    ) {
+      return null;
+    }
+
+    const mapping = new Array<number>(this.palette.length).fill(0);
+    const palette: string[] = [this.palette[0]!];
+    for (let slot = 1; slot < this.refs.length; slot++) {
+      if ((this.refs[slot] ?? 0) <= 0) continue;
+      mapping[slot] = palette.length;
+      palette.push(this.palette[slot]!);
+    }
+    return { mapping, palette, bits: nextBits };
+  }
+
+  /** Publish a compaction plan. The caller must remap its cell stream with `mapping`. */
+  commitCompaction(plan: PaletteCompactionPlan): void {
+    const refs = new Array<number>(plan.palette.length).fill(0);
+    refs[0] = this.refs[0] ?? 0;
+    for (let slot = 1; slot < this.refs.length; slot++) {
+      const target = plan.mapping[slot]!;
+      if (target !== 0) refs[target] = this.refs[slot]!;
+    }
+    this.palette = plan.palette;
+    this.indices = new Map(plan.palette.map((state, index) => [state, index]));
+    this.refs = refs;
+    this.freeSlots.clear();
+    this.deadBytes = 0;
+  }
+}
+
 /** Read a single bit from a 4096-bit (512-byte) bitmap. */
 export function getBit(bytes: Uint8Array, index: number): boolean {
   return ((bytes[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0;

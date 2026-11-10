@@ -25,7 +25,17 @@ import { assertIntegerCoords, validateObservation, validateObservationGap } from
 import type { Vec3Like } from '../types.js';
 import { serializeBlockState } from './blockstate.js';
 import { blockToSection, cellIndex } from './coordinates.js';
-import { bitsRequired, createSection, getBit, repack, setBit, writeCell } from './palette.js';
+import {
+  createSection,
+  getBit,
+  PaletteRetention,
+  readCell,
+  remapCells,
+  repack,
+  setBit,
+  writeCell,
+} from './palette.js';
+import type { PaletteByteCosts } from './palette.js';
 import { sectionKeyString } from './section.js';
 import type { Section, SectionKey } from './section.js';
 import {
@@ -34,6 +44,7 @@ import {
   estimateCellEvidenceResidentBytes,
   estimatePackedCellsResidentBytes,
   estimatePaletteEntryResidentBytes,
+  estimatePaletteResidentBytes,
   estimateVoxelSectionBytes,
   estimateVoxelSectionResidentBytes,
   estimateVoxelSectionSnapshotBytes,
@@ -246,6 +257,12 @@ export type StaleReason = NonNullable<CellEvidence['staleReason']>;
 
 const DEFAULT_VALIDITY_WINDOW_MS = 60_000;
 
+/** The same estimator used by the resident bill, so incremental deltas stay exact. */
+const PALETTE_COSTS: PaletteByteCosts = {
+  entryBytes: estimatePaletteEntryResidentBytes,
+  packedCellsBytes: estimatePackedCellsResidentBytes,
+};
+
 type AppliedCell = { section: Section; kind: CellChangeKind; x: number; y: number; z: number };
 
 type ObservationChangeKind = 'inserted' | 'changed' | 'refreshed' | 'restored' | 'staled';
@@ -280,7 +297,12 @@ export class VoxelMap {
   private residentBytes = 0;
   private residentSectionCount = 0;
   private readonly residentSectionBytes = new WeakMap<Section, number>();
-  private readonly paletteIndices = new WeakMap<Section, Map<string, number>>();
+  /**
+   * Per-resident-Section palette reference accounting, built lazily from the
+   * cells that actually carry evidence. Kept in sync by the accepted write path
+   * and dropped when a path (observation retention) removes evidence in bulk.
+   */
+  private readonly paletteRetentions = new WeakMap<Section, PaletteRetention>();
   private directoryInstalled = false;
   private nextPinToken = 1;
   /**
@@ -775,6 +797,10 @@ export class VoxelMap {
       setBit(section.risk, index, false);
       writeCell(section.cells, section.bits, index, 0);
     }
+    // The forgotten cells no longer reference their slots. Rebuild the palette
+    // accounting lazily from the remaining evidence rather than carrying stale
+    // reference counts into the next accepted write.
+    for (const section of touched.keys()) this.paletteRetentions.delete(section);
     const changes: SectionChange[] = [];
     let removed = 0;
     for (const [section, forgottenRevision] of touched) {
@@ -788,8 +814,6 @@ export class VoxelMap {
         const dimMap = this.sections.get(dim)!;
         dimMap.delete(innerKey(cx, cz, sy));
         if (dimMap.size === 0) this.sections.delete(dim);
-        this.residentBytes -= estimateVoxelSectionResidentBytes(section);
-        this.residentSectionCount -= 1;
         this.bumpResidencyGeneration(dim, cx, cz, sy);
         this.pendingSections.delete(section);
         this.saveRevisionCount += 1;
@@ -1402,15 +1426,18 @@ export class VoxelMap {
         (existing === undefined ? 0 : estimateCellEvidenceResidentBytes(existing));
       if (existing === undefined && section.evidence.size > 0) growth += 1;
     }
+    // The palette write runs before the evidence swap: when reference counts
+    // are built lazily they must see the cell's *previous* state (or no evidence
+    // for an insertion), not the packed value we are about to overwrite.
+    if (update.kind === 'inserted' || update.kind === 'changed') {
+      growth += this.writePalette(section, index, serialized, existing !== undefined);
+    }
     section.evidence.set(index, update.kind === 'staled'
       ? update.evidence
       : { ...update.evidence, observation: cloneObservation(observation) });
     if (update.kind !== 'refreshed') section.revision += 1;
     setBit(section.stale, index, update.kind === 'staled');
     if (update.kind === 'inserted') setBit(section.explored, index, true);
-    if (update.kind === 'inserted' || update.kind === 'changed') {
-      growth += this.writePalette(section, index, serialized);
-    }
     if (this.manualResidency) {
       this.residentBytes += growth;
       this.residentSectionBytes.set(section, this.residentSectionBytes.get(section)! + growth);
@@ -1444,33 +1471,62 @@ export class VoxelMap {
     return section;
   }
 
-  /** Store a palette index for the cell, growing the palette and re-packing as needed. */
-  private writePalette(section: Section, index: number, serialized: string): number {
-    const indices = this.paletteIndexFor(section);
-    let paletteIndex = indices.get(serialized);
-    let growth = 0;
-    if (paletteIndex === undefined) {
-      paletteIndex = section.palette.length;
-      indices.set(serialized, paletteIndex);
-      section.palette.push(serialized);
-      growth += estimatePaletteEntryResidentBytes(serialized) + 1;
-      const newBits = bitsRequired(section.palette.length);
-      if (newBits !== section.bits) {
-        growth += estimatePackedCellsResidentBytes(newBits) - estimatePackedCellsResidentBytes(section.bits);
-        section.cells = repack(section.cells, section.bits, newBits);
-        section.bits = newBits;
-      }
+  /**
+   * Store a palette index for the cell. A same-state refresh never reaches here,
+   * so it pays neither an evidence scan nor a palette scan. A real state change
+   * releases the cell's old slot before allocating, letting a live-change churn
+   * reuse unreferenced entries instead of growing the palette.
+   */
+  private writePalette(section: Section, index: number, serialized: string, releaseExisting: boolean): number {
+    const retention = this.paletteRetentionFor(section);
+    const releaseSlot = releaseExisting ? readCell(section.cells, section.bits, index) : undefined;
+    const result = retention.retainState(serialized, section.bits, releaseSlot, PALETTE_COSTS);
+    if (result.bits !== section.bits) {
+      section.cells = repack(section.cells, section.bits, result.bits);
+      section.bits = result.bits;
     }
-    writeCell(section.cells, section.bits, index, paletteIndex);
-    return growth;
+    writeCell(section.cells, section.bits, index, result.slot);
+    return result.growth;
   }
 
-  private paletteIndexFor(section: Section): Map<string, number> {
-    const existing = this.paletteIndices.get(section);
-    if (existing !== undefined) return existing;
-    const indices = new Map(section.palette.map((state, index) => [state, index]));
-    this.paletteIndices.set(section, indices);
-    return indices;
+  private paletteRetentionFor(section: Section): PaletteRetention {
+    const existing = this.paletteRetentions.get(section);
+    if (existing !== undefined) {
+      // A compaction commit replaces the array; keep `Section.palette` aliased
+      // with the accounting state if the caller has not observed the new array.
+      if (section.palette !== existing.palette) section.palette = existing.palette;
+      return existing;
+    }
+    const retention = PaletteRetention.fromSection(section, PALETTE_COSTS);
+    this.paletteRetentions.set(section, retention);
+    return retention;
+  }
+
+  /**
+   * Drop a Section's unreferenced palette entries once the live set fits a
+   * narrower packing width. Bounded to one Section's cell stream, called at most
+   * once per accepted batch that actually wrote the palette.
+   */
+  private compactPaletteIfJustified(section: Section): void {
+    const retention = this.paletteRetentionFor(section);
+    const previousPalette = retention.palette;
+    const previousBits = section.bits;
+    const plan = retention.compactionPlan(previousBits);
+    if (plan === null) return;
+
+    const cells = remapCells(section.cells, previousBits, plan.bits, plan.mapping);
+    retention.commitCompaction(plan);
+    section.palette = retention.palette;
+    section.cells = cells;
+    section.bits = plan.bits;
+
+    if (this.manualResidency) {
+      const delta =
+        estimatePaletteResidentBytes(retention.palette) - estimatePaletteResidentBytes(previousPalette) +
+        estimatePackedCellsResidentBytes(plan.bits) - estimatePackedCellsResidentBytes(previousBits);
+      this.residentBytes += delta;
+      this.residentSectionBytes.set(section, (this.residentSectionBytes.get(section) ?? 0) + delta);
+    }
   }
 
   /** Statistics-only last-observation time; never proof the whole section is fresh. */
@@ -1552,14 +1608,18 @@ export class VoxelMap {
     }
     if (missing.length > 0) throw new VoxelResidencyError(missing);
 
-    // Model only the cells touched by this batch. The same acceptance rule is
-    // used when applying it, so duplicate, stale-session and out-of-order input
-    // cannot consume capacity; repeated updates to one cell bill its net change.
+    // Model only the cells touched by this batch. The same acceptance rule and
+    // palette allocator are used when applying it, so duplicate, stale-session
+    // and out-of-order input cannot consume capacity; repeated updates to one
+    // cell bill its net change and may reuse the slot they just released.
     const planned = new Map<string, {
       section: Section;
+      resident: boolean;
+      /** Built only when the batch actually writes a state, so refreshes stay scan-free. */
+      retention: PaletteRetention | null;
       evidence: Map<number, CellEvidence>;
-      palette: Set<string>;
-      paletteLength: number;
+      cellSlots: Map<number, number>;
+      bits: number;
       evidenceCount: number;
     }>();
     let sessionId = this.currentSessionId;
@@ -1579,9 +1639,11 @@ export class VoxelMap {
         const section = resident ?? createSection({ worldId: this.worldId, dim: observation.dim, cx, cz, sy });
         plan = {
           section,
+          resident: resident !== undefined,
+          retention: null,
           evidence: new Map(),
-          palette: new Set(),
-          paletteLength: section.palette.length,
+          cellSlots: new Map(),
+          bits: section.bits,
           evidenceCount: section.evidence.size,
         };
         planned.set(key, plan);
@@ -1594,22 +1656,36 @@ export class VoxelMap {
       const existing = plan.evidence.get(index) ?? plan.section.evidence.get(index);
       const serialized = serializeBlockState(observation.state);
       const update = prepareCellUpdate(existing, observation, serialized, this.validityWindowMs);
-      if (update === null) continue;
-      bytes += estimateCellEvidenceResidentBytes(update.evidence) -
-        (existing === undefined ? 0 : estimateCellEvidenceResidentBytes(existing));
-      if (existing === undefined) {
-        if (plan.evidenceCount > 0) bytes += 1;
-        plan.evidenceCount += 1;
+      if (update !== null) {
+        bytes += estimateCellEvidenceResidentBytes(update.evidence) -
+          (existing === undefined ? 0 : estimateCellEvidenceResidentBytes(existing));
+        if (existing === undefined) {
+          if (plan.evidenceCount > 0) bytes += 1;
+          plan.evidenceCount += 1;
+        }
+        plan.evidence.set(index, update.evidence);
+        if (update.kind === 'inserted' || update.kind === 'changed') {
+          let retention = plan.retention;
+          if (retention === null) {
+            // Simulation only: clone the live accounting so nothing reaches the map.
+            retention = plan.resident
+              ? this.paletteRetentionFor(plan.section).clone()
+              : PaletteRetention.empty();
+            plan.retention = retention;
+          }
+          const releaseSlot = update.kind === 'changed'
+            ? plan.cellSlots.get(index) ?? readCell(plan.section.cells, plan.section.bits, index)
+            : undefined;
+          const result = retention.retainState(serialized, plan.bits, releaseSlot, PALETTE_COSTS);
+          plan.bits = result.bits;
+          plan.cellSlots.set(index, result.slot);
+          bytes += result.growth;
+        }
       }
-      plan.evidence.set(index, update.evidence);
-      if ((update.kind === 'inserted' || update.kind === 'changed') &&
-        !this.paletteIndexFor(plan.section).has(serialized) && !plan.palette.has(serialized)) {
-        const beforeBits = bitsRequired(plan.paletteLength);
-        plan.palette.add(serialized);
-        plan.paletteLength += 1;
-        bytes += estimatePaletteEntryResidentBytes(serialized) + 1 +
-          estimatePackedCellsResidentBytes(bitsRequired(plan.paletteLength)) - estimatePackedCellsResidentBytes(beforeBits);
-      }
+      // `maxResidentBytes` bounds the live application, not just the batch's
+      // post-compaction net. Apply compacts only after every observation, so a
+      // large intermediate state is a real allocation and must be rejected here
+      // before the map is mutated.
       if (sections > this.residentLimits.maxResidentSections) {
         throw new Error(`resident sections would exceed maxResidentSections (${sections} > ${this.residentLimits.maxResidentSections})`);
       }
@@ -1626,12 +1702,18 @@ export class VoxelMap {
    */
   private applyObservations(observations: readonly Observation[]): ChangeReport {
     const bySection = new Map<Section, SectionChange>();
+    const paletteTouched = new Set<Section>();
     for (const observation of observations) {
       const applied = this.applyValidated(observation);
       if (applied === null) continue;
       this.recordSaveChange(applied.section);
+      if (applied.kind === 'inserted' || applied.kind === 'changed') paletteTouched.add(applied.section);
       addChange(bySection, applied.section, { pos: { x: applied.x, y: applied.y, z: applied.z }, kind: applied.kind });
     }
+    // Compaction is a layout-only change: no observation identity/time, revision
+    // or save revision moves. Limit it to Sections whose palette this batch
+    // actually wrote, so a same-state refresh keeps its no-scan fast path.
+    for (const section of paletteTouched) this.compactPaletteIfJustified(section);
     return { sections: [...bySection.values()] };
   }
 }
