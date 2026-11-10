@@ -516,6 +516,7 @@ export type {
 // Storage
 export { TABLE_NAMES } from './storage/index.js';
 export type { PersistenceWorker, SaveBatch, SaveConfirmation } from './storage/index.js';
+export type { LegacyStoreSummary } from './storage/sqlite/types.js';
 
 // Facts — semantic place/resource/container anchors (v0.11 plan §3.2).
 // Deliberately separate from topology nodes: flat, bounded, queryable facts

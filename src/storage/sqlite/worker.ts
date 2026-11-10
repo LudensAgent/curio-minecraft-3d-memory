@@ -17,6 +17,7 @@ import type { ActionRecord } from '../../navigation/types.js';
 import { JournalConflictError, canonicalizeJournalRecord } from './journal.js';
 import type {
   HistorySnapshot,
+  LegacyStoreSummary,
   ResolvedJournalLimits,
   ResolvedSnapshotLimits,
   SpatialEvent,
@@ -2732,28 +2733,41 @@ function loadWorld(
   wId: string,
   resolved: ResolvedSnapshotLimits,
   loadSnapshot = true,
-): { baselineCheckpointId: string | null; snapshot: HistorySnapshot | null; bytes: number } {
+): {
+  baselineCheckpointId: string | null;
+  snapshot: HistorySnapshot | null;
+  bytes: number;
+  legacyStore: LegacyStoreSummary;
+} {
   assertValidCheckpointMetadata(connection, wId);
+
+  // Row counts are metadata, never decoded payloads. They are read in both the
+  // snapshot and the `historyLoading: "none"` paths so a fragment-only legacy
+  // world is still distinguishable from an empty one.
+  const fragments = countRows(connection, 'path_fragments', wId);
+  const traversals = countRows(connection, 'traversal_evidence', wId);
+  const nodes = countRows(connection, 'spatial_nodes', wId);
+  const edges = countRows(connection, 'spatial_edges', wId);
+  // The older cutover marker is one indexed point lookup, not a topology read.
+  // The facts migration receipt (`curio_semantic_migration_v1:<worldId>`) is a
+  // different record and never answers this question.
+  const migrationMarker =
+    connection
+      .prepare("SELECT 1 FROM spatial_nodes WHERE world_id = ? AND id = 'curio:migration' LIMIT 1")
+      .get(wId) !== undefined;
+  const legacyStore: LegacyStoreSummary = { fragments, traversals, nodes, edges, migrationMarker };
 
   const cp = connection
     .prepare('SELECT checkpoint_id, topology_extras FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
     .get(wId) as { checkpoint_id: string; topology_extras: string } | undefined;
   if (cp === undefined) {
-    const orphans =
-      countRows(connection, 'path_fragments', wId) +
-      countRows(connection, 'traversal_evidence', wId) +
-      countRows(connection, 'spatial_nodes', wId) +
-      countRows(connection, 'spatial_edges', wId);
+    const orphans = fragments + traversals + nodes + edges;
     if (orphans > 0) {
       throw new Error('world has fact rows but no checkpoint metadata');
     }
-    return { baselineCheckpointId: null, snapshot: null, bytes: 0 };
+    return { baselineCheckpointId: null, snapshot: null, bytes: 0, legacyStore };
   }
 
-  const fragments = countRows(connection, 'path_fragments', wId);
-  const traversals = countRows(connection, 'traversal_evidence', wId);
-  const nodes = countRows(connection, 'spatial_nodes', wId);
-  const edges = countRows(connection, 'spatial_edges', wId);
   const extras = JSON.parse(cp.topology_extras) as {
     portalEdges?: HistorySnapshot['portalEdges'];
     fragmentMerges?: HistorySnapshot['fragmentMerges'];
@@ -2782,7 +2796,7 @@ function loadWorld(
     // Metadata/limit validation still runs, but no history payload is decoded or
     // retained. A caller starting a new main session must not pay the old-domain
     // memory cost merely to learn that a baseline exists.
-    return { baselineCheckpointId: cp.checkpoint_id, snapshot: null, bytes };
+    return { baselineCheckpointId: cp.checkpoint_id, snapshot: null, bytes, legacyStore };
   }
   const snapshot: HistorySnapshot = {
     worldId: wId,
@@ -2794,7 +2808,7 @@ function loadWorld(
     fragmentMerges,
   };
   assertDerivedWithinLimits(computeDerivedCounts(snapshot), resolved);
-  return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes };
+  return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes, legacyStore };
 }
 
 
@@ -3126,6 +3140,7 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       factsSnapshot: msg.kind === 'spatial' ? facts.factsSnapshot : null,
       factsMigration: facts.factsMigration,
       legacyFactsMigrationVersion: readSchemaMeta(db!, 'curio_semantic_migration_v1:' + msg.worldId) === '1' ? 1 : 0,
+      legacyStore: world.legacyStore,
       gameVersion: voxelBaselineCheckpoint?.game_version ?? null,
     });
   } catch (err) {

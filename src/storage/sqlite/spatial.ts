@@ -54,6 +54,7 @@ import type {
   JournalWithdrawalResult,
   JournalWithdrawalSelector,
   LedgerSnapshot,
+  LegacyStoreSummary,
   LoadSectionsResult,
   MeasureSectionsResult,
   OpenSpatialSessionOptions,
@@ -184,6 +185,10 @@ class SpatialSessionImpl implements SpatialSession {
     return this.factsMigrationField;
   }
 
+  get legacyStoreSummary(): LegacyStoreSummary {
+    return this.legacyStoreSummaryField;
+  }
+
   get voxelLoading(): VoxelLoading {
     return this.voxelLoadingField;
   }
@@ -248,6 +253,13 @@ class SpatialSessionImpl implements SpatialSession {
     version: 0,
     target: null,
     committed: false,
+  };
+  private legacyStoreSummaryField: LegacyStoreSummary = {
+    fragments: 0,
+    traversals: 0,
+    nodes: 0,
+    edges: 0,
+    migrationMarker: false,
   };
   private committedJournalRecords = 0;
   private committedJournalBytes = 0;
@@ -361,6 +373,7 @@ class SpatialSessionImpl implements SpatialSession {
       factsSnapshot: FactCheckpointSnapshot | null;
       factsMigration: FactMigrationState;
       legacyFactsMigrationVersion: number;
+      legacyStore: LegacyStoreSummary;
       gameVersion: string | null;
     };
     try {
@@ -404,6 +417,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.factsBaselineCheckpointId = result.factsBaselineCheckpointId;
     this.factsMigrationField = result.factsMigration;
     this.legacyFactsMigrationVersionField = result.legacyFactsMigrationVersion;
+    this.legacyStoreSummaryField = result.legacyStore;
     this.restoredGameVersion = result.gameVersion;
     this.committedJournalRecords = result.journalRecordCount;
     this.committedJournalBytes = result.journalRecordBytes;
@@ -1226,7 +1240,8 @@ class SpatialSessionImpl implements SpatialSession {
     factsBaselineCheckpointId: string | null;
     factsSnapshot: FactCheckpointSnapshot | null;
     factsMigration: FactMigrationState;
-      legacyFactsMigrationVersion: number;
+    legacyFactsMigrationVersion: number;
+    legacyStore: LegacyStoreSummary;
     gameVersion: string | null;
   }> {
     const requestId = this.nextRequestId++;
@@ -1334,6 +1349,7 @@ class SpatialSessionImpl implements SpatialSession {
         factsSnapshot: openMsg.factsSnapshot,
         factsMigration: openMsg.factsMigration,
         legacyFactsMigrationVersion: openMsg.legacyFactsMigrationVersion,
+        legacyStore: openMsg.legacyStore,
         gameVersion: openMsg.gameVersion,
       });
     } else if (entry.kind === 'load') {

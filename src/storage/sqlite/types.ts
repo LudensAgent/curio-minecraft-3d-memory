@@ -708,6 +708,16 @@ export type VoxelLoading = 'eager' | 'manual';
  */
 export type HistoryLoading = 'eager' | 'none';
 
+/** Row counts of one world's retired history/topology domains, read at open. */
+export interface LegacyStoreSummary {
+  fragments: number;
+  traversals: number;
+  nodes: number;
+  edges: number;
+  /** Whether the older cutover marker node (`curio:migration`) exists for this world. */
+  migrationMarker: boolean;
+}
+
 /** Options for `openSpatialSession`. */
 export interface OpenSpatialSessionOptions {
   /** Absolute path to the SQLite database file. Required. */
@@ -858,6 +868,8 @@ export interface SpatialPersistenceState {
 export interface SpatialSession {
   /** Explicit host migration receipt; saving facts alone does not establish it. */
   readonly legacyFactsMigrationVersion: number;
+  /** Counts/marker of the retired history/topology rows, read at open even when not loaded. */
+  readonly legacyStoreSummary: LegacyStoreSummary;
   readonly voxel: VoxelMap;
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
@@ -1114,6 +1126,8 @@ export type WorkerResponse =
       /** Migration/version record read from the same persistence authority. */
       factsMigration: FactMigrationState;
       legacyFactsMigrationVersion: number;
+      /** Row counts + old cutover marker of this world's retired history/topology domains. */
+      legacyStore: LegacyStoreSummary;
       /**
        * Minecraft game version recorded on the voxel baseline this open restores
        * from (the latest checkpoint with `has_voxel = 1`), or `'unknown'` when its
