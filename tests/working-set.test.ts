@@ -180,6 +180,30 @@ describe('WorkingSetManager', () => {
     await session.close();
   });
 
+  it('retries a failed load after the pinned capacity is released', async () => {
+    const dbPath = makeDbPath();
+    await seed(dbPath, 2);
+    const { session, manager } = await manualSession(dbPath, { residencyLimits: { maxResidentSections: 1 } });
+    const first = await manager.prepare([keyAt(0)]);
+    const refused = await manager.prepare([keyAt(1)]);
+    expect(refused.status).toBe('failed');
+    expect(refused.evictionRejected).toContainEqual({ key: keyAt(0), reason: 'pinned' });
+    expect(session.sectionResidency(keyAt(1)).residency).toBe('load_failed');
+
+    session.releasePins([first.lease.token]);
+    expect(manager.free().evicted).toEqual([keyAt(0)]);
+    const retried = await manager.prepare([keyAt(1)]);
+    expect(retried.status).toBe('ready');
+    expect(retried.loaded).toEqual([keyAt(1)]);
+    expect(retried.notReady).toEqual([]);
+    const restored = session.voxel.cellAt(DIM, 16, 64, 0);
+    expect(restored.observed).toBe(true);
+    if (!restored.observed) throw new Error('expected the persisted observation');
+    expect(restored.evidence.observation.observedAt).toBe(1000);
+    session.releasePins([retried.lease.token]);
+    await session.close();
+  });
+
   it('evicts LRU-eligible sections to make room, and a hit changes the victim', async () => {
     const dbPath = makeDbPath();
     await seed(dbPath, 3);

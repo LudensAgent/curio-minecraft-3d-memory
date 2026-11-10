@@ -341,13 +341,15 @@ export class WorkingSetManager {
             resident.push(key);
             break;
           case 'not_resident':
+          case 'load_failed':
+            // A new explicit request may retry after transient capacity or I/O
+            // failure; do not turn the previous attempt into a permanent veto.
             toLoad.push(key);
             break;
           case 'no_record':
             result.noRecord.push(key);
             break;
           case 'loading':
-          case 'load_failed':
             result.notReady.push(key);
             break;
         }
@@ -470,7 +472,7 @@ export class WorkingSetManager {
         this.recordRejection('prepare', 'no_record', 'requested sections have no committed record', result.noRecord);
       }
       if (result.notReady.length > 0) {
-        this.recordRejection('prepare', 'not_ready', 'requested sections are loading or failed a previous load', result.notReady);
+        this.recordRejection('prepare', 'not_ready', 'requested sections are loading', result.notReady);
       }
     }
     return result;
