@@ -25,7 +25,8 @@ import type {
   WorkerResponse,
 } from './types.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
-import type { VoxelDirectoryEntry } from '../../voxel/residency.js';
+import type { SectionKey } from '../../voxel/section.js';
+import type { VoxelDirectorySummary } from '../../voxel/residency.js';
 import {
   decodeVoxelSectionPayload,
   encodeVoxelSectionPayload,
@@ -2024,6 +2025,7 @@ function loadWorld(
   connection: Database.Database,
   wId: string,
   resolved: ResolvedSnapshotLimits,
+  loadSnapshot = true,
 ): { baselineCheckpointId: string | null; snapshot: HistorySnapshot | null; bytes: number } {
   assertValidCheckpointMetadata(connection, wId);
 
@@ -2070,6 +2072,12 @@ function loadWorld(
     resolved,
   );
 
+  if (!loadSnapshot) {
+    // Metadata/limit validation still runs, but no history payload is decoded or
+    // retained. A caller starting a new main session must not pay the old-domain
+    // memory cost merely to learn that a baseline exists.
+    return { baselineCheckpointId: cp.checkpoint_id, snapshot: null, bytes };
+  }
   const snapshot: HistorySnapshot = {
     worldId: wId,
     fragments: readAll(connection, 'path_fragments', wId) as HistorySnapshot['fragments'],
@@ -2181,7 +2189,15 @@ function loadVoxelDirectory(
   wId: string,
   resolved: ResolvedSnapshotLimits,
   byteBudget: number,
-): { voxelBaselineCheckpointId: string | null; voxelDirectory: VoxelDirectoryEntry[]; bytes: number } {
+): {
+  voxelBaselineCheckpointId: string | null;
+  voxelDirectoryKeys: SectionKey[];
+  voxelDirectorySummary: VoxelDirectorySummary;
+  bytes: number;
+} {
+  const empty: VoxelDirectorySummary = {
+    sections: 0, observedCells: 0, paletteEntries: 0, bytes: 0, maxSeq: -1,
+  };
   const cp = connection
     .prepare('SELECT checkpoint_id FROM checkpoints WHERE world_id = ? AND has_voxel = 1 ORDER BY seq DESC LIMIT 1')
     .get(wId) as { checkpoint_id: string } | undefined;
@@ -2189,62 +2205,59 @@ function loadVoxelDirectory(
     if (countRows(connection, 'spatial_sections', wId) > 0) {
       throw new Error('world has voxel rows but no voxel checkpoint metadata');
     }
-    return { voxelBaselineCheckpointId: null, voxelDirectory: [], bytes: 0 };
+    return {
+      voxelBaselineCheckpointId: null,
+      voxelDirectoryKeys: [],
+      voxelDirectorySummary: empty,
+      bytes: 0,
+    };
   }
 
-  const sections = countRows(connection, 'spatial_sections', wId);
+  const totals = connection
+    .prepare(
+      'SELECT COUNT(*) AS sections, COALESCE(SUM(observed_cells), 0) AS observed_cells, '
+      + 'COALESCE(SUM(palette_entries), 0) AS palette_entries, COALESCE(SUM(octet_length(payload)), 0) AS payload_bytes, '
+      + 'COALESCE(MAX(seq), -1) AS max_seq FROM spatial_sections WHERE world_id = ?',
+    )
+    .get(wId) as { sections: number; observed_cells: number; palette_entries: number; payload_bytes: number; max_seq: number };
+  const sections = totals.sections;
   const bytes =
-    sumPayloadBytes(connection, 'spatial_sections', wId) +
+    totals.payload_bytes +
     VOXEL_FRAME_BYTES +
     Buffer.byteLength(JSON.stringify(wId), 'utf8') +
     Math.max(0, sections - 1);
   if (sections > resolved.maxVoxelSections) {
     throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
   }
+  if (totals.observed_cells > resolved.maxObservedCells) {
+    throw new Error(`snapshot exceeds maxObservedCells (${totals.observed_cells})`);
+  }
+  if (totals.palette_entries > resolved.maxPaletteEntries) {
+    throw new Error(`snapshot exceeds maxPaletteEntries (${totals.palette_entries})`);
+  }
   if (bytes > byteBudget) {
     throw new Error(`snapshot exceeds maxBytes (${bytes})`);
   }
 
   const rows = connection
-    .prepare(
-      'SELECT id, seq, octet_length(payload) AS bytes, observed_cells, palette_entries, revision, dimension, cx, cz, sy FROM spatial_sections WHERE world_id = ? ORDER BY seq',
-    )
-    .all(wId) as {
-      id: string;
-      seq: number;
-      bytes: number;
-      observed_cells: number;
-      palette_entries: number;
-      revision: number;
-      dimension: string;
-      cx: number;
-      cz: number;
-      sy: number;
-    }[];
-
-  const directory: VoxelDirectoryEntry[] = [];
-  let observedCells = 0;
-  let paletteEntries = 0;
-  for (const row of rows) {
+    .prepare('SELECT id, dimension, cx, cz, sy FROM spatial_sections WHERE world_id = ? ORDER BY seq')
+    .all(wId) as { id: string; dimension: string; cx: number; cz: number; sy: number }[];
+  const voxelDirectoryKeys: SectionKey[] = rows.map((row) => {
     const [dim, cx, cz, sy] = sectionIdentity(row);
-    observedCells += row.observed_cells;
-    paletteEntries += row.palette_entries;
-    directory.push({
-      key: { worldId: wId, dim, cx, cz, sy },
-      seq: row.seq,
-      bytes: row.bytes,
-      observedCells: row.observed_cells,
-      paletteEntries: row.palette_entries,
-      revision: row.revision,
-    });
-  }
-  if (observedCells > resolved.maxObservedCells) {
-    throw new Error(`snapshot exceeds maxObservedCells (${observedCells})`);
-  }
-  if (paletteEntries > resolved.maxPaletteEntries) {
-    throw new Error(`snapshot exceeds maxPaletteEntries (${paletteEntries})`);
-  }
-  return { voxelBaselineCheckpointId: cp.checkpoint_id, voxelDirectory: directory, bytes };
+    return { worldId: wId, dim, cx, cz, sy };
+  });
+  return {
+    voxelBaselineCheckpointId: cp.checkpoint_id,
+    voxelDirectoryKeys,
+    voxelDirectorySummary: {
+      sections,
+      observedCells: totals.observed_cells,
+      paletteEntries: totals.palette_entries,
+      bytes,
+      maxSeq: totals.max_seq,
+    },
+    bytes,
+  };
 }
 
 /**
@@ -2331,7 +2344,7 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   journalLimits = msg.journalLimits;
   ledgerLimits = msg.ledgerLimits ?? DEFAULT_LEDGER_LIMITS;
   try {
-    const world = loadWorld(connection, msg.worldId, msg.limits);
+    const world = loadWorld(connection, msg.worldId, msg.limits, msg.historyLoading !== 'none');
     const journal = loadJournalMeta(connection, msg.worldId, msg.journalLimits);
     // The Minecraft game version of the voxel baseline this open restores from.
     // It is read from the latest *voxel* checkpoint (`has_voxel = 1`), never from
@@ -2343,7 +2356,10 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       .get(msg.worldId) as { game_version: string } | undefined;
     let voxelBaselineCheckpointId: string | null = null;
     let voxelSnapshot: VoxelCheckpointSnapshot | null = null;
-    let voxelDirectory: VoxelDirectoryEntry[] | null = null;
+    let voxelDirectoryKeys: SectionKey[] = [];
+    let voxelDirectorySummary: VoxelDirectorySummary = {
+      sections: 0, observedCells: 0, paletteEntries: 0, bytes: 0, maxSeq: -1,
+    };
     let ledgerBaselineCheckpointId: string | null = null;
     let ledgerSnapshot: LedgerSnapshot | null = null;
     if (msg.kind === 'spatial') {
@@ -2353,7 +2369,8 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       if (msg.voxelLoading === 'manual') {
         const voxel = loadVoxelDirectory(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
         voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
-        voxelDirectory = voxel.voxelDirectory;
+        voxelDirectoryKeys = voxel.voxelDirectoryKeys;
+        voxelDirectorySummary = voxel.voxelDirectorySummary;
       } else {
         const voxel = loadVoxel(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
         voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
@@ -2370,7 +2387,8 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       snapshot: world.snapshot,
       voxelBaselineCheckpointId,
       voxelSnapshot,
-      voxelDirectory,
+      voxelDirectoryKeys,
+      voxelDirectorySummary,
       journalBaselineCheckpointId: journal.baselineCheckpointId,
       journalRevision: journal.revision,
       journalRecordCount: journal.recordCount,
@@ -2558,6 +2576,60 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
           ledgerRecordCount: committedLedger.placed + committedLedger.visits + committedLedger.traversals,
           ledgerRecordBytes: committedLedger.bytes,
         }),
+  });
+}
+
+function handleDirectoryPage(msg: WorkerRequest & { type: 'directory_page' }): void {
+  if (db === null || worldId === null) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'worker is not open' });
+    return;
+  }
+  if (msg.worldId !== worldId) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'directory worldId does not match session worldId' });
+    return;
+  }
+  if (!Number.isSafeInteger(msg.limit) || msg.limit < 1 || msg.limit > 1024) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'directory limit must be an integer in 1..1024' });
+    return;
+  }
+  if (msg.after !== undefined && (!Number.isSafeInteger(msg.after) || msg.after < 0)) {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'directory after must be a non-negative safe integer' });
+    return;
+  }
+  const rows = db
+    .prepare(
+      'SELECT id, seq, octet_length(payload) AS bytes, observed_cells, palette_entries, revision, dimension, cx, cz, sy '
+      + 'FROM spatial_sections WHERE world_id = ? AND seq > ? ORDER BY seq LIMIT ?',
+    )
+    .all(worldId, msg.after ?? -1, msg.limit + 1) as {
+      id: string;
+      seq: number;
+      bytes: number;
+      observed_cells: number;
+      palette_entries: number;
+      revision: number;
+      dimension: string;
+      cx: number;
+      cz: number;
+      sy: number;
+    }[];
+  const hasMore = rows.length > msg.limit;
+  const items = rows.slice(0, msg.limit).map((row) => {
+    const [dim, cx, cz, sy] = sectionIdentity(row);
+    return {
+      key: { worldId: msg.worldId, dim, cx, cz, sy },
+      seq: row.seq,
+      bytes: row.bytes,
+      observedCells: row.observed_cells,
+      paletteEntries: row.palette_entries,
+      revision: row.revision,
+    };
+  });
+  const nextAfter = hasMore ? items.at(-1)?.seq : undefined;
+  respond({
+    type: 'directory_page_ok',
+    requestId: msg.requestId,
+    page: nextAfter === undefined ? { items } : { items, nextAfter },
   });
 }
 
@@ -2781,6 +2853,9 @@ parentPort!.on('message', (msg: WorkerRequest) => {
       break;
     case 'checkpoint':
       handleCheckpoint(msg);
+      break;
+    case 'directory_page':
+      handleDirectoryPage(msg);
       break;
     case 'load_sections':
       handleLoadSections(msg);

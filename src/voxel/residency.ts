@@ -58,6 +58,19 @@ export interface VoxelDirectoryPage {
   nextAfter?: number;
 }
 
+/**
+ * Aggregate metadata of the committed directory. Manual startup installs this
+ * plus the exact committed key set, never every per-section metadata entry.
+ */
+export interface VoxelDirectorySummary {
+  sections: number;
+  observedCells: number;
+  paletteEntries: number;
+  bytes: number;
+  /** Highest stable seq, or -1 when the directory is empty. */
+  maxSeq: number;
+}
+
 /** Why an unload was refused for a resident section. */
 export type UnloadRejectionReason = 'pinned' | 'dirty' | 'not_committed';
 

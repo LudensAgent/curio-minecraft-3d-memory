@@ -29,6 +29,8 @@ import type {
   SectionResidencyInfo,
   UnloadSectionsResult,
   VoxelDirectoryEntry,
+  VoxelDirectoryPage,
+  VoxelDirectorySummary,
 } from '../../voxel/residency.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelMap, VoxelMapOptions } from '../../voxel/voxel-map.js';
@@ -684,6 +686,15 @@ export interface HistorySession {
 /** How a combined spatial session loads voxel sections at open. */
 export type VoxelLoading = 'eager' | 'manual';
 
+/**
+ * How history/topology is loaded at open. `none` validates the committed
+ * baseline/counts but does not decode or restore old fragments/nodes; callers
+ * starting a new main session use it to avoid materializing the old domain.
+ * A `none` session refuses to overwrite that preserved domain with a full
+ * history/topology checkpoint; migration must be explicit.
+ */
+export type HistoryLoading = 'eager' | 'none';
+
 /** Options for `openSpatialSession`. */
 export interface OpenSpatialSessionOptions {
   /** Absolute path to the SQLite database file. Required. */
@@ -722,6 +733,12 @@ export interface OpenSpatialSessionOptions {
    * committed section directory at open and requires explicit `loadSections`.
    */
   voxelLoading?: VoxelLoading;
+  /**
+   * History/topology loading mode. `eager` (default) restores old fragments and
+   * topology nodes; `none` validates the committed baseline without decoding
+   * payloads and refuses to replace that domain with an implicit full snapshot.
+   */
+  historyLoading?: HistoryLoading;
   /** Working-set bounds used when `voxelLoading` is `manual`. */
   residencyLimits?: ResidencyLimits;
   /** Bound for worker open/checkpoint/close/flush waits. Default 30000 ms. */
@@ -833,7 +850,7 @@ export interface SpatialSession {
    * one transaction. Journal rows are append-only; an empty batch never clears
    * previously committed journal facts.
    */
-  checkpoint(): Promise<SpatialCheckpointResult>;
+  checkpoint(options?: { deadlineMs?: number }): Promise<SpatialCheckpointResult>;
   getPersistenceState(): SpatialPersistenceState;
   /** Bounded, read-only page of committed action records (insertion order). */
   queryActions(query?: ActionJournalQuery): Promise<JournalPage<ActionRecord>>;
@@ -845,6 +862,11 @@ export interface SpatialSession {
   close(): Promise<CloseResult>;
   /** Residency of one section (manual mode); mirrors `VoxelMap.sectionResidency`. */
   sectionResidency(key: SectionKey): SectionResidencyInfo;
+  /**
+   * Worker-backed page of committed directory metadata. No full directory is
+   * materialized in memory; each call reads only one `seq > after` page.
+   */
+  directoryPage(options?: { after?: number; limit?: number }): Promise<VoxelDirectoryPage>;
   /** Explicitly load committed sections into memory (manual mode only). */
   loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult>;
   /**
@@ -916,10 +938,19 @@ export type WorkerRequest =
       limits: ResolvedSnapshotLimits;
       journalLimits: ResolvedJournalLimits;
       kind: WorkerSessionKind;
+      /** How history/topology is loaded at open; `none` validates metadata only. */
+      historyLoading?: HistoryLoading;
       /** How a combined spatial session loads voxel sections at open. */
       voxelLoading: VoxelLoading;
       /** Bounded ledger capacities (spatial sessions only). */
       ledgerLimits?: ResolvedLedgerLimits;
+    }
+  | {
+      type: 'directory_page';
+      requestId: number;
+      worldId: string;
+      after?: number;
+      limit: number;
     }
   | {
       type: 'checkpoint';
@@ -1012,8 +1043,10 @@ export type WorkerResponse =
       /** Voxel baseline checkpoint id, or null when voxel has never been saved. */
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
-      /** Committed section directory (manual loading); null when loaded eagerly. */
-      voxelDirectory: VoxelDirectoryEntry[] | null;
+      /** Exact committed key membership (manual loading); empty when eager. */
+      voxelDirectoryKeys: SectionKey[];
+      /** Aggregate committed metadata; per-page details are queried on demand. */
+      voxelDirectorySummary: VoxelDirectorySummary;
       /** Journal metadata only — payloads are never decoded at open. */
       journalBaselineCheckpointId: string | null;
       journalRevision: number;
@@ -1030,6 +1063,11 @@ export type WorkerResponse =
        * baseline. A newer history-only checkpoint never changes this fact.
        */
       gameVersion: string | null;
+    }
+  | {
+      type: 'directory_page_ok';
+      requestId: number;
+      page: VoxelDirectoryPage;
     }
   | {
       type: 'load_ok';

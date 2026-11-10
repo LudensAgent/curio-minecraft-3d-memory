@@ -602,6 +602,47 @@ describe('SQLite combined spatial persistence', () => {
     await reopened.close();
   });
 
+  it('historyLoading none preserves the old domain without restoring or replacing it', async () => {
+    const dbPath = makeDbPath();
+    const first = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    first.history.saveFragment(frag());
+    first.topology.saveNode({
+      id: 'n1', kind: 'place', source: 'agent', worldId: WORLD, dim: DIM,
+      location: { kind: 'exact', pos: { x: 0.5, y: 64, z: 0.5 } }, observedAt: 1000,
+    });
+    await first.checkpoint();
+    await first.close();
+
+    const reopened = await openSpatialSession({
+      databasePath: dbPath, worldId: WORLD, historyLoading: 'none',
+    });
+    expect(reopened.history.getFragment('f1')).toBeNull();
+    expect(reopened.topology.getNode('n1')).toBeNull();
+    expect(reopened.getPersistenceState().baselineCheckpointId).not.toBeNull();
+    expect(reopened.getPersistenceState().dirty).toBe(false);
+    // A new write cannot silently replace the preserved old domain with a full
+    // snapshot from the unloaded stores.
+    reopened.history.saveFragment(frag({ id: 'f-new' }));
+    await expect(reopened.checkpoint()).rejects.toBeInstanceOf(PersistenceError);
+    await reopened.close();
+
+    const eager = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(eager.history.getFragment('f1')).not.toBeNull();
+    expect(eager.history.getFragment('f-new')).toBeNull();
+    await eager.close();
+  });
+
+  it('checkpoint rejects an expired absolute deadline without starting a save', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    session.voxel.beginSession('s1');
+    session.voxel.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    await expect(session.checkpoint({ deadlineMs: Date.now() - 1 }))
+      .rejects.toMatchObject({ kind: 'timeout' });
+    expect(session.getPersistenceState().dirty).toBe(true);
+    await session.close();
+  });
+
   it('new-session re-observation only refreshes the actually-observed cell', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });

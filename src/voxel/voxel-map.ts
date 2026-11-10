@@ -63,6 +63,7 @@ import type {
   UnloadSectionsResult,
   VoxelDirectoryEntry,
   VoxelDirectoryPage,
+  VoxelDirectorySummary,
 } from './residency.js';
 import type {
   VoxelCheckpointCounts,
@@ -320,6 +321,26 @@ export class VoxelMap {
    */
   private readonly paletteRetentions = new WeakMap<Section, PaletteRetention>();
   private directoryInstalled = false;
+  /** True only when every per-section directory entry is present in `directory`. */
+  private directoryMetadataComplete = false;
+  /** Exact committed key membership, independent of whether metadata is resident. */
+  private readonly committedDirectoryKeys = new Set<string>();
+  /**
+   * Committed metadata learned for sections loaded or confirmed during this
+   * session. Bounded LRU; it supplements the (possibly summary-only) directory
+   * without loading every committed entry.
+   */
+  private readonly knownCommittedMeta = new Map<string, CommittedSectionInfo>();
+  /**
+   * Incrementally maintained totals of the committed directory. `checkpointFullCounts`
+   * combines these with the bounded resident set instead of scanning every committed
+   * directory entry on each checkpoint.
+   */
+  private directoryTotals = { sections: 0, observedCells: 0, paletteEntries: 0, bytes: 0 };
+  /** Next stable seq for a new directory entry; avoids scanning max(seq) per ACK. */
+  private nextDirectorySeq = 0;
+  /** Sorted-by-seq page index; invalidated only when the directory changes. */
+  private directorySeqOrder: VoxelDirectoryEntry[] | null = null;
   private nextPinToken = 1;
   /**
    * Per-section residency generation, bumped on every unload/install. A residency
@@ -716,24 +737,24 @@ export class VoxelMap {
    * `maxPaletteEntries`.
    */
   checkpointFullCounts(): VoxelCheckpointCounts {
-    const residentKeys = new Set<string>();
-    let sections = 0;
-    let observedCells = 0;
-    let paletteEntries = 0;
+    // Start from committed directory totals, then replace each resident entry's
+    // committed metadata with its live state. The work is O(resident sections),
+    // bounded by the working-set limits, not O(directory).
+    let sections = this.directoryTotals.sections;
+    let observedCells = this.directoryTotals.observedCells;
+    let paletteEntries = this.directoryTotals.paletteEntries;
     for (const dimMap of this.sections.values()) {
       for (const section of dimMap.values()) {
-        residentKeys.add(dirKey(section.key.dim, section.key.cx, section.key.cz, section.key.sy));
+        const committed = this.committedInfo(section.key);
+        if (committed !== undefined) {
+          sections -= 1;
+          observedCells -= committed.observedCells;
+          paletteEntries -= committed.paletteEntries;
+        }
         sections += 1;
         observedCells += section.evidence.size;
         paletteEntries += section.palette.length;
       }
-    }
-    for (const entry of this.directory.values()) {
-      const key = dirKey(entry.key.dim, entry.key.cx, entry.key.cz, entry.key.sy);
-      if (residentKeys.has(key)) continue;
-      sections += 1;
-      observedCells += entry.observedCells;
-      paletteEntries += entry.paletteEntries;
     }
     return { sections, observedCells, paletteEntries };
   }
@@ -774,8 +795,8 @@ export class VoxelMap {
    * covers only this batch; unselected sections remain pending and must be
    * confirmed by key, not by a global revision threshold.
    */
-  checkpointDirtyMeasureBounded(maxBytes: number): VoxelDirtyBatchMeasure {
-    const selected = this.selectDirtySections(maxBytes, false);
+  checkpointDirtyMeasureBounded(maxBytes: number, deadlineMs?: number): VoxelDirtyBatchMeasure {
+    const selected = this.selectDirtySections(maxBytes, false, deadlineMs);
     return { count: selected.sections.length, bytes: selected.bytes, capturedRevision: selected.capturedRevision };
   }
 
@@ -785,8 +806,8 @@ export class VoxelMap {
    * `keys` identifies exactly the sections this batch may confirm;
    * `capturedRevision` never implies that unselected pending sections are saved.
    */
-  captureDirtySectionsBounded(maxBytes: number): VoxelDirtyBatch {
-    const selected = this.selectDirtySections(maxBytes, true);
+  captureDirtySectionsBounded(maxBytes: number, deadlineMs?: number): VoxelDirtyBatch {
+    const selected = this.selectDirtySections(maxBytes, true, deadlineMs);
     return {
       sections: selected.sections.map(snapshotVoxelSection),
       keys: selected.keys.map((key) => ({ ...key })),
@@ -823,7 +844,7 @@ export class VoxelMap {
     }
   }
 
-  private selectDirtySections(maxBytes: number, advanceCursor: boolean): {
+  private selectDirtySections(maxBytes: number, advanceCursor: boolean, deadlineMs?: number): {
     sections: Section[];
     keys: SectionKey[];
     removed: { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }[];
@@ -833,6 +854,10 @@ export class VoxelMap {
     if (!Number.isFinite(maxBytes) || maxBytes < 0) {
       throw new Error(`dirty batch maxBytes must be a finite nonnegative number: ${maxBytes}`);
     }
+    if (deadlineMs !== undefined && !Number.isFinite(deadlineMs)) {
+      throw new Error('dirty batch deadlineMs must be finite');
+    }
+    const expired = (): boolean => deadlineMs !== undefined && Date.now() >= deadlineMs;
     const pending = [...this.pendingSections];
     const start = this.dirtyRotationCursor === null
       ? 0
@@ -842,6 +867,9 @@ export class VoxelMap {
     let bytes = 0;
     let capturedRevision = 0;
     for (let offset = 0; offset < pending.length; offset += 1) {
+      // Make progress with at least one Section even when the deadline has
+      // already passed; otherwise this path would never drain.
+      if (sections.length > 0 && expired()) break;
       const [section, revision] = pending[(start + offset) % pending.length]!;
       const sectionBytes = estimateVoxelSectionBytes(section);
       if (sections.length > 0 && bytes + sectionBytes > maxBytes) break;
@@ -858,11 +886,12 @@ export class VoxelMap {
         ? null
         : this.dirtySectionKey(pending[(start + sections.length) % pending.length]![0]);
     }
-    const removed = [...this.removedSections.values()].map((entry) => ({
-      key: { ...entry.key },
-      revision: entry.revision,
-    }));
-    for (const entry of removed) capturedRevision = Math.max(capturedRevision, entry.revision);
+    const removed: { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }[] = [];
+    for (const entry of this.removedSections.values()) {
+      if ((sections.length > 0 || removed.length > 0) && expired()) break;
+      removed.push({ key: { ...entry.key }, revision: entry.revision });
+      capturedRevision = Math.max(capturedRevision, entry.revision);
+    }
     if (sections.length === 0 && removed.length === 0) capturedRevision = this.saveRevisionCount;
     return { sections, keys, removed, capturedRevision, bytes };
   }
@@ -1093,7 +1122,45 @@ export class VoxelMap {
         throw new Error(`duplicate directory entry (${entry.key.dim}, ${entry.key.cx}, ${entry.key.cz}, ${entry.key.sy})`);
       }
       this.directory.set(key, entry);
+      this.committedDirectoryKeys.add(key);
+      this.directoryTotals.sections += 1;
+      this.directoryTotals.observedCells += entry.observedCells;
+      this.directoryTotals.paletteEntries += entry.paletteEntries;
+      this.directoryTotals.bytes += entry.bytes;
+      this.nextDirectorySeq = Math.max(this.nextDirectorySeq, entry.seq + 1);
     }
+    this.directorySeqOrder = null;
+    this.directoryMetadataComplete = true;
+    this.directoryInstalled = true;
+  }
+
+  /**
+   * Install the committed directory's exact key membership and aggregate
+   * metadata without materializing one metadata object per Section. Section
+   * residency/write guards stay exact; per-page metadata is queried from the
+   * session's worker on demand.
+   */
+  installDirectorySummary(summary: VoxelDirectorySummary, keys: readonly SectionKey[]): void {
+    if (!this.manualResidency) {
+      throw new Error('installDirectorySummary is only available in manual residency mode');
+    }
+    if (this.directoryInstalled) {
+      throw new Error('the section directory is already installed');
+    }
+    for (const key of keys) {
+      if (key.worldId !== this.worldId) {
+        throw new Error(`directory key worldId "${key.worldId}" does not match map worldId "${this.worldId}"`);
+      }
+      this.committedDirectoryKeys.add(dirKey(key.dim, key.cx, key.cz, key.sy));
+    }
+    this.directoryTotals = {
+      sections: summary.sections,
+      observedCells: summary.observedCells,
+      paletteEntries: summary.paletteEntries,
+      bytes: summary.bytes,
+    };
+    this.nextDirectorySeq = Math.max(0, summary.maxSeq + 1);
+    this.directoryMetadataComplete = false;
     this.directoryInstalled = true;
   }
 
@@ -1114,9 +1181,24 @@ export class VoxelMap {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
       throw new Error(`directoryPage limit must be an integer in 1..1024: ${String(limit)}`);
     }
-    const all = [...this.directory.values()].sort((a, b) => a.seq - b.seq);
-    const start = after === undefined ? 0 : all.findIndex((entry) => entry.seq > after);
-    if (start < 0) return { items: [] };
+    if (!this.directoryMetadataComplete) {
+      throw new Error('directory metadata is not resident; use the session worker-backed directoryPage');
+    }
+    if (this.directorySeqOrder === null) {
+      this.directorySeqOrder = [...this.directory.values()].sort((a, b) => a.seq - b.seq);
+    }
+    const all = this.directorySeqOrder;
+    // Binary search the stable seq order instead of scanning and sorting the
+    // whole directory for every page.
+    let lo = 0, hi = all.length;
+    if (after !== undefined) {
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (all[mid]!.seq <= after) lo = mid + 1;
+        else hi = mid;
+      }
+    }
+    const start = lo;
     const items = all.slice(start, start + limit).map((entry) => ({
       ...entry,
       key: { ...entry.key },
@@ -1135,7 +1217,10 @@ export class VoxelMap {
     const extra = this.extraResidency.get(dirKey(key.dim, key.cx, key.cz, key.sy));
     if (extra === 'loading') return { residency: 'loading', committed };
     if (extra === 'load_failed') return { residency: 'load_failed', committed };
-    if (committed !== undefined) return { residency: 'not_resident', committed };
+    if (committed !== undefined
+      || this.committedDirectoryKeys.has(dirKey(key.dim, key.cx, key.cz, key.sy))) {
+      return { residency: 'not_resident', ...(committed === undefined ? {} : { committed }) };
+    }
     return { residency: 'no_record' };
   }
 
@@ -1274,6 +1359,13 @@ export class VoxelMap {
       this.setSection(section);
       this.residentSectionBytes.set(section, sectionBytes[index]!);
       this.bumpResidencyGeneration(section.key.dim, section.key.cx, section.key.cz, section.key.sy);
+      const raw = snapshots[index]!;
+      this.rememberCommittedInfo(section.key, {
+        revision: raw.revision,
+        bytes: estimateVoxelSectionSnapshotBytes(raw),
+        observedCells: raw.evidence.length,
+        paletteEntries: raw.palette.length,
+      });
     }
     this.residentSectionCount += fresh.length;
     this.residentBytes += addedBytes;
@@ -1300,7 +1392,7 @@ export class VoxelMap {
         result.rejected.push({ key: { ...key }, reason: 'pinned' });
         continue;
       }
-      if (!this.directory.has(dk)) {
+      if (!this.committedDirectoryKeys.has(dk)) {
         result.rejected.push({ key: { ...key }, reason: 'not_committed' });
         continue;
       }
@@ -1394,25 +1486,80 @@ export class VoxelMap {
     mode: 'full' | 'incremental',
     sections: readonly VoxelSectionSnapshot[],
     committedBytes: readonly { dim: string; cx: number; cz: number; sy: number; bytes: number }[],
+    removedKeys: readonly SectionKey[] = [],
   ): void {
     if (!this.manualResidency) return;
-    if (mode === 'full') this.directory.clear();
+    const remove = (key: string): void => {
+      const entry = this.directory.get(key);
+      if (entry === undefined) {
+        const known = this.knownCommittedMeta.get(key);
+        if (this.committedDirectoryKeys.delete(key)) {
+          this.directoryTotals.sections -= 1;
+          if (known !== undefined) {
+            this.directoryTotals.observedCells -= known.observedCells;
+            this.directoryTotals.paletteEntries -= known.paletteEntries;
+            this.directoryTotals.bytes -= known.bytes;
+          }
+        }
+        this.knownCommittedMeta.delete(key);
+        return;
+      }
+      this.directory.delete(key);
+      this.committedDirectoryKeys.delete(key);
+      this.knownCommittedMeta.delete(key);
+      this.directoryTotals.sections -= 1;
+      this.directoryTotals.observedCells -= entry.observedCells;
+      this.directoryTotals.paletteEntries -= entry.paletteEntries;
+      this.directoryTotals.bytes -= entry.bytes;
+    };
+    if (mode === 'full') {
+      this.directory.clear();
+      this.committedDirectoryKeys.clear();
+      this.knownCommittedMeta.clear();
+      this.directoryTotals = { sections: 0, observedCells: 0, paletteEntries: 0, bytes: 0 };
+      this.nextDirectorySeq = 0;
+    } else {
+      for (const raw of removedKeys) remove(dirKey(raw.dim, raw.cx, raw.cz, raw.sy));
+    }
     const byteMap = new Map(committedBytes.map((b) => [dirKey(b.dim, b.cx, b.cz, b.sy), b.bytes]));
-    let nextSeq = this.directory.size === 0 ? 0 : Math.max(...[...this.directory.values()].map((e) => e.seq)) + 1;
     for (const raw of sections) {
       const key = dirKey(raw.dim, raw.cx, raw.cz, raw.sy);
       const existing = this.directory.get(key);
-      this.directory.set(key, {
+      const previous = existing ?? this.knownCommittedMeta.get(key);
+      const wasCommitted = this.committedDirectoryKeys.has(key);
+      const nextBytes = byteMap.get(key) ?? estimateVoxelSectionSnapshotBytes(raw);
+      const next: VoxelDirectoryEntry = {
         key: { worldId: this.worldId, dim: raw.dim, cx: raw.cx, cz: raw.cz, sy: raw.sy },
-        seq: existing?.seq ?? nextSeq++,
+        seq: existing?.seq ?? this.nextDirectorySeq++,
         // The worker returns the actual committed octet_length; the estimate is only
         // a fallback if the ACK did not carry bytes (never the normal path).
-        bytes: byteMap.get(key) ?? estimateVoxelSectionSnapshotBytes(raw),
+        bytes: nextBytes,
         observedCells: raw.evidence.length,
         paletteEntries: raw.palette.length,
         revision: raw.revision,
+      };
+      if (previous !== undefined) {
+        this.directoryTotals.observedCells -= previous.observedCells;
+        this.directoryTotals.paletteEntries -= previous.paletteEntries;
+        this.directoryTotals.bytes -= previous.bytes;
+      } else if (!wasCommitted) {
+        // Summary-only startup already counts this committed key. Only a genuinely
+        // new key adds one to the aggregate section count.
+        this.directoryTotals.sections += 1;
+      }
+      this.directoryTotals.observedCells += next.observedCells;
+      this.directoryTotals.paletteEntries += next.paletteEntries;
+      this.directoryTotals.bytes += next.bytes;
+      this.directory.set(key, next);
+      this.committedDirectoryKeys.add(key);
+      this.rememberCommittedInfo(next.key, {
+        revision: next.revision,
+        bytes: next.bytes,
+        observedCells: next.observedCells,
+        paletteEntries: next.paletteEntries,
       });
     }
+    this.directorySeqOrder = null;
   }
 
   // --- internals ---
@@ -1458,7 +1605,7 @@ export class VoxelMap {
   private assertHistoryAllocatable(dim: string, cx: number, cz: number, sy: number): void {
     if (!this.manualResidency) return;
     const key = dirKey(dim, cx, cz, sy);
-    if (this.directory.has(key) || this.extraResidency.has(key)) {
+    if (this.committedDirectoryKeys.has(key) || this.extraResidency.has(key)) {
       throw new VoxelResidencyError([{ worldId: this.worldId, dim, cx, cz, sy }]);
     }
     if (this.residentSectionCount + 1 > this.residentLimits.maxResidentSections) {
@@ -1705,19 +1852,35 @@ export class VoxelMap {
   }
 
   private committedInfo(key: SectionKey): CommittedSectionInfo | undefined {
-    const entry = this.directory.get(dirKey(key.dim, key.cx, key.cz, key.sy));
-    if (entry === undefined) return undefined;
-    return {
-      revision: entry.revision,
-      bytes: entry.bytes,
-      observedCells: entry.observedCells,
-      paletteEntries: entry.paletteEntries,
-    };
+    const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+    const entry = this.directory.get(dk);
+    if (entry !== undefined) {
+      return {
+        revision: entry.revision,
+        bytes: entry.bytes,
+        observedCells: entry.observedCells,
+        paletteEntries: entry.paletteEntries,
+      };
+    }
+    return this.knownCommittedMeta.get(dk);
+  }
+
+  private rememberCommittedInfo(key: SectionKey, info: CommittedSectionInfo): void {
+    const dk = dirKey(key.dim, key.cx, key.cz, key.sy);
+    this.knownCommittedMeta.delete(dk);
+    this.knownCommittedMeta.set(dk, info);
+    const limit = Math.max(16, this.residentLimits.maxResidentSections * 2);
+    while (this.knownCommittedMeta.size > limit) {
+      const oldest = this.knownCommittedMeta.keys().next().value;
+      if (oldest === undefined) break;
+      this.knownCommittedMeta.delete(oldest);
+    }
   }
 
   private hasNonResidentDirectory(): boolean {
-    for (const entry of this.directory.values()) {
-      if (!this.hasSectionKey(entry.key.dim, entry.key.cx, entry.key.cz, entry.key.sy)) return true;
+    for (const key of this.committedDirectoryKeys) {
+      const [dim, cx, cz, sy] = splitDirKey(key);
+      if (!this.hasSectionKey(dim, cx, cz, sy)) return true;
     }
     return false;
   }
@@ -1757,7 +1920,7 @@ export class VoxelMap {
       const { cx, cz, sy } = blockToSection(observation.pos.x, observation.pos.y, observation.pos.z);
       const key = dirKey(observation.dim, cx, cz, sy);
       if (this.hasSectionKey(observation.dim, cx, cz, sy)) continue;
-      const known = this.directory.has(key) || this.extraResidency.has(key);
+      const known = this.committedDirectoryKeys.has(key) || this.extraResidency.has(key);
       if (known) {
         if (!missingSeen.has(key)) {
           missingSeen.add(key);
@@ -1984,6 +2147,13 @@ function assertNonEmptyString(value: string, what: string): void {
 /** Internal residency-map key for one section within this map's worldId. */
 function dirKey(dim: string, cx: number, cz: number, sy: number): string {
   return `${dim}|${cx},${cz},${sy}`;
+}
+
+function splitDirKey(key: string): [string, number, number, number] {
+  const sep = key.lastIndexOf('|');
+  const dim = key.slice(0, sep);
+  const [cx, cz, sy] = key.slice(sep + 1).split(',').map(Number);
+  return [dim, cx!, cz!, sy!];
 }
 
 function assertSectionKey(worldId: string, key: SectionKey): void {

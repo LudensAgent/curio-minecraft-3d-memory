@@ -26,7 +26,8 @@ import type {
   ResolvedResidencyLimits,
   SectionResidencyInfo,
   UnloadSectionsResult,
-  VoxelDirectoryEntry,
+  VoxelDirectoryPage,
+  VoxelDirectorySummary,
 } from '../../voxel/residency.js';
 import { jsonEscapedByteLength } from '../../bytes.js';
 import {
@@ -43,6 +44,7 @@ import type {
   CloseResult,
   EventJournalQuery,
   FlushResult,
+  HistoryLoading,
   JournalAcceptResult,
   JournalBatchAcceptResult,
   JournalBatchInput,
@@ -81,7 +83,7 @@ import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/
 import { estimateVoxelSectionResidentBytesFromSnapshot } from '../../voxel/snapshot.js';
 
 interface PendingRequest {
-  kind: 'open' | 'checkpoint' | 'load' | 'query' | 'close';
+  kind: 'open' | 'checkpoint' | 'load' | 'directory' | 'query' | 'close';
   resolve: (value: unknown) => void;
   reject: (e: PersistenceError) => void;
   timer?: NodeJS.Timeout;
@@ -200,6 +202,9 @@ class SpatialSessionImpl implements SpatialSession {
   /** Session-wide operation gate shared by working-set managers and direct load/save. */
   private workingSetLock = false;
   private readonly voxelLoadingField: VoxelLoading;
+  private readonly historyLoadingField: HistoryLoading;
+  /** True when a `none` open preserved an existing committed history/topology. */
+  private preservedHistoryBaseline = false;
   private readonly residencyLimitsField: ResolvedResidencyLimits;
   /** Per-checkpoint voxel dirty batch cap; defaults to the full snapshot limit. */
   private readonly voxelBatchMaxBytes: number;
@@ -280,6 +285,10 @@ class SpatialSessionImpl implements SpatialSession {
       withdraw: (selector: JournalWithdrawalSelector): JournalWithdrawalResult => this.withdrawPending(selector),
     };
     this.voxelLoadingField = options.voxelLoading ?? 'eager';
+    this.historyLoadingField = options.historyLoading ?? 'eager';
+    if (this.historyLoadingField !== 'eager' && this.historyLoadingField !== 'none') {
+      throw new Error(`historyLoading must be "eager" or "none", got ${String(this.historyLoadingField)}`);
+    }
     this.residencyLimitsField = resolveResidencyLimits(options.residencyLimits);
     this.gameVersionField = options.gameVersion;
 
@@ -312,7 +321,8 @@ class SpatialSessionImpl implements SpatialSession {
       snapshot: HistorySnapshot | null;
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
-      voxelDirectory: VoxelDirectoryEntry[] | null;
+      voxelDirectoryKeys: SectionKey[];
+      voxelDirectorySummary: VoxelDirectorySummary;
       journalBaselineCheckpointId: string | null;
       journalRevision: number;
       journalRecordCount: number;
@@ -329,14 +339,15 @@ class SpatialSessionImpl implements SpatialSession {
       throw err;
     }
     try {
-      if (result.snapshot !== null) {
+      if (this.historyLoadingField === 'eager' && result.snapshot !== null) {
         this.history.restoreSnapshot(result.snapshot);
         this.topology.restoreSnapshot(result.snapshot);
       }
+      if (this.historyLoadingField === 'none' && result.baselineCheckpointId !== null) {
+        this.preservedHistoryBaseline = true;
+      }
       if (this.voxelLoadingField === 'manual') {
-        if (result.voxelDirectory !== null) {
-          this.voxel.installDirectory(result.voxelDirectory);
-        }
+        this.voxel.installDirectorySummary(result.voxelDirectorySummary, result.voxelDirectoryKeys);
       } else if (result.voxelSnapshot !== null) {
         this.voxel.restoreSnapshot(result.voxelSnapshot);
       }
@@ -352,7 +363,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.voxelBaselineCheckpointId = result.voxelBaselineCheckpointId;
     this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
     this.voxelRowsPresent = (result.voxelSnapshot?.sections.length ?? 0) > 0
-      || (result.voxelDirectory?.length ?? 0) > 0;
+      || result.voxelDirectorySummary.sections > 0;
     this.journalBaselineCheckpointId = result.journalBaselineCheckpointId;
     this.ledgerBaselineCheckpointId = result.ledgerBaselineCheckpointId;
     this.restoredGameVersion = result.gameVersion;
@@ -369,7 +380,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.voxel.sealInitialization();
   }
 
-  async checkpoint(): Promise<SpatialCheckpointResult> {
+  async checkpoint(options: { deadlineMs?: number } = {}): Promise<SpatialCheckpointResult> {
     if (this.lifecycleField === 'closing') {
       throw new PersistenceError('closing', 'session is closing; new checkpoints are not accepted');
     }
@@ -378,6 +389,14 @@ class SpatialSessionImpl implements SpatialSession {
     }
     if (this.inFlight !== null || this.loadInFlight || this.workingSetLock || this.queryInFlight) {
       throw new PersistenceError('busy', 'a persistence request is already in flight');
+    }
+    if (options.deadlineMs !== undefined
+      && (!Number.isFinite(options.deadlineMs) || options.deadlineMs <= 0)) {
+      throw new PersistenceError('invalid_argument', 'checkpoint deadlineMs must be a positive finite epoch millisecond');
+    }
+    const deadlineMs = options.deadlineMs;
+    if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      throw new PersistenceError('timeout', 'checkpoint deadline expired before capture');
     }
 
     let voxelRevision = this.voxel.saveRevision;
@@ -407,6 +426,12 @@ class SpatialSessionImpl implements SpatialSession {
       this.history.revision !== this.confirmedFragmentRevision ? 'full' : 'none';
     const topologyMode: 'full' | 'none' =
       this.topology.revision !== this.confirmedTopologyRevision ? 'full' : 'none';
+    if (this.preservedHistoryBaseline && (historyMode === 'full' || topologyMode === 'full')) {
+      throw new PersistenceError(
+        'data',
+        'historyLoading "none" preserved an existing history/topology baseline; refusing to replace it with a full snapshot from an unloaded domain (migrate explicitly)',
+      );
+    }
 
     const shared = maxBytes - historyEnvelope - voxelEnvelope;
     const historyMeasure =
@@ -460,6 +485,7 @@ class SpatialSessionImpl implements SpatialSession {
       const counts = this.voxel.checkpointFullCounts();
       const dirtyMeasure = this.voxel.checkpointDirtyMeasureBounded(
         Math.min(this.voxelBatchMaxBytes, Math.max(0, afterTopology)),
+        deadlineMs,
       );
       totalBytes =
         historyEnvelope +
@@ -519,6 +545,7 @@ class SpatialSessionImpl implements SpatialSession {
     } else {
       const batch = this.voxel.captureDirtySectionsBounded(
         Math.min(this.voxelBatchMaxBytes, Math.max(0, afterTopology)),
+        deadlineMs,
       );
       voxelSnapshot = {
         worldId: this.worldId,
@@ -584,10 +611,16 @@ class SpatialSessionImpl implements SpatialSession {
     }
     const ledgerRevision = ledgerCapture?.revision ?? this.confirmedLedgerRevision;
 
+    if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      throw new PersistenceError('timeout', 'checkpoint deadline expired before the worker commit');
+    }
     const checkpointId = randomUUID();
     const promise = new Promise<SpatialCheckpointResult>((resolve, reject) => {
       const requestId = this.nextRequestId++;
-      const timer = setTimeout(() => this.onTimeout(requestId), this.timeoutMs);
+      const waitMs = deadlineMs === undefined
+        ? this.timeoutMs
+        : Math.max(1, Math.min(this.timeoutMs, deadlineMs - Date.now()));
+      const timer = setTimeout(() => this.onTimeout(requestId), waitMs);
       this.pending.set(requestId, {
         kind: 'checkpoint',
         checkpointId,
@@ -633,6 +666,40 @@ class SpatialSessionImpl implements SpatialSession {
 
   sectionResidency(key: SectionKey): SectionResidencyInfo {
     return this.voxel.sectionResidency(key);
+  }
+
+  async directoryPage(options: { after?: number; limit?: number } = {}): Promise<VoxelDirectoryPage> {
+    if (this.voxelLoadingField !== 'manual') {
+      throw new PersistenceError('invalid_argument', 'directoryPage requires voxelLoading "manual"');
+    }
+    if (this.lifecycleField === 'closing' || this.lifecycleField === 'closed') {
+      throw new PersistenceError(this.lifecycleField === 'closing' ? 'closing' : 'closed', 'directoryPage requires an open session');
+    }
+    const after = options.after;
+    if (after !== undefined && (!Number.isSafeInteger(after) || after < 0)) {
+      throw new PersistenceError('invalid_argument', 'directory after must be a non-negative safe integer');
+    }
+    const limit = options.limit ?? 128;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
+      throw new PersistenceError('invalid_argument', 'directory limit must be an integer in 1..1024');
+    }
+    const requestId = this.nextRequestId++;
+    return new Promise<VoxelDirectoryPage>((resolve, reject) => {
+      const timer = setTimeout(() => this.onTimeout(requestId), this.timeoutMs);
+      this.pending.set(requestId, {
+        kind: 'directory',
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timer,
+      });
+      this.worker!.postMessage({
+        type: 'directory_page',
+        requestId,
+        worldId: this.worldId,
+        ...(after === undefined ? {} : { after }),
+        limit,
+      } satisfies WorkerRequest);
+    });
   }
 
   unloadSections(keys: readonly SectionKey[]): UnloadSectionsResult {
@@ -1077,7 +1144,8 @@ class SpatialSessionImpl implements SpatialSession {
     snapshot: HistorySnapshot | null;
     voxelBaselineCheckpointId: string | null;
     voxelSnapshot: VoxelCheckpointSnapshot | null;
-    voxelDirectory: VoxelDirectoryEntry[] | null;
+    voxelDirectoryKeys: SectionKey[];
+    voxelDirectorySummary: VoxelDirectorySummary;
     journalBaselineCheckpointId: string | null;
     journalRevision: number;
     journalRecordCount: number;
@@ -1099,6 +1167,7 @@ class SpatialSessionImpl implements SpatialSession {
         journalLimits: this.journalLimitsField,
         ledgerLimits: this.ledgerLimitsField,
         kind: 'spatial',
+        historyLoading: this.historyLoadingField,
         voxelLoading: this.voxelLoadingField,
       } satisfies WorkerRequest);
     });
@@ -1178,7 +1247,8 @@ class SpatialSessionImpl implements SpatialSession {
         snapshot: openMsg.snapshot,
         voxelBaselineCheckpointId: openMsg.voxelBaselineCheckpointId,
         voxelSnapshot: openMsg.voxelSnapshot,
-        voxelDirectory: openMsg.voxelDirectory,
+        voxelDirectoryKeys: openMsg.voxelDirectoryKeys,
+        voxelDirectorySummary: openMsg.voxelDirectorySummary,
         journalBaselineCheckpointId: openMsg.journalBaselineCheckpointId,
         journalRevision: openMsg.journalRevision,
         journalRecordCount: openMsg.journalRecordCount,
@@ -1190,6 +1260,12 @@ class SpatialSessionImpl implements SpatialSession {
     } else if (entry.kind === 'load') {
       const loadMsg = msg as WorkerResponse & { type: 'load_ok' };
       entry.resolve({ sections: loadMsg.sections, missing: loadMsg.missing });
+    } else if (entry.kind === 'directory') {
+      if (msg.type !== 'directory_page_ok') {
+        entry.reject(new PersistenceError('data', 'unexpected worker response to directory page'));
+        return;
+      }
+      entry.resolve(msg.page);
     } else if (entry.kind === 'query') {
       if (msg.type !== 'query_actions_ok' && msg.type !== 'query_events_ok') {
         entry.reject(new PersistenceError('data', 'unexpected worker response to journal query'));
@@ -1215,7 +1291,12 @@ class SpatialSessionImpl implements SpatialSession {
       // ACK-time memory state), so a confirmed save is reflected as committed and
       // its committed metadata matches what the worker actually wrote.
       if (entry.voxelMode !== undefined && entry.voxelMode !== 'none') {
-        this.voxel.commitDirectory(entry.voxelMode, entry.voxelSections ?? [], okMsg.voxelBytes);
+        this.voxel.commitDirectory(
+          entry.voxelMode,
+          entry.voxelSections ?? [],
+          okMsg.voxelBytes,
+          entry.removedVoxelKeys ?? [],
+        );
         // This confirmed checkpoint wrote voxel rows, so it is the new voxel
         // baseline and its rows carry exactly this session's version. A
         // history-only checkpoint never changes the voxel baseline's version.

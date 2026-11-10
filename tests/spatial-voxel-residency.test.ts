@@ -455,6 +455,32 @@ describe('SQLite manual voxel loading', () => {
     await s2.close();
   });
 
+  it('worker-backed directory pages expose committed metadata without full resident directory', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s1.voxel.beginSession('s1');
+    s1.voxel.observe(voxelObs({ state: stone, pos: { x: 0, y: 0, z: 0 }, observedAt: 1000 }));
+    s1.voxel.observe(voxelObs({ state: dirt, pos: { x: 16, y: 0, z: 0 }, observedAt: 1000, sequence: 2 }));
+    await s1.checkpoint();
+    await s1.close();
+
+    const s2 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD, voxelLoading: 'manual' });
+    expect(s2.voxel.checkpointFullCounts()).toEqual({ sections: 2, observedCells: 2, paletteEntries: 4 });
+    await s2.loadSections([sectionKey(DIM, 0, 0, 0)]);
+    expect(s2.voxel.checkpointFullCounts()).toEqual({ sections: 2, observedCells: 2, paletteEntries: 4 });
+    const first = await s2.directoryPage({ limit: 1 });
+    expect(first.items).toHaveLength(1);
+    expect(first.nextAfter).toBeTypeOf('number');
+    const second = await s2.directoryPage({ after: first.nextAfter, limit: 1 });
+    expect(second.items).toHaveLength(1);
+    expect(new Set([...first.items, ...second.items].map((entry) => entry.key.dim))).toEqual(new Set([DIM]));
+    expect(first.items[0]!.observedCells).toBeGreaterThan(0);
+    // Snapshot ordering is by stable seq, never by caller-local insertion.
+    expect(second.items[0]!.seq).toBeGreaterThan(first.items[0]!.seq);
+    expect((await s2.directoryPage({ after: second.items[0]!.seq, limit: 1 })).items).toEqual([]);
+    await s2.close();
+  });
+
   it('loadSections reports missing keys and leaves the rest untouched', async () => {
     const dbPath = makeDbPath();
     const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });

@@ -73,6 +73,7 @@ export type {
   JournalWithdrawalSelector,
   LedgerLimits,
   LedgerSnapshot,
+  HistoryLoading,
   LoadSectionsResult,
   MeasureSectionsResult,
   OpenHistorySessionOptions,
