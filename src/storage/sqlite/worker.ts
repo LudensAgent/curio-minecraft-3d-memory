@@ -1475,7 +1475,7 @@ function writeCheckpoint(
   voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections']; removedIds?: string[] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
   ledger: { mode: 'none' | 'full' | 'delta'; revision: number; prepared: PreparedLedgerWrite | null },
-  facts: { mode: 'none' | 'full'; prepared: PreparedFacts | null },
+  facts: { mode: 'none' | 'full'; prepared: PreparedFacts | null; completeLegacyMigration?: boolean },
   resolved: ResolvedSnapshotLimits,
   resolvedJournal: ResolvedJournalLimits,
 ): {
@@ -1655,6 +1655,10 @@ function writeCheckpoint(
     if (facts.mode === 'full') {
       if (facts.prepared === null) throw new Error('facts save mode requires a prepared facts set');
       writeFacts(connection, wId, checkpointId, facts.prepared);
+      if (facts.completeLegacyMigration === true) {
+        connection.prepare('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+          .run('curio_semantic_migration_v1:' + wId, '1');
+      }
     }
 
     // A `none` topology write leaves the committed extras untouched, so the new
@@ -3121,6 +3125,7 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       factsBaselineCheckpointId: msg.kind === 'spatial' ? facts.factsBaselineCheckpointId : null,
       factsSnapshot: msg.kind === 'spatial' ? facts.factsSnapshot : null,
       factsMigration: facts.factsMigration,
+      legacyFactsMigrationVersion: readSchemaMeta(db!, 'curio_semantic_migration_v1:' + msg.worldId) === '1' ? 1 : 0,
       gameVersion: voxelBaselineCheckpoint?.game_version ?? null,
     });
   } catch (err) {
@@ -3209,6 +3214,14 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   }
   if (ledgerMode === 'delta' && msg.ledgerDelta === undefined) {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'ledger mode delta requires a delta' });
+    return;
+  }
+  if (msg.completeLegacyFactsMigration !== undefined && typeof msg.completeLegacyFactsMigration !== 'boolean') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid migration receipt' });
+    return;
+  }
+  if (msg.completeLegacyFactsMigration === true && msg.factsMode !== 'full') {
+    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'migration requires a complete facts capture' });
     return;
   }
   const factsMode = msg.factsMode ?? 'none';
@@ -3305,6 +3318,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     }, {
       mode: factsMode,
       prepared: preparedFacts,
+      completeLegacyMigration: msg.completeLegacyFactsMigration,
     }, limits, journalLimits);
     committedLedger = committed.ledgerStats;
     voxelStats = committed.voxelStats;

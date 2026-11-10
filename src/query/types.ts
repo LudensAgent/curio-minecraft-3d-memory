@@ -417,6 +417,8 @@ export type FrontierQuerySource =
  * observe, save, pin, load, or execute.
  */
 export interface SpatialQuerySources {
+  /** When supplied, semantic queries use facts exclusively, including empty results. */
+  facts?: Pick<import('../facts/types.js').FactStore, 'places' | 'resources' | 'containers'>;
   readonly worldId: string;
   currentSessionId(): string | null;
   cellAt(dim: string, x: number, y: number, z: number): CellView;

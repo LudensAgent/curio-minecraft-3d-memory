@@ -110,6 +110,7 @@ interface PendingRequest {
   factsRevision?: number;
   /** Whether this checkpoint captured the facts domain. */
   factsCaptured?: boolean;
+  completeLegacyFactsMigration?: boolean;
   /** The captured journal batch, for the ACK-time pending clear. */
   journalCapture?: JournalCapture;
   /**
@@ -176,6 +177,8 @@ class SpatialSessionImpl implements SpatialSession {
   readonly topology: TopologyStore;
   readonly ledger: LedgerStore;
   readonly facts: FactStore;
+  private legacyFactsMigrationVersionField = 0;
+  get legacyFactsMigrationVersion(): number { return this.legacyFactsMigrationVersionField; }
 
   get factsMigration(): FactMigrationState {
     return this.factsMigrationField;
@@ -357,6 +360,7 @@ class SpatialSessionImpl implements SpatialSession {
       factsBaselineCheckpointId: string | null;
       factsSnapshot: FactCheckpointSnapshot | null;
       factsMigration: FactMigrationState;
+      legacyFactsMigrationVersion: number;
       gameVersion: string | null;
     };
     try {
@@ -399,6 +403,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.ledgerBaselineCheckpointId = result.ledgerBaselineCheckpointId;
     this.factsBaselineCheckpointId = result.factsBaselineCheckpointId;
     this.factsMigrationField = result.factsMigration;
+    this.legacyFactsMigrationVersionField = result.legacyFactsMigrationVersion;
     this.restoredGameVersion = result.gameVersion;
     this.committedJournalRecords = result.journalRecordCount;
     this.committedJournalBytes = result.journalRecordBytes;
@@ -414,7 +419,7 @@ class SpatialSessionImpl implements SpatialSession {
     this.voxel.sealInitialization();
   }
 
-  async checkpoint(options: { deadlineMs?: number } = {}): Promise<SpatialCheckpointResult> {
+  async checkpoint(options: { deadlineMs?: number; completeLegacyFactsMigration?: boolean } = {}): Promise<SpatialCheckpointResult> {
     if (this.lifecycleField === 'closing') {
       throw new PersistenceError('closing', 'session is closing; new checkpoints are not accepted');
     }
@@ -648,7 +653,7 @@ class SpatialSessionImpl implements SpatialSession {
     // Facts: only a domain that actually changed since its confirmed revision is
     // captured and replaced. Capture is synchronous and takes the exact revision
     // an ACK must confirm; later writes keep a newer revision pending.
-    const factsCaptured = this.facts.revision !== this.confirmedFactsRevision;
+    const factsCaptured = this.facts.revision !== this.confirmedFactsRevision || options.completeLegacyFactsMigration === true;
     const factsSnapshot: FactCheckpointSnapshot | undefined = factsCaptured
       ? this.facts.checkpointSnapshot()
       : undefined;
@@ -689,6 +694,7 @@ class SpatialSessionImpl implements SpatialSession {
         ledgerCapture,
         factsRevision,
         factsCaptured,
+        completeLegacyFactsMigration: options.completeLegacyFactsMigration === true,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -714,6 +720,7 @@ class SpatialSessionImpl implements SpatialSession {
         ...(ledgerSnapshot === undefined ? {} : { ledgerSnapshot }),
         ...(ledgerDelta === undefined ? {} : { ledgerDelta }),
         factsMode: factsCaptured ? 'full' : 'none',
+        completeLegacyFactsMigration: options.completeLegacyFactsMigration === true,
         factsRevision,
         ...(factsSnapshot === undefined ? {} : { factsSnapshot }),
         gameVersion: this.gameVersionField,
@@ -1219,6 +1226,7 @@ class SpatialSessionImpl implements SpatialSession {
     factsBaselineCheckpointId: string | null;
     factsSnapshot: FactCheckpointSnapshot | null;
     factsMigration: FactMigrationState;
+      legacyFactsMigrationVersion: number;
     gameVersion: string | null;
   }> {
     const requestId = this.nextRequestId++;
@@ -1325,6 +1333,7 @@ class SpatialSessionImpl implements SpatialSession {
         factsBaselineCheckpointId: openMsg.factsBaselineCheckpointId,
         factsSnapshot: openMsg.factsSnapshot,
         factsMigration: openMsg.factsMigration,
+        legacyFactsMigrationVersion: openMsg.legacyFactsMigrationVersion,
         gameVersion: openMsg.gameVersion,
       });
     } else if (entry.kind === 'load') {
@@ -1391,6 +1400,7 @@ class SpatialSessionImpl implements SpatialSession {
         this.facts.confirmRevision(entry.factsRevision);
         this.confirmedFactsRevision = Math.max(this.confirmedFactsRevision, entry.factsRevision);
         this.factsBaselineCheckpointId = okMsg.checkpointId;
+        if (entry.completeLegacyFactsMigration === true) this.legacyFactsMigrationVersionField = 1;
         this.factsMigrationField = {
           version: FACT_MIGRATION_VERSION,
           target: FACT_MIGRATION_TARGET,

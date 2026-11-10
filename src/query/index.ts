@@ -13,8 +13,9 @@
 import { queryAnchors } from './anchors.js';
 import { queryCapabilities, querySnapshot } from './capabilities.js';
 import { queryCells } from './cells.js';
-import { invalidQueryResult } from './envelope.js';
+import { invalidQueryResult, unsupportedQueryResult } from './envelope.js';
 import { queryFrontiers } from './frontiers.js';
+import { queryFacts } from './facts.js';
 import { queryHistory } from './history.js';
 import { queryTopology } from './topology.js';
 import { validateSpatialQueryRequest } from './validate.js';
@@ -92,6 +93,14 @@ function dispatch(
   context: SpatialQueryContext,
   request: SpatialQueryRequest,
 ): SpatialQueryResult {
+  if (context.sources.facts !== undefined) {
+    if (request.kind === 'nodes' || request.kind === 'resourceAnchors' || request.kind === 'containerAnchors') {
+      return queryFacts(context, request);
+    }
+    if (['fragments', 'traversals', 'edges', 'portals', 'historyRoute', 'anchor', 'components', 'segments'].includes(request.kind)) {
+      return unsupportedQueryResult(context, request.kind, 'legacy route queries are retired; query facts for places and voxel cells for geometry');
+    }
+  }
   // TypeScript cannot carry the kind→handler correlation through an indexed
   // union lookup; the table is exhaustive, so widening the looked-up handler to
   // the full request union is sound.

@@ -856,6 +856,8 @@ export interface SpatialPersistenceState {
 
 /** The combined spatial persistence session handed to the caller by `openSpatialSession`. */
 export interface SpatialSession {
+  /** Explicit host migration receipt; saving facts alone does not establish it. */
+  readonly legacyFactsMigrationVersion: number;
   readonly voxel: VoxelMap;
   readonly history: FragmentStore;
   readonly topology: TopologyStore;
@@ -883,7 +885,7 @@ export interface SpatialSession {
    * one transaction. Journal rows are append-only; an empty batch never clears
    * previously committed journal facts.
    */
-  checkpoint(options?: { deadlineMs?: number }): Promise<SpatialCheckpointResult>;
+  checkpoint(options?: { deadlineMs?: number; completeLegacyFactsMigration?: boolean }): Promise<SpatialCheckpointResult>;
   getPersistenceState(): SpatialPersistenceState;
   /** Bounded, read-only page of committed action records (insertion order). */
   queryActions(query?: ActionJournalQuery): Promise<JournalPage<ActionRecord>>;
@@ -1032,6 +1034,8 @@ export type WorkerRequest =
        * transaction. An empty capture is a valid explicit empty domain.
        */
       factsMode?: 'none' | 'full';
+      /** Commit an offline migration receipt in the same transaction as its facts. */
+      completeLegacyFactsMigration?: boolean;
       /** Captured local facts revision. */
       factsRevision?: number;
       /** Complete world-scoped facts capture for `full`. */
@@ -1109,6 +1113,7 @@ export type WorkerResponse =
       factsSnapshot: FactCheckpointSnapshot | null;
       /** Migration/version record read from the same persistence authority. */
       factsMigration: FactMigrationState;
+      legacyFactsMigrationVersion: number;
       /**
        * Minecraft game version recorded on the voxel baseline this open restores
        * from (the latest checkpoint with `has_voxel = 1`), or `'unknown'` when its

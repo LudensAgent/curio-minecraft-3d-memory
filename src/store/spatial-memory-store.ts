@@ -110,6 +110,8 @@ export type WalkSearchSnapshotProvider = (
 ) => WalkSearchSnapshot | null;
 
 export interface SpatialMemoryStoreOptions {
+  /** Semantic query authority; never falls back to legacy nodes when empty. */
+  facts?: SpatialQuerySources['facts'];
   /** Immutable world identity for this store. Every composed part must agree. */
   worldId: string;
   /** Defaults to `new VoxelMap(worldId)`. */
@@ -207,6 +209,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
   private readonly topologyStore: TopologyStore;
   private readonly frontierSource: WalkSearchSnapshotProvider | undefined;
   private readonly queryPort: SpatialQueryPort;
+  private readonly facts: SpatialQuerySources['facts'];
 
   constructor(options: SpatialMemoryStoreOptions) {
     const worldId = options.worldId;
@@ -226,6 +229,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
     this.fragmentStore = fragments;
     this.topologyStore = topology;
     this.frontierSource = options.frontierSource;
+    this.facts = options.facts;
     this.queryPort = createSpatialQueryPort(this.buildQuerySources(), options.query);
   }
 
@@ -677,6 +681,7 @@ export class SpatialMemoryStoreImpl implements SpatialMemoryStore, MemoryIngest,
   /** The narrow, mutation-free view the query port is allowed to see. */
   private buildQuerySources(): SpatialQuerySources {
     return {
+      ...(this.facts === undefined ? {} : { facts: this.facts }),
       worldId: this.worldId,
       currentSessionId: () => this.voxel.sessionId,
       cellAt: (dim, x, y, z) => this.voxel.cellAt(dim, x, y, z),
