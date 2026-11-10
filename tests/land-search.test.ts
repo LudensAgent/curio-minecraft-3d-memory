@@ -456,6 +456,48 @@ describe('A* cost and cooperative work', () => {
     expect((await pending).status).toBe('FOUND');
   });
 
+  it.each(['current', 'remembered'] as const)('keeps a %s search alive when fresh evidence is observed again', async (evidenceMode) => {
+    const map = terrain(flat());
+    const before = map.sectionAt('overworld', 1, -1, 0)!.revision;
+    const pending = searchLandRouteAsync(map, request({ maxWorkPerSlice: 1, evidenceMode }), 2000);
+    const report = map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 1500 }));
+
+    expect(report.sections[0]!.invalidated).toBe(false);
+    expect(map.sectionAt('overworld', 1, -1, 0)!.revision).toBe(before);
+    const result = await pending;
+    expect(result.status).toBe('FOUND');
+    expect(result.transitions).toHaveLength(2);
+  });
+
+  it('invalidates a current search when a same-content refresh restores evidence it read as expired', async () => {
+    const map = terrainObserved(flat().map((column) => ({ ...column, observedAt: column.x === 1 ? 1000 : 62_000 })));
+    const pending = searchLandRouteAsync(map, request({ maxWorkPerSlice: 1 }), 62_000);
+    // The first support-column read is (1,-5,0); it was already expired at
+    // search time, although the stored freshness flag still says FRESH.
+    const report = map.observe(obs(STONE, { x: 1, y: -5, z: 0 }, { observedAt: 62_000 }));
+
+    expect(report.sections[0]!.invalidated).toBe(false);
+    const result = await pending;
+    expect(result.status).toBe('INVALIDATED');
+    expect(result.transitions).toEqual([]);
+    expect(result.prefix).toBeUndefined();
+  });
+
+  it('does not invalidate a fresh cell refresh because another cell in its section is expired', async () => {
+    const map = terrain(flat());
+    flat().forEach(({ x, z }) => {
+      for (let y = -1; y <= 2; y++) {
+        map.observe(obs(y === -1 ? STONE : AIR, { x, y, z }, { observedAt: 62_000 }));
+      }
+    });
+    const pending = searchLandRouteAsync(map, request({ maxWorkPerSlice: 1 }), 62_000);
+    map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 62_001 }));
+
+    const result = await pending;
+    expect(result.stats.staleReads).toBeGreaterThan(0);
+    expect(result.status).toBe('FOUND');
+  });
+
   it.each([false, true])('invalidates a used page unloaded during a slice, including same-revision reload=%s', async (reload) => {
     const sections = terrain(flat()).checkpointSnapshot().sections;
     const map = new VoxelMap('world', { manualResidency: true });

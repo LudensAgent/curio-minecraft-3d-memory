@@ -406,6 +406,11 @@ function* searchChunks(
     durationMs: 0, yieldCount: 0, maxSyncSliceMs: 0,
   };
   const dependencies = new Map<string, { key: SectionKey; generation: number }>();
+  const cellKeyOf = (point: Vec3Like): string => `${Math.floor(point.x)},${Math.floor(point.y)},${Math.floor(point.z)}`;
+  // Same-content observations leave current geometry unchanged, except when
+  // they restore a cell this search already rejected as expired/stale. Keep
+  // those read dependencies separate from Section content/residency changes.
+  const refreshSensitiveCells = new Set<string>();
   const unavailable = new Map<string, SectionKey>();
   const boundaries: LandSearchBoundary[] = [];
   const counts = { UNKNOWN: 0, STALE: 0, BLOCKED: 0, UNSUPPORTED: 0, INCOMPLETE: 0 };
@@ -539,7 +544,10 @@ function* searchChunks(
         : now > evidence.validUntil ? 'expired' : null;
       if (staleReason !== null) {
         stats.staleReads += 1;
-        if (evidenceMode === 'current') return { pos, kind: 'stale', reason: staleReason };
+        if (evidenceMode === 'current') {
+          refreshSensitiveCells.add(cellKeyOf(pos));
+          return { pos, kind: 'stale', reason: staleReason };
+        }
       }
       if (!evidence.observation.stateComplete) return { pos, kind: 'incomplete' };
       const state = evidence.observation.state;
@@ -598,8 +606,6 @@ function* searchChunks(
     }
     return { surfaces, gaps };
   }
-  const cellKeyOf = (point: Vec3Like): string =>
-    `${Math.floor(point.x)},${Math.floor(point.y)},${Math.floor(point.z)}`;
   const climbSourceCache = new Map<string, boolean>();
   /**
    * Classify a node as a climb source using the same explicit provider that
@@ -790,7 +796,8 @@ function* searchChunks(
   let found: SearchNode | null = null;
   const unsubscribe = map.subscribeChanges((report) => {
     if (report.sections.some((section) => dependencies.has(sectionKeyString(section.key))
-      && (evidenceMode === 'current' || section.invalidated))) invalidated = true;
+      && (section.invalidated || (evidenceMode === 'current'
+        && section.cells.some((cell) => cell.kind === 'refreshed' && refreshSensitiveCells.has(cellKeyOf(cell.pos))))))) invalidated = true;
   });
   try {
     search: while (open.size > 0) {
@@ -844,7 +851,9 @@ function* searchChunks(
                 if (neighborReads > geometryLimits.maxNeighborReads || shapeWork > geometryLimits.maxWork) {
                   throw new LandSearchGeometryBudgetExceeded();
                 }
-                return neighbor.cell(nx, ny, nz);
+                const view = neighbor.cell(nx, ny, nz);
+                if (evidenceMode === 'current' && view.kind === 'stale') refreshSensitiveCells.add(cellKeyOf(view.pos));
+                return view;
               },
             });
             if (resolution.kind === 'shape') {
@@ -867,6 +876,12 @@ function* searchChunks(
             ? evaluateRememberedLandTransition(map, { ...scope, transition: { kind, from: node.point, to } }, rules, now, geometryLimits)
             : evaluateLandTransition(map, { ...scope, transition: { kind, from: node.point, to } }, rules, now, geometryLimits);
         evaluation.dependencies.forEach((dependency) => addDependency(dependency.key));
+        if ('reasons' in evaluation) {
+          evaluation.reasons.filter((reason) => reason.kind === 'stale' || reason.kind === 'expired' || reason.kind === 'wrong_session')
+            .flatMap((reason) => reason.cells).forEach((cell) => refreshSensitiveCells.add(cellKeyOf(cell)));
+        } else if ('problem' in evaluation && evaluation.problem?.kind === 'stale') {
+          evaluation.problem.cells.forEach((cell) => refreshSensitiveCells.add(cellKeyOf(cell)));
+        }
         if ('work' in evaluation && evaluation.work.exhausted) budget = 'geometry';
         if ('limitGap' in evaluation && evaluation.limitGap !== undefined) budget = 'geometry';
         const status = 'geometry' in evaluation
