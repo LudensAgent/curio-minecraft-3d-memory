@@ -19,7 +19,7 @@ import type { SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
 
-export type LandSearchKind = 'walk' | 'step' | 'drop';
+export type LandSearchKind = 'walk' | 'step' | 'drop' | 'ladder';
 export type LandSearchArrival = { kind: 'exact' } | { kind: 'near'; radius: number };
 export type LandSearchStatus =
   | 'FOUND'
@@ -347,8 +347,8 @@ function* searchChunks(
   const heuristicMode = request.heuristic ?? 'horizontal';
   if (heuristicMode !== 'horizontal' && heuristicMode !== 'zero') throw new Error('unsupported land search heuristic');
   const allowed = new Set(request.allowed ?? ['walk', 'step', 'drop']);
-  if ([...allowed].some((kind) => kind !== 'walk' && kind !== 'step' && kind !== 'drop')) {
-    throw new Error('land search supports walk, step and drop geometry only');
+  if ([...allowed].some((kind) => kind !== 'walk' && kind !== 'step' && kind !== 'drop' && kind !== 'ladder')) {
+    throw new Error('land search supports walk, step, drop and ladder geometry only');
   }
   // Validate, copy and normalize the corridor exactly once at the request
   // boundary so the hot expansion loop only compares finite numbers.
@@ -718,6 +718,149 @@ function* searchChunks(
       // is already outside never authorizes a "return to corridor" move because
       // the from-endpoint remains outside, so every candidate here is skipped.
       const fromInCorridor = corridor === undefined || corridorContains(node.point);
+      /**
+       * One bounded candidate edge shared by horizontal and ladder expansion.
+       * Returns 'stop' only for a search-wide budget/cancellation stop; policy
+       * rejection is a delegation restriction and returns 'ok'.
+       */
+      const considerEdge = function* (
+        kind: LandSearchKind,
+        to: Vec3Like,
+        dx: number,
+        dz: number,
+      ): Generator<void, 'ok' | 'stop', void> {
+        if (!allowed.has(kind)) {
+          // Keep the diagnostic boundary, but never turn an authorization /
+          // movement-kind restriction into an observed terrain blocker: no
+          // geometry was evaluated for this candidate.
+          boundary(node.point, to, 'UNSUPPORTED', `${kind} is outside the requested movement kinds`);
+          return 'ok';
+        }
+        if (stats.edgesEvaluated >= maxEdges) { budget = 'edges'; return 'stop'; }
+        const dy = to.y - node.point.y;
+        const edgeBody = { ...body, feet: node.point };
+        const scope = { worldId: request.worldId, dim: request.dim, sessionId: request.sessionId, body: edgeBody };
+        // Walk predates LandLimits. Bound provider-derived work for it as well
+        // as for step/drop/ladder, without silently translating capacity into an obstacle.
+        let shapeBoxes = 0;
+        let supportFaces = 0;
+        let neighborReads = 0;
+        let shapeWork = 0;
+        const shapeProvider: CollisionShapeProvider = {
+          version: ruleVersion,
+          resolve(state, cell, neighbor) {
+            shapeWork += 1;
+            if (shapeWork > geometryLimits.maxWork) throw new LandSearchGeometryBudgetExceeded();
+            const resolution = request.rules.shapeProvider.resolve(state, cell, {
+              cell(nx, ny, nz) {
+                neighborReads += 1;
+                shapeWork += 1;
+                if (neighborReads > geometryLimits.maxNeighborReads || shapeWork > geometryLimits.maxWork) {
+                  throw new LandSearchGeometryBudgetExceeded();
+                }
+                return neighbor.cell(nx, ny, nz);
+              },
+            });
+            if (resolution.kind === 'shape') {
+              shapeBoxes += resolution.shape.boxes.length;
+              supportFaces += resolution.shape.supportFaces.length;
+              shapeWork += resolution.shape.boxes.length + resolution.shape.supportFaces.length;
+              if (shapeBoxes > geometryLimits.maxShapeBoxes || supportFaces > geometryLimits.maxSupportFaces
+                || shapeWork > geometryLimits.maxWork) throw new LandSearchGeometryBudgetExceeded();
+            }
+            return resolution;
+          },
+        };
+        const rules = { ...request.rules, shapeProvider };
+        stats.edgesEvaluated += 1;
+        const evaluation = kind === 'walk'
+          ? evidenceMode === 'remembered'
+            ? evaluateRememberedWalkStep(map, { ...scope, mode: 'walk', direction: dx === 0 ? { axis: 'z', sign: dz as 1 | -1 } : { axis: 'x', sign: dx as 1 | -1 } }, shapeProvider, now)
+            : evaluateWalkStep(map, { ...scope, mode: 'walk', direction: dx === 0 ? { axis: 'z', sign: dz as 1 | -1 } : { axis: 'x', sign: dx as 1 | -1 } }, shapeProvider, now)
+          : evidenceMode === 'remembered'
+            ? evaluateRememberedLandTransition(map, { ...scope, transition: { kind, from: node.point, to } }, rules, now, geometryLimits)
+            : evaluateLandTransition(map, { ...scope, transition: { kind, from: node.point, to } }, rules, now, geometryLimits);
+        evaluation.dependencies.forEach((dependency) => addDependency(dependency.key));
+        if ('work' in evaluation && evaluation.work.exhausted) budget = 'geometry';
+        if ('limitGap' in evaluation && evaluation.limitGap !== undefined) budget = 'geometry';
+        const status = 'geometry' in evaluation
+          ? evaluation.geometry === 'PASSABLE' ? 'OPEN'
+            : evaluation.geometry === 'OBSTRUCTED' ? 'BLOCKED' : evaluation.geometry
+          : evaluation.status;
+        if (status !== 'OPEN') {
+          const reason = typeof evaluation.reason === 'string'
+            ? evaluation.reason : evaluation.reason?.detail ?? 'transition geometry is not available';
+          boundary(node.point, to, status, reason);
+          noteBlocker(node, to, status, reason);
+          return 'ok';
+        }
+        let cost = kind === 'walk' ? 1 : kind === 'ladder' ? 1 : 2 + Math.abs(dy);
+        if (edgePolicy !== undefined) {
+          if (stopped() !== null) return 'stop';
+          policyReadsThisEdge = 0;
+          const edge: LandSearchPolicyEdge = {
+            kind,
+            from: { ...node.point },
+            to: { ...to },
+            baseCost: cost,
+            hazards: evaluation.hazards ?? [],
+            evidenceMode,
+          };
+          let decision!: LandSearchPolicyDecision;
+          try {
+            decision = validatePolicyDecision(edgePolicy.evaluate(edge, policyRead));
+          } catch (error) {
+            if (error instanceof LandSearchPolicyAborted) return 'stop';
+            throw error;
+          }
+          if (stopped() !== null) return 'stop';
+          if (decision.allow) {
+            const extraCost = decision.extraCost ?? 0;
+            cost += extraCost;
+            if (!Number.isFinite(cost)) {
+              throw new Error('land search edge policy produced a non-finite path cost');
+            }
+          } else {
+            policyRejectedEdges += 1;
+            policyFirstRejection ??= {
+              from: { ...node.point },
+              to: { ...to },
+              reason: decision.reason,
+            };
+            // Rejections are delegation restrictions, not terrain facts.
+            yield* pause();
+            return 'ok';
+          }
+        }
+        const g = node.g + cost;
+        if (edgePolicy !== undefined && !Number.isFinite(g)) {
+          throw new Error('land search edge policy produced non-finite accumulated path cost');
+        }
+        const key = keyOf(to);
+        const previous = nodes.get(key);
+        if (previous === undefined || g < previous.g) {
+          if (previous === undefined && nodes.size >= maxNodes) { budget = 'nodes'; return 'stop'; }
+          const via = { kind, from: { ...node.point }, to: { ...to }, cost, hazards: evaluation.hazards ?? [] };
+          const next: SearchNode = { point: to, g, parent: node, via };
+          // A point can be reached again with a lower g. Carry the bounded
+          // node blocker forward, and re-point `closest` when it still
+          // referenced the superseded object so the prefix follows the new
+          // (cheaper, already evaluated) parent chain.
+          if (previous !== undefined && previous.blocker !== undefined) next.blocker = previous.blocker;
+          nodes.set(key, next);
+          stats.nodesReached = nodes.size;
+          // Track the closest actually reached node on insertion, not on
+          // pop: a goal queued just before a budget stop still counts.
+          const metric = remainingMetric(to);
+          if (closest === previous || metric < closestMetric) {
+            closest = next;
+            closestMetric = metric;
+          }
+          open.push({ key, g, f: g + heuristic(to) });
+        }
+        yield* pause();
+        return 'ok';
+      };
       for (const [dx, dz] of DIRECTIONS) {
         const x = node.point.x + dx;
         const z = node.point.z + dz;
@@ -775,136 +918,20 @@ function* searchChunks(
           const dy = y - node.point.y;
           const kind: LandSearchKind = Math.abs(dy) <= EPS ? 'walk' : dy > 0 ? 'step' : 'drop';
           const to = { x, y, z };
-          if (!allowed.has(kind)) {
-            // Keep the diagnostic boundary, but never turn an authorization /
-            // movement-kind restriction into an observed terrain blocker: no
-            // geometry was evaluated for this candidate.
-            boundary(node.point, to, 'UNSUPPORTED', `${kind} is outside the requested movement kinds`);
+          const outcome = yield* considerEdge(kind, to, dx, dz);
+          if (outcome === 'stop') break search;
+        }
+      }
+      if (allowed.has('ladder') && fromInCorridor) {
+        for (const dy of [1, -1]) {
+          if (stopped() !== null) break search;
+          const to = { x: node.point.x, y: node.point.y + dy, z: node.point.z };
+          if (!corridorContains(to)) {
+            stats.corridorSkipped += 1;
             continue;
           }
-          if (stats.edgesEvaluated >= maxEdges) { budget = 'edges'; break search; }
-          const edgeBody = { ...body, feet: node.point };
-          const scope = { worldId: request.worldId, dim: request.dim, sessionId: request.sessionId, body: edgeBody };
-          // Walk predates LandLimits. Bound provider-derived work for it as well
-          // as for step/drop, without silently translating capacity into an obstacle.
-          let shapeBoxes = 0;
-          let supportFaces = 0;
-          let neighborReads = 0;
-          let shapeWork = 0;
-          const shapeProvider: CollisionShapeProvider = {
-            version: ruleVersion,
-            resolve(state, cell, neighbor) {
-              shapeWork += 1;
-              if (shapeWork > geometryLimits.maxWork) throw new LandSearchGeometryBudgetExceeded();
-              const resolution = request.rules.shapeProvider.resolve(state, cell, {
-                cell(nx, ny, nz) {
-                  neighborReads += 1;
-                  shapeWork += 1;
-                  if (neighborReads > geometryLimits.maxNeighborReads || shapeWork > geometryLimits.maxWork) {
-                    throw new LandSearchGeometryBudgetExceeded();
-                  }
-                  return neighbor.cell(nx, ny, nz);
-                },
-              });
-              if (resolution.kind === 'shape') {
-                shapeBoxes += resolution.shape.boxes.length;
-                supportFaces += resolution.shape.supportFaces.length;
-                shapeWork += resolution.shape.boxes.length + resolution.shape.supportFaces.length;
-                if (shapeBoxes > geometryLimits.maxShapeBoxes || supportFaces > geometryLimits.maxSupportFaces
-                  || shapeWork > geometryLimits.maxWork) throw new LandSearchGeometryBudgetExceeded();
-              }
-              return resolution;
-            },
-          };
-          const rules = { ...request.rules, shapeProvider };
-          stats.edgesEvaluated += 1;
-          const evaluation = kind === 'walk'
-            ? evidenceMode === 'remembered'
-              ? evaluateRememberedWalkStep(map, { ...scope, mode: 'walk', direction: dx === 0 ? { axis: 'z', sign: dz as 1 | -1 } : { axis: 'x', sign: dx as 1 | -1 } }, shapeProvider, now)
-              : evaluateWalkStep(map, { ...scope, mode: 'walk', direction: dx === 0 ? { axis: 'z', sign: dz as 1 | -1 } : { axis: 'x', sign: dx as 1 | -1 } }, shapeProvider, now)
-            : evidenceMode === 'remembered'
-              ? evaluateRememberedLandTransition(map, { ...scope, transition: { kind, from: node.point, to } }, rules, now, geometryLimits)
-              : evaluateLandTransition(map, { ...scope, transition: { kind, from: node.point, to } }, rules, now, geometryLimits);
-          evaluation.dependencies.forEach((dependency) => addDependency(dependency.key));
-          if ('work' in evaluation && evaluation.work.exhausted) budget = 'geometry';
-          if ('limitGap' in evaluation && evaluation.limitGap !== undefined) budget = 'geometry';
-          const status = 'geometry' in evaluation
-            ? evaluation.geometry === 'PASSABLE' ? 'OPEN'
-              : evaluation.geometry === 'OBSTRUCTED' ? 'BLOCKED' : evaluation.geometry
-            : evaluation.status;
-          if (status !== 'OPEN') {
-            const reason = typeof evaluation.reason === 'string'
-              ? evaluation.reason : evaluation.reason?.detail ?? 'transition geometry is not available';
-            boundary(node.point, to, status, reason);
-            noteBlocker(node, to, status, reason);
-          } else {
-            let cost = kind === 'walk' ? 1 : 2 + Math.abs(dy);
-            if (edgePolicy !== undefined) {
-              if (stopped() !== null) break search;
-              policyReadsThisEdge = 0;
-              const edge: LandSearchPolicyEdge = {
-                kind,
-                from: { ...node.point },
-                to: { ...to },
-                baseCost: cost,
-                hazards: evaluation.hazards ?? [],
-                evidenceMode,
-              };
-              let decision!: LandSearchPolicyDecision;
-              try {
-                decision = validatePolicyDecision(edgePolicy.evaluate(edge, policyRead));
-              } catch (error) {
-                if (error instanceof LandSearchPolicyAborted) break search;
-                throw error;
-              }
-              if (stopped() !== null) break search;
-              if (decision.allow) {
-                const extraCost = decision.extraCost ?? 0;
-                cost += extraCost;
-                if (!Number.isFinite(cost)) {
-                  throw new Error('land search edge policy produced a non-finite path cost');
-                }
-              } else {
-                policyRejectedEdges += 1;
-                policyFirstRejection ??= {
-                  from: { ...node.point },
-                  to: { ...to },
-                  reason: decision.reason,
-                };
-                // Rejections are delegation restrictions, not terrain facts.
-                // Keep the cooperative pause on this candidate.
-                yield* pause();
-                continue;
-              }
-            }
-            const g = node.g + cost;
-            if (edgePolicy !== undefined && !Number.isFinite(g)) {
-              throw new Error('land search edge policy produced non-finite accumulated path cost');
-            }
-            const key = keyOf(to);
-            const previous = nodes.get(key);
-            if (previous === undefined || g < previous.g) {
-              if (previous === undefined && nodes.size >= maxNodes) { budget = 'nodes'; break search; }
-              const via = { kind, from: { ...node.point }, to: { ...to }, cost, hazards: evaluation.hazards ?? [] };
-              const next: SearchNode = { point: to, g, parent: node, via };
-              // A point can be reached again with a lower g. Carry the bounded
-              // node blocker forward, and re-point `closest` when it still
-              // referenced the superseded object so the prefix follows the new
-              // (cheaper, already evaluated) parent chain.
-              if (previous !== undefined && previous.blocker !== undefined) next.blocker = previous.blocker;
-              nodes.set(key, next);
-              stats.nodesReached = nodes.size;
-              // Track the closest actually reached node on insertion, not on
-              // pop: a goal queued just before a budget stop still counts.
-              const metric = remainingMetric(to);
-              if (closest === previous || metric < closestMetric) {
-                closest = next;
-                closestMetric = metric;
-              }
-              open.push({ key, g, f: g + heuristic(to) });
-            }
-          }
-          yield* pause();
+          const outcome = yield* considerEdge('ladder', to, 0, 0);
+          if (outcome === 'stop') break search;
         }
       }
     }

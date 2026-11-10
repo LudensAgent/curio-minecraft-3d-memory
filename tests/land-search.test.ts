@@ -5,7 +5,8 @@ import { evaluateRememberedWalkStep, evaluateWalkStep } from '../src/traversabil
 import type { CollisionShapeProvider } from '../src/traversability/collision-shape.js';
 import { evaluateRememberedLandTransition, resolveLandLimits } from '../src/traversability/land-transition.js';
 import { VoxelMap } from '../src/voxel/voxel-map.js';
-import { AIR, SLAB, STONE, bodyAt, fakeProvider, obs, stepQuery } from './fakes.js';
+import type { ClimbRegionProvider } from '../src/traversability/index.js';
+import { AIR, EMPTY, SLAB, STONE, bodyAt, fakeProvider, obs, stepQuery } from './fakes.js';
 
 type Column = { x: number; z: number; height: number };
 
@@ -44,6 +45,22 @@ function request(overrides: Partial<LandSearchRequest> = {}): LandSearchRequest 
 
 const flat = (length = 3): Column[] => Array.from({ length }, (_, x) => ({ x, z: 0, height: 0 }));
 
+const LADDER = { name: 'minecraft:ladder', properties: { facing: 'north' } };
+const ladderShapes: CollisionShapeProvider = {
+  version: 'ladder-search-shapes-v1',
+  resolve(state, cell, read) {
+    if (state.name === LADDER.name) return { kind: 'shape', shape: EMPTY };
+    return fakeProvider.resolve(state, cell, read);
+  },
+};
+const ladderClimb: ClimbRegionProvider = {
+  version: 'ladder-search-climb-v1',
+  resolve(input) {
+    if (input.state.name !== LADDER.name) return { kind: 'regions', regions: [] };
+    return { kind: 'regions', regions: [{ minFeetY: input.cell.y, maxFeetY: input.cell.y + 1 }] };
+  },
+};
+
 describe('bounded voxel land search', () => {
   it('finds a voxel-only route across negative coordinates, slabs, steps and drops', () => {
     const map = terrain([
@@ -59,6 +76,29 @@ describe('bounded voxel land search', () => {
     expect(result.executable).toBe(false);
     expect(result.needsRevalidation).toBe(true);
     expect(map.checkpointSnapshot()).toEqual(before);
+  });
+
+  it('plans vertical ladder edges only when the caller explicitly allows them', () => {
+    const map = new VoxelMap('world', { now: () => 1000 });
+    let ladderSequence = 0;
+    const ladderObs = (state: typeof AIR, y: number) => map.observe(obs(state, { x: 0, y, z: 0 }, {
+      sequence: ++ladderSequence, observedAt: 1000 + ladderSequence,
+    }));
+    ladderObs(STONE, -1);
+    for (const y of [0, 1, 2]) ladderObs(LADDER, y);
+    for (const y of [3, 4]) ladderObs(AIR, y);
+    const rules = { shapeProvider: ladderShapes, climbProvider: ladderClimb };
+    const ladderRequest = request({
+      body: bodyAt(0.5, 0, 0.5), to: { x: 0.5, y: 2, z: 0.5 }, rules, allowed: ['ladder'],
+    });
+    const result = searchLandRoute(map, ladderRequest, 2000);
+    expect(result.status).toBe('FOUND');
+    expect(result.transitions.map((transition) => transition.kind)).toEqual(['ladder', 'ladder']);
+    expect(result.points.map((point) => point.y)).toEqual([0, 1, 2]);
+    expect(result.cost).toBe(2);
+
+    const defaultKinds = searchLandRoute(map, { ...ladderRequest, allowed: ['walk', 'step', 'drop'] }, 2000);
+    expect(defaultKinds.status).not.toBe('FOUND');
   });
 
   it('preserves fractional starting offsets and exact targets without centering or height snapping', () => {
