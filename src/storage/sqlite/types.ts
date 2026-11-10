@@ -1,12 +1,14 @@
 /**
- * Public types for the SQLite history-persistence entry (phase 5A).
+ * Public types for the SQLite voxel/facts/ledger/journal persistence entry.
  *
- * These are the concrete contracts for the `openHistorySession` lifecycle —
- * explicit, bounded checkpoint save + restore of the four historical facts
- * (`PathFragment`, `TraversalEvidence`, `SpatialNode`, and topology edges with
- * their original binding snapshots). They are deliberately named separately from
- * the general `PersistenceWorker`/`SaveBatch` sketches in `storage/worker.ts`,
- * which this phase neither implements nor supersedes.
+ * The retired history and topology domains are not part of this contract. One
+ * worker owns the committed voxel sections, the world-scoped ledger, the
+ * append-only journal, and the semantic facts domain; `checkpoint()` is the
+ * only explicit save trigger.
+ *
+ * `LegacyStoreSummary` is the sole remnant of the old route tables: a read-only
+ * count/marker projection. The worker never writes those tables and never
+ * restores their data.
  */
 
 import type { ActionRecord } from '../../navigation/types.js';
@@ -17,15 +19,6 @@ import type {
   FactStore,
 } from '../../facts/types.js';
 import type { LedgerDelta, LedgerStore } from './ledger.js';
-import type { FragmentStore, FragmentStoreOptions } from '../../topology/fragment-store.js';
-import type { TopologyStore, TopologyStoreOptions } from '../../topology/topology-store.js';
-import type {
-  PathFragment,
-  SpatialNode,
-  TopologyEdgeSnapshot,
-  TopologyPortalEdgeSnapshot,
-  TraversalEvidence,
-} from '../../topology/index.js';
 import type { Vec3Like } from '../../types.js';
 import type { SectionKey } from '../../voxel/section.js';
 import type {
@@ -40,7 +33,7 @@ import type {
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import type { VoxelMap, VoxelMapOptions } from '../../voxel/voxel-map.js';
 
-/** Lifecycle of a history session. */
+/** Lifecycle of a persistence session. */
 export type SessionLifecycle = 'open' | 'closing' | 'closed';
 
 /** Distinct persistence failure modes. Thrown as `PersistenceError`. */
@@ -73,22 +66,6 @@ export class PersistenceError extends Error {
 
 /** Bounded snapshot capacity limits. These are implementation capacities, not game rules. */
 export interface SnapshotLimits {
-  /** Maximum fragments captured in one checkpoint. Default 10000. */
-  maxFragments?: number;
-  /** Maximum traversal records captured in one checkpoint. Default 100000. */
-  maxTraversals?: number;
-  /** Maximum nodes captured in one checkpoint. Default 20000. */
-  maxNodes?: number;
-  /** Maximum edges captured in one checkpoint. Default 20000. */
-  maxEdges?: number;
-  /** Maximum total polyline points across all fragments. Default 2_000_000. */
-  maxPolylinePoints?: number;
-  /** Maximum total entrance points across all fragments. Default 100_000. */
-  maxEntrancePoints?: number;
-  /** Maximum total link pairs across all fragments. Default 2_000_000. */
-  maxLinks?: number;
-  /** Maximum total edge evidence refs (binding snapshots). Default 50_000. */
-  maxEdgeEvidenceRefs?: number;
   /** Maximum voxel sections captured in one checkpoint. Default 10000. */
   maxVoxelSections?: number;
   /** Maximum observed voxel cells (evidence entries) captured in one checkpoint. Default 1_000_000. */
@@ -105,14 +82,6 @@ export interface SnapshotLimits {
 
 /** `SnapshotLimits` with every default resolved. Shared with the worker for load/write bounds. */
 export interface ResolvedSnapshotLimits {
-  maxFragments: number;
-  maxTraversals: number;
-  maxNodes: number;
-  maxEdges: number;
-  maxPolylinePoints: number;
-  maxEntrancePoints: number;
-  maxLinks: number;
-  maxEdgeEvidenceRefs: number;
   maxVoxelSections: number;
   maxObservedCells: number;
   maxPaletteEntries: number;
@@ -122,14 +91,6 @@ export interface ResolvedSnapshotLimits {
 }
 
 export const DEFAULT_SNAPSHOT_LIMITS: ResolvedSnapshotLimits = {
-  maxFragments: 10_000,
-  maxTraversals: 100_000,
-  maxNodes: 20_000,
-  maxEdges: 20_000,
-  maxPolylinePoints: 2_000_000,
-  maxEntrancePoints: 100_000,
-  maxLinks: 2_000_000,
-  maxEdgeEvidenceRefs: 50_000,
   maxVoxelSections: 10_000,
   maxObservedCells: 1_000_000,
   maxPaletteEntries: 200_000,
@@ -393,12 +354,6 @@ export function resolveLedgerLimits(options: LedgerLimits | undefined): Resolved
  * The explicit event vocabulary accepted by the journal. This is deliberately a
  * closed union rather than an arbitrary JSON blob: every variant names the
  * original evidence and scope it rests on.
- *
- * `cell_blocked` / `cell_cleared` / `cell_revalidated` classify an important
- * traversability change for one cell. Their `evidence` is the observation that
- * established the classification; it must belong to the event's own session and
- * carry its exact acquisition time. The classification itself is the caller's
- * statement about traversability, not an inferred game rule.
  */
 export type SpatialEvent =
   | {
@@ -487,9 +442,8 @@ export interface JournalBatchAcceptResult {
 
 /**
  * Bounded snapshot of caller-accepted records not yet confirmed by a checkpoint
- * ACK, for explicit recovery. A timed-out checkpoint may already have committed
- * while its confirmation was lost. Entries are isolated copies; mutating them
- * cannot change the session's pending queue.
+ * ACK, for explicit recovery. Entries are isolated copies; mutating them cannot
+ * change the session's pending queue.
  */
 export interface PendingJournalSnapshot {
   revision: number;
@@ -562,12 +516,6 @@ export interface JournalController {
   recordEvent(event: SpatialEvent): JournalAcceptResult;
   recordBatch(batch: JournalBatchInput): JournalBatchAcceptResult;
   readPending(): PendingJournalSnapshot;
-  /**
-   * Deliberately drop exact pending records (e.g. a rejected/conflicting replay).
-   * Rejects with `busy` while any checkpoint is in flight. Never deletes committed
-   * rows. An actual withdrawal advances the local journal revision so an empty
-   * checkpoint can confirm the new state.
-   */
   withdraw(selector: JournalWithdrawalSelector): JournalWithdrawalResult;
 }
 
@@ -575,138 +523,13 @@ export interface JournalController {
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
- * Fixed byte cost of the outer snapshot envelope (`{"worldId":…,"fragments":…,
- * "traversals":…,"nodes":…,"edges":…}` — field names, braces, colons, and the four
- * `[`/`]` array brackets), *excluding* the JSON-escaped `worldId` value and the
- * inter-record commas (both counted separately, since they grow with content).
- */
-export const SNAPSHOT_FRAME_BYTES = 65;
-
-/**
  * Fixed byte cost of the outer voxel snapshot envelope (`{"worldId":…,"sections":[
- * …]}` — field names, braces, colons and the `[`/`]` brackets), *excluding* the
- * JSON-escaped `worldId` value and inter-section commas (counted separately, since
- * they grow with content). The worldId is counted twice across the history and
- * voxel envelopes in a combined snapshot — a conservative over-count, never an
- * under-estimate.
+ * …]}`), excluding the JSON-escaped `worldId` value and inter-section commas.
  */
 export const VOXEL_FRAME_BYTES = 30;
 
-/**
- * The full four-fact snapshot sent to and returned from the worker. This is the
- * persisted shape, not a query projection: edges carry their original binding
- * snapshots, and records are ordered by insertion order.
- */
-export interface HistorySnapshot {
-  worldId: string;
-  fragments: PathFragment[];
-  traversals: TraversalEvidence[];
-  nodes: SpatialNode[];
-  edges: TopologyEdgeSnapshot[];
-  /**
-   * Portal edges are a separate graph from walk edges; they must survive a
-   * restart together with their raw traversal evidence.
-   */
-  portalEdges?: TopologyPortalEdgeSnapshot[];
-  /** Evidence-backed explicit fragment merges (id pairs). */
-  fragmentMerges?: [string, string][];
-}
-
-/** Options for `openHistorySession`. */
-export interface OpenHistorySessionOptions {
-  /** Absolute path to the SQLite database file. Required. */
-  databasePath: string;
-  /** The world this session persists. Required. */
-  worldId: string;
-  fragmentOptions?: FragmentStoreOptions;
-  topologyOptions?: TopologyStoreOptions;
-  snapshotLimits?: SnapshotLimits;
-  /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
-  journalLimits?: JournalLimits;
-  /** Bound for worker open/checkpoint/close/flush waits. Default 30000 ms. */
-  timeoutMs?: number;
-}
-
-/** Result of a successful, committed checkpoint. */
-export interface CheckpointResult {
-  checkpointId: string;
-  worldId: string;
-  fragmentRevision: number;
-  topologyRevision: number;
-}
-
-/** Result of `flush()`. */
-export interface FlushResult {
-  /** Whether there was an in-flight checkpoint at flush time. */
-  pending: boolean;
-  /** Whether the awaited checkpoint (if any) committed. */
-  completed: boolean;
-  /** Whether the memory revisions still lead the confirmed checkpoint. */
-  dirty: boolean;
-  error: PersistenceError | null;
-}
-
-/** Result of `close()`. */
-export interface CloseResult {
-  /** Whether the persistence channel closed cleanly. */
-  completed: boolean;
-  /** Last checkpoint id confirmed this session (null if none). */
-  lastConfirmedCheckpointId: string | null;
-  /** Whether an accepted request was left unconfirmed (failed/timed out). */
-  unconfirmedRequest: boolean;
-  /** Whether memory revisions still lead the confirmed checkpoint. */
-  dirty: boolean;
-  error: PersistenceError | null;
-}
-
-/** Snapshot of the session's persistence state. */
-export interface PersistenceState {
-  lifecycle: SessionLifecycle;
-  /** Current fragment-store mutation revision. */
-  fragmentRevision: number;
-  /** Current topology-store mutation revision. */
-  topologyRevision: number;
-  /** Fragment revision last confirmed on disk (recovery baseline or last checkpoint). */
-  confirmedFragmentRevision: number;
-  /** Topology revision last confirmed on disk (recovery baseline or last checkpoint). */
-  confirmedTopologyRevision: number;
-  /** Whether current revisions lead the confirmed revisions. */
-  dirty: boolean;
-  /** Checkpoint id restored from disk at open (null when the DB had no committed state). */
-  baselineCheckpointId: string | null;
-  /** Last checkpoint id confirmed this session (null until the first one). */
-  lastConfirmedCheckpointId: string | null;
-  /** Checkpoint id currently in flight (null when none). */
-  inFlightCheckpointId: string | null;
-  /** Checkpoint id whose commit confirmation was lost (timeout/unconfirmed), if any. */
-  unconfirmedCheckpointId: string | null;
-  lastError: PersistenceError | null;
-}
-
-/** The history persistence session handed to the caller by `openHistorySession`. */
-export interface HistorySession {
-  readonly history: FragmentStore;
-  readonly topology: TopologyStore;
-  /** Capture and commit the current full history; rejects when busy/closing/closed/over-capacity. */
-  checkpoint(): Promise<CheckpointResult>;
-  getPersistenceState(): PersistenceState;
-  /** Wait only for an already-accepted checkpoint; never captures new memory changes. */
-  flush(): Promise<FlushResult>;
-  /** Stop accepting writes and shut the persistence channel down within a bounded time. */
-  close(): Promise<CloseResult>;
-}
-
 /** How a combined spatial session loads voxel sections at open. */
 export type VoxelLoading = 'eager' | 'manual';
-
-/**
- * How history/topology is loaded at open. `none` validates the committed
- * baseline/counts but does not decode or restore old fragments/nodes; callers
- * starting a new main session use it to avoid materializing the old domain.
- * A `none` session refuses to overwrite that preserved domain with a full
- * history/topology checkpoint; migration must be explicit.
- */
-export type HistoryLoading = 'eager' | 'none';
 
 /** Row counts of one world's retired history/topology domains, read at open. */
 export interface LegacyStoreSummary {
@@ -725,19 +548,11 @@ export interface OpenSpatialSessionOptions {
   /** The world this session persists. Required. */
   worldId: string;
   voxelOptions?: VoxelMapOptions;
-  fragmentOptions?: FragmentStoreOptions;
-  topologyOptions?: TopologyStoreOptions;
   snapshotLimits?: SnapshotLimits;
   /**
-   * Per-checkpoint voxel dirty-batch byte cap. Defaults to `snapshotLimits.maxBytes`
-   * (one batch, preserving the previous behavior). A smaller value makes each
-   * checkpoint commit a bounded dirty prefix; remaining dirty sections stay pending
-   * and require a later checkpoint. The ACK confirms only the captured section keys.
-   *
-   * The cap is a soft bound for one oversized Section: the first dirty Section is
-   * always included so a batch can make progress. `snapshotLimits.maxBytes` remains
-   * the full committed-set quota checked by the worker, not a per-batch quota.
-   * Must not exceed `snapshotLimits.maxBytes`.
+   * Per-checkpoint voxel dirty-batch byte cap. Defaults to `snapshotLimits.maxBytes`.
+   * A smaller value makes each checkpoint commit a bounded dirty prefix; remaining
+   * dirty sections stay pending and require a later checkpoint.
    */
   voxelBatchMaxBytes?: number;
   /** Bounded journal capacities. Defaults are in `DEFAULT_JOURNAL_LIMITS`. */
@@ -752,16 +567,10 @@ export interface OpenSpatialSessionOptions {
   gameVersion?: string;
   /**
    * Voxel loading mode. `eager` (default) restores every committed section into
-   * memory at open, preserving the phase 5B/5C behavior. `manual` reads only the
-   * committed section directory at open and requires explicit `loadSections`.
+   * memory at open. `manual` reads only the committed section directory at open
+   * and requires explicit `loadSections`.
    */
   voxelLoading?: VoxelLoading;
-  /**
-   * History/topology loading mode. `eager` (default) restores old fragments and
-   * topology nodes; `none` validates the committed baseline without decoding
-   * payloads and refuses to replace that domain with an implicit full snapshot.
-   */
-  historyLoading?: HistoryLoading;
   /** Working-set bounds used when `voxelLoading` is `manual`. */
   residencyLimits?: ResidencyLimits;
   /** Bound for worker open/checkpoint/close/flush waits. Default 30000 ms. */
@@ -789,8 +598,6 @@ export interface SpatialCheckpointResult {
   checkpointId: string;
   worldId: string;
   voxelRevision: number;
-  fragmentRevision: number;
-  topologyRevision: number;
   /**
    * The exact journal revision captured for this checkpoint and confirmed by its
    * ACK. A batch truncated by `maxBatchRecords`/`maxBatchBytes` reports only the
@@ -808,22 +615,15 @@ export interface SpatialCheckpointResult {
 }
 
 /**
- * Snapshot of a combined spatial session's persistence state. Each domain reports
- * its own current and confirmed revisions and its own restore baseline, so a
- * history-only checkpoint can never be read as a voxel save confirmation.
+ * Snapshot of a spatial session's persistence state. Each domain reports its own
+ * current and confirmed revisions and its own restore baseline.
  */
 export interface SpatialPersistenceState {
   lifecycle: SessionLifecycle;
   voxelRevision: number;
-  fragmentRevision: number;
-  topologyRevision: number;
   confirmedVoxelRevision: number;
-  confirmedFragmentRevision: number;
-  confirmedTopologyRevision: number;
   /** True when any domain's current revision leads its confirmed revision. */
   dirty: boolean;
-  /** History/topology restore baseline checkpoint id (null when the DB had no committed state). */
-  baselineCheckpointId: string | null;
   /** Voxel restore baseline checkpoint id (null when voxel has never been saved). */
   voxelBaselineCheckpointId: string | null;
   /** Local journal revision (acceptances/withdrawals); not a save confirmation. */
@@ -836,7 +636,7 @@ export interface SpatialPersistenceState {
    * Minecraft game version recorded on the voxel baseline this session restored
    * from, updated whenever a checkpoint that writes voxel rows is confirmed.
    * `'unknown'` means the baseline rows never recorded a version; null before any
-   * voxel baseline exists. A history-only checkpoint never changes it.
+   * voxel baseline exists.
    */
   restoredGameVersion: string | null;
   /** Local placement/visit/portal ledger revision (not a save confirmation). */
@@ -856,14 +656,11 @@ export interface SpatialPersistenceState {
    * `committed` is false when this world has never written the facts domain.
    */
   factsMigration: FactMigrationState;
-  /**
-   * Accepted but not yet ACK-confirmed journal records (a timed-out checkpoint may
-   * already have committed).
-   */
+  /** Accepted but not yet ACK-confirmed journal records. */
   pendingJournalRecords: number;
   /** Accepted but not yet ACK-confirmed canonical payload bytes. */
   pendingJournalBytes: number;
-  /** Committed journal rows for this world (metadata known without loading payloads). */
+  /** Committed journal rows for this world. */
   committedJournalRecords: number;
   /** Committed canonical payload bytes for this world. */
   committedJournalBytes: number;
@@ -876,15 +673,13 @@ export interface SpatialPersistenceState {
   lastError: PersistenceError | null;
 }
 
-/** The combined spatial persistence session handed to the caller by `openSpatialSession`. */
+/** The spatial persistence session handed to the caller by `openSpatialSession`. */
 export interface SpatialSession {
   /** Explicit host migration receipt; saving facts alone does not establish it. */
   readonly legacyFactsMigrationVersion: number;
-  /** Counts/marker of the retired history/topology rows, read at open even when not loaded. */
+  /** Counts/marker of the retired history/topology rows, read at open as metadata only. */
   readonly legacyStoreSummary: LegacyStoreSummary;
   readonly voxel: VoxelMap;
-  readonly history: FragmentStore;
-  readonly topology: TopologyStore;
   /** World-scoped placement, chunk-visit and portal-crossing ledger. */
   readonly ledger: LedgerStore;
   /**
@@ -905,9 +700,9 @@ export interface SpatialSession {
   /** Synchronous acceptance into the bounded pending journal; acceptance is not a save. */
   readonly journal: JournalController;
   /**
-   * Capture and commit history + topology + voxel + the pending journal batch in
-   * one transaction. Journal rows are append-only; an empty batch never clears
-   * previously committed journal facts.
+   * Capture and commit voxel state + the pending journal batch + the ledger and
+   * facts domains in one transaction. Journal rows are append-only; an empty
+   * batch never clears previously committed journal facts.
    */
   checkpoint(options?: { deadlineMs?: number; completeLegacyFactsMigration?: boolean }): Promise<SpatialCheckpointResult>;
   getPersistenceState(): SpatialPersistenceState;
@@ -930,9 +725,7 @@ export interface SpatialSession {
   loadSections(keys: readonly SectionKey[]): Promise<LoadSectionsResult>;
   /**
    * Bounded read: decode the requested committed sections *without* installing them,
-   * returning their snapshots and their exact resident cost. Used by the working-set
-   * manager to decide how much to evict before installing; the manager holds the
-   * session operation gate while it drives measure → evict → install.
+   * returning their snapshots and their exact resident cost.
    */
   measureSections(keys: readonly SectionKey[]): Promise<MeasureSectionsResult>;
   /** Install already-measured section snapshots into the resident working set. */
@@ -963,27 +756,47 @@ export interface MeasureSectionsResult {
   residentBytes: number;
 }
 
-/** Which facts a worker session persists (history-only vs combined spatial). */
-export type WorkerSessionKind = 'history' | 'spatial';
+/** Result of `flush()`. */
+export interface FlushResult {
+  /** Whether there was an in-flight checkpoint at flush time. */
+  pending: boolean;
+  /** Whether the awaited checkpoint (if any) committed. */
+  completed: boolean;
+  /** Whether the memory revisions still lead the confirmed checkpoint. */
+  dirty: boolean;
+  error: PersistenceError | null;
+}
+
+/** Result of `close()`. */
+export interface CloseResult {
+  /** Whether the persistence channel closed cleanly. */
+  completed: boolean;
+  /** Last checkpoint id confirmed this session (null if none). */
+  lastConfirmedCheckpointId: string | null;
+  /** Whether an accepted request was left unconfirmed (failed/timed out). */
+  unconfirmedRequest: boolean;
+  /** Whether memory revisions still lead the confirmed checkpoint. */
+  dirty: boolean;
+  error: PersistenceError | null;
+}
 
 /**
  * How a checkpoint persists voxel state.
  *
- * - `none`: history-only; the checkpoint never touches `spatial_sections`.
  * - `full`: complete replacement — delete all of this world's sections, then insert
  *   the full set. Used to establish the first voxel save baseline.
  * - `incremental`: upsert only the included sections, leaving all others untouched.
  *   An empty `sections` array means "no voxel change", never "clear the voxel data".
+ * - `none`: legacy wire value; new sessions never send it.
  */
 export type VoxelSaveMode = 'none' | 'full' | 'incremental';
 
 /**
  * How a checkpoint persists the journal.
  *
- * - `none`: never touches journal rows or the journal baseline (history-only sessions).
+ * - `none`: never touches journal rows or the journal baseline.
  * - `append`: appends the captured batch and records a new journal baseline revision.
- *   An empty batch is valid and never deletes committed rows; it is how an
- *   acceptance/withdrawal revision is confirmed without new records.
+ *   An empty batch is valid and never deletes committed rows.
  */
 export type JournalSaveMode = 'none' | 'append';
 
@@ -996,12 +809,9 @@ export type WorkerRequest =
       worldId: string;
       limits: ResolvedSnapshotLimits;
       journalLimits: ResolvedJournalLimits;
-      kind: WorkerSessionKind;
-      /** How history/topology is loaded at open; `none` validates metadata only. */
-      historyLoading?: HistoryLoading;
-      /** How a combined spatial session loads voxel sections at open. */
+      /** How voxel sections are loaded at open. */
       voxelLoading: VoxelLoading;
-      /** Bounded ledger capacities (spatial sessions only). */
+      /** Bounded ledger capacities. */
       ledgerLimits?: ResolvedLedgerLimits;
     }
   | {
@@ -1016,34 +826,21 @@ export type WorkerRequest =
       requestId: number;
       checkpointId: string;
       worldId: string;
-      fragmentRevision: number;
-      topologyRevision: number;
-      snapshot: HistorySnapshot;
-      /**
-       * Whether this checkpoint persists the history (fragments + traversals) and
-       * topology (nodes, edges, portal edges, merges) domains. Omitted means
-       * `full` (every existing caller's behavior). `none` writes no rows for that
-       * domain and keeps its committed baseline untouched, so the omitted arrays
-       * in `snapshot` are never read as "clear this domain".
-       */
-      historyMode?: 'full' | 'none';
-      topologyMode?: 'full' | 'none';
-      /** How this checkpoint persists voxel state (history-only / full / incremental). */
+      /** How this checkpoint persists voxel state (full / incremental). */
       voxelMode: VoxelSaveMode;
       voxelRevision: number;
       /** The full set for `full`, the changed set for `incremental`; ignored for `none`. */
       voxelSnapshot: VoxelCheckpointSnapshot;
-      /** How this checkpoint persists the journal (`none` never alters journal facts/baseline). */
+      /** How this checkpoint persists the journal. */
       journalMode: JournalSaveMode;
       /** Local journal revision captured with this batch. */
       journalRevision: number;
       /** Captured pending records, in acceptance order (may be empty). */
       journalBatch: { actions: ActionRecord[]; events: SpatialEvent[] };
       /**
-       * Ledger persistence mode. `none` (default for history-only checkpoints)
-       * never touches ledger rows; `full` replaces this world's ledger rows in the
-       * same transaction; `delta` upserts/removes only the changed rows (the first
-       * ledger save is still `full`, so an omission is never a deletion).
+       * Ledger persistence mode. `none` never touches ledger rows; `full` replaces
+       * this world's ledger rows in the same transaction; `delta` upserts/removes
+       * only the changed rows.
        */
       ledgerMode?: 'none' | 'full' | 'delta';
       /** Captured ledger revision. */
@@ -1053,9 +850,8 @@ export type WorkerRequest =
       /** Changed placed/visit rows plus new portal crossings for `delta`. */
       ledgerDelta?: LedgerDelta;
       /**
-       * Facts persistence mode. `none` (default) never touches the facts domain;
-       * `full` replaces this world's place/resource/container rows in the same
-       * transaction. An empty capture is a valid explicit empty domain.
+       * Facts persistence mode. `none` never touches the facts domain; `full`
+       * replaces this world's place/resource/container rows in the same transaction.
        */
       factsMode?: 'none' | 'full';
       /** Commit an offline migration receipt in the same transaction as its facts. */
@@ -1066,8 +862,7 @@ export type WorkerRequest =
       factsSnapshot?: FactCheckpointSnapshot;
       /**
        * Explicit Minecraft game version this checkpoint's voxel rows were written
-       * under, supplied by the caller (never guessed by the worker). When absent,
-       * the checkpoint and its section rows record `'unknown'`.
+       * under, supplied by the caller (never guessed by the worker).
        */
       gameVersion?: string;
     }
@@ -1109,8 +904,6 @@ export type WorkerResponse =
   | {
       type: 'open_ok';
       requestId: number;
-      baselineCheckpointId: string | null;
-      snapshot: HistorySnapshot | null;
       /** Voxel baseline checkpoint id, or null when voxel has never been saved. */
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
@@ -1123,16 +916,15 @@ export type WorkerResponse =
       journalRevision: number;
       journalRecordCount: number;
       journalRecordBytes: number;
-      /** Ledger restore baseline (spatial sessions; null when never saved). */
+      /** Ledger restore baseline (null when never saved). */
       ledgerBaselineCheckpointId: string | null;
-      /** Restored world-scoped ledger (spatial sessions only). */
+      /** Restored world-scoped ledger. */
       ledgerSnapshot: LedgerSnapshot | null;
       /** Facts baseline checkpoint id (null when the facts domain was never saved). */
       factsBaselineCheckpointId: string | null;
       /**
        * Restored facts-domain capture (including gone/revoked records), or null
-       * when this world has no committed facts domain. Never derived from the
-       * legacy topology/fragment/JSON domains.
+       * when this world has no committed facts domain.
        */
       factsSnapshot: FactCheckpointSnapshot | null;
       /** Migration/version record read from the same persistence authority. */
@@ -1140,12 +932,7 @@ export type WorkerResponse =
       legacyFactsMigrationVersion: number;
       /** Row counts + old cutover marker of this world's retired history/topology domains. */
       legacyStore: LegacyStoreSummary;
-      /**
-       * Minecraft game version recorded on the voxel baseline this open restores
-       * from (the latest checkpoint with `has_voxel = 1`), or `'unknown'` when its
-       * rows never recorded one (pre-v8 rows). Null when the world has no voxel
-       * baseline. A newer history-only checkpoint never changes this fact.
-       */
+      /** Minecraft game version recorded on the voxel baseline, or null. */
       gameVersion: string | null;
     }
   | {
@@ -1186,12 +973,7 @@ export type WorkerResponse =
       journalRecordBytes: number;
       factsCommitted: boolean;
       factsDeferred?: FactSourceGap;
-      /**
-       * Committed ledger row count/bytes for this world after the transaction, when
-       * this checkpoint wrote the ledger. Computed by the worker from the committed
-       * rows (never from a delta), so a caller does not need to serialize the
-       * full set to learn its size.
-       */
+      /** Committed ledger row count/bytes for this world, when this checkpoint wrote the ledger. */
       ledgerRecordCount?: number;
       ledgerRecordBytes?: number;
     }
@@ -1203,14 +985,6 @@ export function resolveSnapshotLimits(options: SnapshotLimits | undefined): Reso
   const limits: ResolvedSnapshotLimits = { ...DEFAULT_SNAPSHOT_LIMITS };
   if (options === undefined) return limits;
   const keys = [
-    'maxFragments',
-    'maxTraversals',
-    'maxNodes',
-    'maxEdges',
-    'maxPolylinePoints',
-    'maxEntrancePoints',
-    'maxLinks',
-    'maxEdgeEvidenceRefs',
     'maxVoxelSections',
     'maxObservedCells',
     'maxPaletteEntries',

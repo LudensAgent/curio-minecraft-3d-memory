@@ -1,71 +1,19 @@
 /**
- * Host capability report (contract §2.3).
+ * Host capability report (contract §2.3) for the voxel + facts composition.
  *
- * This is the machine-checkable contract between the library and a host:
- * `false` is a contract fact, not advice. The host must check the relevant
- * capability before calling an interface, and must never silently fall back to
- * a wider backend when the answer is `false`.
+ * `false` is a contract fact, not advice. The retired fragment/topology/route
+ * domains are not advertised: a host that needs them must treat the capability
+ * as unavailable rather than fall back to a removed implementation.
  *
  * The report is deliberately split by domain so that partially wired hosts can
- * be honest. M2 fills `memory` from the store's per-method report and `query`
- * from the implemented query kinds. `plan` landed as a static M3 report and is
- * consolidated here as the single source in M5.4; `execute`/`persistence` remain
- * `false` (D-059).
- *
- * Additive note: `query.resourceAnchors` and `query.segments` are not present
- * in contract §2.3 v0.1; they are added because the request union exposes those
- * kinds and the host must be able to negotiate them. `query.containerContents`
- * stays a literal `false`: container contents belong to the host's precise
- * inventory ledger.
- *
- * Version note: adding the `containerContents`/`segments` kinds and requiring
- * `SpatialMemoryStore.query` are contract changes under §12.3. The pre-release
- * string remains `memory-host-contract/1` until M9 decides and synchronizes the
- * release version; hosts must negotiate capabilities rather than assume v1.
- *
- * Single source (D-010): `RoutePlanCapabilities` and `ROUTE_PLAN_CAPABILITIES`
- * live here, in the dependency-free memory core, and are consumed by both the
- * navigation layer and the query capability report. A pure-memory consumer can
- * therefore negotiate the plan block without importing `src/navigation/*`.
+ * be honest. `memory` describes the evidence write port, `query` the read-only
+ * projection and `persistence` the SQLite/working-set channel. Body execution
+ * and route planning are host responsibilities and are not advertised here.
  */
 
-export type ContractVersion = 'memory-host-contract/1';
+export type ContractVersion = 'memory-host-contract/2';
 
-export const CONTRACT_VERSION: ContractVersion = 'memory-host-contract/1';
-
-/**
- * Planning capability report for the optional `planRoute` entry (contract §2.3
- * `plan`, plan M3.7; consolidated here in M5.4).
- *
- * `false` is a contract fact: the host must not call or emulate that planning
- * mode through `planRoute`. In particular near/reach_block arrival, digging,
- * placing, towering, swimming and boating are not planned in v1; unsupported
- * requests are rejected with structured problems rather than silently routed
- * to a wider backend.
- */
-export interface RoutePlanCapabilities {
-  walkSearch: boolean;
-  walkHistory: boolean;
-  walkAuto: boolean;
-  nearArrival: boolean;
-  reachBlockArrival: boolean;
-  digPlaceTower: boolean;
-  swim: boolean;
-  boat: boolean;
-}
-
-export type RoutePlanCapabilityName = keyof RoutePlanCapabilities;
-
-export const ROUTE_PLAN_CAPABILITIES = Object.freeze({
-  walkSearch: true,
-  walkHistory: true,
-  walkAuto: true,
-  nearArrival: false,
-  reachBlockArrival: false,
-  digPlaceTower: false,
-  swim: false,
-  boat: false,
-} as const satisfies RoutePlanCapabilities);
+export const CONTRACT_VERSION: ContractVersion = 'memory-host-contract/2';
 
 export interface MemoryHostCapabilities {
   contract: ContractVersion;
@@ -76,44 +24,22 @@ export interface MemoryHostCapabilities {
     markStale: boolean;
     markTraversed: boolean;
     markModified: boolean;
-    saveFragment: boolean;
-    addTraversal: boolean;
-    recordNode: boolean;
-    upsertEdge: boolean;
-    savePortalEdge: boolean;
     checkpoint: boolean;
     flush: boolean;
     close: boolean;
   };
   query: {
     cells: boolean;
-    fragments: boolean;
-    traversals: boolean;
+    /** Facts-backed semantic place projection. */
     nodes: boolean;
-    edges: boolean;
-    historyRoute: boolean;
-    anchors: boolean;
-    components: boolean;
-    segments: boolean;
-    portals: boolean;
-    /** Additive to contract §2.3: bounded places-only paging over semantic facts. */
+    /** Bounded places-only paging over semantic facts. */
     places: boolean;
-    /** Additive to contract §2.3: resource anchors are a separate query kind. */
     resourceAnchors: boolean;
     containerAnchors: boolean;
-    /** Additive to contract §2.3: never-observed boundary projection from a caller snapshot. */
-    frontiers: boolean;
     /** Always false: container contents are owned by the host precise ledger. */
     containerContents: false;
-  };
-  plan: RoutePlanCapabilities;
-  execute: {
-    walk: boolean;
-    groundedArrival: boolean;
-    invalidation: boolean;
-    cancellation: boolean;
-    swim: boolean;
-    boat: boolean;
+    snapshot: boolean;
+    capabilities: boolean;
   };
   persistence: {
     sqlite: boolean;
@@ -124,10 +50,10 @@ export interface MemoryHostCapabilities {
 }
 
 // ---------------------------------------------------------------------------
-// Library / host composition (Batch 5 C)
+// Library / host composition
 // ---------------------------------------------------------------------------
 
-export const CAPABILITY_DOMAINS = ['memory', 'query', 'plan', 'execute', 'persistence'] as const;
+export const CAPABILITY_DOMAINS = ['memory', 'query', 'persistence'] as const;
 
 export type CapabilityDomain = (typeof CAPABILITY_DOMAINS)[number];
 
@@ -263,8 +189,6 @@ function cloneCapabilities(report: MemoryHostCapabilities): MemoryHostCapabiliti
     contract: report.contract,
     memory: { ...report.memory },
     query: { ...report.query },
-    plan: { ...report.plan },
-    execute: { ...report.execute },
     persistence: { ...report.persistence },
   };
 }

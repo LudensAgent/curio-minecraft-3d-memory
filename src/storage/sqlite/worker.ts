@@ -12,12 +12,11 @@
 import { parentPort } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
-import { SNAPSHOT_FRAME_BYTES, VOXEL_FRAME_BYTES } from './types.js';
+import { VOXEL_FRAME_BYTES } from './types.js';
 import type { ActionRecord } from '../../navigation/types.js';
 import { JournalConflictError, canonicalizeJournalRecord } from './journal.js';
 import type {
   FactSourceGap,
-  HistorySnapshot,
   LegacyStoreSummary,
   ResolvedJournalLimits,
   ResolvedSnapshotLimits,
@@ -64,15 +63,20 @@ import {
 } from './migration.js';
 import type { MigrationRowMeta } from './migration.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
-const KNOWN_TABLES_V1 = new Set([
-  'schema_meta',
-  'checkpoints',
+/** Retired route tables. They may exist in an older database but are never written. */
+const RETIRED_ROUTE_TABLES = new Set([
   'path_fragments',
   'traversal_evidence',
   'spatial_nodes',
   'spatial_edges',
+]);
+
+const KNOWN_TABLES_V1 = new Set([
+  'schema_meta',
+  'checkpoints',
+  ...RETIRED_ROUTE_TABLES,
 ]);
 
 const KNOWN_TABLES_V2 = new Set([...KNOWN_TABLES_V1, 'spatial_sections']);
@@ -328,6 +332,38 @@ const REQUIRED_COLUMNS_V9: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = 
   },
 };
 
+/**
+ * v10 is the current schema: the four retired route tables are optional and are
+ * never read or written by this worker. Only the live domains are required.
+ */
+const REQUIRED_COLUMNS_V10: Record<string, Record<string, 'INTEGER' | 'TEXT'>> = {
+  schema_meta: REQUIRED_COLUMNS_V9.schema_meta!,
+  checkpoints: {
+    checkpoint_id: 'TEXT',
+    world_id: 'TEXT',
+    fragment_revision: 'INTEGER',
+    topology_revision: 'INTEGER',
+    voxel_revision: 'INTEGER',
+    has_voxel: 'INTEGER',
+    journal_revision: 'INTEGER',
+    has_journal: 'INTEGER',
+    ledger_revision: 'INTEGER',
+    has_ledger: 'INTEGER',
+    game_version: 'TEXT',
+    seq: 'INTEGER',
+  },
+  spatial_sections: REQUIRED_COLUMNS_V9.spatial_sections!,
+  action_records: REQUIRED_COLUMNS_V9.action_records!,
+  spatial_events: REQUIRED_COLUMNS_V9.spatial_events!,
+  placed_blocks: REQUIRED_COLUMNS_V9.placed_blocks!,
+  chunk_visits: REQUIRED_COLUMNS_V9.chunk_visits!,
+  portal_traversals: REQUIRED_COLUMNS_V9.portal_traversals!,
+  fact_places: REQUIRED_COLUMNS_V9.fact_places!,
+  fact_resources: REQUIRED_COLUMNS_V9.fact_resources!,
+  fact_containers: REQUIRED_COLUMNS_V9.fact_containers!,
+  fact_domain: REQUIRED_COLUMNS_V9.fact_domain!,
+};
+
 const SCHEMA_SQL = `
 CREATE TABLE schema_meta (
   key TEXT PRIMARY KEY,
@@ -345,47 +381,12 @@ CREATE TABLE checkpoints (
   has_journal INTEGER NOT NULL DEFAULT 0,
   ledger_revision INTEGER NOT NULL DEFAULT 0,
   has_ledger INTEGER NOT NULL DEFAULT 0,
-  -- Portal edges + evidence-backed fragment merges: low-frequency, nested
-  -- topology facts that do not fit the four walk-edge history arrays.
-  topology_extras TEXT NOT NULL DEFAULT '{}',
   -- Minecraft game version this checkpoint's voxel rows were written under
   -- ('unknown' when the caller never supplied one).
   game_version TEXT NOT NULL DEFAULT 'unknown',
   seq INTEGER NOT NULL
 );
 CREATE INDEX checkpoints_world_seq ON checkpoints (world_id, seq);
-
-CREATE TABLE path_fragments (
-  world_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  id TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  PRIMARY KEY (world_id, id)
-);
-
-CREATE TABLE traversal_evidence (
-  world_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  id TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  PRIMARY KEY (world_id, id)
-);
-
-CREATE TABLE spatial_nodes (
-  world_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  id TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  PRIMARY KEY (world_id, id)
-);
-
-CREATE TABLE spatial_edges (
-  world_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  id TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  PRIMARY KEY (world_id, id)
-);
 
 CREATE TABLE spatial_sections (
   world_id TEXT NOT NULL,
@@ -534,22 +535,6 @@ CREATE TABLE fact_domain (
 );
 `;
 
-interface PreparedSnapshot {
-  fragments: { id: string; payload: string }[];
-  traversals: { id: string; payload: string }[];
-  nodes: { id: string; payload: string }[];
-  edges: { id: string; payload: string }[];
-  /** Serialized portal edges + fragment merges stored on the checkpoint row. */
-  extras: string;
-  portalEdges: number;
-  fragmentMerges: number;
-  polylinePoints: number;
-  entrancePoints: number;
-  linkPairs: number;
-  edgeEvidenceRefs: number;
-  bytes: number;
-}
-
 interface PreparedVoxelSnapshot {
   sections: {
     id: string;
@@ -654,6 +639,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -669,6 +655,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -683,6 +670,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -696,6 +684,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -708,6 +697,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -719,6 +709,7 @@ function openDatabase(databasePath: string): Database.Database {
     upgradeV6ToV7(connection, databasePath);
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -729,6 +720,7 @@ function openDatabase(databasePath: string): Database.Database {
     }
     upgradeV7ToV8(connection, databasePath);
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
@@ -738,12 +730,25 @@ function openDatabase(databasePath: string): Database.Database {
       assertRequiredColumns(connection, table, columns);
     }
     upgradeV8ToV9(connection, databasePath);
+    upgradeV9ToV10(connection, databasePath);
     return connection;
   }
 
-  // version === SCHEMA_VERSION (9).
+  if (version === 9) {
+    // Old v9 databases may carry the retired route tables; they are optional and
+    // are never read or written by this worker.
+    validateKnownTables(connection, names, KNOWN_TABLES_V9);
+    for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V10)) {
+      assertRequiredColumns(connection, table, columns);
+    }
+    upgradeV9ToV10(connection, databasePath);
+    assertFactMigrationMeta(connection);
+    return connection;
+  }
+
+  // version === SCHEMA_VERSION (10).
   validateKnownTables(connection, names, KNOWN_TABLES_V9);
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V9)) {
+  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS_V10)) {
     assertRequiredColumns(connection, table, columns);
   }
   assertFactMigrationMeta(connection);
@@ -762,6 +767,9 @@ function validateKnownTables(
     }
   }
   for (const required of known) {
+    // Retired route tables are tolerated when present and not required when absent:
+    // the current worker only reports their row counts as metadata.
+    if (RETIRED_ROUTE_TABLES.has(required)) continue;
     if (!names.has(required)) {
       connection.close();
       throw new Error(`missing required table "${required}"`);
@@ -1141,6 +1149,22 @@ function upgradeV8ToV9(connection: Database.Database, databasePath: string): voi
   tx();
 }
 
+/**
+ * Upgrade a validated v9 database in place to the current schema.
+ *
+ * The retired route tables are deliberately left byte-identical: no row is read,
+ * rewritten or deleted. The schema bump only records that a fresh database no
+ * longer creates those tables and that the worker will never write them.
+ */
+function upgradeV9ToV10(connection: Database.Database, databasePath: string): void {
+  const backupPath = `${databasePath}.pre-v10-${randomUUID()}`;
+  connection.prepare('VACUUM INTO ?').run(backupPath);
+  const tx = connection.transaction(() => {
+    connection.prepare("UPDATE schema_meta SET value = '10' WHERE key = 'schema_version'").run();
+  });
+  tx();
+}
+
 /** Record the facts-model migration version/target in the same schema authority. */
 function writeFactMigrationMeta(connection: Database.Database): void {
   const write = connection.prepare(
@@ -1196,6 +1220,10 @@ function assertRequiredColumns(
   table: string,
   required: Record<string, 'INTEGER' | 'TEXT'>,
 ): void {
+  // Retired route tables are optional in every schema version: the current
+  // worker neither reads nor writes them, so an upgrade must not fail just
+  // because a fixture or compacted database omits them.
+  if (RETIRED_ROUTE_TABLES.has(table)) return;
   const cols = connection.prepare(`PRAGMA table_info(${table})`).all() as { name: string; type: string }[];
   const byName = new Map(cols.map((c) => [c.name, c]));
   for (const [column, affinity] of Object.entries(required)) {
@@ -1225,55 +1253,6 @@ function affinityOf(declaredType: string): 'INTEGER' | 'TEXT' | 'REAL' | 'BLOB' 
 
 function stringifyRecord(record: unknown): string {
   return JSON.stringify(record);
-}
-
-function prepareSnapshot(snapshot: HistorySnapshot): PreparedSnapshot {
-  const portalEdges = snapshot.portalEdges ?? [];
-  const fragmentMerges = snapshot.fragmentMerges ?? [];
-  const extras =
-    portalEdges.length === 0 && fragmentMerges.length === 0
-      ? '{}'
-      : JSON.stringify({ portalEdges, fragmentMerges });
-  const prepared: PreparedSnapshot = {
-    fragments: [],
-    traversals: [],
-    nodes: [],
-    edges: [],
-    extras,
-    portalEdges: snapshot.portalEdges?.length ?? 0,
-    fragmentMerges: snapshot.fragmentMerges?.length ?? 0,
-    polylinePoints: 0,
-    entrancePoints: 0,
-    linkPairs: 0,
-    edgeEvidenceRefs: 0,
-    bytes: Buffer.byteLength(extras, 'utf8'),
-  };
-  for (const f of snapshot.fragments) {
-    const payload = stringifyRecord(f);
-    prepared.fragments.push({ id: f.id, payload });
-    prepared.bytes += Buffer.byteLength(payload, 'utf8');
-    prepared.polylinePoints += f.polyline.length;
-    prepared.entrancePoints += f.entrances.length;
-    prepared.linkPairs += f.links?.length ?? 0;
-  }
-  for (const t of snapshot.traversals) {
-    const payload = stringifyRecord(t);
-    prepared.traversals.push({ id: t.id, payload });
-    prepared.bytes += Buffer.byteLength(payload, 'utf8');
-  }
-  for (const n of snapshot.nodes) {
-    const payload = stringifyRecord(n);
-    prepared.nodes.push({ id: n.id, payload });
-    prepared.bytes += Buffer.byteLength(payload, 'utf8');
-  }
-  for (const e of snapshot.edges) {
-    const payload = stringifyRecord(e);
-    prepared.edges.push({ id: e.id, payload });
-    prepared.bytes += Buffer.byteLength(payload, 'utf8');
-    prepared.edgeEvidenceRefs += e.refs.length;
-  }
-  prepared.bytes += snapshotEnvelopeBytes(snapshot);
-  return prepared;
 }
 
 /**
@@ -1389,93 +1368,13 @@ function prepareJournalBatch(
   return prepared;
 }
 
-/** Exact outer-envelope bytes: fixed frame + inter-record commas + JSON-escaped worldId. */
-function snapshotEnvelopeBytes(snapshot: HistorySnapshot): number {
-  return (
-    SNAPSHOT_FRAME_BYTES +
-    interRecordCommas(
-      snapshot.fragments.length,
-      snapshot.traversals.length,
-      snapshot.nodes.length,
-      snapshot.edges.length,
-    ) +
-    Buffer.byteLength(JSON.stringify(snapshot.worldId), 'utf8')
-  );
-}
-
-/** Sum of `,` separators between adjacent records in the four arrays (0 for empty/single). */
-function interRecordCommas(fragments: number, traversals: number, nodes: number, edges: number): number {
-  return (
-    Math.max(0, fragments - 1) +
-    Math.max(0, traversals - 1) +
-    Math.max(0, nodes - 1) +
-    Math.max(0, edges - 1)
-  );
-}
-
-function assertCountsWithinLimits(
-  fragments: number,
-  traversals: number,
-  nodes: number,
-  edges: number,
-  bytes: number,
-  resolved: ResolvedSnapshotLimits,
-): void {
-  if (fragments > resolved.maxFragments) throw new Error(`snapshot exceeds maxFragments (${fragments})`);
-  if (traversals > resolved.maxTraversals) throw new Error(`snapshot exceeds maxTraversals (${traversals})`);
-  if (nodes > resolved.maxNodes) throw new Error(`snapshot exceeds maxNodes (${nodes})`);
-  if (edges > resolved.maxEdges) throw new Error(`snapshot exceeds maxEdges (${edges})`);
-  if (bytes > resolved.maxBytes) throw new Error(`snapshot exceeds maxBytes (${bytes})`);
-}
-
-function assertDerivedWithinLimits(
-  derived: { polylinePoints: number; entrancePoints: number; linkPairs: number; edgeEvidenceRefs: number },
-  resolved: ResolvedSnapshotLimits,
-): void {
-  if (derived.polylinePoints > resolved.maxPolylinePoints) {
-    throw new Error(`snapshot exceeds maxPolylinePoints (${derived.polylinePoints})`);
-  }
-  if (derived.entrancePoints > resolved.maxEntrancePoints) {
-    throw new Error(`snapshot exceeds maxEntrancePoints (${derived.entrancePoints})`);
-  }
-  if (derived.linkPairs > resolved.maxLinks) throw new Error(`snapshot exceeds maxLinks (${derived.linkPairs})`);
-  if (derived.edgeEvidenceRefs > resolved.maxEdgeEvidenceRefs) {
-    throw new Error(`snapshot exceeds maxEdgeEvidenceRefs (${derived.edgeEvidenceRefs})`);
-  }
-}
-
-function assertWithinLimits(prepared: PreparedSnapshot, resolved: ResolvedSnapshotLimits): void {
-  // Portal edges and evidence-backed fragment merges are connections too; they
-  // share the topology edge capacity with walk edges.
-  assertCountsWithinLimits(
-    prepared.fragments.length,
-    prepared.traversals.length,
-    prepared.nodes.length,
-    prepared.edges.length + prepared.portalEdges + prepared.fragmentMerges,
-    prepared.bytes,
-    resolved,
-  );
-  assertDerivedWithinLimits(
-    {
-      polylinePoints: prepared.polylinePoints,
-      entrancePoints: prepared.entrancePoints,
-      linkPairs: prepared.linkPairs,
-      edgeEvidenceRefs: prepared.edgeEvidenceRefs,
-    },
-    resolved,
-  );
-}
 
 function writeCheckpoint(
   connection: Database.Database,
   checkpointId: string,
   wId: string,
-  fragmentRevision: number,
-  topologyRevision: number,
   gameVersion: string,
-  domain: { history: 'full' | 'none'; topology: 'full' | 'none' },
-  prepared: PreparedSnapshot,
-  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections']; removedIds?: string[] },
+  voxel: { mode: VoxelSaveMode; voxelRevision: number; sections: PreparedVoxelSnapshot['sections'] },
   journal: { mode: 'none' | 'append'; revision: number; prepared: PreparedJournal },
   ledger: { mode: 'none' | 'full' | 'delta'; revision: number; prepared: PreparedLedgerWrite | null },
   facts: { mode: 'none' | 'full'; prepared: PreparedFacts | null; completeLegacyMigration?: boolean },
@@ -1500,32 +1399,8 @@ function writeCheckpoint(
       .get(wId) as { n: number };
     const nextSeq = nextSeqRow.n;
 
-    // Each domain is independent: `none` keeps that domain's committed rows and
-    // baseline untouched, so an omitted (empty) array is never read as a clear.
-    if (domain.history === 'full') {
-      connection.prepare('DELETE FROM path_fragments WHERE world_id = ?').run(wId);
-      connection.prepare('DELETE FROM traversal_evidence WHERE world_id = ?').run(wId);
-      const insertFragment = connection.prepare(
-        'INSERT INTO path_fragments (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-      );
-      const insertTraversal = connection.prepare(
-        'INSERT INTO traversal_evidence (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-      );
-      prepared.fragments.forEach((f, i) => insertFragment.run(wId, i, f.id, f.payload));
-      prepared.traversals.forEach((t, i) => insertTraversal.run(wId, i, t.id, t.payload));
-    }
-    if (domain.topology === 'full') {
-      connection.prepare('DELETE FROM spatial_nodes WHERE world_id = ?').run(wId);
-      connection.prepare('DELETE FROM spatial_edges WHERE world_id = ?').run(wId);
-      const insertNode = connection.prepare(
-        'INSERT INTO spatial_nodes (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-      );
-      const insertEdge = connection.prepare(
-        'INSERT INTO spatial_edges (world_id, seq, id, payload) VALUES (?, ?, ?, ?)',
-      );
-      prepared.nodes.forEach((n, i) => insertNode.run(wId, i, n.id, n.payload));
-      prepared.edges.forEach((e, i) => insertEdge.run(wId, i, e.id, e.payload));
-    }
+    // Retired route tables are never read or written here. Their existing rows
+    // stay byte-identical across every new checkpoint.
 
     // `none` never touches spatial_sections, so an existing voxel baseline
     // survives. `full` replaces the whole set (first save baseline). `incremental`
@@ -1571,22 +1446,6 @@ function writeCheckpoint(
         .prepare('SELECT COALESCE(MAX(seq), 0) AS n FROM spatial_sections WHERE world_id = ?')
         .get(wId) as { n: number };
       const baseSeq = maxSeqRow.n;
-      // Sections dropped by observation retention: delete before the upsert, so a
-      // section re-created after its removal is written back as a fresh row.
-      if (voxel.removedIds?.length) {
-        const deleteSection = connection.prepare('DELETE FROM spatial_sections WHERE world_id = ? AND id = ?');
-        for (const id of voxel.removedIds) {
-          const old = readSectionStats.get(wId, id) as
-            { observed_cells: number; palette_entries: number; bytes: number } | undefined;
-          if (old !== undefined) {
-            nextVoxelStats.sections -= 1;
-            nextVoxelStats.observedCells -= old.observed_cells;
-            nextVoxelStats.paletteEntries -= old.palette_entries;
-            nextVoxelStats.payloadBytes -= old.bytes;
-          }
-          deleteSection.run(wId, id);
-        }
-      }
       const upsertSection = connection.prepare(
         'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy, game_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
           'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision, dimension = excluded.dimension, cx = excluded.cx, cz = excluded.cz, sy = excluded.sy, game_version = excluded.game_version',
@@ -1624,7 +1483,7 @@ function writeCheckpoint(
     }
     // The resulting full set must still re-open under the same limits: reject
     // (and roll back) before commit if the increments accumulate past capacity.
-    assertVoxelFullSetWithinLimits(nextVoxelStats, wId, prepared.bytes, resolved);
+    assertVoxelFullSetWithinLimits(nextVoxelStats, wId, resolved);
 
     // The journal is append-only. `none` never touches rows or the journal
     // baseline; `append` inserts the captured batch (possibly empty) and records
@@ -1708,32 +1567,21 @@ function writeCheckpoint(
       }
     }
 
-    // A `none` topology write leaves the committed extras untouched, so the new
-    // checkpoint row must carry the previous row's extras forward: the opener reads
-    // portal edges/merges from the latest checkpoint only.
-    const topologyExtras =
-      domain.topology === 'full'
-        ? prepared.extras
-        : ((connection
-            .prepare('SELECT topology_extras FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
-            .get(wId) as { topology_extras: string } | undefined)?.topology_extras ?? prepared.extras);
-
     connection
       .prepare(
-        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, topology_extras, game_version, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO checkpoints (checkpoint_id, world_id, fragment_revision, topology_revision, voxel_revision, has_voxel, journal_revision, has_journal, ledger_revision, has_ledger, game_version, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         checkpointId,
         wId,
-        fragmentRevision,
-        topologyRevision,
+        0,
+        0,
         voxel.mode === 'none' ? 0 : voxel.voxelRevision,
         voxel.mode === 'none' ? 0 : 1,
         journal.mode === 'none' ? 0 : journal.revision,
         journal.mode === 'none' ? 0 : 1,
         ledger.mode === 'none' ? 0 : ledger.revision,
         ledger.mode === 'none' ? 0 : 1,
-        topologyExtras,
         gameVersion,
         nextSeq,
       );
@@ -1849,7 +1697,6 @@ function appendJournal(
 function assertVoxelFullSetWithinLimits(
   stats: VoxelCommittedStats,
   wId: string,
-  historyBytes: number,
   resolved: ResolvedSnapshotLimits,
 ): void {
   if (stats.sections > resolved.maxVoxelSections) {
@@ -1866,17 +1713,9 @@ function assertVoxelFullSetWithinLimits(
     VOXEL_FRAME_BYTES +
     Buffer.byteLength(JSON.stringify(wId), 'utf8') +
     Math.max(0, stats.sections - 1);
-  const total = historyBytes + voxelBytes;
-  if (total > resolved.maxBytes) {
-    throw new Error(`snapshot exceeds maxBytes (${total})`);
+  if (voxelBytes > resolved.maxBytes) {
+    throw new Error(`snapshot exceeds maxBytes (${voxelBytes})`);
   }
-}
-
-function sumColumn(connection: Database.Database, table: string, column: string, wId: string): number {
-  const row = connection
-    .prepare(`SELECT COALESCE(SUM(${column}), 0) AS n FROM ${table} WHERE world_id = ?`)
-    .get(wId) as { n: number };
-  return row.n;
 }
 
 function countRows(connection: Database.Database, table: string, wId: string): number {
@@ -1891,13 +1730,6 @@ function sumPayloadBytes(connection: Database.Database, table: string, wId: stri
     .prepare(`SELECT COALESCE(SUM(octet_length(payload)), 0) AS n FROM ${table} WHERE world_id = ?`)
     .get(wId) as { n: number };
   return row.n;
-}
-
-function readAll(connection: Database.Database, table: string, wId: string): unknown[] {
-  const rows = connection
-    .prepare(`SELECT payload FROM ${table} WHERE world_id = ? ORDER BY seq`)
-    .all(wId) as { payload: string }[];
-  return rows.map((r) => JSON.parse(r.payload) as unknown);
 }
 
 // --- placement / chunk-visit / portal ledger --------------------------------
@@ -2737,25 +2569,6 @@ function loadFacts(
   };
 }
 
-function computeDerivedCounts(snapshot: HistorySnapshot): {
-  polylinePoints: number;
-  entrancePoints: number;
-  linkPairs: number;
-  edgeEvidenceRefs: number;
-} {
-  let polylinePoints = 0;
-  let entrancePoints = 0;
-  let linkPairs = 0;
-  let edgeEvidenceRefs = 0;
-  for (const f of snapshot.fragments) {
-    polylinePoints += f.polyline.length;
-    entrancePoints += f.entrances.length;
-    linkPairs += f.links?.length ?? 0;
-  }
-  for (const e of snapshot.edges) edgeEvidenceRefs += e.refs.length;
-  return { polylinePoints, entrancePoints, linkPairs, edgeEvidenceRefs };
-}
-
 /** Reject checkpoint rows whose ordering/identity/revision metadata is corrupt or out of range. */
 function assertValidCheckpointMetadata(connection: Database.Database, wId: string): void {
   const bad = connection
@@ -2773,7 +2586,6 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
               OR typeof(journal_revision) != 'integer' OR journal_revision < 0
               OR typeof(has_ledger) != 'integer' OR (has_ledger != 0 AND has_ledger != 1)
               OR typeof(ledger_revision) != 'integer' OR ledger_revision < 0
-              OR typeof(topology_extras) != 'text'
               OR typeof(game_version) != 'text' OR game_version = '')`,
     )
     .get(wId) as { n: number };
@@ -2782,87 +2594,37 @@ function assertValidCheckpointMetadata(connection: Database.Database, wId: strin
   }
 }
 
-function loadWorld(
+/** True when the database still carries one of the retired route tables. */
+function hasTable(connection: Database.Database, name: string): boolean {
+  return connection
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+    .get(name) !== undefined;
+}
+
+/**
+ * Read only the row counts and old cutover marker of the retired route domains.
+ * Payloads are never decoded or restored, and a fresh database without those
+ * tables reports zero. This is the sole old-table read path.
+ */
+function loadLegacyStoreSummary(
   connection: Database.Database,
   wId: string,
-  resolved: ResolvedSnapshotLimits,
-  loadSnapshot = true,
-): {
-  baselineCheckpointId: string | null;
-  snapshot: HistorySnapshot | null;
-  bytes: number;
-  legacyStore: LegacyStoreSummary;
-} {
+): LegacyStoreSummary {
   assertValidCheckpointMetadata(connection, wId);
-
-  // Row counts are metadata, never decoded payloads. They are read in both the
-  // snapshot and the `historyLoading: "none"` paths so a fragment-only legacy
-  // world is still distinguishable from an empty one.
-  const fragments = countRows(connection, 'path_fragments', wId);
-  const traversals = countRows(connection, 'traversal_evidence', wId);
-  const nodes = countRows(connection, 'spatial_nodes', wId);
-  const edges = countRows(connection, 'spatial_edges', wId);
+  const count = (table: string): number =>
+    hasTable(connection, table) ? countRows(connection, table, wId) : 0;
+  const fragments = count('path_fragments');
+  const traversals = count('traversal_evidence');
+  const nodes = count('spatial_nodes');
+  const edges = count('spatial_edges');
   // The older cutover marker is one indexed point lookup, not a topology read.
   // The facts migration receipt (`curio_semantic_migration_v1:<worldId>`) is a
   // different record and never answers this question.
-  const migrationMarker =
-    connection
+  const migrationMarker = hasTable(connection, 'spatial_nodes')
+    && connection
       .prepare("SELECT 1 FROM spatial_nodes WHERE world_id = ? AND id = 'curio:migration' LIMIT 1")
       .get(wId) !== undefined;
-  const legacyStore: LegacyStoreSummary = { fragments, traversals, nodes, edges, migrationMarker };
-
-  const cp = connection
-    .prepare('SELECT checkpoint_id, topology_extras FROM checkpoints WHERE world_id = ? ORDER BY seq DESC LIMIT 1')
-    .get(wId) as { checkpoint_id: string; topology_extras: string } | undefined;
-  if (cp === undefined) {
-    const orphans = fragments + traversals + nodes + edges;
-    if (orphans > 0) {
-      throw new Error('world has fact rows but no checkpoint metadata');
-    }
-    return { baselineCheckpointId: null, snapshot: null, bytes: 0, legacyStore };
-  }
-
-  const extras = JSON.parse(cp.topology_extras) as {
-    portalEdges?: HistorySnapshot['portalEdges'];
-    fragmentMerges?: HistorySnapshot['fragmentMerges'];
-  };
-  const portalEdges = extras.portalEdges ?? [];
-  const fragmentMerges = extras.fragmentMerges ?? [];
-  const bytes =
-    sumPayloadBytes(connection, 'path_fragments', wId) +
-    sumPayloadBytes(connection, 'traversal_evidence', wId) +
-    sumPayloadBytes(connection, 'spatial_nodes', wId) +
-    sumPayloadBytes(connection, 'spatial_edges', wId) +
-    SNAPSHOT_FRAME_BYTES +
-    interRecordCommas(fragments, traversals, nodes, edges) +
-    Buffer.byteLength(JSON.stringify(wId), 'utf8') +
-    Buffer.byteLength(cp.topology_extras, 'utf8');
-  assertCountsWithinLimits(
-    fragments,
-    traversals,
-    nodes,
-    edges + portalEdges.length + fragmentMerges.length,
-    bytes,
-    resolved,
-  );
-
-  if (!loadSnapshot) {
-    // Metadata/limit validation still runs, but no history payload is decoded or
-    // retained. A caller starting a new main session must not pay the old-domain
-    // memory cost merely to learn that a baseline exists.
-    return { baselineCheckpointId: cp.checkpoint_id, snapshot: null, bytes, legacyStore };
-  }
-  const snapshot: HistorySnapshot = {
-    worldId: wId,
-    fragments: readAll(connection, 'path_fragments', wId) as HistorySnapshot['fragments'],
-    traversals: readAll(connection, 'traversal_evidence', wId) as HistorySnapshot['traversals'],
-    nodes: readAll(connection, 'spatial_nodes', wId) as HistorySnapshot['nodes'],
-    edges: readAll(connection, 'spatial_edges', wId) as HistorySnapshot['edges'],
-    portalEdges,
-    fragmentMerges,
-  };
-  assertDerivedWithinLimits(computeDerivedCounts(snapshot), resolved);
-  return { baselineCheckpointId: cp.checkpoint_id, snapshot, bytes, legacyStore };
+  return { fragments, traversals, nodes, edges, migrationMarker };
 }
 
 
@@ -3134,15 +2896,14 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   journalLimits = msg.journalLimits;
   ledgerLimits = msg.ledgerLimits ?? DEFAULT_LEDGER_LIMITS;
   try {
-    const world = loadWorld(connection, msg.worldId, msg.limits, msg.historyLoading !== 'none');
+    const legacyStore = loadLegacyStoreSummary(connection, msg.worldId);
     const journal = loadJournalMeta(connection, msg.worldId, msg.journalLimits);
     voxelStats = readVoxelStats(connection, msg.worldId);
     journalStats = { records: journal.recordCount, bytes: journal.recordBytes };
     // The Minecraft game version of the voxel baseline this open restores from.
     // It is read from the latest *voxel* checkpoint (`has_voxel = 1`), never from
-    // a newer history-only checkpoint, which writes no voxel rows and records
-    // `'unknown'`. `'unknown'` means the rows never recorded one (pre-v8 rows);
-    // a world with no voxel baseline is reported as null.
+    // an older row that wrote no voxel data. `'unknown'` means the rows never
+    // recorded one (pre-v8 rows); a world with no voxel baseline is reported null.
     const voxelBaselineCheckpoint = connection
       .prepare('SELECT game_version FROM checkpoints WHERE world_id = ? AND has_voxel = 1 ORDER BY seq DESC LIMIT 1')
       .get(msg.worldId) as { game_version: string } | undefined;
@@ -3154,32 +2915,27 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
     };
     let ledgerBaselineCheckpointId: string | null = null;
     let ledgerSnapshot: LedgerSnapshot | null = null;
-    // The facts domain is independent of history/topology loading: a missing
-    // facts domain stays empty and is never reconstructed from old tables.
+    // A missing facts domain stays empty; it is never reconstructed from the
+    // retired route tables.
     const facts = loadFacts(connection, msg.worldId, msg.limits);
-    if (msg.kind === 'spatial') {
-      // Hand the voxel loader the budget left after history, so the shared combined
-      // budget is checked against `octet_length` *before* any voxel payload is read
-      // or decoded — never "sum of two full quotas, checked only after decoding".
-      if (msg.voxelLoading === 'manual') {
-        const voxel = loadVoxelDirectory(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
-        voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
-        voxelDirectoryKeys = voxel.voxelDirectoryKeys;
-        voxelDirectorySummary = voxel.voxelDirectorySummary;
-      } else {
-        const voxel = loadVoxel(connection, msg.worldId, msg.limits, msg.limits.maxBytes - world.bytes);
-        voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
-        voxelSnapshot = voxel.voxelSnapshot;
-      }
-      const ledger = loadLedger(connection, msg.worldId, ledgerLimits);
-      ledgerBaselineCheckpointId = ledger.baselineCheckpointId;
-      ledgerSnapshot = ledger.snapshot;
+    // The byte budget is checked against `octet_length` *before* any voxel
+    // payload is read or decoded.
+    if (msg.voxelLoading === 'manual') {
+      const voxel = loadVoxelDirectory(connection, msg.worldId, msg.limits, msg.limits.maxBytes);
+      voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
+      voxelDirectoryKeys = voxel.voxelDirectoryKeys;
+      voxelDirectorySummary = voxel.voxelDirectorySummary;
+    } else {
+      const voxel = loadVoxel(connection, msg.worldId, msg.limits, msg.limits.maxBytes);
+      voxelBaselineCheckpointId = voxel.voxelBaselineCheckpointId;
+      voxelSnapshot = voxel.voxelSnapshot;
     }
+    const ledger = loadLedger(connection, msg.worldId, ledgerLimits);
+    ledgerBaselineCheckpointId = ledger.baselineCheckpointId;
+    ledgerSnapshot = ledger.snapshot;
     respond({
       type: 'open_ok',
       requestId: msg.requestId,
-      baselineCheckpointId: world.baselineCheckpointId,
-      snapshot: world.snapshot,
       voxelBaselineCheckpointId,
       voxelSnapshot,
       voxelDirectoryKeys,
@@ -3190,11 +2946,11 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
       journalRecordBytes: journal.recordBytes,
       ledgerBaselineCheckpointId,
       ledgerSnapshot,
-      factsBaselineCheckpointId: msg.kind === 'spatial' ? facts.factsBaselineCheckpointId : null,
-      factsSnapshot: msg.kind === 'spatial' ? facts.factsSnapshot : null,
+      factsBaselineCheckpointId: facts.factsBaselineCheckpointId,
+      factsSnapshot: facts.factsSnapshot,
       factsMigration: facts.factsMigration,
       legacyFactsMigrationVersion: readSchemaMeta(db!, 'curio_semantic_migration_v1:' + msg.worldId) === '1' ? 1 : 0,
-      legacyStore: world.legacyStore,
+      legacyStore,
       gameVersion: voxelBaselineCheckpoint?.game_version ?? null,
     });
   } catch (err) {
@@ -3219,36 +2975,6 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   }
   if (msg.worldId !== worldId) {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'checkpoint worldId does not match session worldId' });
-    return;
-  }
-  if (msg.snapshot.worldId !== worldId) {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'data', message: 'snapshot worldId does not match session worldId' });
-    return;
-  }
-  const historyMode = msg.historyMode ?? 'full';
-  if (historyMode !== 'full' && historyMode !== 'none') {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid history save mode' });
-    return;
-  }
-  const topologyMode = msg.topologyMode ?? 'full';
-  if (topologyMode !== 'full' && topologyMode !== 'none') {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'invalid topology save mode' });
-    return;
-  }
-  // A domain declared `none` must not smuggle rows in the snapshot: silently
-  // dropping them would turn "unchanged" into data loss.
-  if (historyMode === 'none' && (msg.snapshot.fragments.length > 0 || msg.snapshot.traversals.length > 0)) {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'history mode none must not carry fragments or traversals' });
-    return;
-  }
-  if (
-    topologyMode === 'none' &&
-    (msg.snapshot.nodes.length > 0 ||
-      msg.snapshot.edges.length > 0 ||
-      (msg.snapshot.portalEdges?.length ?? 0) > 0 ||
-      (msg.snapshot.fragmentMerges?.length ?? 0) > 0)
-  ) {
-    respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'topology mode none must not carry nodes, edges or topology extras' });
     return;
   }
   if (msg.journalMode !== 'none' && msg.journalMode !== 'append') {
@@ -3316,14 +3042,11 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     respond({ type: 'error', requestId: msg.requestId, kind: 'invalid_argument', message: 'game version must be a non-empty string' });
     return;
   }
-  let prepared: PreparedSnapshot;
   let preparedVoxel: PreparedVoxelSnapshot | null = null;
   let preparedJournal: PreparedJournal;
   let preparedLedger: PreparedLedgerWrite | null = null;
   let preparedFacts: PreparedFacts | null = null;
   try {
-    prepared = prepareSnapshot(msg.snapshot);
-    assertWithinLimits(prepared, limits);
     if (msg.voxelMode !== 'none') {
       if (msg.voxelSnapshot.worldId !== worldId) {
         throw new Error('voxel snapshot worldId does not match session worldId');
@@ -3332,9 +3055,8 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       if (preparedVoxel.sections.length > limits.maxVoxelSections) {
         throw new Error(`snapshot exceeds maxVoxelSections (${preparedVoxel.sections.length})`);
       }
-      const totalBytes = prepared.bytes + preparedVoxel.bytes;
-      if (totalBytes > limits.maxBytes) {
-        throw new Error(`snapshot exceeds maxBytes (${totalBytes})`);
+      if (preparedVoxel.bytes > limits.maxBytes) {
+        throw new Error(`snapshot exceeds maxBytes (${preparedVoxel.bytes})`);
       }
     }
     preparedJournal =
@@ -3370,14 +3092,10 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   let factsCommitted = false;
   let factsDeferred: FactSourceGap | undefined;
   try {
-    const committed = writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, {
-      history: historyMode,
-      topology: topologyMode,
-    }, prepared, {
+    const committed = writeCheckpoint(db, msg.checkpointId, msg.worldId, gameVersion, {
       mode: msg.voxelMode,
       voxelRevision: msg.voxelRevision,
       sections: preparedVoxel?.sections ?? [],
-      removedIds: (msg.voxelSnapshot?.removedSections ?? []).map(voxelSectionIdFromKey),
     }, {
       mode: msg.journalMode,
       revision: msg.journalRevision,

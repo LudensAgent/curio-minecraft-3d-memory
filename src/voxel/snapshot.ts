@@ -105,7 +105,7 @@ export interface VoxelSectionSnapshot {
   modified?: Uint8Array;
   /** Derived current risk candidates (optional: absent in v1 snapshots). */
   risk?: Uint8Array;
-  /** Revision retired by observation retention (optional; absent means 0). See `Section.retiredRevision`. */
+  /** Legacy retired revision (optional; absent means 0). Preserved when reading old snapshots. */
   retiredRevision?: number;
 }
 
@@ -115,11 +115,6 @@ export interface VoxelCheckpointSnapshot {
   /** Snapshot schema version; absent means v1 (full state in evidence, no history). */
   schemaVersion?: number;
   sections: VoxelSectionSnapshot[];
-  /**
-   * Incremental saves only: sections removed by observation retention since the last
-   * confirmed save. Their rows are deleted before `sections` are upserted.
-   */
-  removedSections?: { dim: string; cx: number; cz: number; sy: number }[];
 }
 
 // --- deep copy ---------------------------------------------------------------

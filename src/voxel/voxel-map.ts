@@ -13,7 +13,7 @@
  * `sectionRef` is a trusted internal read for hot evaluators: it returns the
  * live section and must be treated as read-only, never exposed to callers.
  *
- * This is deliberately *not* the full `SpatialMemoryStore`: routing, topology,
+ * This is deliberately *not* a navigation or route store: routing, topology,
  * frontiers and persistence are composed beside it later, so none of their
  * methods appear here as fake-success stubs.
  */
@@ -269,11 +269,10 @@ type AppliedCell = { section: Section; kind: CellChangeKind; x: number; y: numbe
 
 type ObservationChangeKind = 'inserted' | 'changed' | 'refreshed' | 'restored' | 'staled';
 
-/** One bounded dirty batch; only `keys` and `removedSections` may be confirmed by its ACK. */
+/** One bounded dirty batch; only these `keys` may be confirmed by its ACK. */
 export interface VoxelDirtyBatch {
   sections: VoxelSectionSnapshot[];
   keys: SectionKey[];
-  removedSections: SectionKey[];
   capturedRevision: number;
 }
 
@@ -376,13 +375,6 @@ export class VoxelMap {
    * same batch.
    */
   private dirtyRotationCursor: string | null = null;
-  /**
-   * Sections removed by `retainNewestObservedCells` since the last confirmed save,
-   * keyed by `dirKey` with the save revision of the removal. The next incremental
-   * checkpoint deletes their rows; a section re-created later is simply upserted
-   * again after the delete.
-   */
-  private readonly removedSections = new Map<string, { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }>();
   /**
    * True once the owning session has finished initialization and handed the map to
    * the caller. `restoreSnapshot` is the initialization path only: after this flag
@@ -811,14 +803,13 @@ export class VoxelMap {
     return {
       sections: selected.sections.map(snapshotVoxelSection),
       keys: selected.keys.map((key) => ({ ...key })),
-      removedSections: selected.removed.map((entry) => ({ worldId: this.worldId, ...entry.key })),
       capturedRevision: selected.capturedRevision,
     };
   }
 
-  /** True when any section or removal is waiting for a confirmed save. */
+  /** True when any section is waiting for a confirmed save. */
   hasPendingChanges(): boolean {
-    return this.pendingSections.size > 0 || this.removedSections.size > 0;
+    return this.pendingSections.size > 0;
   }
 
   /**
@@ -828,7 +819,6 @@ export class VoxelMap {
    */
   confirmCapturedSections(
     keys: readonly SectionKey[],
-    removedKeys: readonly SectionKey[],
     capturedRevision: number,
   ): void {
     const captured = new Set(keys.map((key) => dirKey(key.dim, key.cx, key.cz, key.sy)));
@@ -838,16 +828,11 @@ export class VoxelMap {
         this.pendingSections.delete(section);
       }
     }
-    const removed = new Set(removedKeys.map((key) => dirKey(key.dim, key.cx, key.cz, key.sy)));
-    for (const [key, entry] of this.removedSections) {
-      if (removed.has(key) && entry.revision <= capturedRevision) this.removedSections.delete(key);
-    }
   }
 
   private selectDirtySections(maxBytes: number, advanceCursor: boolean, deadlineMs?: number): {
     sections: Section[];
     keys: SectionKey[];
-    removed: { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }[];
     capturedRevision: number;
     bytes: number;
   } {
@@ -886,14 +871,8 @@ export class VoxelMap {
         ? null
         : this.dirtySectionKey(pending[(start + sections.length) % pending.length]![0]);
     }
-    const removed: { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }[] = [];
-    for (const entry of this.removedSections.values()) {
-      if ((sections.length > 0 || removed.length > 0) && expired()) break;
-      removed.push({ key: { ...entry.key }, revision: entry.revision });
-      capturedRevision = Math.max(capturedRevision, entry.revision);
-    }
-    if (sections.length === 0 && removed.length === 0) capturedRevision = this.saveRevisionCount;
-    return { sections, keys, removed, capturedRevision, bytes };
+    if (sections.length === 0) capturedRevision = this.saveRevisionCount;
+    return { sections, keys, capturedRevision, bytes };
   }
 
   private dirtySectionKey(section: Section): string {
@@ -911,80 +890,6 @@ export class VoxelMap {
     for (const [section, revision] of this.pendingSections) {
       if (revision <= capturedRevision) this.pendingSections.delete(section);
     }
-    for (const [key, removed] of this.removedSections) {
-      if (removed.revision <= capturedRevision) this.removedSections.delete(key);
-    }
-  }
-
-  /** Keys of sections removed since the last confirmed save (for the next incremental checkpoint to delete). */
-  captureRemovedSections(): { dim: string; cx: number; cz: number; sy: number }[] {
-    return [...this.removedSections.values()].map((r) => ({ ...r.key }));
-  }
-
-  /**
-   * Bounded observation retention: keep only the `maxCells` most recently observed
-   * cells (by `observedAt`) and forget the rest. A forgotten cell loses its evidence,
-   * explored/stale/risk bits and content — it reads as unknown, exactly like a cell
-   * never observed. The historical `traversed`/`modified` marks are kept (they are
-   * history, not observation). A section left with no evidence and no history marks
-   * is removed from the map and its row is deleted by the next incremental
-   * checkpoint; a pinned section is only emptied, never removed.
-   *
-   * Every touched section advances its revision and is reported once as
-   * `invalidated` (without per-cell entries, which could be hundreds of thousands).
-   * Eager residency only: in manual mode non-resident committed sections cannot be
-   * ranked against resident ones, so this throws instead of silently under-trimming.
-   */
-  retainNewestObservedCells(maxCells: number): { forgottenCells: number; removedSections: number; keptCells: number } {
-    if (!Number.isInteger(maxCells) || maxCells < 0) throw new Error(`maxCells must be a non-negative integer: ${maxCells}`);
-    if (this.manualResidency) throw new Error('retainNewestObservedCells requires eager residency');
-    const all: { section: Section; index: number; at: number }[] = [];
-    for (const dimMap of this.sections.values()) {
-      for (const section of dimMap.values()) {
-        for (const [index, evidence] of section.evidence) all.push({ section, index, at: evidence.observation.observedAt });
-      }
-    }
-    if (all.length <= maxCells) return { forgottenCells: 0, removedSections: 0, keptCells: all.length };
-    all.sort((a, b) => a.at - b.at);
-    const forget = all.slice(0, all.length - maxCells);
-    // Per touched section: revision carried by its forgotten cells (see Section.retiredRevision).
-    const touched = new Map<Section, number>();
-    for (const { section, index } of forget) {
-      touched.set(section, (touched.get(section) ?? 0) + section.evidence.get(index)!.revision);
-      section.evidence.delete(index);
-      setBit(section.explored, index, false);
-      setBit(section.stale, index, false);
-      setBit(section.risk, index, false);
-      writeCell(section.cells, section.bits, index, 0);
-    }
-    // The forgotten cells no longer reference their slots. Rebuild the palette
-    // accounting lazily from the remaining evidence rather than carrying stale
-    // reference counts into the next accepted write.
-    for (const section of touched.keys()) this.paletteRetentions.delete(section);
-    const changes: SectionChange[] = [];
-    let removed = 0;
-    for (const [section, forgottenRevision] of touched) {
-      section.revision += 1;
-      section.retiredRevision = (section.retiredRevision ?? 0) + forgottenRevision + 1;
-      changes.push({ key: { ...section.key }, revision: section.revision, invalidated: true, cells: [] });
-      const { dim, cx, cz, sy } = section.key;
-      const dk = dirKey(dim, cx, cz, sy);
-      const hasHistory = section.traversed.some((b) => b !== 0) || section.modified.some((b) => b !== 0);
-      if (section.evidence.size === 0 && !hasHistory && (this.pinCounts.get(dk) ?? 0) === 0) {
-        const dimMap = this.sections.get(dim)!;
-        dimMap.delete(innerKey(cx, cz, sy));
-        if (dimMap.size === 0) this.sections.delete(dim);
-        this.bumpResidencyGeneration(dim, cx, cz, sy);
-        this.pendingSections.delete(section);
-        this.saveRevisionCount += 1;
-        this.removedSections.set(dk, { key: { dim, cx, cz, sy }, revision: this.saveRevisionCount });
-        removed += 1;
-      } else {
-        this.recordSaveChange(section);
-      }
-    }
-    this.emit({ sections: changes });
-    return { forgottenCells: forget.length, removedSections: removed, keptCells: all.length - forget.length };
   }
 
   /**
@@ -1089,7 +994,7 @@ export class VoxelMap {
     // Restore establishes a clean baseline: nothing is pending, and the confirmed
     // revision is the post-restore revision (set by the session initializer).
     this.pendingSections.clear();
-    // Restore is a baseline-establishing mutation (mirrors FragmentStore): only a
+    // Restore is a baseline-establishing mutation: only a
     // session initializer, which then sets the confirmed baseline to the
     // post-restore revision, treats it as clean.
     this.saveRevisionCount += 1;
@@ -1486,40 +1391,14 @@ export class VoxelMap {
     mode: 'full' | 'incremental',
     sections: readonly VoxelSectionSnapshot[],
     committedBytes: readonly { dim: string; cx: number; cz: number; sy: number; bytes: number }[],
-    removedKeys: readonly SectionKey[] = [],
   ): void {
     if (!this.manualResidency) return;
-    const remove = (key: string): void => {
-      const entry = this.directory.get(key);
-      if (entry === undefined) {
-        const known = this.knownCommittedMeta.get(key);
-        if (this.committedDirectoryKeys.delete(key)) {
-          this.directoryTotals.sections -= 1;
-          if (known !== undefined) {
-            this.directoryTotals.observedCells -= known.observedCells;
-            this.directoryTotals.paletteEntries -= known.paletteEntries;
-            this.directoryTotals.bytes -= known.bytes;
-          }
-        }
-        this.knownCommittedMeta.delete(key);
-        return;
-      }
-      this.directory.delete(key);
-      this.committedDirectoryKeys.delete(key);
-      this.knownCommittedMeta.delete(key);
-      this.directoryTotals.sections -= 1;
-      this.directoryTotals.observedCells -= entry.observedCells;
-      this.directoryTotals.paletteEntries -= entry.paletteEntries;
-      this.directoryTotals.bytes -= entry.bytes;
-    };
     if (mode === 'full') {
       this.directory.clear();
       this.committedDirectoryKeys.clear();
       this.knownCommittedMeta.clear();
       this.directoryTotals = { sections: 0, observedCells: 0, paletteEntries: 0, bytes: 0 };
       this.nextDirectorySeq = 0;
-    } else {
-      for (const raw of removedKeys) remove(dirKey(raw.dim, raw.cx, raw.cz, raw.sy));
     }
     const byteMap = new Map(committedBytes.map((b) => [dirKey(b.dim, b.cx, b.cz, b.sy), b.bytes]));
     for (const raw of sections) {

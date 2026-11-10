@@ -9,7 +9,6 @@
 // Base primitives + configuration
 export {
   AIR_PALETTE_INDEX,
-  PASSAGE_LINK,
   SECTION_CELL_COUNT,
   SECTION_SIZE,
   VOXEL_SECTION_PAYLOAD_VERSION,
@@ -68,7 +67,6 @@ export type {
   ChangeReportDeliveryFailure,
   ChangeReportErrorHandler,
   ChangeReportListener,
-  ChangeReportSubscriptionOptions,
   CommittedSectionInfo,
   PinLease,
   ResidencyLimits,
@@ -108,7 +106,7 @@ export type {
   VoxelSectionPayloadV2,
 } from './voxel/index.js';
 
-// Traversability
+// Traversability (land walking, jumps, steps, drops; water primitives separately)
 export {
   DEFAULT_LAND_LIMITS,
   evaluateLandTransition,
@@ -116,7 +114,6 @@ export {
   LandRouteVerifier,
   resolveLandLimits,
   TraversabilityCache,
-  RouteVerifier,
 } from './traversability/index.js';
 export type {
   ClimbCellInput,
@@ -173,127 +170,7 @@ export type {
   Traversability,
   TraversabilityEntry,
 } from './traversability/index.js';
-export type {
-  PendingReason,
-  RouteRequest,
-  RouteStatus,
-  RouteStepState,
-  RouteVerdict,
-  RouteVerifierOptions,
-} from './traversability/index.js';
-
-// Topology — historical geometry + confirmed traversal evidence (phase 4A),
-// explicit in-memory topology facts (phase 4B), and bounded historical graph
-// queries (phase 4C)
-export {
-  canonicalCellKey,
-  canonicalCellPoint,
-  FragmentStore,
-  TopologyStore,
-  writeConfirmedCorridor,
-} from './topology/index.js';
-export type {
-  AdjacencyOptions,
-  AdjacencyResult,
-  AnchorOrder,
-  ConfirmedCorridorEdge,
-  ConfirmedCorridorInput,
-  ConfirmedCorridorNode,
-  ConnectionType,
-  CorridorCoordinateMode,
-  CorridorWriteProblem,
-  CorridorWriteProblemKind,
-  CorridorWriteReceipt,
-  EdgeBasis,
-  EdgeChanges,
-  EdgePage,
-  EdgeQuery,
-  EdgeReference,
-  EdgeView,
-  FragmentChanges,
-  FragmentCheckpointMeasure,
-  FragmentCheckpointSnapshot,
-  FragmentPage,
-  FragmentQuery,
-  FragmentScope,
-  FragmentStoreOptions,
-  HistoricalAnchorCandidate,
-  HistoricalAnchorQueryOptions,
-  HistoricalAnchorQueryResult,
-  LandmarkTag,
-  NodeChanges,
-  NodeKind,
-  NodePage,
-  NodeQuery,
-  NodeSource,
-  PathFragment,
-  QueryBudget,
-  QueryBudgetKey,
-  QueryStats,
-  ReachabilityResult,
-  ReferenceStatus,
-  RouteQueryResult,
-  RouteQueryStatus,
-  RouteSegment,
-  SaveResult,
-  SaveStatus,
-  SearchDiagnostic,
-  SearchDisposition,
-  SearchGapKind,
-  SpatialEdge,
-  SpatialNode,
-  TopologyCheckpointMeasure,
-  TopologyCheckpointSnapshot,
-  TopologyEdge,
-  TopologyEdgeSnapshot,
-  TopologyEvidenceRefSnapshot,
-  TopologyHistorySource,
-  TopologyQueryOptions,
-  TopologyStoreOptions,
-  TraversalEvidence,
-  TraversalPage,
-  TraversalQuery,
-} from './topology/index.js';
-// Topology runtime state (design §5): edge verification, portals, anchors,
-// fragmentation, occupancy. Derived state never deletes history.
-export { TransientOccupancy } from './topology/index.js';
-export type {
-  AnchorQueryOptions,
-  AnchorResult,
-  ComponentReport,
-  ConnectivityLink,
-  EdgeBlockInput,
-  EdgeDependency,
-  EdgeDirection,
-  EdgeDirectionState,
-  EdgeModeState,
-  EdgeRuntimeShape,
-  EdgeRuntimeView,
-  EdgeUsability,
-  EdgeUsabilityReason,
-  EdgeVerification,
-  EdgeVerificationInput,
-  EdgeVerificationStatus,
-  FragmentConnectivityInput,
-  FragmentMerge,
-  FragmentPiece,
-  FragmentSegment,
-  FragmentSegmentsResult,
-  FragmentSegmentsView,
-  FragmentationResult,
-  GoneEvidence,
-  OccupancyObservationInput,
-  OccupancyOptions,
-  OccupancyQuery,
-  OccupancyRecord,
-  PortalEdgeInput,
-  PortalEdgeView,
-  PortalTraversalEvidence,
-  RecordNodeOptions,
-  RuntimeQueryOptions,
-} from './topology/index.js';
-
-// Memory write/change ports (pure memory core)
+// Memory capability contract and change-report port
 export {
   CAPABILITY_DOMAINS,
   CapabilityContractError,
@@ -308,22 +185,22 @@ export type {
   CapabilityNameOf,
   ChangeReportSink,
   ChangeReportSource,
+  ChangeReportSubscriptionOptions,
   ComposedCapabilityReport,
   ContractVersion,
   HostCapabilityDeclaration,
-  LegacyRouteIngest,
   MemoryHostCapabilities,
-  MemoryIngest,
-  ObservationIngest,
 } from './memory/index.js';
 
-// Query — read-only projection (contract §5, plan M2)
+// Query — read-only voxel + facts projection
 export { createVoxelFactsQueryPort } from './query/index.js';
 export type {
   CellQueryView,
-  FrontierBoundaryDirection,
-  FrontierCandidateQueryView,
-  FrontierQueryData,
+  SemanticPlaceLocation,
+  SemanticPlaceSource,
+  SemanticPlaceTag,
+  SemanticPlaceView,
+  SpatialMemoryStoreSnapshot,
   SpatialQueryData,
   SpatialQueryKind,
   SpatialQueryOptions,
@@ -356,31 +233,15 @@ export type {
   WorldAdapter,
 } from './adapter/index.js';
 
-// Navigation
-export {
-  createWalkPath,
-  createWalkPathExecution,
-  createWalkRouteSearchSource,
-  DEFAULT_START_TOLERANCE,
-  followKnownPath,
-  frontierCandidates,
-  inspectKnownRoute,
-  inspectRoute,
-  NAVIGATION_CAPABILITIES,
-  NAVIGATION_CAPABILITY_STATUSES,
-  navigateTo,
-  planRoute,
-  ROUTE_PLAN_CAPABILITIES,
-  RoutePlanRegistryCapacityError,
-  RoutePlanRegistryImpl,
-  searchLandRoute,
-  searchLandRouteAsync,
-  startKnownWalkRoute,
-  WalkRouteSearch,
-} from './navigation/index.js';
+// Navigation — current voxel land search + shared delegation contracts
+export { searchLandRoute, searchLandRouteAsync } from './navigation/index.js';
 export type {
   ActionRecord,
   ArrivalSpec,
+  LastObservation,
+  NavOutcome,
+  NavProblem,
+  NavResult,
   LandSearchArrival,
   LandSearchBoundary,
   LandSearchBoundaryStatus,
@@ -399,134 +260,27 @@ export type {
   LandSearchResult,
   LandSearchStatus,
   LandSearchTransition,
-  FollowKnownPathEnvironment,
-  FollowKnownPathOutcome,
-  FollowKnownPathRequest,
-  InspectKnownRouteOptions,
-  KnownRouteCurrentFacts,
-  KnownRouteEvidence,
-  KnownRouteInspection,
-  KnownRouteInspectionResult,
-  KnownRouteNotFound,
-  KnownRouteTraversalView,
-  NavigateEnvironment,
-  NavigateOutcome,
-  NavigateSearchSource,
-  NavigateSegment,
-  NavigationMemoryWrite,
-  Frontier,
-  FrontierCandidateView,
-  FrontierCandidatesResult,
-  KnownWalkRouteRejectionReason,
-  KnownWalkRouteRequest,
-  KnownWalkRouteSnapshot,
-  KnownWalkRouteStart,
-  LastObservation,
-  NavigateRequest,
-  NavigationCapability,
-  NavigationCapabilityEffects,
-  NavigationCapabilityName,
-  NavigationCapabilityStatus,
-  NavOutcome,
-  CancellationOrigin,
-  // The walk-path port has its own `subscribe` shape; alias it so the memory
-  // write port's existing `ChangeReportSource` export stays unchanged.
-  ChangeReportSource as WalkPathChangeReportSource,
-  NavProblem,
-  NavResult,
-  RouteBoundary,
-  RouteBoundaryFact,
-  RouteEvidence,
-  RouteInspection,
-  RoutePlan,
-  RoutePlanCapabilities,
-  RoutePlanCapabilityName,
-  RoutePlanConstraints,
-  RoutePlanDraft,
-  RoutePlanEnvironment,
-  RoutePlanRegistrar,
-  RoutePlanRegistry,
-  RoutePlanRegistryOptions,
-  RoutePlanRegistryProblem,
-  RoutePlanRequest,
-  RoutePlanResult,
-  RoutePlanScope,
-  RoutePlanSegment,
-  RoutePlanSource,
-  RouteSearchSource,
-  RouteUnsupported,
-  WalkBodyPort,
-  WalkPath,
-  WalkPathEnvironment,
-  WalkPathExecute,
-  WalkPathExecutionOptions,
-  WalkPathInvalidationReason,
-  WalkPathOptions,
-  WalkPathOutcome,
-  WalkPathRegistry,
-  WalkPathRequest,
-  WalkPathResult,
-  WalkPathStartContext,
-  WalkSearchArrival,
-  WalkSearchCandidate,
-  WalkSearchCounters,
-  WalkSearchDiagnostic,
-  WalkSearchFrontier,
-  WalkSearchLimits,
-  WalkSearchOptions,
-  WalkSearchProblem,
-  WalkSearchRequest,
-  WalkSearchSnapshot,
-  WalkSearchState,
-  WalkSearchUnavailableEvidence,
-  WalkSearchUnavailableResidency,
-  WalkSearchUnavailableSection,
 } from './navigation/index.js';
 
-// Execution — controlled walk-route execution loop (design §7 first step, phase 3)
-export { WalkRouteExecutor } from './execution/index.js';
-export { GROUNDED_ARRIVAL_DEFAULTS } from './execution/index.js';
-export type {
-  BodySample,
-  GroundedArrival,
-  ExecutableMove,
-  ExecutableMoveResult,
-  MoveExecutor,
-  MoveFailure,
-  WalkRouteExecutorOptions,
-  WalkRouteRequest,
-  WalkRouteStatus,
-} from './execution/index.js';
-
-// Store — runtime composition and scope guard (design §9)
-export {
-  FRAGMENTATION_HOP_DISTANCE,
-  FRAGMENTATION_LINK_DISTANCE,
-  SpatialMemoryScopeError,
-  SpatialMemoryStoreImpl,
-  SpatialMemoryUnsupportedError,
-} from './store/index.js';
-export type {
-  FrontierInspection,
-  HistoricalRouteInspection,
-  SpatialEdgeRecord,
-  SpatialMemoryCapabilities,
-  SpatialMemoryCapability,
-  SpatialMemoryCapabilityName,
-  SpatialMemoryStore,
-  SpatialMemoryStoreOptions,
-  SpatialMemoryStoreSnapshot,
-  WalkSearchSnapshotProvider,
-} from './store/index.js';
-
-// Storage
+// Storage — voxel/facts/ledger/journal persistence
 export { TABLE_NAMES } from './storage/index.js';
 export type { PersistenceWorker, SaveBatch, SaveConfirmation } from './storage/index.js';
-export type { LegacyStoreSummary } from './storage/sqlite/types.js';
+export type {
+  CloseResult,
+  FlushResult,
+  LegacyStoreSummary,
+  OpenSpatialSessionOptions,
+  PersistenceErrorKind,
+  SessionLifecycle,
+  SnapshotLimits,
+  SpatialCheckpointResult,
+  SpatialPersistenceState,
+  SpatialSession,
+  VoxelLoading,
+} from './storage/sqlite/types.js';
+export { PersistenceError } from './storage/sqlite/types.js';
 
-// Facts — semantic place/resource/container anchors (v0.11 plan §3.2).
-// Deliberately separate from topology nodes: flat, bounded, queryable facts
-// with gone/revocation retained, plus a pure legacy-node migration dry run.
+// Facts — semantic place/resource/container anchors, separate from route history
 export {
   FACT_MIGRATION_TARGET,
   FACT_MIGRATION_VERSION,

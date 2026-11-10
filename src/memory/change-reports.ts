@@ -2,9 +2,9 @@
  * Change-report forwarding (implementation plan M1.6, contract §8.1).
  *
  * Every accepted observation or lifecycle change produces a localized
- * `ChangeReport`. The host must hand that report to the active verifier/executor
- * before the next control step; this module defines the narrow port used to do
- * so without importing the navigation or execution layers.
+ * `ChangeReport`. The host must hand that report to its own control loop before
+ * the next step; this module defines the narrow port used to do so without
+ * importing the navigation or execution layers.
  */
 
 import type {

@@ -16,7 +16,6 @@
  * name into a surface height.
  */
 
-import type { BodySample } from '../execution/types.js';
 import type { BlockState, Vec3Like } from '../types.js';
 import type {
   CollisionShapeProvider,
@@ -363,6 +362,33 @@ export interface BoatDockGoal {
 }
 
 export type WaterArrivalGoal = SurfaceTargetGoal | DryShoreGoal | BoatDockGoal;
+
+/**
+ * One measured body sample with the execution identity it belongs to.
+ *
+ * This is the shared body-evidence record retained after the walk-route
+ * executor was retired; water arrival validation is its only current consumer.
+ */
+export interface BodySample {
+  worldId: string;
+  dim: string;
+  sessionId: string;
+  /** Measured feet position in continuous space. */
+  pos: Vec3Like;
+  /** Real timestamp the sample was captured (never the receive time). */
+  observedAt: number;
+  /** Measured velocity in blocks per physics tick. */
+  velocity?: Vec3Like;
+  alive: boolean;
+  connected: boolean;
+  observationReady: boolean;
+  onGround: boolean;
+  inWater: boolean;
+  /** Execution identity this sample belongs to; never inferred from time. */
+  executionId: string;
+  /** Monotonic per-delegation sample identity (not a receive counter). */
+  sequence: number;
+}
 
 /**
  * Boat telemetry explicitly bound to the same sample receipt. This is the
