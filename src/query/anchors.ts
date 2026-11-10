@@ -50,9 +50,18 @@ function queryResourceAnchors(
   context: SpatialQueryContext,
   request: Extract<AnchorQuery, { kind: 'resourceAnchors' }>,
 ): SpatialQueryResult {
+  const topology = context.sources.topology;
+  if (topology === undefined) {
+    return unsupportedQueryResult(
+      context,
+      request.kind,
+      'this query composition has no legacy topology store and no facts store',
+      request.dim,
+    );
+  }
   const page = collectQueryPages<SpatialNode>(
     (after, limit) =>
-      context.sources.topology.nodes({
+      topology.nodes({
         ...(request.dim === undefined ? {} : { dim: request.dim }),
         ...(request.tag === undefined ? {} : { tag: request.tag }),
         ...(request.label === undefined ? {} : { label: request.label }),
@@ -72,11 +81,12 @@ function queryContainerAnchors(
   request: Extract<AnchorQuery, { kind: 'containerAnchors' }>,
 ): SpatialQueryResult {
   const isContainer = context.isContainer;
-  if (isContainer === undefined) {
+  const topology = context.sources.topology;
+  if (isContainer === undefined || topology === undefined) {
     return unsupportedQueryResult(
       context,
       'containerAnchors',
-      NO_CLASSIFIER_DETAIL,
+      isContainer === undefined ? NO_CLASSIFIER_DETAIL : 'this query composition has no legacy topology store and no facts store',
       request.dim,
     );
   }
@@ -89,7 +99,7 @@ function queryContainerAnchors(
   const matches: SpatialNode[] = [];
   let cursor: string | undefined;
   for (;;) {
-    const page = context.sources.topology.nodes({
+    const page = topology.nodes({
       ...(request.dim === undefined ? {} : { dim: request.dim }),
       ...(cursor === undefined ? {} : { after: cursor }),
       limit: CONTAINER_SCAN_PAGE_SIZE,

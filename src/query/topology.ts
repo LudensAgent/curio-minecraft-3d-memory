@@ -6,7 +6,7 @@
  * drain every page (`fragments`, `graph`, `edgesDetailed`).
  */
 
-import { makeQueryResult } from './envelope.js';
+import { makeQueryResult, unsupportedQueryResult } from './envelope.js';
 import { collectQueryPages, pagePortalEdges, resolveLimit } from './paging.js';
 import type { QueryPage } from './paging.js';
 import type {
@@ -59,12 +59,22 @@ export function queryTopology(
   context: SpatialQueryContext,
   request: TopologyQuery,
 ): SpatialQueryResult {
+  const fragments = context.sources.fragments;
+  const topology = context.sources.topology;
+  if (fragments === undefined || topology === undefined) {
+    return unsupportedQueryResult(
+      context,
+      request.kind,
+      'this query composition has no legacy fragment/topology stores',
+      'dim' in request ? request.dim : undefined,
+    );
+  }
   const limit = resolveLimit(request.limit);
   switch (request.kind) {
     case 'fragments': {
       const page = collectQueryPages(
         (after, pageLimit) =>
-          context.sources.fragments.fragments({
+          fragments.fragments({
             dim: request.dim,
             kind: request.fragmentKind,
             source: request.geometrySource,
@@ -79,7 +89,7 @@ export function queryTopology(
     case 'traversals': {
       const page = collectQueryPages(
         (after, pageLimit) =>
-          context.sources.fragments.traversals({
+          fragments.traversals({
             dim: request.dim,
             fragmentId: request.fragmentId,
             after,
@@ -93,7 +103,7 @@ export function queryTopology(
     case 'nodes': {
       const page = collectQueryPages(
         (after, pageLimit) =>
-          context.sources.topology.nodes({
+          topology.nodes({
             dim: request.dim,
             tag: request.tag,
             label: request.label,
@@ -109,7 +119,7 @@ export function queryTopology(
     case 'edges': {
       const page = collectQueryPages(
         (after, pageLimit) =>
-          context.sources.topology.edges({
+          topology.edges({
             dim: request.dim,
             from: request.from,
             to: request.to,
@@ -125,7 +135,7 @@ export function queryTopology(
     }
     case 'portals': {
       const page = pagePortalEdges(
-        context.sources.topology.portalEdges(),
+        topology.portalEdges(),
         request.after,
         limit,
       );

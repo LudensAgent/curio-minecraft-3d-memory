@@ -36,7 +36,12 @@ export type {
   ChangeReportSource,
   ChangeReportSubscriptionOptions,
 } from './change-reports.js';
-export type { MemoryIngest, SpatialEdgeRecord } from './ingest.js';
+export type {
+  LegacyRouteIngest,
+  MemoryIngest,
+  ObservationIngest,
+  SpatialEdgeRecord,
+} from './ingest.js';
 
 // Observation / evidence
 export type { Observation, ObservationBatch } from '../observation/types.js';

@@ -1,6 +1,7 @@
 import type { SemanticFact, FactPage, FactQuery } from '../facts/types.js';
 import type { SpatialNode } from '../topology/graph.js';
 import { pagedQueryResult } from './topology.js';
+import { unsupportedQueryResult } from './envelope.js';
 import { resolveLimit } from './paging.js';
 import type { SpatialQueryContext, SpatialQueryRequest, SpatialQueryResult } from './types.js';
 
@@ -9,7 +10,10 @@ export function queryFacts(
   context: SpatialQueryContext,
   request: Extract<SpatialQueryRequest, { kind: 'nodes' | 'resourceAnchors' | 'containerAnchors' }>,
 ): SpatialQueryResult {
-  const facts = context.sources.facts!;
+  const facts = context.sources.facts;
+  if (facts === undefined) {
+    return unsupportedQueryResult(context, request.kind, 'no semantic fact store is composed into this query port', request.dim);
+  }
   const readers: ((query: FactQuery) => FactPage<SemanticFact>)[] = request.kind === 'resourceAnchors'
     ? [query => facts.resources(query)]
     : request.kind === 'containerAnchors'

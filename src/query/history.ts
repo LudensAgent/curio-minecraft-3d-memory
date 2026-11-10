@@ -7,7 +7,7 @@
  */
 
 import type { ComponentReport } from '../topology/index.js';
-import { makeQueryResult } from './envelope.js';
+import { makeQueryResult, unsupportedQueryResult } from './envelope.js';
 import { MAX_QUERY_LIMIT } from './paging.js';
 import type { SpatialQueryContext, SpatialQueryRequest, SpatialQueryResult } from './types.js';
 
@@ -49,15 +49,19 @@ function collectAll<T>(
  * counters. Connectivity still comes only from `traversed` edges whose two
  * endpoints exist and belong to the requested dimension.
  */
-function computeComponents(context: SpatialQueryContext, dim: string): ComponentReport {
+function computeComponents(
+  context: SpatialQueryContext,
+  topology: NonNullable<SpatialQueryContext['sources']['topology']>,
+  dim: string,
+): ComponentReport {
   const nodes = collectAll((after, limit) =>
-    context.sources.topology.nodes({ dim, after, limit }),
+    topology.nodes({ dim, after, limit }),
   );
   const nodeIds = new Set(nodes.map((node) => node.id));
   const adjacency = new Map<string, string[]>();
   for (const id of nodeIds) adjacency.set(id, []);
   const edges = collectAll((after, limit) =>
-    context.sources.topology.edges({ dim, basis: 'traversed', after, limit }),
+    topology.edges({ dim, basis: 'traversed', after, limit }),
   );
   for (const edge of edges) {
     // A traversed edge only connects two nodes of this dimension when both
@@ -99,15 +103,25 @@ function computeComponents(context: SpatialQueryContext, dim: string): Component
   return { components: groups.length, groups, byNode, recomputedNodes: nodes.length };
 }
 
+const LEGACY_STORES_ABSENT =
+  'this query composition has no legacy fragment/topology stores; ' +
+  'use facts for semantic places/anchors and voxel cells for geometry';
+
 export function queryHistory(
   context: SpatialQueryContext,
   request: HistoryQuery,
 ): SpatialQueryResult {
+  const history = context.sources.history;
+  const fragments = context.sources.fragments;
+  const topology = context.sources.topology;
   switch (request.kind) {
     case 'historyRoute': {
+      if (history === undefined) {
+        return unsupportedQueryResult(context, request.kind, LEGACY_STORES_ABSENT, request.dim);
+      }
       // The store's detailed inspection already reports endpoint snapping,
       // gaps, and the historicalGeometry/executable/currentPassability flags.
-      const inspection = context.sources.history.routeInspection(
+      const inspection = history.routeInspection(
         request.dim,
         request.from,
         request.to,
@@ -120,13 +134,16 @@ export function queryHistory(
       });
     }
     case 'anchor': {
+      if (history === undefined) {
+        return unsupportedQueryResult(context, request.kind, LEGACY_STORES_ABSENT, request.dim);
+      }
       const options = request.near === undefined ? {} : { near: request.near };
       // `null` means no exact anchor was found near `here`; it is a valid answer,
       // not a `not_found` problem.
       const anchor =
         request.order === 'surface'
-          ? context.sources.history.surfaceAnchor(request.dim, request.here, options)
-          : context.sources.history.deepestAnchor(request.dim, request.here, options);
+          ? history.surfaceAnchor(request.dim, request.here, options)
+          : history.deepestAnchor(request.dim, request.here, options);
       return makeQueryResult(context, {
         status: 'ok',
         dim: request.dim,
@@ -134,9 +151,12 @@ export function queryHistory(
       });
     }
     case 'components': {
+      if (topology === undefined) {
+        return unsupportedQueryResult(context, request.kind, LEGACY_STORES_ABSENT, request.dim);
+      }
       // Computed from read-only list pages so the query never mutates the
       // store's derived component cache.
-      const report = computeComponents(context, request.dim);
+      const report = computeComponents(context, topology, request.dim);
       return makeQueryResult(context, {
         status: 'ok',
         dim: request.dim,
@@ -144,7 +164,10 @@ export function queryHistory(
       });
     }
     case 'segments': {
-      const fragment = context.sources.fragments.getFragment(request.fragmentId);
+      if (fragments === undefined || history === undefined) {
+        return unsupportedQueryResult(context, request.kind, LEGACY_STORES_ABSENT);
+      }
+      const fragment = fragments.getFragment(request.fragmentId);
       if (fragment === null) {
         return makeQueryResult(context, {
           status: 'not_found',
@@ -162,7 +185,7 @@ export function queryHistory(
         dim: fragment.dim,
         data: {
           kind: 'segments',
-          segments: context.sources.history.segments(request.fragmentId),
+          segments: history.segments(request.fragmentId),
         },
       });
     }

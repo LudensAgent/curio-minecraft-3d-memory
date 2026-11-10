@@ -311,11 +311,14 @@ export type {
   ComposedCapabilityReport,
   ContractVersion,
   HostCapabilityDeclaration,
+  LegacyRouteIngest,
   MemoryHostCapabilities,
   MemoryIngest,
+  ObservationIngest,
 } from './memory/index.js';
 
 // Query — read-only projection (contract §5, plan M2)
+export { createVoxelFactsQueryPort } from './query/index.js';
 export type {
   CellQueryView,
   FrontierBoundaryDirection,
@@ -328,7 +331,10 @@ export type {
   SpatialQueryProblem,
   SpatialQueryRequest,
   SpatialQueryResult,
+  SpatialQuerySources,
   SpatialQueryStatus,
+  VoxelFactsQueryOptions,
+  VoxelFactsQueryVoxel,
 } from './query/index.js';
 
 // Adapter

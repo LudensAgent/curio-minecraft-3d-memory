@@ -43,7 +43,7 @@ import type {
   TraversalEvidence,
 } from '../topology/index.js';
 import type { BlockState, Vec3Like, WorldScope } from '../types.js';
-import type { CellView, SectionResidency } from '../voxel/index.js';
+import type { CellView, SectionKey, SectionResidency } from '../voxel/index.js';
 
 export interface SpatialQueryPort {
   query(request: SpatialQueryRequest): SpatialQueryResult;
@@ -209,7 +209,52 @@ export type SpatialMemoryCapabilities = Record<
   SpatialMemoryCapability
 >;
 
-/** Read-only runtime summary. Never refreshes evidence or changes a revision. */
+/** Runtime list mirroring `SpatialMemoryCapabilityName` for honest empty reports. */
+export const SPATIAL_MEMORY_CAPABILITY_NAMES = [
+  'observe',
+  'observeBatch',
+  'beginSession',
+  'markStale',
+  'sectionAt',
+  'markTraversed',
+  'markModified',
+  'saveFragment',
+  'addTraversal',
+  'forgetFragment',
+  'fragments',
+  'recordNode',
+  'upsertNode',
+  'upsertEdge',
+  'dropEdge',
+  'graph',
+  'displayNodes',
+  'markGone',
+  'goneNear',
+  'verifyEdge',
+  'blockEdge',
+  'clearEdgeBlock',
+  'edgeRuntime',
+  'savePortalEdge',
+  'addPortalTraversal',
+  'portalEdges',
+  'route',
+  'surfaceAnchor',
+  'deepestAnchor',
+  'fragmentation',
+  'components',
+  'segments',
+  'mergeFragments',
+  'query',
+  'frontierCandidates',
+  'subscribeChanges',
+] as const satisfies readonly SpatialMemoryCapabilityName[];
+
+/**
+ * Read-only runtime summary. Never refreshes evidence or changes a revision.
+ *
+ * A voxel+facts production composition has no legacy fragment/topology domain;
+ * those blocks are absent rather than reported as zero recorded history.
+ */
 export interface SpatialMemoryStoreSnapshot {
   worldId: string;
   voxel: {
@@ -219,8 +264,12 @@ export interface SpatialMemoryStoreSnapshot {
     pinLeases: number;
     pinnedSections: number;
   };
-  fragments: { revision: number; total: number };
-  topology: { revision: number; nodes: number; edges: number };
+  /** Present when semantic facts are part of the composition. */
+  facts?: { revision: number; places: number; resources: number; containers: number };
+  /** Present only in a composition that actually carries historical geometry. */
+  fragments?: { revision: number; total: number };
+  /** Present only in a composition that actually carries the legacy topology. */
+  topology?: { revision: number; nodes: number; edges: number };
   capabilities: SpatialMemoryCapabilities;
 }
 
@@ -415,6 +464,11 @@ export type FrontierQuerySource =
  * Narrow read-only source set for the query handlers. It deliberately does not
  * expose the write stores' mutation APIs, so a handler cannot accidentally
  * observe, save, pin, load, or execute.
+ *
+ * `fragments`/`topology`/`history` belong to the legacy route domain. A
+ * voxel+facts production composition omits them; the corresponding query
+ * kinds then return a structured `unsupported` instead of falling back to
+ * immediately-empty compatibility stores.
  */
 export interface SpatialQuerySources {
   /** When supplied, semantic queries use facts exclusively, including empty results. */
@@ -423,9 +477,9 @@ export interface SpatialQuerySources {
   currentSessionId(): string | null;
   cellAt(dim: string, x: number, y: number, z: number): CellView;
   residencyAt(dim: string, x: number, y: number, z: number): SectionResidency;
-  fragments: Pick<FragmentStore, 'fragments' | 'traversals' | 'getFragment'>;
-  topology: Pick<TopologyStore, 'nodes' | 'edges' | 'portalEdges'>;
-  history: {
+  fragments?: Pick<FragmentStore, 'fragments' | 'traversals' | 'getFragment'>;
+  topology?: Pick<TopologyStore, 'nodes' | 'edges' | 'portalEdges'>;
+  history?: {
     routeInspection(
       dim: string,
       from: Vec3Like,
@@ -443,8 +497,39 @@ export interface SpatialQuerySources {
    * truthfully → `unsupported`; it never triggers a scan.
    */
   frontiers?(dim: string, here: Vec3Like): FrontierQuerySource;
-  snapshot(): SpatialMemoryStoreSnapshot;
-  memoryCapabilities(): SpatialMemoryCapabilities;
+  snapshot?(): SpatialMemoryStoreSnapshot;
+  memoryCapabilities?(): SpatialMemoryCapabilities;
+}
+
+/**
+ * The voxel view a production facts query port needs. `VoxelMap` satisfies it
+ * structurally; tests may supply a narrower stand-in.
+ */
+export interface VoxelFactsQueryVoxel {
+  readonly worldId: string;
+  readonly sessionId: string | null;
+  readonly saveRevision: number;
+  cellAt(dim: string, x: number, y: number, z: number): CellView;
+  sectionResidency(key: SectionKey): { residency: SectionResidency };
+  residentSize(): { sections: number; bytes: number };
+  pinState(): { leases: number; pinnedSections: number };
+  observe?(observation: Observation): unknown;
+  observeBatch?(batch: import('../observation/types.js').ObservationBatch): unknown;
+  beginSession?(sessionId: string): unknown;
+  markStale?(dim: string, reason: import('../voxel/voxel-map.js').StaleReason): unknown;
+  sectionAt?(dim: string, x: number, y: number, z: number): unknown;
+  markTraversed?(dim: string, pos: Vec3Like): unknown;
+  markModified?(dim: string, pos: Vec3Like, actionId: string): unknown;
+  subscribeChanges?(sink: import('../memory/change-reports.js').ChangeReportSink): unknown;
+}
+
+/** Options for the minimal production query composition: voxel state + facts. */
+export interface VoxelFactsQueryOptions {
+  /** Immutable world identity; must match the supplied voxel map. */
+  worldId: string;
+  voxel: VoxelFactsQueryVoxel;
+  facts: Pick<import('../facts/types.js').FactStore, 'places' | 'resources' | 'containers' | 'revision'>;
+  query?: SpatialQueryOptions;
 }
 
 /** Internal, already-resolved query context shared by the handlers. */

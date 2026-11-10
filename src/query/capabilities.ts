@@ -6,19 +6,44 @@
  * optimistic placeholders.
  */
 
-import type { MemoryHostCapabilities } from '../memory/capabilities.js';
+import type { MemoryHostCapabilities, RoutePlanCapabilities } from '../memory/capabilities.js';
 import {
   CONTRACT_VERSION,
   ROUTE_PLAN_CAPABILITIES,
 } from '../memory/capabilities.js';
-import { makeQueryResult } from './envelope.js';
-import type { SpatialQueryContext, SpatialQueryResult } from './types.js';
+import { makeQueryResult, unsupportedQueryResult } from './envelope.js';
+import { SPATIAL_MEMORY_CAPABILITY_NAMES } from './types.js';
+import type { SpatialMemoryCapabilities, SpatialQueryContext, SpatialQueryResult } from './types.js';
+
+/**
+ * Planning/route history is a capability of a composition that actually
+ * carries the legacy route stores. A voxel+facts production composition reports
+ * the retired route entries as false instead of advertising the package's
+ * compatibility surface.
+ */
+const NO_ROUTE_PLAN_CAPABILITIES: RoutePlanCapabilities = Object.freeze({
+  walkSearch: false,
+  walkHistory: false,
+  walkAuto: false,
+  nearArrival: false,
+  reachBlockArrival: false,
+  digPlaceTower: false,
+  swim: false,
+  boat: false,
+});
 
 export function buildMemoryHostCapabilities(
   context: SpatialQueryContext,
 ): MemoryHostCapabilities {
-  const memory = context.sources.memoryCapabilities();
+  const memory = context.sources.memoryCapabilities?.() ?? (Object.fromEntries(
+    SPATIAL_MEMORY_CAPABILITY_NAMES.map((name) => [name, { available: false }]),
+  ) as SpatialMemoryCapabilities);
   const available = (name: keyof typeof memory): boolean => memory[name].available;
+  const facts = context.sources.facts !== undefined;
+  const topology = context.sources.topology !== undefined;
+  const fragments = context.sources.fragments !== undefined;
+  const history = context.sources.history !== undefined;
+  const routeMemory = fragments && topology && history;
   return {
     contract: CONTRACT_VERSION,
     memory: {
@@ -39,17 +64,17 @@ export function buildMemoryHostCapabilities(
     },
     query: {
       cells: true,
-      fragments: true,
-      traversals: true,
-      nodes: true,
-      edges: true,
-      historyRoute: true,
-      anchors: true,
-      components: true,
-      segments: true,
-      portals: true,
-      resourceAnchors: true,
-      containerAnchors: context.isContainer !== undefined,
+      fragments: routeMemory,
+      traversals: routeMemory,
+      nodes: facts || topology,
+      edges: routeMemory,
+      historyRoute: routeMemory,
+      anchors: routeMemory,
+      components: routeMemory,
+      segments: routeMemory,
+      portals: routeMemory,
+      resourceAnchors: facts || topology,
+      containerAnchors: facts || context.isContainer !== undefined,
       // Available only when the host injected the caller-supplied snapshot
       // source; the library never starts a search of its own.
       frontiers: context.sources.frontiers !== undefined,
@@ -58,7 +83,8 @@ export function buildMemoryHostCapabilities(
     // M3 planning is present in this package. Reference the single source in
     // `src/memory/capabilities.ts` directly (D-010) so the report and the
     // constant cannot drift; the constant is frozen against host mutation.
-    plan: ROUTE_PLAN_CAPABILITIES,
+    // The route-plan block only applies when the route stores are composed.
+    plan: routeMemory ? ROUTE_PLAN_CAPABILITIES : NO_ROUTE_PLAN_CAPABILITIES,
     // These four entries have real runtime implementations in this package:
     // WalkRouteExecutor + walkPath (walk), measured grounded arrival,
     // ChangeReport-driven current-segment invalidation, and delegation-scoped
@@ -83,9 +109,17 @@ export function buildMemoryHostCapabilities(
 }
 
 export function querySnapshot(context: SpatialQueryContext): SpatialQueryResult {
+  const snapshot = context.sources.snapshot;
+  if (snapshot === undefined) {
+    return unsupportedQueryResult(
+      context,
+      'snapshot',
+      'this query composition does not expose a runtime snapshot',
+    );
+  }
   return makeQueryResult(context, {
     status: 'ok',
-    data: { kind: 'snapshot', snapshot: context.sources.snapshot() },
+    data: { kind: 'snapshot', snapshot: snapshot() },
   });
 }
 

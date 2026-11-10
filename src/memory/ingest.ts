@@ -40,7 +40,11 @@ import type { BatchChangeReport, ChangeReport, StaleReason } from '../voxel/voxe
 export type SpatialEdgeRecord = SpatialEdge &
   Partial<Pick<TopologyEdge, 'basis' | 'evidenceIds' | 'source'>>;
 
-export interface MemoryIngest {
+/**
+ * Observation and voxel-state writes. This is the port a production host needs
+ * for evidence; it says nothing about the retired route/topology stores.
+ */
+export interface ObservationIngest {
   /** Begin/switch the observation session; returns the local invalidation report. */
   beginSession(sessionId: string): ChangeReport;
 
@@ -53,6 +57,16 @@ export interface MemoryIngest {
   /** Mark a cell changed by a confirmed own action; `actionId` is required. */
   markModified(dim: string, pos: Vec3Like, actionId: string): void;
 
+  /** Observation interrupted/unloaded/session changed; freshness only, history is kept. */
+  markStale(dim: string, reason: StaleReason): ChangeReport;
+}
+
+/**
+ * Legacy route/topology writes. Retained for offline migration and explicit
+ * compatibility callers; a production voxel+facts composition does not
+ * implement or advertise these methods.
+ */
+export interface LegacyRouteIngest {
   /** Save historical geometry; this does not create a traversal or prove current passability. */
   saveFragment(fragment: PathFragment): void;
 
@@ -73,7 +87,7 @@ export interface MemoryIngest {
   /** Portal connectivity and its raw crossing evidence, separate from the walk graph. */
   savePortalEdge(edge: PortalEdgeInput, traversals: PortalTraversalEvidence[]): void;
   addPortalTraversal(edgeId: string, traversal: PortalTraversalEvidence): void;
-
-  /** Observation interrupted/unloaded/session changed; freshness only, history is kept. */
-  markStale(dim: string, reason: StaleReason): ChangeReport;
 }
+
+/** Full compatibility write port: observation plus legacy route writes. */
+export interface MemoryIngest extends ObservationIngest, LegacyRouteIngest {}
