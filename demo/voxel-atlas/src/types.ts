@@ -15,6 +15,7 @@ export type ViewerCell = {
   traversed: boolean;
   modified: boolean;
   risk: boolean;
+  snapshotEvidence?: import('../../../src/voxel/snapshot.ts').VoxelCellEvidenceSnapshot;
 };
 export type FactMarker = {
   id: string;

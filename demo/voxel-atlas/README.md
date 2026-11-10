@@ -24,6 +24,16 @@ Open the local URL printed by Vite (normally `http://127.0.0.1:5174`). The devel
 4. Orbit, pan, or zoom the 3D view. Select a voxel or fact to inspect the original coordinates, observation time, source, and retained state.
 5. Toggle resource, container, portal, place, historical, and observed-air layers as needed.
 
+## Simulate a 3D A* route
+
+After loading a region, choose **Pick A**, then click a support voxel in the 3D view; choose B the same way. Solid voxels select the feet cell immediately above them, while observed air selects that cell. Coordinates remain editable; adjust Y for slab surfaces. X/Z refer to cell indices, and the simulated body stands at their centers.
+
+Choose **Start search** to run the library's real `searchLandRoute` in a separate Worker. Dim red dust replays the actual expanded nodes in order; bright red dust connects the final path. Pause, scrub the timeline, or jump to the complete path. The translucent body is an animation, not game control, and playback speed is not search timing.
+
+The default historical-geometry mode assumes the recorded blocks have not changed. It preserves original evidence and never turns unknown cells into air. Current-evidence mode requires fresh evidence; restored offline observations normally cannot satisfy it. Neither mode produces an executable movement guarantee. Search is limited to the loaded region and supports walking, supported steps, and bounded drops using Minecraft Java 1.20.1 collision data; it does not dig, place, fly, or traverse portals. Unsupported/incomplete geometry stays a gap.
+
+Search has finite time/node/read budgets. Replay retains at most the first 6,000 expanded nodes, with truncation shown explicitly. Cancelling or replacing the region terminates the search Worker and clears the overlay. The SQLite file and saved observations are never modified.
+
 ## Data and memory behavior
 
 - SQLite is streamed into a private browser-local OPFS copy, then queried in a Web Worker. The original file is not changed or uploaded to a server. A full file copy is necessary, but the file is not loaded into a single JavaScript buffer.

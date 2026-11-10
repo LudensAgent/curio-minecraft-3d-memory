@@ -1,6 +1,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import type { FactMarker, RegionData, ViewerCell, ViewerSelection } from './types';
+import type { FactMarker, RegionData, Vec3, ViewerCell, ViewerSelection } from './types';
+
+export type NavigationOverlay = {
+  start: Vec3 | null;
+  goal: Vec3 | null;
+  path: Vec3[];
+  partial?: boolean;
+};
 
 type SceneOptions = {
   showAir: boolean;
@@ -80,6 +87,10 @@ export function createVoxelScene(
 
   const content = new THREE.Group();
   scene.add(content);
+  const navigation = new THREE.Group();
+  scene.add(navigation);
+  const search = new THREE.Group();
+  scene.add(search);
   const outlineGeometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.035, 1.035, 1.035));
   const outlineMaterial = new THREE.LineBasicMaterial({ color: 0xffcc74, depthTest: false });
   const outline = new THREE.LineSegments(outlineGeometry, outlineMaterial);
@@ -96,6 +107,12 @@ export function createVoxelScene(
   const pickSources = new Map<THREE.Object3D, PickSource>();
   const factObjects: { object: THREE.Object3D; fact: FactMarker }[] = [];
   let airPoints: THREE.Points | undefined;
+  let playbackBody: THREE.Mesh<THREE.BoxGeometry, THREE.MeshBasicMaterial> | undefined;
+  let playbackPath: THREE.Vector3[] = [];
+  let playbackDistances: number[] = [];
+  let searchTrace: Vec3[] | undefined;
+  let searchMesh: THREE.InstancedMesh<THREE.BoxGeometry, THREE.MeshBasicMaterial> | undefined;
+  let searchSampleIndices: number[] = [];
   let selected: ViewerSelection = null;
   let disposed = false;
   let frame = 0;
@@ -109,6 +126,199 @@ export function createVoxelScene(
   };
   const requestRender = () => {
     if (!disposed && !frame) frame = requestAnimationFrame(render);
+  };
+
+  const clearNavigation = () => {
+    const geometries = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    navigation.traverse(object => {
+      if (object instanceof THREE.Mesh || object instanceof THREE.Line || object instanceof THREE.Points) {
+        geometries.add(object.geometry);
+        const values = Array.isArray(object.material) ? object.material : [object.material];
+        values.forEach(material => materials.add(material));
+      } else if (object instanceof THREE.Sprite) {
+        object.material.map?.dispose();
+        materials.add(object.material);
+      }
+      if (object instanceof THREE.InstancedMesh) object.dispose();
+    });
+    geometries.forEach(geometry => geometry.dispose());
+    materials.forEach(material => material.dispose());
+    navigation.clear();
+    playbackBody = undefined;
+    playbackPath = [];
+    playbackDistances = [];
+  };
+
+  const clearSearch = () => {
+    if (searchMesh) {
+      searchMesh.geometry.dispose();
+      searchMesh.material.dispose();
+      searchMesh.dispose();
+    }
+    search.clear();
+    searchMesh = undefined;
+    searchTrace = undefined;
+    searchSampleIndices = [];
+  };
+
+  const setSearchProgress = (progress: number) => {
+    if (!searchMesh || !searchTrace) return;
+    const expanded = Math.floor(Math.min(1, Math.max(0, progress)) * searchTrace.length);
+    let low = 0, high = searchSampleIndices.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (searchSampleIndices[middle]! < expanded) low = middle + 1;
+      else high = middle;
+    }
+    searchMesh.count = low;
+    requestRender();
+  };
+
+  const setSearchTrace = (trace: Vec3[], progress: number) => {
+    if (trace !== searchTrace) {
+      clearSearch();
+      searchTrace = trace;
+      const count = Math.min(trace.length, 6000);
+      if (count) {
+        searchSampleIndices = Array.from({ length: count }, (_, index) => count === 1 ? 0 : Math.floor(index * (trace.length - 1) / (count - 1)));
+        searchMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.14, 0.025, 0.14), new THREE.MeshBasicMaterial({ color: 0x88372e, transparent: true, opacity: 0.7, depthTest: false, depthWrite: false }), count);
+        const matrix = new THREE.Matrix4();
+        searchSampleIndices.forEach((traceIndex, instanceIndex) => {
+          const point = trace[traceIndex]!;
+          matrix.makeTranslation(point.x + 0.5 - origin.x, point.y + 0.04 - origin.y, point.z + 0.5 - origin.z);
+          searchMesh!.setMatrixAt(instanceIndex, matrix);
+        });
+        searchMesh.instanceMatrix.needsUpdate = true;
+        searchMesh.computeBoundingSphere();
+        searchMesh.renderOrder = 5;
+        search.add(searchMesh);
+      }
+    }
+    setSearchProgress(progress);
+    if (!searchMesh) requestRender();
+  };
+
+  const setNavigation = (overlay: NavigationOverlay | null) => {
+    clearNavigation();
+    if (!overlay) { requestRender(); return; }
+    for (const endpoint of [
+      { point: overlay.start, label: 'A', color: '#91e6b8' },
+      { point: overlay.goal, label: 'B', color: '#f29e7d' },
+    ]) {
+      if (!endpoint.point) continue;
+      const { x, y, z } = endpoint.point;
+      const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.22, 12, 8), new THREE.MeshBasicMaterial({ color: endpoint.color, depthTest: false }));
+      sphere.position.set(x + 0.5 - origin.x, y + 0.22 - origin.y, z + 0.5 - origin.z);
+      sphere.renderOrder = 7;
+      navigation.add(sphere);
+      const labelCanvas = document.createElement('canvas');
+      labelCanvas.width = 64;
+      labelCanvas.height = 64;
+      const context = labelCanvas.getContext('2d')!;
+      context.fillStyle = endpoint.color;
+      context.beginPath();
+      context.arc(32, 32, 27, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = '#13251e';
+      context.font = 'bold 38px sans-serif';
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillText(endpoint.label, 32, 34);
+      const texture = new THREE.CanvasTexture(labelCanvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false, depthWrite: false }));
+      label.position.set(x + 0.5 - origin.x, y + 1.55 - origin.y, z + 0.5 - origin.z);
+      label.scale.set(1.65, 1.65, 1);
+      label.renderOrder = 8;
+      navigation.add(label);
+    }
+    playbackPath = overlay.path.map(point => new THREE.Vector3(point.x + 0.5 - origin.x, point.y - origin.y, point.z + 0.5 - origin.z));
+    playbackDistances = playbackPath.map((point, index) => index ? point.distanceTo(playbackPath[index - 1]!) : 0);
+    playbackDistances.forEach((distance, index) => {
+      if (index) playbackDistances[index] = distance + playbackDistances[index - 1]!;
+    });
+    if (playbackPath.length) {
+      const dustMaterial = new THREE.MeshStandardMaterial({ color: overlay.partial ? 0x963b24 : 0xc92b24, emissive: overlay.partial ? 0x56170a : 0xff2115, emissiveIntensity: overlay.partial ? 0.25 : 0.8, roughness: 1, depthTest: false, depthWrite: false });
+      const dust = new THREE.InstancedMesh(new THREE.BoxGeometry(0.28, 0.045, 0.28), dustMaterial, playbackPath.length);
+      const matrix = new THREE.Matrix4();
+      playbackPath.forEach((point, index) => {
+        matrix.makeTranslation(point.x, point.y + 0.065, point.z);
+        dust.setMatrixAt(index, matrix);
+      });
+      dust.instanceMatrix.needsUpdate = true;
+      dust.computeBoundingSphere();
+      dust.renderOrder = 6;
+      navigation.add(dust);
+      if (overlay.partial && playbackPath.length > 1) {
+        const points = playbackPath.map(point => point.clone().add(new THREE.Vector3(0, 0.07, 0)));
+        const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineDashedMaterial({ color: 0xb64b2d, dashSize: 0.42, gapSize: 0.3, depthTest: false, depthWrite: false }));
+        line.computeLineDistances();
+        line.renderOrder = 6;
+        navigation.add(line);
+      } else if (playbackPath.length > 1) {
+        const links = new THREE.InstancedMesh(new THREE.BoxGeometry(0.12, 0.035, 1), dustMaterial, playbackPath.length - 1);
+        const forward = new THREE.Vector3(0, 0, 1);
+        const direction = new THREE.Vector3();
+        const midpoint = new THREE.Vector3();
+        const rotation = new THREE.Quaternion();
+        const scale = new THREE.Vector3(1, 1, 1);
+        let count = 0;
+        playbackPath.forEach((point, index) => {
+          if (!index) return;
+          const previous = playbackPath[index - 1]!;
+          direction.subVectors(point, previous);
+          const length = direction.length();
+          if (!length) return;
+          midpoint.addVectors(point, previous).multiplyScalar(0.5);
+          midpoint.y += 0.065;
+          rotation.setFromUnitVectors(forward, direction.divideScalar(length));
+          scale.z = length;
+          matrix.compose(midpoint, rotation, scale);
+          links.setMatrixAt(count++, matrix);
+        });
+        links.count = count;
+        links.instanceMatrix.needsUpdate = true;
+        links.computeBoundingSphere();
+        links.renderOrder = 6;
+        navigation.add(links);
+        const glow = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.012, 0.5), new THREE.MeshBasicMaterial({ color: 0xff2817, transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false }), playbackPath.length);
+        playbackPath.forEach((point, index) => {
+          matrix.makeTranslation(point.x, point.y + 0.035, point.z);
+          glow.setMatrixAt(index, matrix);
+        });
+        glow.instanceMatrix.needsUpdate = true;
+        glow.computeBoundingSphere();
+        glow.renderOrder = 5;
+        navigation.add(glow);
+      }
+      playbackBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.8, 0.6), new THREE.MeshBasicMaterial({ color: 0xffdc8c, transparent: true, opacity: 0.48, depthWrite: false }));
+      playbackBody.visible = false;
+      playbackBody.renderOrder = 6;
+      navigation.add(playbackBody);
+    }
+    requestRender();
+  };
+
+  // Playback interpolates a visual body only; it never executes movement.
+  const setPlayback = (progress: number | null) => {
+    if (!playbackBody) return;
+    playbackBody.visible = progress !== null;
+    if (progress !== null) {
+      const distance = Math.min(1, Math.max(0, progress)) * (playbackDistances.at(-1) ?? 0);
+      let low = 0, high = playbackDistances.length - 1;
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if (playbackDistances[middle]! < distance) low = middle + 1;
+        else high = middle;
+      }
+      const previous = Math.max(0, low - 1);
+      const fromDistance = playbackDistances[previous]!;
+      const length = playbackDistances[low]! - fromDistance;
+      playbackBody.position.lerpVectors(playbackPath[previous]!, playbackPath[low]!, length > 0 ? (distance - fromDistance) / length : 0);
+      playbackBody.position.y += 0.9;
+    }
+    requestRender();
   };
   controls.addEventListener('change', requestRender);
 
@@ -180,6 +390,8 @@ export function createVoxelScene(
 
   const setData = (data: RegionData) => {
     disposeContent();
+    clearNavigation();
+    clearSearch();
     clearSelection();
     const { bounds } = data;
     origin.set((bounds.minX + bounds.maxX + 1) / 2, (bounds.minY + bounds.maxY + 1) / 2, (bounds.minZ + bounds.maxZ + 1) / 2);
@@ -324,6 +536,10 @@ export function createVoxelScene(
 
   return {
     setData,
+    setNavigation,
+    setPlayback,
+    setSearchTrace,
+    setSearchProgress,
     setOptions(next: Partial<SceneOptions>) { Object.assign(options, next); applyOptions(); },
     fit,
     top() {
@@ -346,6 +562,8 @@ export function createVoxelScene(
       renderer.domElement.removeEventListener('pointerup', pointerUp);
       renderer.domElement.removeEventListener('pointercancel', cancelPointer);
       disposeContent();
+      clearNavigation();
+      clearSearch();
       outlineGeometry.dispose();
       outlineMaterial.dispose();
       renderer.dispose();

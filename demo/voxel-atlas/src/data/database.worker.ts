@@ -670,6 +670,7 @@ function appendSectionCells(
       y,
       z,
       state,
+      snapshotEvidence: evidence,
       observedAt: evidence.observedAt,
       source: evidence.source,
       evidence: evidence.evidence,

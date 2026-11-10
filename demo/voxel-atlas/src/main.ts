@@ -2,6 +2,7 @@ import './styles.css';
 import { createDatabaseClient } from './data/client';
 import { createVoxelScene } from './scene';
 import { createRegionMap } from './region-map';
+import { createNavigationPanel } from './navigation-panel';
 import type { Bounds, DatabaseSummary, FactMarker, RegionData, ScopeSummary, ViewerSelection } from './types';
 
 const app = document.getElementById('app');
@@ -35,6 +36,7 @@ app.innerHTML = `
       <div class="layers" aria-label="可见图层">
         <label><input type="checkbox" id="layer-resources" checked /><i class="dot resource"></i>资源点</label><label><input type="checkbox" id="layer-containers" checked /><i class="dot container"></i>容器</label><label><input type="checkbox" id="layer-portals" checked /><i class="dot portal"></i>传送门</label><label><input type="checkbox" id="layer-places" checked /><i class="dot place"></i>记录点</label><label><input type="checkbox" id="layer-air" />空气</label><label><input type="checkbox" id="layer-gone" />已消失 / 撤销</label>
       </div>
+      <section class="navigation-panel" id="navigation-panel" aria-label="三维 A* 红石寻路模拟"></section>
       <div class="viewport-wrap">
         <div id="scene" class="scene"></div>
         <div id="empty-view" class="empty-view"><div class="empty-cube" aria-hidden="true"><span></span><span></span><span></span></div><span class="eyebrow">YOUR WORLD, AS REMEMBERED</span><h2>让记忆有形状</h2><p>拖入 SQLite 文件，或从上方导入。<br />在左侧选择区域，体素会在这里展开。</p><button class="button light" id="empty-import">选择数据库</button></div>
@@ -78,6 +80,7 @@ let pendingBounds: Bounds | null = null;
 let loaded: RegionData | null = null;
 let fileBusy = false, regionBusy = false, generation = 0;
 let scene: ReturnType<typeof createVoxelScene> | null = null;
+let navigation: ReturnType<typeof createNavigationPanel> | undefined;
 const num = (value: number) => value.toLocaleString('zh-CN');
 const timestamp = (value: number) => Number.isFinite(value) ? new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '未记录';
 const dimensions: Record<string, string> = { overworld: '主世界', the_nether: '下界', the_end: '末地' };
@@ -101,6 +104,7 @@ const map = createRegionMap(element<HTMLCanvasElement>('region-map'), rectangle 
 });
 try { scene = createVoxelScene(element('scene'), showSelection); }
 catch (error) { showError(error); }
+navigation = createNavigationPanel(element('navigation-panel'), scene);
 
 function updateAvailability() {
   importButton.disabled = fileBusy; emptyImport.disabled = fileBusy; clearButton.disabled = fileBusy || !summary;
@@ -116,6 +120,7 @@ function emptyRegion(currentScope: ScopeSummary): RegionData {
 }
 
 function resetView(previousScope: ScopeSummary | null = scope) {
+  navigation?.setRegion(null);
   if (previousScope) scene?.setData(emptyRegion(previousScope));
   loaded = null; regionBusy = false; emptyView.hidden = false;
   element('loaded-bounds').textContent = '未加载区域';
@@ -164,12 +169,13 @@ async function importFile(file: File) {
 async function loadRegion() {
   if (!scope || !pendingBounds || fileBusy) return;
   const request = ++generation;
+  navigation?.setRegion(null);
   const query = { worldId: scope.worldId, dimension: scope.dimension, bounds: { ...pendingBounds } };
   clearError(); regionBusy = true; status.textContent = `读取选区 · ${boundsLabel(query.bounds)}`; updateAvailability();
   try {
     const result = await client.loadRegion(query);
     if (request !== generation) return;
-    scene?.setData(result); loaded = result; emptyView.hidden = true;
+    scene?.setData(result); loaded = result; navigation?.setRegion(result); emptyView.hidden = true;
     element('loaded-bounds').textContent = boundsLabel(result.bounds);
     const stats = element('region-stats'); stats.replaceChildren();
     const values: [number, string][] = [[result.stats.observedCells, '体素格'], [result.stats.solidCells, '非空气'], [result.stats.airCells, '空气'], [result.markers.length, '记录点']];
@@ -177,7 +183,7 @@ async function loadRegion() {
     const note = document.createElement('span'); note.className = 'stat-note'; note.textContent = `${num(result.stats.sections)} 个 Section · ${num(result.stats.staleCells)} 格已标过期`; stats.append(note);
     renderFacts(); showSelection(null);
     status.textContent = result.stats.observedCells || result.markers.length ? '已加载选区 · 点击体素或标记查看原始观测' : '该选区没有已保存的体素或事实记录，请选择其他区域。';
-  } catch (error) { if (request === generation) showError(error); }
+  } catch (error) { if (request === generation) { navigation?.setRegion(loaded); showError(error); } }
   finally { if (request === generation) { regionBusy = false; updateAvailability(); } }
 }
 
@@ -201,6 +207,7 @@ function renderFacts() {
 }
 
 function showSelection(selection: ViewerSelection) {
+  navigation?.select(selection);
   const content = element('inspector-content'); content.replaceChildren();
   if (!selection) { element('inspector-title').textContent = '查看一条观测'; const p = document.createElement('p'); p.className = 'muted'; p.textContent = '点击体素、标记或左侧记录，查看坐标、观测时间和来源。'; content.append(p); return; }
   const data = document.createElement('dl'); data.className = 'detail-grid';
@@ -253,5 +260,5 @@ document.addEventListener('dragenter', event => { if (!event.dataTransfer?.types
 document.addEventListener('dragleave', event => { if (!event.dataTransfer?.types.includes('Files')) return; dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) dropOverlay.hidden = true; });
 document.addEventListener('dragover', event => { if (event.dataTransfer?.types.includes('Files')) event.preventDefault(); });
 document.addEventListener('drop', event => { if (!event.dataTransfer?.types.includes('Files')) return; event.preventDefault(); dragDepth = 0; dropOverlay.hidden = true; const file = event.dataTransfer.files[0]; if (file) void importFile(file); });
-window.addEventListener('beforeunload', () => { client.dispose(); scene?.dispose(); map.dispose(); });
+window.addEventListener('beforeunload', () => { navigation?.dispose(); client.dispose(); scene?.dispose(); map.dispose(); });
 updateAvailability();

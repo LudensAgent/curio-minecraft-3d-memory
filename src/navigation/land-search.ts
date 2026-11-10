@@ -94,6 +94,8 @@ export interface LandSearchRequest {
   signal?: AbortSignal;
   /** Budget clock; evidence freshness is evaluated at the entry point's `now` argument. */
   clock?: () => number;
+  /** Optional offline visualizer hook, called in actual expansion order with a detached point. */
+  onExpand?: (point: Readonly<Vec3Like>) => void;
 }
 
 export interface LandSearchTransition {
@@ -817,6 +819,7 @@ function* searchChunks(
       if (head.g !== node.g) continue;
       if (reached(node.point)) { found = node; break; }
       stats.nodesExpanded += 1;
+      request.onExpand?.({ ...node.point });
       // Both action endpoints must be inside the corridor. An actual start that
       // is already outside never authorizes a "return to corridor" move because
       // the from-endpoint remains outside, so every candidate here is skipped.
