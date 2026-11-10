@@ -3,7 +3,7 @@
  * The heap, support-surface expansion and cooperative search remain here;
  * host geometry data, risk policy, body control and permanent history do not.
  */
-import type { Vec3Like } from '../types.js';
+import type { BlockState, Vec3Like } from '../types.js';
 import type { CollisionShapeProvider, NeighborCellView, NeighborRead } from '../traversability/collision-shape.js';
 import {
   evaluateLandTransition,
@@ -59,6 +59,15 @@ export interface LandSearchRequest {
   allowed?: readonly LandSearchKind[];
   /** Candidate columns/actions outside this finite-width strip are not expanded. */
   corridor?: LandSearchCorridor;
+  /**
+   * Caller-owned admission/cost decision for geometrically OPEN edges. Without
+   * it, search behavior, costs and diagnostics are unchanged.
+   */
+  edgePolicy?: LandSearchEdgePolicy;
+  /** Total policy-read budget, independent of maxSurfaceReads. Default 131072. */
+  maxPolicyReads?: number;
+  /** Per-edge policy-read budget. Default 64. */
+  maxPolicyReadsPerEdge?: number;
   /** Search range only, not a claim that a drop is safe or physically executable. Default 4. */
   maxDrop?: number;
   maxNodes?: number;
@@ -85,9 +94,68 @@ export interface LandSearchTransition {
   kind: LandSearchKind;
   from: Vec3Like;
   to: Vec3Like;
-  /** Cost units are geometric search weights, not elapsed time or risk estimates. */
+  /**
+   * Geometric search weight plus any caller edge-policy surcharge. These are
+   * not elapsed time or risk estimates.
+   */
   cost: number;
   hazards: HazardFact[];
+}
+
+/** One geometrically OPEN candidate offered to the caller's edge policy. */
+export interface LandSearchPolicyEdge {
+  kind: LandSearchKind;
+  from: Readonly<Vec3Like>;
+  to: Readonly<Vec3Like>;
+  /** Geometric walk/step/drop cost before the caller's surcharge. */
+  baseCost: number;
+  hazards: readonly HazardFact[];
+  evidenceMode: 'current' | 'remembered';
+}
+
+export type LandSearchPolicyDecision =
+  | { allow: true; extraCost?: number }
+  | { allow: false; reason: string };
+
+/**
+ * Recorded facts for a policy read. This is not geometry-OPEN proof and does
+ * not claim freshness: `recorded` may be stale, foreign-session or incomplete.
+ */
+export type LandSearchPolicyCell =
+  | { kind: 'recorded'; state: BlockState; stateComplete: boolean }
+  | { kind: 'unknown' }
+  | { kind: 'unavailable' };
+
+/**
+ * Bounded, read-only policy accessor scoped to the request world/dimension.
+ * Valid only during the synchronous `evaluate` call that received it.
+ */
+export interface LandSearchPolicyRead {
+  cell(x: number, y: number, z: number): LandSearchPolicyCell;
+}
+
+/**
+ * Trusted synchronous caller policy. Like a shape provider it must perform
+ * bounded work and must bump `version` whenever its behavior changes.
+ */
+export interface LandSearchEdgePolicy {
+  version: string;
+  evaluate(edge: LandSearchPolicyEdge, read: LandSearchPolicyRead): LandSearchPolicyDecision;
+}
+
+export interface LandSearchPolicyRejection {
+  from: Vec3Like;
+  to: Vec3Like;
+  reason: string;
+}
+
+/** Fixed-size policy diagnostics; never an unbounded rejection list. */
+export interface LandSearchPolicySummary {
+  version: string;
+  reads: number;
+  rejectedEdges: number;
+  /** One bounded example, never the prefix's known terrain blocker. */
+  firstRejection?: LandSearchPolicyRejection;
 }
 
 export interface LandSearchBoundary {
@@ -129,8 +197,11 @@ export interface LandSearchResult {
   arrival: LandSearchArrival;
   points: Vec3Like[];
   transitions: LandSearchTransition[];
+  /** Sum of transition costs, including caller edge-policy surcharges. */
   cost: number;
   boundaries: LandSearchBoundary[];
+  /** Present whenever an edge policy was supplied, including zero calls. */
+  policy?: LandSearchPolicySummary;
   /**
    * Current-mode only. Present for non-FOUND results once a current start chain
    * is available; omitted for remembered searches, CANCELLED/INVALIDATED
@@ -148,7 +219,10 @@ export interface LandSearchResult {
     nodesReached: number;
     nodesExpanded: number;
     edgesEvaluated: number;
-    /** Candidate support reads only; not a total of evaluator-internal evidence reads. */
+    /**
+     * Candidate support reads only; not evaluator-internal evidence reads and
+     * not policy reads (reported separately in `result.policy.reads`).
+     */
     surfaceReads: number;
     sectionsRead: number;
     staleReads: number;
@@ -165,6 +239,26 @@ const EPS = 1e-9;
 const DIRECTIONS = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
 
 class LandSearchGeometryBudgetExceeded extends Error {}
+/** Private sentinel: policy reads hit work/readability limits or stop state. */
+class LandSearchPolicyAborted extends Error {}
+
+function validatePolicyDecision(value: unknown): LandSearchPolicyDecision {
+  if (typeof value !== 'object' || value === null || typeof (value as { allow?: unknown }).allow !== 'boolean') {
+    throw new Error('land search edge policy must return an object with a boolean allow field');
+  }
+  const decision = value as { allow: boolean; extraCost?: unknown; reason?: unknown };
+  if (decision.allow) {
+    if (decision.extraCost !== undefined
+      && (typeof decision.extraCost !== 'number' || !Number.isFinite(decision.extraCost) || decision.extraCost < 0)) {
+      throw new Error('land search edge policy extraCost must be a finite nonnegative number');
+    }
+    return decision.extraCost === undefined ? { allow: true } : { allow: true, extraCost: decision.extraCost };
+  }
+  if (typeof decision.reason !== 'string' || decision.reason.length === 0) {
+    throw new Error('land search edge policy rejection requires a nonempty reason string');
+  }
+  return { allow: false, reason: decision.reason };
+}
 
 /** Heap entries carry their own g so superseded entries cannot expand newer nodes twice. */
 class MinHeap {
@@ -275,11 +369,19 @@ function* searchChunks(
       maxLateral,
     };
   }
+  // Capture the trusted policy reference and version once, like shape rules.
+  const edgePolicy = request.edgePolicy;
+  const policyVersion = edgePolicy?.version;
+  if (edgePolicy !== undefined && (typeof policyVersion !== 'string' || policyVersion.length === 0)) {
+    throw new Error('land search edge policy requires a nonempty version');
+  }
   const maxDrop = request.maxDrop ?? 4;
   if (!Number.isFinite(maxDrop) || maxDrop < 0) throw new Error('maxDrop must be finite and nonnegative');
   const maxNodes = positive(request.maxNodes, 2048, 'maxNodes');
   const maxEdges = positive(request.maxEdges, 8192, 'maxEdges');
   const maxSurfaceReads = positive(request.maxSurfaceReads, 262144, 'maxSurfaceReads');
+  const maxPolicyReads = positive(request.maxPolicyReads, 131072, 'maxPolicyReads');
+  const maxPolicyReadsPerEdge = positive(request.maxPolicyReadsPerEdge, 64, 'maxPolicyReadsPerEdge');
   const maxSections = positive(request.maxSections, 1024, 'maxSections');
   const maxRoutePoints = positive(request.maxRoutePoints, 2048, 'maxRoutePoints');
   const maxBoundaries = positive(request.maxBoundaries, 64, 'maxBoundaries');
@@ -306,7 +408,14 @@ function* searchChunks(
   const boundaries: LandSearchBoundary[] = [];
   const counts = { UNKNOWN: 0, STALE: 0, BLOCKED: 0, UNSUPPORTED: 0, INCOMPLETE: 0 };
   let invalidated = false;
+  let invalidatedReason = 'search dependency or provider version changed';
   let budget: LandSearchBudget | undefined;
+  /** Precise non-terrain detail for a policy/read/section budget stop. */
+  let budgetDetail: string | undefined;
+  let policyReads = 0;
+  let policyReadsThisEdge = 0;
+  let policyRejectedEdges = 0;
+  let policyFirstRejection: LandSearchPolicyRejection | undefined;
   // Continuous feet XZ, never centered block coordinates. The origin/bearing
   // were validated and normalized once at the request boundary.
   const corridorContains = (point: Vec3Like): boolean => corridor === undefined
@@ -353,6 +462,55 @@ function* searchChunks(
     if (dependencies.size >= maxSections) { budget = 'sections'; return; }
     dependencies.set(id, { key: { ...key }, generation: map.residencyGeneration(key.dim, key.cx, key.cz, key.sy) });
     stats.sectionsRead = dependencies.size;
+  };
+  /**
+   * Recorded-fact projection for the trusted policy. Never yields geometry-OPEN
+   * proof or freshness, never loads cold pages, and participates in the same
+   * Section dependencies/change subscription/generation check as geometry.
+   */
+  const policyRead: LandSearchPolicyRead = {
+    cell(x, y, z): LandSearchPolicyCell {
+      if (![x, y, z].every(Number.isSafeInteger)) {
+        throw new Error('policy read coordinates must be safe integers');
+      }
+      if (stopped() !== null) throw new LandSearchPolicyAborted();
+      if (policyReads >= maxPolicyReads) {
+        budget = 'reads';
+        budgetDetail = `policy reads exceeded maxPolicyReads (${maxPolicyReads})`;
+        throw new LandSearchPolicyAborted();
+      }
+      if (policyReadsThisEdge >= maxPolicyReadsPerEdge) {
+        budget = 'reads';
+        budgetDetail = `policy reads exceeded maxPolicyReadsPerEdge (${maxPolicyReadsPerEdge}) on one edge`;
+        throw new LandSearchPolicyAborted();
+      }
+      policyReads += 1;
+      policyReadsThisEdge += 1;
+      const { cx, cz, sy, lx, ly, lz } = blockToSection(x, y, z);
+      const key = { worldId: map.worldId, dim: request.dim, cx, cz, sy };
+      addDependency(key);
+      if (budget !== undefined) {
+        budgetDetail ??= 'policy read reached maxSections';
+        throw new LandSearchPolicyAborted();
+      }
+      const section = map.sectionRef(request.dim, x, y, z);
+      if (section === null) {
+        const residency = map.sectionResidency(key).residency;
+        if (residency === 'not_resident' || residency === 'loading' || residency === 'load_failed') {
+          unavailable.set(sectionKeyString(key), key);
+          return { kind: 'unavailable' };
+        }
+        return { kind: 'unknown' };
+      }
+      const evidence = section.evidence.get(cellIndex(lx, ly, lz));
+      if (evidence === undefined) return { kind: 'unknown' };
+      const state = evidence.observation.state;
+      return {
+        kind: 'recorded',
+        state: { name: state.name, properties: { ...state.properties } },
+        stateComplete: evidence.observation.stateComplete,
+      };
+    },
   };
   const read: NeighborRead = {
     cell(x, y, z): NeighborCellView {
@@ -413,9 +571,10 @@ function* searchChunks(
       }
     }
     if (request.rules.shapeProvider.version !== ruleVersion) invalidated = true;
+    if (edgePolicy !== undefined && edgePolicy.version !== policyVersion) invalidated = true;
     if (invalidated && status !== 'CANCELLED') {
       status = 'INVALIDATED';
-      reason = 'a section used by this search changed or was unloaded/reloaded';
+      reason = invalidatedReason;
       points = [];
       transitions = [];
       cost = 0;
@@ -492,6 +651,20 @@ function* searchChunks(
       evidenceMode, executable: false, needsRevalidation: true,
       from: start, target, arrival, points, transitions, cost, boundaries,
       ...(publishedPrefix === undefined ? {} : { prefix: publishedPrefix }),
+      ...(edgePolicy === undefined ? {} : {
+        policy: {
+          version: policyVersion!,
+          reads: policyReads,
+          rejectedEdges: policyRejectedEdges,
+          ...(policyFirstRejection === undefined ? {} : {
+            firstRejection: {
+              from: { ...policyFirstRejection.from },
+              to: { ...policyFirstRejection.to },
+              reason: policyFirstRejection.reason,
+            },
+          }),
+        },
+      }),
       ...(status !== 'FOUND' && stats.corridorSkipped > 0 ? { corridorLimited: true as const } : {}),
       unavailableSections: [...unavailable.values()], reason,
       ...(budget === undefined ? {} : { budget }), evaluatedAt: now, stats,
@@ -501,6 +674,7 @@ function* searchChunks(
     ? Math.abs(point.x - target.x) <= EPS && Math.abs(point.y - target.y) <= EPS && Math.abs(point.z - target.z) <= EPS
     : Math.hypot(point.x - target.x, point.y - target.y, point.z - target.z) <= arrival.radius + EPS;
   // Each edge changes one horizontal coordinate by exactly one and costs >= 1.
+  // Caller policy surcharges are nonnegative, so this remains a lower bound.
   // Subtracting sqrt(2)*radius is an admissible L1 lower bound for a near sphere.
   // Vertical distance is deliberately absent: a four-block drop costs six, not nine.
   const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' ? 0
@@ -664,8 +838,49 @@ function* searchChunks(
             boundary(node.point, to, status, reason);
             noteBlocker(node, to, status, reason);
           } else {
-            const cost = kind === 'walk' ? 1 : 2 + Math.abs(dy);
+            let cost = kind === 'walk' ? 1 : 2 + Math.abs(dy);
+            if (edgePolicy !== undefined) {
+              if (stopped() !== null) break search;
+              policyReadsThisEdge = 0;
+              const edge: LandSearchPolicyEdge = {
+                kind,
+                from: { ...node.point },
+                to: { ...to },
+                baseCost: cost,
+                hazards: evaluation.hazards ?? [],
+                evidenceMode,
+              };
+              let decision!: LandSearchPolicyDecision;
+              try {
+                decision = validatePolicyDecision(edgePolicy.evaluate(edge, policyRead));
+              } catch (error) {
+                if (error instanceof LandSearchPolicyAborted) break search;
+                throw error;
+              }
+              if (stopped() !== null) break search;
+              if (decision.allow) {
+                const extraCost = decision.extraCost ?? 0;
+                cost += extraCost;
+                if (!Number.isFinite(cost)) {
+                  throw new Error('land search edge policy produced a non-finite path cost');
+                }
+              } else {
+                policyRejectedEdges += 1;
+                policyFirstRejection ??= {
+                  from: { ...node.point },
+                  to: { ...to },
+                  reason: decision.reason,
+                };
+                // Rejections are delegation restrictions, not terrain facts.
+                // Keep the cooperative pause on this candidate.
+                yield* pause();
+                continue;
+              }
+            }
             const g = node.g + cost;
+            if (edgePolicy !== undefined && !Number.isFinite(g)) {
+              throw new Error('land search edge policy produced non-finite accumulated path cost');
+            }
             const key = keyOf(to);
             const previous = nodes.get(key);
             if (previous === undefined || g < previous.g) {
@@ -694,15 +909,22 @@ function* searchChunks(
       }
     }
     const stop = stopped();
-    if (stop !== null) return finish(stop, stop === 'INVALIDATED'
-      ? 'a section used by this search changed; retry against the updated map'
-      : 'search stopped within its original cancellation or work budget');
+    if (stop !== null) return finish(stop, budgetDetail ?? (stop === 'INVALIDATED'
+      ? invalidatedReason
+      : 'search stopped within its original cancellation or work budget'));
     if (found === null) {
-      const status = counts.UNKNOWN > 0 || counts.STALE > 0 || counts.INCOMPLETE > 0 ? 'INSUFFICIENT_EVIDENCE'
-        : counts.UNSUPPORTED > 0 ? 'UNSUPPORTED' : 'NO_PATH_IN_MEMORY';
-      return finish(status, stats.corridorSkipped > 0
-        ? 'no candidate was found within the available geometry, requested movement kinds and requested corridor; candidates outside the corridor were not expanded'
-        : 'no candidate was found within the available remembered geometry and requested movement kinds');
+      const evidenceGap = counts.UNKNOWN > 0 || counts.STALE > 0 || counts.INCOMPLETE > 0;
+      const baseReason = 'no candidate was found within the available remembered geometry and requested movement kinds';
+      const corridorReason = 'no candidate was found within the available geometry, requested movement kinds and requested corridor; candidates outside the corridor were not expanded';
+      const plainReason = stats.corridorSkipped > 0 ? corridorReason : baseReason;
+      if (evidenceGap) return finish('INSUFFICIENT_EVIDENCE', plainReason);
+      if (policyRejectedEdges > 0) {
+        return finish('UNSUPPORTED',
+          'the caller edge policy excluded geometrically open candidate edges; this is a delegation restriction and does not prove whether a route exists without the policy'
+          + (stats.corridorSkipped > 0 ? '; candidates outside the requested corridor were not expanded' : ''));
+      }
+      if (counts.UNSUPPORTED > 0) return finish('UNSUPPORTED', plainReason);
+      return finish('NO_PATH_IN_MEMORY', plainReason);
     }
     const points: Vec3Like[] = [];
     const transitions: LandSearchTransition[] = [];
