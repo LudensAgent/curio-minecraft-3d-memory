@@ -390,6 +390,8 @@ function* searchChunks(
   const maxWorkPerSlice = positive(request.maxWorkPerSlice, 32, 'maxWorkPerSlice');
   const geometryLimits = resolveLandLimits(request.geometryLimits);
   const ruleVersion = request.rules.shapeProvider.version;
+  const jumpVersion = request.rules.jumpModel?.version;
+  const climbVersion = request.rules.climbProvider?.version;
   if (ruleVersion.length === 0) throw new Error('land search shape rules require a nonempty version');
   const clock = request.clock ?? Date.now;
   const startedAt = clock();
@@ -652,6 +654,8 @@ function* searchChunks(
       }
     }
     if (request.rules.shapeProvider.version !== ruleVersion) invalidated = true;
+    if (request.rules.jumpModel?.version !== jumpVersion) invalidated = true;
+    if (request.rules.climbProvider?.version !== climbVersion) invalidated = true;
     if (edgePolicy !== undefined && edgePolicy.version !== policyVersion) invalidated = true;
     if (invalidated && status !== 'CANCELLED') {
       status = 'INVALIDATED';
@@ -754,11 +758,12 @@ function* searchChunks(
   const reached = (point: Vec3Like): boolean => arrival.kind === 'exact'
     ? Math.abs(point.x - target.x) <= EPS && Math.abs(point.y - target.y) <= EPS && Math.abs(point.z - target.z) <= EPS
     : Math.hypot(point.x - target.x, point.y - target.y, point.z - target.z) <= arrival.radius + EPS;
-  // Each edge changes one horizontal coordinate by exactly one and costs >= 1.
+  // Without jumps, each edge changes horizontal L1 distance by at most one and costs >= 1.
   // Caller policy surcharges are nonnegative, so this remains a lower bound.
   // Subtracting sqrt(2)*radius is an admissible L1 lower bound for a near sphere.
   // Vertical distance is deliberately absent: a four-block drop costs six, not nine.
-  const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' ? 0
+  // Jumps can travel more than two horizontal blocks for cost two; use h=0 when allowed.
+  const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' || allowed.has('jump') ? 0
     : Math.max(0, Math.abs(point.x - target.x) + Math.abs(point.z - target.z)
       - (arrival.kind === 'near' ? Math.SQRT2 * arrival.radius : 0));
   const keyOf = (point: Vec3Like): string => `${Math.round(point.x - start.x)},${point.y},${Math.round(point.z - start.z)}`;

@@ -193,6 +193,39 @@ describe('bounded voxel land search', () => {
     expect(walkOnly.status).not.toBe('FOUND');
   });
 
+  it('matches zero-heuristic cost when long jumps make a detour cheaper', () => {
+    const map = terrain(Array.from({ length: 5 }, (_, x) =>
+      Array.from({ length: 5 }, (_, z) => ({ x, z, height: 0 }))
+    ).flat());
+    const edges = new Map([
+      ['0.5,0.5>4.5,0.5', 6],
+      ['0.5,0.5>0.5,4.5', 0],
+      ['0.5,4.5>4.5,4.5', 0],
+      ['4.5,4.5>4.5,0.5', 0],
+    ]);
+    const query = request({
+      to: { x: 4.5, y: 0, z: 0.5 }, allowed: ['jump'], maxDrop: 0,
+      rules: {
+        shapeProvider: fakeProvider,
+        jumpModel: { version: 'long-jump-v1', resolve: () => ({ kind: 'supported', trajectory: { apexHeight: 1.25 } }) },
+      },
+      edgePolicy: {
+        version: 'jump-detour-v1',
+        evaluate(edge) {
+          const extraCost = edges.get(`${edge.from.x},${edge.from.z}>${edge.to.x},${edge.to.z}`);
+          return extraCost === undefined ? { allow: false, reason: 'outside delegation' } : { allow: true, extraCost };
+        },
+      },
+    });
+    const result = searchLandRoute(map, query, 2000);
+    const reference = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
+    expect(result.status).toBe('FOUND');
+    expect(reference.status).toBe('FOUND');
+    expect(reference.cost).toBe(6);
+    expect(result.cost).toBe(reference.cost);
+    expect(result.transitions).toHaveLength(3);
+  });
+
   it('preserves fractional starting offsets and exact targets without centering or height snapping', () => {
     const map = terrain(flat());
     const exact = request({ body: bodyAt(0.4, 0, 0.4), to: { x: 2.4, y: 0, z: 0.4 } });
@@ -851,6 +884,57 @@ describe('prefix budget and cancellation semantics', () => {
     const versionResult = await versionPending;
     expect(versionResult.status).toBe('INVALIDATED');
     expect(versionResult.prefix).toBeUndefined();
+  });
+
+  it('invalidates a jump candidate when the motion model changes during a slice', async () => {
+    let version = 'before';
+    const query = request({
+      allowed: ['jump'], maxDrop: 0, maxWorkPerSlice: 1,
+      rules: {
+        shapeProvider: fakeProvider,
+        jumpModel: {
+          get version() { return version; },
+          resolve() {
+            if (version === 'after') return { kind: 'unsupported', detail: 'motion no longer supported' };
+            queueMicrotask(() => { version = 'after'; });
+            return { kind: 'supported', trajectory: { apexHeight: 1.25 } };
+          },
+        },
+      },
+    });
+    const result = await searchLandRouteAsync(terrain([
+      { x: 0, z: 0, height: 0 }, { x: 1, z: 0, height: -2 }, { x: 2, z: 0, height: 0 },
+    ]), query, 2000);
+    expect(version).toBe('after');
+    expect(result.status).toBe('INVALIDATED');
+    expect(result.points).toEqual([]);
+    expect(result.transitions).toEqual([]);
+    expect(result.prefix).toBeUndefined();
+  });
+
+  it('invalidates a ladder candidate when the climb provider changes during a slice', async () => {
+    const map = new VoxelMap('world', { now: () => 1000 });
+    [LADDER, LADDER, AIR, AIR].forEach((state, y) => map.observe(obs(state, { x: 0, y, z: 0 })));
+    let version = 'before';
+    const result = await searchLandRouteAsync(map, request({
+      to: { x: 0.5, y: 1, z: 0.5 }, allowed: ['ladder'], maxWorkPerSlice: 1,
+      rules: {
+        shapeProvider: ladderShapes,
+        climbProvider: {
+          get version() { return version; },
+          resolve(input, read) {
+            if (version === 'after') return { kind: 'unsupported', detail: 'climb no longer supported' };
+            queueMicrotask(() => { version = 'after'; });
+            return ladderClimb.resolve(input, read);
+          },
+        },
+      },
+    }), 2000);
+    expect(version).toBe('after');
+    expect(result.status).toBe('INVALIDATED');
+    expect(result.points).toEqual([]);
+    expect(result.transitions).toEqual([]);
+    expect(result.prefix).toBeUndefined();
   });
 
   it.each([false, true])('drops a current prefix when a used page is unloaded (reload=%s)', async (reload) => {
