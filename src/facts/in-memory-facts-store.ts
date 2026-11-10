@@ -15,6 +15,7 @@
  *   the collection or changing the id order.
  */
 
+import { cloneJsonObject, jsonObjectsEqual, snapshotJsonObject, type JsonObject } from '../json-value.js';
 import {
   containerCanonicalKey,
   locationsEqual,
@@ -39,6 +40,8 @@ import {
   type ResourceFactQuery,
   type ResourceSourceRef,
   type ResourceSourceUpdate,
+  type SemanticFact,
+  type SemanticFactKind,
 } from './types.js';
 import {
   assertContainer,
@@ -178,6 +181,28 @@ export class InMemoryFactStore {
     return { outcome: 'updated', record: snapshotContainer(record) };
   }
 
+  updateHostData(kind: SemanticFactKind, id: string, hostData: JsonObject): FactWriteResult<SemanticFact> {
+    const data = snapshotJsonObject(hostData, 'fact hostData');
+    const update = <T extends SemanticFact>(
+      keys: ReadonlyMap<string, string>,
+      records: Map<string, T>,
+      snapshot: (record: T) => T,
+    ): FactWriteResult<T> => {
+      const key = keys.get(id);
+      const existing = key === undefined ? undefined : records.get(key);
+      if (key === undefined || existing === undefined) throw new Error(`unknown ${kind} id: ${id}`);
+      if (jsonObjectsEqual(existing.hostData, data)) return { outcome: 'duplicate', record: snapshot(existing) };
+      const record = { ...existing, hostData: data };
+      records.set(key, record);
+      return { outcome: 'updated', record: snapshot(record) };
+    };
+    switch (kind) {
+      case 'place': return update(this.placeKeysById, this.placesByKey, snapshotPlace);
+      case 'resource': return update(this.resourceKeysById, this.resourcesByKey, snapshotResource);
+      case 'container': return update(this.containerKeysById, this.containersByKey, snapshotContainer);
+    }
+  }
+
   /**
    * Mark a place gone from concrete disappearance evidence. The record and its
    * history stay in the store; only the query projection changes.
@@ -187,7 +212,7 @@ export class InMemoryFactStore {
     const key = this.placeKeysById.get(id);
     if (key === undefined) throw new Error(`unknown place id: ${id}`);
     const existing = this.requirePlace(key);
-    if (existing.gone) {
+    if (existing.gone && evidence.observedAt <= placeLastObserved(existing)) {
       return { outcome: 'duplicate', record: snapshotPlace(existing) };
     }
     if (evidence.observedAt < existing.observedAt) {
@@ -212,7 +237,7 @@ export class InMemoryFactStore {
     const key = this.containerKeysById.get(id);
     if (key === undefined) throw new Error(`unknown container id: ${id}`);
     const existing = this.requireContainer(key);
-    if (existing.gone) {
+    if (existing.gone && evidence.observedAt <= containerLastObserved(existing)) {
       return { outcome: 'duplicate', record: snapshotContainer(existing) };
     }
     if (evidence.observedAt < existing.observedAt) {
@@ -503,7 +528,7 @@ export class InMemoryFactStore {
     existing: ResourceAnchorFact,
     evidence: FactGoneEvidence,
   ): FactWriteResult<ResourceAnchorFact> {
-    if (existing.revoked) {
+    if (existing.revoked && evidence.observedAt <= resourceLastObserved(existing)) {
       return { outcome: 'duplicate', record: snapshotResource(existing) };
     }
     if (evidence.observedAt < existing.observedAt) {
@@ -614,7 +639,8 @@ function samePlace(a: PlaceFact, b: PlaceFact): boolean {
     a.label === b.label &&
     locationsEqual(a.location, b.location) &&
     a.gone === b.gone &&
-    a.goneAt === b.goneAt
+    a.goneAt === b.goneAt &&
+    jsonObjectsEqual(a.hostData, b.hostData)
   );
 }
 
@@ -627,7 +653,8 @@ function sameResource(a: ResourceAnchorFact, b: ResourceAnchorFact): boolean {
     a.resourceType === b.resourceType &&
     pointsEqual(a.sourceCell, b.sourceCell) &&
     a.revoked === b.revoked &&
-    a.revokedAt === b.revokedAt
+    a.revokedAt === b.revokedAt &&
+    jsonObjectsEqual(a.hostData, b.hostData)
   );
 }
 
@@ -640,7 +667,8 @@ function sameContainer(a: ContainerAnchorFact, b: ContainerAnchorFact): boolean 
     a.externalRef === b.externalRef &&
     a.ledgerRef === b.ledgerRef &&
     a.gone === b.gone &&
-    a.goneAt === b.goneAt
+    a.goneAt === b.goneAt &&
+    jsonObjectsEqual(a.hostData, b.hostData)
   );
 }
 
@@ -672,6 +700,7 @@ function firstIdAfter(order: readonly string[], after: string | undefined): numb
 function snapshotPlace(place: PlaceFact): PlaceFact {
   return {
     ...place,
+    ...(place.hostData === undefined ? {} : { hostData: cloneJsonObject(place.hostData) }),
     location: snapshotLocation(place.location),
     source: snapshotProvenance(place.source),
     ...(place.goneSource === undefined
@@ -683,6 +712,7 @@ function snapshotPlace(place: PlaceFact): PlaceFact {
 function snapshotResource(resource: ResourceAnchorFact): ResourceAnchorFact {
   return {
     ...resource,
+    ...(resource.hostData === undefined ? {} : { hostData: cloneJsonObject(resource.hostData) }),
     sourceCell: { ...resource.sourceCell },
     source: snapshotProvenance(resource.source),
     ...(resource.revokedSource === undefined
@@ -694,6 +724,7 @@ function snapshotResource(resource: ResourceAnchorFact): ResourceAnchorFact {
 function snapshotContainer(container: ContainerAnchorFact): ContainerAnchorFact {
   return {
     ...container,
+    ...(container.hostData === undefined ? {} : { hostData: cloneJsonObject(container.hostData) }),
     pos: { ...container.pos },
     source: snapshotProvenance(container.source),
     ...(container.goneSource === undefined

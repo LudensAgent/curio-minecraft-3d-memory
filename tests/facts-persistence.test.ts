@@ -141,6 +141,26 @@ afterEach(async () => {
 });
 
 describe('PersistentFactStore revision lifecycle', () => {
+  it('rejects foreign-world writes before mutation and tracks only changed host metadata', () => {
+    const store = new PersistentFactStore({ worldId: WORLD });
+    expect(() => store.upsertPlace(place('p', { worldId: 'other' }))).toThrow(/worldId/);
+    expect(() => store.upsertResource(resource('r', { worldId: 'other' }))).toThrow(/worldId/);
+    expect(() => store.upsertContainer(container('c', { worldId: 'other' }))).toThrow(/worldId/);
+    expect(store.revision).toBe(0);
+    expect(store.hasPendingChanges()).toBe(false);
+    expect(store.checkpointSnapshot()).toMatchObject({ places: [], resources: [], containers: [] });
+
+    const original = place('p');
+    store.upsertPlace(original);
+    store.confirmRevision(store.revision);
+    expect(store.updateHostData('place', 'p', { primary: true }).outcome).toBe('updated');
+    expect(store.revision).toBe(2);
+    expect(store.places().items[0]).toEqual({ ...original, hostData: { primary: true } });
+    store.confirmRevision(store.revision);
+    expect(store.updateHostData('place', 'p', { primary: true }).outcome).toBe('duplicate');
+    expect(store.hasPendingChanges()).toBe(false);
+  });
+
   it('confirms only the captured revision and a late ACK cannot clear newer facts', () => {
     const store = new PersistentFactStore({ worldId: WORLD });
     expect(store.revision).toBe(0);
@@ -234,6 +254,28 @@ describe('PersistentFactStore revision lifecycle', () => {
 });
 
 describe('SQLite facts persistence', () => {
+  it('persists host business metadata independently from observation times', async () => {
+    const dbPath = makeDbPath();
+    const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const records = {
+      place: place('p', { hostData: { primary: false, farm: { cells: [{ x: 1, y: 64, z: 2 }], harvests: 3 } } }),
+      resource: resource('r', { hostData: { role: 'ore' } }),
+      container: container('c', { hostData: { block: 'furnace', roles: ['furnace', 'station'] } }),
+    };
+    session.facts.upsertPlace(records.place);
+    session.facts.upsertResource(records.resource);
+    session.facts.upsertContainer(records.container);
+    session.facts.updateHostData('place', 'p', { ...records.place.hostData, primary: true });
+    await session.checkpoint();
+    await session.close();
+    const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(reopened.facts.places().items[0]).toEqual({ ...records.place, hostData: { ...records.place.hostData, primary: true } });
+    expect(reopened.facts.resources().items[0]).toEqual(records.resource);
+    expect(reopened.facts.containers().items[0]).toEqual(records.container);
+    expect(reopened.facts.hasPendingChanges()).toBe(false);
+    await reopened.close();
+  });
+
   it('confirms a checkpoint and restores stable ids, times and provenance after restart', async () => {
     const dbPath = makeDbPath();
     const session = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });

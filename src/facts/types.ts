@@ -14,6 +14,7 @@
  * was seen. Gone/revoked is explicit state, never a deletion of the record.
  */
 
+import type { JsonObject } from '../json-value.js';
 import type { Vec3Like } from '../types.js';
 
 /** How a fact was observed. Opaque to the library. */
@@ -57,6 +58,12 @@ export interface PlaceFact {
   goneSource?: FactProvenance;
   /** Compatibility-source id, preserved verbatim during a migration. */
   legacyId?: string;
+  /**
+   * Opaque host metadata (e.g. base selection or harvest counters). The library
+   * validates that it is finite JSON and deep-copies it; its schema and meaning
+   * belong to the host. It never changes observation time or availability.
+   */
+  hostData?: JsonObject;
 }
 
 /** A resource label observed at one exact source cell. */
@@ -81,6 +88,8 @@ export interface ResourceAnchorFact {
   revokedSource?: FactProvenance;
   /** Compatibility-source id, preserved verbatim during a migration. */
   legacyId?: string;
+  /** Opaque host metadata; validated, deep-copied and never interpreted here. */
+  hostData?: JsonObject;
 }
 
 /**
@@ -114,6 +123,8 @@ export interface ContainerAnchorFact {
   ledgerRef?: string;
   /** Compatibility-source id, preserved verbatim during a migration. */
   legacyId?: string;
+  /** Opaque host metadata; validated, deep-copied and never interpreted here. */
+  hostData?: JsonObject;
 }
 
 export type SemanticFact = PlaceFact | ResourceAnchorFact | ContainerAnchorFact;
@@ -265,6 +276,16 @@ export interface FactStore {
   revokeResource(id: string, evidence: FactGoneEvidence): FactWriteResult<ResourceAnchorFact>;
   markContainerGone(id: string, evidence: FactGoneEvidence): FactWriteResult<ContainerAnchorFact>;
   updateResourceSource(id: string, update: ResourceSourceUpdate): FactWriteResult<ResourceAnchorFact>;
+  /**
+   * Replace only the opaque host metadata of one fact. Observation time,
+   * position and gone/revoked state are untouched; `duplicate` means the
+   * supplied data already equals the stored value.
+   */
+  updateHostData(
+    kind: SemanticFactKind,
+    id: string,
+    hostData: JsonObject,
+  ): FactWriteResult<SemanticFact>;
 
   places(query?: FactQuery): FactPage<PlaceFact>;
   resources(query?: ResourceFactQuery): FactPage<ResourceAnchorFact>;

@@ -12,6 +12,7 @@ import {
   placeCanonicalKey,
   resourceCanonicalKey,
 } from './canonical.js';
+import { snapshotJsonObject } from '../json-value.js';
 import type { Vec3Like } from '../types.js';
 import type {
   ContainerAnchorFact,
@@ -37,6 +38,7 @@ export function assertPlace(place: PlaceFact): void {
   if (place.goneAt !== undefined) assertFiniteNumber(place.goneAt, 'place goneAt');
   if (place.goneSource !== undefined) assertProvenance(place.goneSource);
   if (place.legacyId !== undefined) assertNonEmptyString(place.legacyId, 'place legacyId');
+  if (place.hostData !== undefined) assertHostData(place.hostData, 'place hostData');
 }
 
 export function assertResource(resource: ResourceAnchorFact): void {
@@ -56,6 +58,7 @@ export function assertResource(resource: ResourceAnchorFact): void {
   if (resource.legacyId !== undefined) {
     assertNonEmptyString(resource.legacyId, 'resource legacyId');
   }
+  if (resource.hostData !== undefined) assertHostData(resource.hostData, 'resource hostData');
 }
 
 export function assertContainer(container: ContainerAnchorFact): void {
@@ -75,6 +78,12 @@ export function assertContainer(container: ContainerAnchorFact): void {
   if (container.legacyId !== undefined) {
     assertNonEmptyString(container.legacyId, 'container legacyId');
   }
+  if (container.hostData !== undefined) assertHostData(container.hostData, 'container hostData');
+}
+
+/** Host metadata must be finite JSON; the store deep-copies it separately. */
+export function assertHostData(value: unknown, label: string): void {
+  snapshotJsonObject(value, label);
 }
 
 export function assertGoneEvidence(evidence: FactGoneEvidence): void {

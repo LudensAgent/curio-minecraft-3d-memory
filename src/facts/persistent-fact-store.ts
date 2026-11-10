@@ -9,6 +9,7 @@
  * rewrites, deletes or re-dates newer facts.
  */
 
+import type { JsonObject } from '../json-value.js';
 import { InMemoryFactStore } from './in-memory-facts-store.js';
 import {
   type ContainerAnchorFact,
@@ -23,6 +24,8 @@ import {
   type ResourceAnchorFact,
   type ResourceFactQuery,
   type ResourceSourceUpdate,
+  type SemanticFact,
+  type SemanticFactKind,
 } from './types.js';
 import { validateFactCheckpointSnapshot } from './validation.js';
 
@@ -49,14 +52,17 @@ export class PersistentFactStore implements FactStore {
   }
 
   upsertPlace(fact: PlaceFact): FactWriteResult<PlaceFact> {
+    if (fact.worldId !== this.worldId) throw new Error('place worldId does not match store worldId');
     return this.apply(this.inner.upsertPlace(fact));
   }
 
   upsertResource(fact: ResourceAnchorFact): FactWriteResult<ResourceAnchorFact> {
+    if (fact.worldId !== this.worldId) throw new Error('resource worldId does not match store worldId');
     return this.apply(this.inner.upsertResource(fact));
   }
 
   upsertContainer(fact: ContainerAnchorFact): FactWriteResult<ContainerAnchorFact> {
+    if (fact.worldId !== this.worldId) throw new Error('container worldId does not match store worldId');
     return this.apply(this.inner.upsertContainer(fact));
   }
 
@@ -77,6 +83,10 @@ export class PersistentFactStore implements FactStore {
     update: ResourceSourceUpdate,
   ): FactWriteResult<ResourceAnchorFact> {
     return this.apply(this.inner.updateResourceSource(id, update));
+  }
+
+  updateHostData(kind: SemanticFactKind, id: string, hostData: JsonObject): FactWriteResult<SemanticFact> {
+    return this.apply(this.inner.updateHostData(kind, id, hostData));
   }
 
   places(query: FactQuery = {}): FactPage<PlaceFact> {

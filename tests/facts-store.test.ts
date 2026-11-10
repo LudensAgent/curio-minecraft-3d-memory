@@ -57,6 +57,55 @@ function container(
   };
 }
 
+describe('fact evidence and host metadata', () => {
+  it('keeps newer disappearance evidence ahead of delayed present observations', () => {
+    const store = new InMemoryFactStore();
+    store.upsertPlace(place('p'));
+    store.upsertResource(resource('r'));
+    store.upsertContainer(container('c'));
+    for (const observedAt of [200, 300]) {
+      const evidence = { observedAt, source: SOURCE };
+      expect(store.markPlaceGone('p', evidence).outcome).toBe('updated');
+      expect(store.revokeResource('r', evidence).outcome).toBe('updated');
+      expect(store.markContainerGone('c', evidence).outcome).toBe('updated');
+    }
+    expect(store.upsertPlace(place('p', { observedAt: 250 })).outcome).toBe('duplicate');
+    expect(store.upsertResource(resource('r', { observedAt: 250 })).outcome).toBe('duplicate');
+    expect(store.upsertContainer(container('c', { observedAt: 250 })).outcome).toBe('duplicate');
+    expect(store.places().total + store.resources().total + store.containers().total).toBe(0);
+    expect(store.places({ includeGone: true }).items[0]?.goneAt).toBe(300);
+    expect(store.resources({ includeGone: true }).items[0]?.revokedAt).toBe(300);
+    expect(store.containers({ includeGone: true }).items[0]?.goneAt).toBe(300);
+    expect(store.markContainerGone('c', { observedAt: 250, source: SOURCE }).outcome).toBe('duplicate');
+  });
+
+  it('updates opaque host data without re-dating evidence or sharing mutable references', () => {
+    const store = new InMemoryFactStore();
+    const original = { cells: [{ x: 1, y: 64, z: 2 }], harvests: 1 };
+    store.upsertPlace(place('p', { hostData: original }));
+    store.upsertResource(resource('r', { hostData: { role: 'ore' } }));
+    store.upsertContainer(container('c', { hostData: { block: 'furnace' } }));
+    original.cells[0]!.x = 99;
+    expect(store.places().items[0]?.hostData).toEqual({ cells: [{ x: 1, y: 64, z: 2 }], harvests: 1 });
+    const update = { nested: { count: 2 } };
+    for (const [kind, id] of [['place', 'p'], ['resource', 'r'], ['container', 'c']] as const) {
+      const result = store.updateHostData(kind, id, update);
+      expect(result.outcome).toBe('updated');
+      expect(result.record.observedAt).toBe(100);
+      expect(store.updateHostData(kind, id, { nested: { count: 2 } }).outcome).toBe('duplicate');
+      expect(() => store.updateHostData(kind, id, { invalid: NaN })).toThrow();
+    }
+    update.nested.count = 3;
+    const captured = store.captureSnapshot();
+    expect(captured.places[0]?.hostData).toEqual({ nested: { count: 2 } });
+    expect(captured.resources[0]?.hostData).toEqual({ nested: { count: 2 } });
+    expect(captured.containers[0]?.hostData).toEqual({ nested: { count: 2 } });
+    expect(store.upsertPlace(place('p', { hostData: { nested: { count: 4 } } })).outcome).toBe('conflict');
+    captured.places[0]!.hostData!.changed = true;
+    expect(store.places().items[0]?.hostData).toEqual({ nested: { count: 2 } });
+  });
+});
+
 describe('InMemoryFactStore places', () => {
   it('keeps negative coordinates and pages with a stable exclusive cursor', () => {
     const store = new InMemoryFactStore();
@@ -248,7 +297,7 @@ describe('InMemoryFactStore resources', () => {
     expect(
       store.revokeResource('ore', { observedAt: 400, source: { source: 'vision_scan' } })
         .outcome,
-    ).toBe('duplicate');
+    ).toBe('updated');
 
     // A revoked anchor is not moved until it is re-observed through upsert.
     expect(
@@ -350,7 +399,7 @@ describe('InMemoryFactStore containers', () => {
 
     expect(
       store.markContainerGone('c1', { observedAt: 300, source: SOURCE }).outcome,
-    ).toBe('duplicate');
+    ).toBe('updated');
     // Gone evidence older than the observed shell is a conflict, not a write.
     store.upsertContainer(container('c2', {
       externalRef: 'chest:base:2',

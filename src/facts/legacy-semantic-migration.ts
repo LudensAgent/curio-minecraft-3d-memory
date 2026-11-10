@@ -25,6 +25,7 @@
  */
 
 import type { Vec3Like } from '../types.js';
+import { snapshotJsonObject, jsonObjectsEqual, type JsonObject } from '../json-value.js';
 import {
   containerCanonicalKey,
   locationsEqual,
@@ -81,6 +82,7 @@ export interface LegacySemanticNode {
   gone?: boolean;
   goneAt?: number;
   legacyId?: string;
+  hostData?: JsonObject;
 }
 
 /** Only used to count/report skipped route geometry. */
@@ -330,6 +332,7 @@ function placeFromLegacyNode(
     ...(gone && goneAt !== undefined ? { goneAt } : {}),
     ...(gone ? { goneSource: legacyProvenance(node) } : {}),
     legacyId,
+    ...(node.hostData === undefined ? {} : { hostData: snapshotJsonObject(node.hostData, 'legacy hostData') }),
   };
 }
 
@@ -368,6 +371,7 @@ function resourceFromLegacyNode(
     ...(revoked && revokedAt !== undefined ? { revokedAt } : {}),
     ...(revoked ? { revokedSource: legacyProvenance(node) } : {}),
     legacyId,
+    ...(node.hostData === undefined ? {} : { hostData: snapshotJsonObject(node.hostData, 'legacy hostData') }),
   };
 }
 
@@ -403,6 +407,7 @@ function containerFromLegacyNode(
     gone: false,
     ...(ledgerRef === undefined ? {} : { ledgerRef }),
     legacyId,
+    ...(node.hostData === undefined ? {} : { hostData: snapshotJsonObject(node.hostData, 'legacy hostData') }),
   };
 }
 
@@ -532,6 +537,7 @@ function compareFact<T extends SemanticFact>(
 }
 
 function sameSemanticFact(a: SemanticFact, b: SemanticFact): boolean {
+  if (!jsonObjectsEqual(a.hostData, b.hostData)) return false;
   if (isPlaceFact(a) && isPlaceFact(b)) {
     return (
       a.id === b.id &&
