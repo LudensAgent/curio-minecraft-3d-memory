@@ -60,37 +60,6 @@ export type ArrivalSpec =
   | { kind: 'near'; radius: number }
   | { kind: 'reach_block' };
 
-/** Input to `navigate_to`. The original request and the parsed target are both retained. */
-export interface NavigateRequest {
-  destination: Vec3Like;
-  arrival: ArrivalSpec;
-  allowedModes: MoveMode[];
-  allowDigging: boolean;
-  allowPlacing: boolean;
-  allowTower: boolean;
-  materials: MaterialAllowance[];
-  exploration: 'known_only' | 'allow_frontier';
-  /**
-   * Optional delegation constraints. Only an empty `avoid` is executable today;
-   * a non-empty one is rejected instead of being silently ignored.
-   */
-  constraints?: StepConstraints;
-}
-
-/** Input to `follow_known_path`. */
-export interface FollowKnownPathRequest {
-  /** Stable historical fragment id to follow. At least one of pathId/fragmentId is required. */
-  pathId?: string;
-  /** Older alias for `pathId`; both may be supplied only when they are equal. */
-  fragmentId?: string;
-  /** Only `walk` is executed; other modes are rejected before the executor starts. */
-  mode: MoveMode;
-  /** Only `{ kind: 'exact' }` is executed; other completion conditions are rejected. */
-  arrival: ArrivalSpec;
-  /** Only an empty `avoid` is executable today. */
-  constraints?: StepConstraints;
-}
-
 /** Body/world evidence snapshot that must accompany an ARRIVED position (§7). */
 export interface LastObservation {
   worldId: string;

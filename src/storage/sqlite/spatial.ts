@@ -1,23 +1,18 @@
 /**
- * Combined spatial persistence entry (phase 5B): `openSpatialSession`.
+ * Combined spatial persistence entry: `openSpatialSession`.
  *
- * Holds one `VoxelMap`, one `FragmentStore` and one `TopologyStore` for the same
- * `worldId`, all persisted through a single SQLite worker. `checkpoint()` is the
- * *only* explicit save trigger and captures all three stores in one transaction;
- * a history-only `openHistorySession` and this combined entry never run two
- * workers over the same database, and neither claims concurrency across the two.
+ * Holds one `VoxelMap`, the world-scoped ledger, the journal queue and the
+ * semantic fact store for the same `worldId`, all persisted through a single
+ * SQLite worker. `checkpoint()` is the *only* explicit save trigger and captures
+ * every domain in one transaction.
  *
- * Each domain keeps its own save baseline: a history-only checkpoint replaces
- * only the history facts and never touches voxel rows, so a later combined
- * restore reports the voxel baseline from the last combined checkpoint — not from
- * the newer history-only checkpoint id.
+ * The retired history/topology tables are never loaded or written. Their row
+ * counts are read once at open as `legacyStoreSummary` metadata.
  */
 
 import { Worker } from 'node:worker_threads';
 import { isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { FragmentStore } from '../../topology/fragment-store.js';
-import { TopologyStore } from '../../topology/topology-store.js';
 import { VoxelMap } from '../../voxel/voxel-map.js';
 import { sectionKeyString } from '../../voxel/section.js';
 import type { SectionKey } from '../../voxel/section.js';
@@ -36,7 +31,6 @@ import {
   resolveLedgerLimits,
   resolveSnapshotLimits,
   resolveTimeoutMs,
-  SNAPSHOT_FRAME_BYTES,
   VOXEL_FRAME_BYTES,
 } from './types.js';
 import type {
@@ -44,7 +38,6 @@ import type {
   CloseResult,
   EventJournalQuery,
   FlushResult,
-  HistoryLoading,
   JournalAcceptResult,
   JournalBatchAcceptResult,
   JournalBatchInput,
@@ -86,7 +79,6 @@ import {
 } from '../../facts/types.js';
 import { JournalQueue } from './journal.js';
 import type { JournalCapture } from './journal.js';
-import type { HistorySnapshot } from './types.js';
 import { UNKNOWN_GAME_VERSION } from '../../voxel/serialization.js';
 import type { VoxelCheckpointSnapshot, VoxelSectionSnapshot } from '../../voxel/snapshot.js';
 import { estimateVoxelSectionResidentBytesFromSnapshot } from '../../voxel/snapshot.js';
@@ -98,15 +90,12 @@ interface PendingRequest {
   timer?: NodeJS.Timeout;
   checkpointId?: string;
   voxelRevision?: number;
-  fragmentRevision?: number;
-  topologyRevision?: number;
   /** How this checkpoint persisted voxel state, for the directory update on ACK. */
   voxelMode?: VoxelSaveMode;
   /** The captured (committed) voxel sections, for the directory update on ACK. */
   voxelSections?: VoxelSectionSnapshot[];
   /** Exactly the voxel sections this batch may confirm; unselected dirty stays pending. */
   voxelKeys?: SectionKey[];
-  removedVoxelKeys?: SectionKey[];
   /** Exact facts revision captured by this checkpoint (confirmed only on ACK). */
   factsRevision?: number;
   /** Whether this checkpoint captured the facts domain. */
@@ -127,7 +116,6 @@ interface InFlightCheckpoint {
   promise: Promise<SpatialCheckpointResult>;
   /** Exactly the voxel sections captured by this batch; the ACK confirms only these. */
   voxelKeys: SectionKey[];
-  removedVoxelKeys: SectionKey[];
 }
 
 interface JournalQueryMessage {
@@ -153,9 +141,10 @@ function optionalQueryString(value: string | undefined, what: string): string | 
 
 /**
  * Open a combined spatial persistence session bound to one world and one database
- * file. Resolves only after the committed history/topology and voxel state (if
- * any) has been restored into fresh in-memory stores; rejects without exposing a
- * half-restored session on any startup/load/schema failure, cleaning up its worker.
+ * file. Resolves only after the committed voxel, ledger, journal and facts state
+ * (if any) has been restored into fresh in-memory stores; rejects without
+ * exposing a half-restored session on any startup/load/schema failure, cleaning
+ * up its worker.
  */
 export async function openSpatialSession(options: OpenSpatialSessionOptions): Promise<SpatialSession> {
   const session = new SpatialSessionImpl(options);
@@ -163,19 +152,8 @@ export async function openSpatialSession(options: OpenSpatialSessionOptions): Pr
   return session;
 }
 
-function interRecordCommas(fragments: number, traversals: number, nodes: number, edges: number): number {
-  return (
-    Math.max(0, fragments - 1) +
-    Math.max(0, traversals - 1) +
-    Math.max(0, nodes - 1) +
-    Math.max(0, edges - 1)
-  );
-}
-
 class SpatialSessionImpl implements SpatialSession {
   readonly voxel: VoxelMap;
-  readonly history: FragmentStore;
-  readonly topology: TopologyStore;
   readonly ledger: LedgerStore;
   readonly facts: FactStore;
   private legacyFactsMigrationVersionField = 0;
@@ -227,9 +205,6 @@ class SpatialSessionImpl implements SpatialSession {
   /** Session-wide operation gate shared by working-set managers and direct load/save. */
   private workingSetLock = false;
   private readonly voxelLoadingField: VoxelLoading;
-  private readonly historyLoadingField: HistoryLoading;
-  /** True when a `none` open preserved an existing committed history/topology. */
-  private preservedHistoryBaseline = false;
   private readonly residencyLimitsField: ResolvedResidencyLimits;
   /** Per-checkpoint voxel dirty batch cap; defaults to the full snapshot limit. */
   private readonly voxelBatchMaxBytes: number;
@@ -239,12 +214,9 @@ class SpatialSessionImpl implements SpatialSession {
   private restoredGameVersion: string | null = null;
 
   private confirmedVoxelRevision = 0;
-  private confirmedFragmentRevision = 0;
-  private confirmedTopologyRevision = 0;
   private confirmedJournalRevision = 0;
   private confirmedLedgerRevision = 0;
   private confirmedFactsRevision = 0;
-  private baselineCheckpointId: string | null = null;
   private voxelBaselineCheckpointId: string | null = null;
   private journalBaselineCheckpointId: string | null = null;
   private ledgerBaselineCheckpointId: string | null = null;
@@ -325,10 +297,6 @@ class SpatialSessionImpl implements SpatialSession {
       withdraw: (selector: JournalWithdrawalSelector): JournalWithdrawalResult => this.withdrawPending(selector),
     };
     this.voxelLoadingField = options.voxelLoading ?? 'eager';
-    this.historyLoadingField = options.historyLoading ?? 'eager';
-    if (this.historyLoadingField !== 'eager' && this.historyLoadingField !== 'none') {
-      throw new Error(`historyLoading must be "eager" or "none", got ${String(this.historyLoadingField)}`);
-    }
     this.residencyLimitsField = resolveResidencyLimits(options.residencyLimits);
     this.gameVersionField = options.gameVersion;
 
@@ -345,8 +313,6 @@ class SpatialSessionImpl implements SpatialSession {
       manualResidency: this.voxelLoadingField === 'manual',
       residencyLimits: options.residencyLimits,
     });
-    this.history = new FragmentStore(options.worldId, options.fragmentOptions);
-    this.topology = new TopologyStore(this.history, options.topologyOptions);
   }
 
   async initialize(): Promise<void> {
@@ -357,8 +323,6 @@ class SpatialSessionImpl implements SpatialSession {
     worker.on('exit', () => this.handleWorkerExit());
 
     let result: {
-      baselineCheckpointId: string | null;
-      snapshot: HistorySnapshot | null;
       voxelBaselineCheckpointId: string | null;
       voxelSnapshot: VoxelCheckpointSnapshot | null;
       voxelDirectoryKeys: SectionKey[];
@@ -384,13 +348,6 @@ class SpatialSessionImpl implements SpatialSession {
       throw err;
     }
     try {
-      if (this.historyLoadingField === 'eager' && result.snapshot !== null) {
-        this.history.restoreSnapshot(result.snapshot);
-        this.topology.restoreSnapshot(result.snapshot);
-      }
-      if (this.historyLoadingField === 'none' && result.baselineCheckpointId !== null) {
-        this.preservedHistoryBaseline = true;
-      }
       if (this.voxelLoadingField === 'manual') {
         this.voxel.installDirectorySummary(result.voxelDirectorySummary, result.voxelDirectoryKeys);
       } else if (result.voxelSnapshot !== null) {
@@ -407,7 +364,6 @@ class SpatialSessionImpl implements SpatialSession {
       await this.terminateWorker();
       throw new PersistenceError('data', `restore failed: ${(err as Error).message}`);
     }
-    this.baselineCheckpointId = result.baselineCheckpointId;
     this.voxelBaselineCheckpointId = result.voxelBaselineCheckpointId;
     this.voxelBaselineEstablished = result.voxelBaselineCheckpointId !== null;
     this.voxelRowsPresent = (result.voxelSnapshot?.sections.length ?? 0) > 0
@@ -425,8 +381,6 @@ class SpatialSessionImpl implements SpatialSession {
     this.confirmedJournalRevision = result.journalRevision;
     this.confirmedLedgerRevision = this.ledger.revision;
     this.confirmedFactsRevision = this.facts.confirmedRevision;
-    this.confirmedFragmentRevision = this.history.revision;
-    this.confirmedTopologyRevision = this.topology.revision;
     this.confirmedVoxelRevision = this.voxel.saveRevision;
     // Once initialization is complete the map is live: a second `restoreSnapshot`
     // must never silently replace its facts (see `sealInitialization`).
@@ -453,57 +407,18 @@ class SpatialSessionImpl implements SpatialSession {
     }
 
     let voxelRevision = this.voxel.saveRevision;
-    const fragmentRevision = this.history.revision;
-    const topologyRevision = this.topology.revision;
 
     const maxBytes = this.limits.maxBytes;
-    // Cheap lower bound first (2 × worldId `.length` + both fixed frames + 4 quotes):
-    // each code unit encodes to ≥ 1 escaped byte, so this is a safe under-estimate
-    // that rejects an obviously-over-limit worldId before scanning its characters.
-    const frameTotal = SNAPSHOT_FRAME_BYTES + VOXEL_FRAME_BYTES;
-    if (frameTotal + 2 * this.worldId.length + 4 > maxBytes) {
+    // Cheap lower bound first: each code unit encodes to ≥ 1 escaped byte, so this
+    // safely rejects an obviously-over-limit worldId before scanning its characters.
+    if (VOXEL_FRAME_BYTES + this.worldId.length + 2 > maxBytes) {
       throw new PersistenceError('capacity', `worldId alone exceeds maxBytes (${maxBytes})`);
     }
-    // Compute the escaped worldId cost exactly once and reuse it in both envelopes.
     const escapedWorldId = jsonEscapedByteLength(this.worldId);
-    const historyEnvelope = SNAPSHOT_FRAME_BYTES + escapedWorldId + 2;
     const voxelEnvelope = VOXEL_FRAME_BYTES + escapedWorldId + 2;
-    if (historyEnvelope + voxelEnvelope > maxBytes) {
+    if (voxelEnvelope > maxBytes) {
       throw new PersistenceError('capacity', `worldId alone exceeds maxBytes (${maxBytes})`);
     }
-
-    // Only domains whose revision leads their confirmed revision are sent and
-    // rewritten. A clean domain contributes an empty snapshot and its measure is
-    // zero; the worker leaves its committed rows and baseline untouched.
-    const historyMode: 'full' | 'none' =
-      this.history.revision !== this.confirmedFragmentRevision ? 'full' : 'none';
-    const topologyMode: 'full' | 'none' =
-      this.topology.revision !== this.confirmedTopologyRevision ? 'full' : 'none';
-    if (this.preservedHistoryBaseline && (historyMode === 'full' || topologyMode === 'full')) {
-      throw new PersistenceError(
-        'data',
-        'historyLoading "none" preserved an existing history/topology baseline; refusing to replace it with a full snapshot from an unloaded domain (migrate explicitly)',
-      );
-    }
-
-    const shared = maxBytes - historyEnvelope - voxelEnvelope;
-    const historyMeasure =
-      historyMode === 'full'
-        ? this.history.checkpointMeasure(shared)
-        : { fragments: 0, traversals: 0, polylinePoints: 0, entrancePoints: 0, linkPairs: 0, bytes: 0 };
-    const afterHistory = shared - historyMeasure.bytes;
-    const topologyMeasure =
-      topologyMode === 'full'
-        ? this.topology.checkpointMeasure(Math.max(0, afterHistory))
-        : { nodes: 0, edges: 0, edgeEvidenceRefs: 0, bytes: 0 };
-    const afterTopology = afterHistory - topologyMeasure.bytes;
-
-    const historyCommas = interRecordCommas(
-      historyMeasure.fragments,
-      historyMeasure.traversals,
-      topologyMeasure.nodes,
-      topologyMeasure.edges,
-    );
 
     // The first save on an empty database can use incremental upserts, so a large
     // initial map is also split by voxelBatchMaxBytes. A database that already has
@@ -519,15 +434,12 @@ class SpatialSessionImpl implements SpatialSession {
     let voxelSections: number;
     let observedCells: number;
     let paletteEntries: number;
+    const shared = maxBytes - voxelEnvelope;
     if (voxelMode === 'full') {
-      const voxelMeasure = this.voxel.checkpointMeasure(Math.max(0, afterTopology));
+      const voxelMeasure = this.voxel.checkpointMeasure(shared);
       totalBytes =
-        historyEnvelope +
         voxelEnvelope +
-        historyCommas +
         Math.max(0, voxelMeasure.sections - 1) +
-        historyMeasure.bytes +
-        topologyMeasure.bytes +
         voxelMeasure.bytes;
       voxelSections = voxelMeasure.sections;
       observedCells = voxelMeasure.observedCells;
@@ -537,16 +449,12 @@ class SpatialSessionImpl implements SpatialSession {
       // under-count the committed fact set against the voxel capacity limits.
       const counts = this.voxel.checkpointFullCounts();
       const dirtyMeasure = this.voxel.checkpointDirtyMeasureBounded(
-        Math.min(this.voxelBatchMaxBytes, Math.max(0, afterTopology)),
+        Math.min(this.voxelBatchMaxBytes, shared),
         deadlineMs,
       );
       totalBytes =
-        historyEnvelope +
         voxelEnvelope +
-        historyCommas +
         Math.max(0, dirtyMeasure.count - 1) +
-        historyMeasure.bytes +
-        topologyMeasure.bytes +
         dirtyMeasure.bytes;
       voxelSections = counts.sections;
       observedCells = counts.observedCells;
@@ -554,15 +462,7 @@ class SpatialSessionImpl implements SpatialSession {
     }
 
     this.assertWithinLimits(
-      historyMeasure.fragments,
-      historyMeasure.traversals,
-      topologyMeasure.nodes,
-      topologyMeasure.edges,
       {
-        polylinePoints: historyMeasure.polylinePoints,
-        entrancePoints: historyMeasure.entrancePoints,
-        linkPairs: historyMeasure.linkPairs,
-        edgeEvidenceRefs: topologyMeasure.edgeEvidenceRefs,
         voxelSections,
         observedCells,
         paletteEntries,
@@ -570,43 +470,24 @@ class SpatialSessionImpl implements SpatialSession {
       },
     );
 
-    // Copy only dirty domains after the bounded pre-flight passed. A clean domain
-    // is sent as empty arrays under its `none` mode, never as a stale full copy.
-    const historySnapshot = historyMode === 'full' ? this.history.checkpointSnapshot() : null;
-    const topologySnapshot = topologyMode === 'full' ? this.topology.checkpointSnapshot() : null;
-    const snapshot: HistorySnapshot = {
-      worldId: this.worldId,
-      fragments: historySnapshot?.fragments ?? [],
-      traversals: historySnapshot?.traversals ?? [],
-      nodes: topologySnapshot?.nodes ?? [],
-      edges: topologySnapshot?.edges ?? [],
-      portalEdges: topologySnapshot?.portalEdges ?? [],
-      fragmentMerges: topologySnapshot?.fragmentMerges ?? [],
-    };
     // Deep copy only after the bounded pre-flight passed (before copy/postMessage).
     let voxelSnapshot: VoxelCheckpointSnapshot;
     let voxelKeys: SectionKey[];
-    let removedVoxelKeys: SectionKey[];
     if (voxelMode === 'full') {
       voxelSnapshot = this.voxel.checkpointSnapshot();
       voxelKeys = voxelSnapshot.sections.map((section) => ({
         worldId: this.worldId, dim: section.dim, cx: section.cx, cz: section.cz, sy: section.sy,
       }));
-      removedVoxelKeys = (voxelSnapshot.removedSections ?? []).map((section) => ({
-        worldId: this.worldId, ...section,
-      }));
     } else {
       const batch = this.voxel.captureDirtySectionsBounded(
-        Math.min(this.voxelBatchMaxBytes, Math.max(0, afterTopology)),
+        Math.min(this.voxelBatchMaxBytes, shared),
         deadlineMs,
       );
       voxelSnapshot = {
         worldId: this.worldId,
         sections: batch.sections,
-        removedSections: batch.removedSections.map(({ dim, cx, cz, sy }) => ({ dim, cx, cz, sy })),
       };
       voxelKeys = batch.keys;
-      removedVoxelKeys = batch.removedSections;
       // A split batch acknowledges only this prefix; unselected sections keep
       // higher pending entries and the next checkpoint saves them.
       voxelRevision = batch.capturedRevision;
@@ -698,12 +579,9 @@ class SpatialSessionImpl implements SpatialSession {
         kind: 'checkpoint',
         checkpointId,
         voxelRevision,
-        fragmentRevision,
-        topologyRevision,
         voxelMode,
         voxelSections: voxelSnapshot.sections,
         voxelKeys,
-        removedVoxelKeys,
         journalCapture,
         ledgerCapture,
         factsRevision,
@@ -718,17 +596,12 @@ class SpatialSessionImpl implements SpatialSession {
         requestId,
         checkpointId,
         worldId: this.worldId,
-        fragmentRevision,
-        topologyRevision,
-        snapshot,
         voxelMode,
         voxelRevision,
         voxelSnapshot,
         journalMode: 'append',
         journalRevision: journalCapture.revision,
         journalBatch: { actions: journalCapture.actions, events: journalCapture.events },
-        historyMode,
-        topologyMode,
         ledgerMode,
         ledgerRevision,
         ...(ledgerSnapshot === undefined ? {} : { ledgerSnapshot }),
@@ -740,7 +613,7 @@ class SpatialSessionImpl implements SpatialSession {
         gameVersion: this.gameVersionField,
       } satisfies WorkerRequest);
     });
-    this.inFlight = { checkpointId, promise, voxelKeys, removedVoxelKeys };
+    this.inFlight = { checkpointId, promise, voxelKeys };
     return promise;
   }
 
@@ -923,13 +796,8 @@ class SpatialSessionImpl implements SpatialSession {
     return {
       lifecycle: this.lifecycleField,
       voxelRevision: this.voxel.saveRevision,
-      fragmentRevision: this.history.revision,
-      topologyRevision: this.topology.revision,
       confirmedVoxelRevision: this.confirmedVoxelRevision,
-      confirmedFragmentRevision: this.confirmedFragmentRevision,
-      confirmedTopologyRevision: this.confirmedTopologyRevision,
       dirty: this.isDirty(),
-      baselineCheckpointId: this.baselineCheckpointId,
       voxelBaselineCheckpointId: this.voxelBaselineCheckpointId,
       journalRevision: this.journalQueue.revision,
       confirmedJournalRevision: this.confirmedJournalRevision,
@@ -1216,8 +1084,6 @@ class SpatialSessionImpl implements SpatialSession {
     return (
       this.voxel.saveRevision !== this.confirmedVoxelRevision ||
       this.voxel.hasPendingChanges() ||
-      this.history.revision !== this.confirmedFragmentRevision ||
-      this.topology.revision !== this.confirmedTopologyRevision ||
       this.journalQueue.revision !== this.confirmedJournalRevision ||
       this.ledger.revision !== this.confirmedLedgerRevision ||
       this.facts.hasPendingChanges()
@@ -1225,8 +1091,6 @@ class SpatialSessionImpl implements SpatialSession {
   }
 
   private requestOpen(): Promise<{
-    baselineCheckpointId: string | null;
-    snapshot: HistorySnapshot | null;
     voxelBaselineCheckpointId: string | null;
     voxelSnapshot: VoxelCheckpointSnapshot | null;
     voxelDirectoryKeys: SectionKey[];
@@ -1256,40 +1120,20 @@ class SpatialSessionImpl implements SpatialSession {
         limits: this.limits,
         journalLimits: this.journalLimitsField,
         ledgerLimits: this.ledgerLimitsField,
-        kind: 'spatial',
-        historyLoading: this.historyLoadingField,
         voxelLoading: this.voxelLoadingField,
       } satisfies WorkerRequest);
     });
   }
 
-  private assertWithinLimits(
-    fragments: number,
-    traversals: number,
-    nodes: number,
-    edges: number,
-    extra: {
-      polylinePoints: number;
-      entrancePoints: number;
-      linkPairs: number;
-      edgeEvidenceRefs: number;
-      voxelSections: number;
-      observedCells: number;
-      paletteEntries: number;
-      bytes: number;
-    },
-  ): void {
+  private assertWithinLimits(extra: {
+    voxelSections: number;
+    observedCells: number;
+    paletteEntries: number;
+    bytes: number;
+  }): void {
     const L = this.limits;
     const over = (name: string, value: number): PersistenceError =>
       new PersistenceError('capacity', `${name} exceeds limit ${L[name as keyof ResolvedSnapshotLimits]} (${value})`);
-    if (fragments > L.maxFragments) throw over('maxFragments', fragments);
-    if (traversals > L.maxTraversals) throw over('maxTraversals', traversals);
-    if (nodes > L.maxNodes) throw over('maxNodes', nodes);
-    if (edges > L.maxEdges) throw over('maxEdges', edges);
-    if (extra.polylinePoints > L.maxPolylinePoints) throw over('maxPolylinePoints', extra.polylinePoints);
-    if (extra.entrancePoints > L.maxEntrancePoints) throw over('maxEntrancePoints', extra.entrancePoints);
-    if (extra.linkPairs > L.maxLinks) throw over('maxLinks', extra.linkPairs);
-    if (extra.edgeEvidenceRefs > L.maxEdgeEvidenceRefs) throw over('maxEdgeEvidenceRefs', extra.edgeEvidenceRefs);
     if (extra.voxelSections > L.maxVoxelSections) throw over('maxVoxelSections', extra.voxelSections);
     if (extra.observedCells > L.maxObservedCells) throw over('maxObservedCells', extra.observedCells);
     if (extra.paletteEntries > L.maxPaletteEntries) throw over('maxPaletteEntries', extra.paletteEntries);
@@ -1333,8 +1177,6 @@ class SpatialSessionImpl implements SpatialSession {
     if (entry.kind === 'open') {
       const openMsg = msg as WorkerResponse & { type: 'open_ok' };
       entry.resolve({
-        baselineCheckpointId: openMsg.baselineCheckpointId,
-        snapshot: openMsg.snapshot,
         voxelBaselineCheckpointId: openMsg.voxelBaselineCheckpointId,
         voxelSnapshot: openMsg.voxelSnapshot,
         voxelDirectoryKeys: openMsg.voxelDirectoryKeys,
@@ -1379,7 +1221,6 @@ class SpatialSessionImpl implements SpatialSession {
       // split batch never clears an unselected tail.
       this.voxel.confirmCapturedSections(
         entry.voxelKeys ?? [],
-        entry.removedVoxelKeys ?? [],
         entry.voxelRevision!,
       );
       // Update the committed directory from the *captured* snapshot (not the
@@ -1390,19 +1231,15 @@ class SpatialSessionImpl implements SpatialSession {
           entry.voxelMode,
           entry.voxelSections ?? [],
           okMsg.voxelBytes,
-          entry.removedVoxelKeys ?? [],
         );
         // This confirmed checkpoint wrote voxel rows, so it is the new voxel
-        // baseline and its rows carry exactly this session's version. A
-        // history-only checkpoint never changes the voxel baseline's version.
+        // baseline and its rows carry exactly this session's version.
         this.restoredGameVersion = this.gameVersionField ?? UNKNOWN_GAME_VERSION;
       }
       this.voxelBaselineEstablished = true;
       // A split batch may confirm an older revision after a newer one; the
       // confirmed marker only advances, while per-key pending state decides dirty.
       this.confirmedVoxelRevision = Math.max(this.confirmedVoxelRevision, entry.voxelRevision!);
-      this.confirmedFragmentRevision = entry.fragmentRevision!;
-      this.confirmedTopologyRevision = entry.topologyRevision!;
       if (entry.ledgerCapture !== undefined) {
         // Clear exactly the captured rows; a key re-dirtied after capture keeps
         // its newer pending entry and is re-sent by the next checkpoint.
@@ -1436,8 +1273,6 @@ class SpatialSessionImpl implements SpatialSession {
         checkpointId: okMsg.checkpointId,
         worldId: this.worldId,
         voxelRevision: entry.voxelRevision!,
-        fragmentRevision: entry.fragmentRevision!,
-        topologyRevision: entry.topologyRevision!,
         // Exact captured (and now ACK-confirmed) revision, not the latest queue
         // revision. A truncated capture reports only its confirmed prefix.
         journalRevision: entry.journalCapture?.revision ?? this.confirmedJournalRevision,

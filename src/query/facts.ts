@@ -1,10 +1,18 @@
-import type { SemanticFact, SemanticFactKind, FactPage, FactQuery } from '../facts/types.js';
-import type { SpatialNode } from '../topology/graph.js';
+import type {
+  FactPage,
+  FactQuery,
+  SemanticFact,
+  SemanticFactKind,
+} from '../facts/types.js';
 import { invalidQueryResult, makeQueryResult, unsupportedQueryResult } from './envelope.js';
 import { resolveLimit } from './paging.js';
 import type { QueryPage } from './paging.js';
-import { pagedQueryResult } from './topology.js';
-import type { SpatialQueryContext, SpatialQueryRequest, SpatialQueryResult } from './types.js';
+import type {
+  SemanticPlaceView,
+  SpatialQueryContext,
+  SpatialQueryRequest,
+  SpatialQueryResult,
+} from './types.js';
 
 type FactsQuery = Extract<
   SpatialQueryRequest,
@@ -14,7 +22,7 @@ type FactsQuery = Extract<
 const NODES_CURSOR_PREFIX = 'facts:nodes:v1:';
 
 /**
- * Read-only compatibility projection; it does not create topology nodes.
+ * Facts-backed semantic projection. It never creates or reads topology nodes.
  *
  * Every list is paged from the facts store with its own exclusive cursor. The
  * query layer never loads all records, sorts them, and slices: `nodes` merges
@@ -33,7 +41,6 @@ export function queryFacts(
       const page = pageOneStream(
         'place',
         query => facts.places(query),
-        fact => factToNode(fact),
         context.worldId,
         request.dim,
         request.includeGone === true,
@@ -48,14 +55,13 @@ export function queryFacts(
         ...(request.dim === undefined ? {} : { dim: request.dim }),
         data: { kind: 'places', pageSource: 'memory', ...page },
         total: page.total,
-        nextAfter: page.nextAfter,
+        ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
       });
     }
     case 'resourceAnchors': {
       const page = pageOneStream(
         'resource',
         query => facts.resources(query),
-        fact => factToNode(fact),
         context.worldId,
         request.dim,
         request.includeGone === true,
@@ -71,7 +77,6 @@ export function queryFacts(
       const page = pageOneStream(
         'container',
         query => facts.containers(query),
-        fact => factToNode(fact),
         context.worldId,
         request.dim,
         false,
@@ -102,13 +107,28 @@ export function queryFacts(
         afters = (decoded as (string | null)[]).map(value => value ?? undefined);
       }
       const streams = [
-        pageOneStream('place', query => facts.places(query), fact => factToNode(fact), context.worldId, request.dim, false, afters[0], limit, request.tag, request.label, request.source),
-        pageOneStream('resource', query => facts.resources(query), fact => factToNode(fact), context.worldId, request.dim, false, afters[1], limit, request.tag, request.label, request.source),
-        pageOneStream('container', query => facts.containers(query), fact => factToNode(fact), context.worldId, request.dim, false, afters[2], limit, request.tag, request.label, request.source),
+        pageOneStream('place', query => facts.places(query), context.worldId, request.dim, false, afters[0], limit, request.tag, request.label, request.source),
+        pageOneStream('resource', query => facts.resources(query), context.worldId, request.dim, false, afters[1], limit, request.tag, request.label, request.source),
+        pageOneStream('container', query => facts.containers(query), context.worldId, request.dim, false, afters[2], limit, request.tag, request.label, request.source),
       ];
       return pagedQueryResult(context, 'nodes', mergeIdPages(streams, limit, afters), request.dim);
     }
   }
+}
+
+function pagedQueryResult(
+  context: SpatialQueryContext,
+  kind: 'nodes' | 'resourceAnchors' | 'containerAnchors',
+  page: QueryPage<SemanticPlaceView>,
+  dim: string | undefined,
+): SpatialQueryResult {
+  return makeQueryResult(context, {
+    status: 'ok',
+    ...(dim === undefined ? {} : { dim }),
+    data: { kind, ...page },
+    total: page.total,
+    ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
+  });
 }
 
 /**
@@ -121,16 +141,15 @@ export function queryFacts(
 function pageOneStream(
   kind: SemanticFactKind,
   read: (query: FactQuery) => FactPage<SemanticFact>,
-  project: (fact: SemanticFact) => SpatialNode,
   worldId: string,
   dim: string | undefined,
   includeGone: boolean,
   after: string | undefined,
   limit: number,
-  tag: SpatialNode['tag'] | undefined,
+  tag: SemanticPlaceView['tag'] | undefined,
   label: string | undefined,
-  source: SpatialNode['source'] | undefined,
-): QueryPage<SpatialNode> {
+  source: SemanticPlaceView['source'] | undefined,
+): QueryPage<SemanticPlaceView> {
   let placeKinds: FactQuery['placeKinds'];
   if (tag !== undefined) {
     if (kind === 'place') {
@@ -153,7 +172,7 @@ function pageOneStream(
     limit,
   });
   return {
-    items: page.items.map(project),
+    items: page.items.map(factToPlaceView),
     total: page.total,
     ...(page.nextAfter === undefined ? {} : { nextAfter: page.nextAfter }),
   };
@@ -161,11 +180,11 @@ function pageOneStream(
 
 /** Merge already id-sorted, cursor-limited stream pages into one page window. */
 function mergeIdPages(
-  pages: readonly QueryPage<SpatialNode>[],
+  pages: readonly QueryPage<SemanticPlaceView>[],
   limit: number,
   afters: readonly (string | undefined)[],
-): QueryPage<SpatialNode> {
-  const items: SpatialNode[] = [];
+): QueryPage<SemanticPlaceView> {
+  const items: SemanticPlaceView[] = [];
   const cursors = pages.map(() => 0);
   const nextAfters = [...afters];
   for (;;) {
@@ -193,8 +212,8 @@ function mergeIdPages(
   };
 }
 
-/** Project one semantic fact to the compatibility `SpatialNode` view. */
-function factToNode(fact: SemanticFact): SpatialNode {
+/** Project one semantic fact to the compatibility place view. */
+function factToPlaceView(fact: SemanticFact): SemanticPlaceView {
   const resource = 'sourceCell' in fact;
   const container = 'externalRef' in fact;
   const gone = resource ? fact.revoked : fact.gone;

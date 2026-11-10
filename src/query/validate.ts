@@ -2,14 +2,10 @@
  * Strict runtime validation for `SpatialQueryRequest` (contract §2.1/§5.6).
  *
  * TypeScript types are erased; a host or tool can still send an unknown field,
- * a non-integer cell, an over-limit page, or an unknown query kind. This module
+ * a non-integer cell, an over-limit page, or a retired query kind. This module
  * is the single boundary that turns those into a structured `invalid_request`
  * detail before any store method is called. Handlers therefore receive an
  * already-validated request and do not repeat these checks.
- *
- * Field specs are declared per kind in request order: the first invalid field
- * still wins and the allowed-field set is derived from the same table, so the
- * validator, the accepted shape, and the unknown-field check cannot drift.
  */
 
 import { MAX_QUERY_LIMIT } from './paging.js';
@@ -18,33 +14,8 @@ import type { Vec3Like } from '../types.js';
 
 export const MAX_CELL_POSITIONS = 4096;
 
-const FRAGMENT_KINDS = ['dug', 'walked', 'bridge', 'built'] as const;
-const GEOMETRY_SOURCES = ['traversal', 'observed_structure', 'legacy'] as const;
-const LANDMARK_TAGS = [
-  'base',
-  'resource',
-  'danger',
-  'discovery',
-  'death',
-  'waypoint',
-  'herd',
-  'portal',
-] as const;
-const NODE_SOURCES = ['agent', 'program'] as const;
-const CONNECTION_TYPES = [
-  'HORIZONTAL',
-  'STAIRCASE',
-  'VERTICAL_SHAFT',
-  'LADDER',
-  'BRIDGE',
-  'DROP',
-  'CLIMB',
-  'SWIM',
-  'CAVE_PASSAGE',
-  'PORTAL',
-] as const;
-const EDGE_BASES = ['candidate', 'traversed'] as const;
-const ANCHOR_ORDERS = ['surface', 'deepest'] as const;
+const PLACE_TAGS = ['base', 'resource', 'danger', 'discovery', 'death', 'portal'] as const;
+const PLACE_SOURCES = ['agent', 'program'] as const;
 
 export type RequestValidation =
   | { ok: true; request: SpatialQueryRequest }
@@ -144,22 +115,6 @@ function isPoint(value: unknown, integer: boolean): value is Vec3Like {
   return valid(x) && valid(y) && valid(z);
 }
 
-function pointField(key: RequestFieldKey, integer: boolean): FieldSpec {
-  return {
-    key,
-    validate: (value, what) => {
-      if (!isPoint(value, integer)) {
-        return fail(
-          integer
-            ? `${what} must have finite integer x, y, z and no other fields`
-            : `${what} must have finite x, y, z and no other fields`,
-        );
-      }
-      return accept({ x: value.x, y: value.y, z: value.z });
-    },
-  };
-}
-
 const LIMIT_FIELD: FieldSpec = {
   key: 'limit',
   validate: (value) => {
@@ -171,17 +126,6 @@ const LIMIT_FIELD: FieldSpec = {
       value > MAX_QUERY_LIMIT
     ) {
       return fail(`limit must be an integer in [1, ${MAX_QUERY_LIMIT}]`);
-    }
-    return accept(value);
-  },
-};
-
-const NEAR_FIELD: FieldSpec = {
-  key: 'near',
-  validate: (value) => {
-    if (value === undefined) return accept(undefined);
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-      return fail('near must be a finite non-negative number');
     }
     return accept(value);
   },
@@ -210,70 +154,32 @@ const POSITIONS_FIELD: FieldSpec = {
 
 const FIELD_SPECS: Record<SpatialQueryKind, readonly FieldSpec[]> = {
   cells: [stringField('dim', true), POSITIONS_FIELD],
-  fragments: [
-    stringField('dim', false),
-    enumField('fragmentKind', FRAGMENT_KINDS, false),
-    enumField('geometrySource', GEOMETRY_SOURCES, false),
-    stringField('after', false),
-    LIMIT_FIELD,
-  ],
-  traversals: [
-    stringField('dim', false),
-    stringField('fragmentId', false),
-    stringField('after', false),
-    LIMIT_FIELD,
-  ],
   nodes: [
     stringField('dim', false),
-    enumField('tag', LANDMARK_TAGS, false),
+    enumField('tag', PLACE_TAGS, false),
     stringField('label', false),
-    enumField('source', NODE_SOURCES, false),
+    enumField('source', PLACE_SOURCES, false),
     stringField('after', false),
     LIMIT_FIELD,
   ],
   places: [
     stringField('dim', false),
-    enumField('tag', LANDMARK_TAGS, false),
+    enumField('tag', PLACE_TAGS, false),
     stringField('label', false),
-    enumField('source', NODE_SOURCES, false),
+    enumField('source', PLACE_SOURCES, false),
     booleanField('includeGone', false),
     stringField('after', false),
     LIMIT_FIELD,
   ],
-  edges: [
-    stringField('dim', false),
-    stringField('from', false),
-    stringField('to', false),
-    enumField('type', CONNECTION_TYPES, false),
-    enumField('basis', EDGE_BASES, false),
-    stringField('after', false),
-    LIMIT_FIELD,
-  ],
-  historyRoute: [
-    stringField('dim', true),
-    pointField('from', false),
-    pointField('to', false),
-    NEAR_FIELD,
-  ],
-  anchor: [
-    stringField('dim', true),
-    pointField('here', false),
-    enumField('order', ANCHOR_ORDERS, true),
-    NEAR_FIELD,
-  ],
-  components: [stringField('dim', true)],
-  segments: [stringField('fragmentId', true)],
-  portals: [stringField('after', false), LIMIT_FIELD],
   resourceAnchors: [
     stringField('dim', false),
-    enumField('tag', LANDMARK_TAGS, false),
+    enumField('tag', PLACE_TAGS, false),
     stringField('label', false),
     booleanField('includeGone', false),
     stringField('after', false),
     LIMIT_FIELD,
   ],
   containerAnchors: [stringField('dim', false), stringField('after', false), LIMIT_FIELD],
-  frontiers: [stringField('dim', true), pointField('here', false), LIMIT_FIELD],
   containerContents: [stringField('dim', false)],
   snapshot: [],
   capabilities: [],

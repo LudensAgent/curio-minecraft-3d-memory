@@ -1,112 +1,43 @@
 /**
- * Query capability and snapshot handlers (contract §2.3, plan M2.6).
+ * Query capability and snapshot handlers (contract §2.3).
  *
- * The capability report is derived from what the current in-memory store can
- * actually do. Domains that are not implemented stay `false`; they are not
- * optimistic placeholders.
+ * The capability report describes exactly the callable voxel + facts surface.
+ * Retired fragment/topology/route entries are absent, not reported as `false`
+ * compatibility placeholders, and no capability block is composed from a
+ * legacy store even when one happens to exist in the process.
  */
 
-import type { MemoryHostCapabilities, RoutePlanCapabilities } from '../memory/capabilities.js';
-import {
-  CONTRACT_VERSION,
-  ROUTE_PLAN_CAPABILITIES,
-} from '../memory/capabilities.js';
+import type { MemoryHostCapabilities } from '../memory/capabilities.js';
+import { CONTRACT_VERSION } from '../memory/capabilities.js';
 import { makeQueryResult, unsupportedQueryResult } from './envelope.js';
-import { SPATIAL_MEMORY_CAPABILITY_NAMES } from './types.js';
-import type { SpatialMemoryCapabilities, SpatialQueryContext, SpatialQueryResult } from './types.js';
-
-/**
- * Planning/route history is a capability of a composition that actually
- * carries the legacy route stores. A voxel+facts production composition reports
- * the retired route entries as false instead of advertising the package's
- * compatibility surface.
- */
-const NO_ROUTE_PLAN_CAPABILITIES: RoutePlanCapabilities = Object.freeze({
-  walkSearch: false,
-  walkHistory: false,
-  walkAuto: false,
-  nearArrival: false,
-  reachBlockArrival: false,
-  digPlaceTower: false,
-  swim: false,
-  boat: false,
-});
+import type { SpatialQueryContext, SpatialQueryResult } from './types.js';
 
 export function buildMemoryHostCapabilities(
   context: SpatialQueryContext,
 ): MemoryHostCapabilities {
-  const memory = context.sources.memoryCapabilities?.() ?? (Object.fromEntries(
-    SPATIAL_MEMORY_CAPABILITY_NAMES.map((name) => [name, { available: false }]),
-  ) as SpatialMemoryCapabilities);
-  const available = (name: keyof typeof memory): boolean => memory[name].available;
+  const memory = context.sources.memoryCapabilities?.() ?? {
+    observeBatch: false,
+    beginSession: false,
+    markStale: false,
+    markTraversed: false,
+    markModified: false,
+    checkpoint: false,
+    flush: false,
+    close: false,
+  };
   const facts = context.sources.facts !== undefined;
-  const topology = context.sources.topology !== undefined;
-  const fragments = context.sources.fragments !== undefined;
-  const history = context.sources.history !== undefined;
-  /**
-   * Dispatch retires legacy route reads as soon as a facts store is composed,
-   * regardless of which compatibility stores happen to be present. The
-   * capability report must describe that same callable surface, not the
-   * package's optional legacy stores.
-   */
-  const routeMemory = !facts && fragments && topology && history;
   return {
     contract: CONTRACT_VERSION,
-    memory: {
-      observeBatch: available('observeBatch'),
-      beginSession: available('beginSession'),
-      markStale: available('markStale'),
-      markTraversed: available('markTraversed'),
-      markModified: available('markModified'),
-      saveFragment: available('saveFragment'),
-      addTraversal: available('addTraversal'),
-      recordNode: available('recordNode'),
-      upsertEdge: available('upsertEdge'),
-      savePortalEdge: available('savePortalEdge'),
-      // The in-memory store has no persistence lifecycle methods.
-      checkpoint: false,
-      flush: false,
-      close: false,
-    },
+    memory,
     query: {
       cells: true,
-      fragments: routeMemory,
-      traversals: routeMemory,
-      nodes: facts || topology,
-      edges: routeMemory,
-      historyRoute: routeMemory,
-      anchors: routeMemory,
-      components: routeMemory,
-      segments: routeMemory,
-      portals: routeMemory,
-      // Places-only paging is answered by the facts authority; the legacy
-      // topology `nodes` kind is not a places pager.
+      nodes: facts,
       places: facts,
-      resourceAnchors: facts || topology,
-      containerAnchors: facts || (topology && context.isContainer !== undefined),
-      // Available only when the host injected the caller-supplied snapshot
-      // source; the library never starts a search of its own.
-      frontiers: context.sources.frontiers !== undefined,
+      resourceAnchors: facts,
+      containerAnchors: facts,
       containerContents: false,
-    },
-    // M3 planning is present in this package. Reference the single source in
-    // `src/memory/capabilities.ts` directly (D-010) so the report and the
-    // constant cannot drift; the constant is frozen against host mutation.
-    // The route-plan block only applies when the route stores are composed.
-    plan: routeMemory ? ROUTE_PLAN_CAPABILITIES : NO_ROUTE_PLAN_CAPABILITIES,
-    // These four entries have real runtime implementations in this package:
-    // WalkRouteExecutor + walkPath (walk), measured grounded arrival,
-    // ChangeReport-driven current-segment invalidation, and delegation-scoped
-    // cancellation. Reporting `true` is a library fact; the host must still
-    // intersect it with its own wiring via `composeCapabilities`. Swim/boat
-    // execution remain false (geometry validation only).
-    execute: {
-      walk: true,
-      groundedArrival: true,
-      invalidation: true,
-      cancellation: true,
-      swim: false,
-      boat: false,
+      snapshot: context.sources.snapshot !== undefined,
+      capabilities: true,
     },
     persistence: {
       sqlite: false,

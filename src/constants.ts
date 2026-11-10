@@ -1,9 +1,7 @@
 /**
  * Single-source configuration constants.
  *
- * Design §3.1 / §4 require these thresholds to live in exactly one place —
- * history shows duplicated magic numbers (e.g. the passage-link distance)
- * drifting apart across `touchesPassage` / `bridgeNode` / `passageGraph`.
+ * Design §3.1 / §4 require these thresholds to live in exactly one place.
  */
 
 /** Edge length of a voxel Section (a 16×16×16 cube). */
@@ -14,16 +12,6 @@ export const SECTION_CELL_COUNT = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE; //
 
 /** Palette index reserved for air; cell data must never default to it as "known air". */
 export const AIR_PALETTE_INDEX = 0;
-
-/**
- * Distance threshold (in blocks) used to associate nearby geometry as the *same*
- * path fragment. It is a candidate-matching hint only — it never fabricates a
- * traversed `links` edge between positions that were not actually walked.
- *
- * Single source: the compatibility layer re-exports this value instead of
- * declaring its own copy.
- */
-export const PASSAGE_LINK = 3.5;
 
 /**
  * Version of the persisted voxel-section payload (design §4 / §9).

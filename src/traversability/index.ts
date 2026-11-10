@@ -25,15 +25,6 @@ export type {
 } from './step.js';
 export { TraversabilityCache } from './cache.js';
 export type { TraversabilityCacheOptions } from './cache.js';
-export { RouteVerifier } from './route.js';
-export type {
-  PendingReason,
-  RouteRequest,
-  RouteStatus,
-  RouteStepState,
-  RouteVerdict,
-  RouteVerifierOptions,
-} from './route.js';
 export { DEFAULT_LAND_LIMITS, evaluateLandTransition, resolveLandLimits } from './land-transition.js';
 export type {
   ClimbCellInput,
