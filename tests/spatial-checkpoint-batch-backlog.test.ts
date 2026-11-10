@@ -131,6 +131,68 @@ describe('VoxelMap bounded batch late ACK (pure core)', () => {
     expect(map.hasPendingChanges()).toBe(false);
     expect(pendingCount(map)).toBe(0);
   });
+
+  it('rotates past a persistently re-dirtied head instead of starving the tail', () => {
+    const map = new VoxelMap(WORLD);
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })); // cx 0
+    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } })); // cx 1
+
+    const first = map.captureDirtySectionsBounded(1);
+    expect(first.keys[0]).toMatchObject({ cx: 0 });
+
+    // Re-dirty the captured head before the ACK; it stays pending.
+    map.observe(obs({ state: air, pos: { x: 0, y: 0, z: 0 }, observedAt: 2000, sequence: 2 }));
+    map.confirmCapturedSections(first.keys, first.removedSections, first.capturedRevision);
+    expect(pendingCount(map)).toBe(2);
+
+    // The next cap-1 batch must rotate to cx1; the re-dirtied head must not starve it.
+    const second = map.captureDirtySectionsBounded(1);
+    expect(second.keys[0]).toMatchObject({ cx: 1 });
+    map.confirmCapturedSections(second.keys, second.removedSections, second.capturedRevision);
+    expect(pendingCount(map)).toBe(1);
+
+    const third = map.captureDirtySectionsBounded(1);
+    expect(third.keys[0]).toMatchObject({ cx: 0 });
+    map.confirmCapturedSections(third.keys, third.removedSections, third.capturedRevision);
+    expect(map.hasPendingChanges()).toBe(false);
+  });
+
+  it('bounded measure does not advance the rotation cursor and matches capture', () => {
+    const map = new VoxelMap(WORLD);
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } }));
+    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } }));
+    map.observe(obs({ state: air, pos: { x: 40, y: 0, z: 0 } }));
+
+    // Move the cursor to cx1 with a first cap-1 capture.
+    const first = map.captureDirtySectionsBounded(1);
+    expect(first.keys[0]).toMatchObject({ cx: 0 });
+    map.confirmCapturedSections(first.keys, first.removedSections, first.capturedRevision);
+
+    const measureA = map.checkpointDirtyMeasureBounded(1);
+    const measureB = map.checkpointDirtyMeasureBounded(1);
+    expect(measureB).toEqual(measureA);
+    const batch = map.captureDirtySectionsBounded(1);
+    expect(batch.keys).toHaveLength(measureA.count);
+    expect(batch.capturedRevision).toBe(measureA.capturedRevision);
+    expect(batch.keys[0]).toMatchObject({ cx: 1 });
+  });
+
+  it('falls back to the insertion-order head when the cursor key is no longer pending', () => {
+    const map = new VoxelMap(WORLD);
+    map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })); // cx 0
+    map.observe(obs({ state: dirt, pos: { x: 20, y: 0, z: 0 } })); // cx 1
+    map.observe(obs({ state: air, pos: { x: 40, y: 0, z: 0 } })); // cx 2
+
+    const first = map.captureDirtySectionsBounded(1);
+    expect(first.keys[0]).toMatchObject({ cx: 0 }); // cursor now points at cx1
+    // Clear every pending entry through the legacy global path; the cursor key vanishes.
+    map.confirmSections(map.saveRevision);
+    expect(pendingCount(map)).toBe(0);
+
+    map.observe(obs({ state: stone, pos: { x: 40, y: 0, z: 0 }, observedAt: 2000, sequence: 2 })); // cx 2
+    const next = map.captureDirtySectionsBounded(1);
+    expect(next.keys[0]).toMatchObject({ cx: 2 });
+  });
 });
 
 // ==============================================================================

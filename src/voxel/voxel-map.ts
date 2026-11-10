@@ -347,6 +347,15 @@ export class VoxelMap {
    */
   private readonly pendingSections = new Map<Section, number>();
   /**
+   * Next pending-section key a bounded batch should start from. Stored as a key
+   * string, not an index, because confirmations and unloads shift positions.
+   * `null` means start from the insertion-order head. Bounded capture advances it
+   * past the selected batch so a persistently re-dirtied head cannot starve the
+   * tail; measure reads it without advancing so measure and capture select the
+   * same batch.
+   */
+  private dirtyRotationCursor: string | null = null;
+  /**
    * Sections removed by `retainNewestObservedCells` since the last confirmed save,
    * keyed by `dirKey` with the save revision of the removal. The next incremental
    * checkpoint deletes their rows; a section re-created later is simply upserted
@@ -758,24 +767,26 @@ export class VoxelMap {
   }
 
   /**
-   * Bounded version of `checkpointDirtyMeasure`: select a first-dirty prefix whose
-   * estimated bytes stay within `maxBytes` (at least one section when any is
-   * pending), plus all removed keys. The returned revision covers only this batch;
-   * unselected sections remain pending and must be confirmed by key, not by a
-   * global revision threshold.
+   * Bounded version of `checkpointDirtyMeasure`: select the next batch from the
+   * round-robin cursor whose estimated bytes stay within `maxBytes` (at least one
+   * section when any is pending), plus all removed keys. It does not advance the
+   * cursor, so the following capture selects the same batch. The returned revision
+   * covers only this batch; unselected sections remain pending and must be
+   * confirmed by key, not by a global revision threshold.
    */
   checkpointDirtyMeasureBounded(maxBytes: number): VoxelDirtyBatchMeasure {
-    const selected = this.selectDirtySections(maxBytes);
+    const selected = this.selectDirtySections(maxBytes, false);
     return { count: selected.sections.length, bytes: selected.bytes, capturedRevision: selected.capturedRevision };
   }
 
   /**
-   * Deep-copied snapshots for one bounded dirty batch. `keys` identifies exactly
-   * the sections this batch may confirm; `capturedRevision` never implies that
-   * unselected pending sections are saved.
+   * Deep-copied snapshots for one bounded dirty batch. Selects the same batch the
+   * preceding bounded measure would, then advances the rotation cursor past it.
+   * `keys` identifies exactly the sections this batch may confirm;
+   * `capturedRevision` never implies that unselected pending sections are saved.
    */
   captureDirtySectionsBounded(maxBytes: number): VoxelDirtyBatch {
-    const selected = this.selectDirtySections(maxBytes);
+    const selected = this.selectDirtySections(maxBytes, true);
     return {
       sections: selected.sections.map(snapshotVoxelSection),
       keys: selected.keys.map((key) => ({ ...key })),
@@ -812,7 +823,7 @@ export class VoxelMap {
     }
   }
 
-  private selectDirtySections(maxBytes: number): {
+  private selectDirtySections(maxBytes: number, advanceCursor: boolean): {
     sections: Section[];
     keys: SectionKey[];
     removed: { key: { dim: string; cx: number; cz: number; sy: number }; revision: number }[];
@@ -822,17 +833,30 @@ export class VoxelMap {
     if (!Number.isFinite(maxBytes) || maxBytes < 0) {
       throw new Error(`dirty batch maxBytes must be a finite nonnegative number: ${maxBytes}`);
     }
+    const pending = [...this.pendingSections];
+    const start = this.dirtyRotationCursor === null
+      ? 0
+      : Math.max(0, pending.findIndex(([section]) => this.dirtySectionKey(section) === this.dirtyRotationCursor));
     const sections: Section[] = [];
     const keys: SectionKey[] = [];
     let bytes = 0;
     let capturedRevision = 0;
-    for (const [section, revision] of this.pendingSections) {
+    for (let offset = 0; offset < pending.length; offset += 1) {
+      const [section, revision] = pending[(start + offset) % pending.length]!;
       const sectionBytes = estimateVoxelSectionBytes(section);
       if (sections.length > 0 && bytes + sectionBytes > maxBytes) break;
       sections.push(section);
       keys.push({ ...section.key });
       bytes += sectionBytes;
       capturedRevision = Math.max(capturedRevision, revision);
+    }
+    if (advanceCursor) {
+      // Point at the first section this batch did not select; wrap to the head
+      // after a full pass. A missing cursor key (confirmed/unloaded in the
+      // meantime) safely falls back to the insertion-order head next time.
+      this.dirtyRotationCursor = pending.length === 0 || sections.length >= pending.length
+        ? null
+        : this.dirtySectionKey(pending[(start + sections.length) % pending.length]![0]);
     }
     const removed = [...this.removedSections.values()].map((entry) => ({
       key: { ...entry.key },
@@ -841,6 +865,11 @@ export class VoxelMap {
     for (const entry of removed) capturedRevision = Math.max(capturedRevision, entry.revision);
     if (sections.length === 0 && removed.length === 0) capturedRevision = this.saveRevisionCount;
     return { sections, keys, removed, capturedRevision, bytes };
+  }
+
+  private dirtySectionKey(section: Section): string {
+    const { dim, cx, cz, sy } = section.key;
+    return dirKey(dim, cx, cz, sy);
   }
 
   /**
