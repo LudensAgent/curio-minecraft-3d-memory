@@ -1116,13 +1116,32 @@ function evaluateLandGeometry(
           && (Math.abs(to.x - from.x) > LAND_EPS || Math.abs(to.z - from.z) > LAND_EPS);
 
         const regions: Array<[number, number]> = [];
-        /** Cells whose provider region covers the common endpoint feet height. */
-        const endpointClimbCells = new Set<string>();
-        for (const cell of bodyCells) {
+        const fromCell = {
+          x: Math.floor(from.x),
+          y: Math.floor(from.y),
+          z: Math.floor(from.z),
+        };
+        const toCell = {
+          x: Math.floor(to.x),
+          y: Math.floor(to.y),
+          z: Math.floor(to.z),
+        };
+        // A climb region [cell.y, cell.y+1] covers feet at both the bottom and
+        // the top of the source cell. At a ladder top, the feet cell itself can
+        // be air while the block one cell below is still the climb source.
+        const belowFromCell = { ...fromCell, y: fromCell.y - 1 };
+        const belowToCell = { ...toCell, y: toCell.y - 1 };
+        const fromKey = keyOf(fromCell);
+        const toKey = keyOf(toCell);
+        const belowFromKey = keyOf(belowFromCell);
+        const belowToKey = keyOf(belowToCell);
+        let fromClimb = false;
+        let toClimb = false;
+        const addClimbRegions = (cell: Vec3Like): void => {
           const read = readCell(cell.x, cell.y, cell.z);
           if (read.kind !== 'observed') {
             noteRead(read, cell);
-            continue;
+            return;
           }
           charge(1);
           const resolution = provider.resolve(
@@ -1131,11 +1150,11 @@ function evaluateLandGeometry(
           );
           if (resolution.kind === 'unsupported') {
             unsupportedProvider.push(resolution.detail);
-            continue;
+            return;
           }
           if (!Array.isArray(resolution.regions)) {
             unsupportedProvider.push('climb provider returned a non-array region list');
-            continue;
+            return;
           }
           climbRegionCount += resolution.regions.length;
           if (climbRegionCount > limits.maxClimbRegions) {
@@ -1146,6 +1165,7 @@ function evaluateLandGeometry(
               `climb regions exceed maxClimbRegions (${limits.maxClimbRegions})`,
             );
           }
+          const key = keyOf(cell);
           for (const region of resolution.regions) {
             charge(1);
             if (
@@ -1166,9 +1186,19 @@ function evaluateLandGeometry(
               && region.minFeetY <= from.y + LAND_EPS
               && region.maxFeetY >= from.y - LAND_EPS
             ) {
-              endpointClimbCells.add(keyOf(cell));
+              if (key === fromKey || key === belowFromKey) fromClimb = true;
+              if (key === toKey || key === belowToKey) toClimb = true;
             }
           }
+        };
+        for (const cell of bodyCells) addClimbRegions(cell);
+        if (horizontalEntryOrExit && (!fromClimb || !toClimb)) {
+          // Only consult a below-cell when that endpoint is not already proven
+          // by the body envelope; this avoids turning an unrelated unobserved
+          // support block into an evidence gap.
+          const alreadyRead = new Set(bodyCells.map(keyOf));
+          if (!fromClimb && !alreadyRead.has(belowFromKey)) addClimbRegions(belowFromCell);
+          if (!toClimb && !alreadyRead.has(belowToKey)) addClimbRegions(belowToCell);
         }
 
         const gaps = uncoveredIntervals(regions, lo, hi);
@@ -1201,23 +1231,9 @@ function evaluateLandGeometry(
         // cell itself is not a support face, so only the non-climb endpoint is
         // checked. If neither endpoint is climbable the uncovered interval above
         // already reports missing climb contact.
-        if (horizontalEntryOrExit) {
-          const fromCell = {
-            x: Math.floor(from.x),
-            y: Math.floor(from.y),
-            z: Math.floor(from.z),
-          };
-          const toCell = {
-            x: Math.floor(to.x),
-            y: Math.floor(to.y),
-            z: Math.floor(to.z),
-          };
-          const fromClimb = endpointClimbCells.has(keyOf(fromCell));
-          const toClimb = endpointClimbCells.has(keyOf(toCell));
-          if (fromClimb || toClimb) {
-            if (!fromClimb) checkSupport(from);
-            if (!toClimb) checkSupport(to);
-          }
+        if (horizontalEntryOrExit && (fromClimb || toClimb)) {
+          if (!fromClimb) checkSupport(from);
+          if (!toClimb) checkSupport(to);
         }
         break;
       }

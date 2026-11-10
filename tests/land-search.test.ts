@@ -134,6 +134,38 @@ describe('bounded voxel land search', () => {
     expect(result.cost).toBe(3);
   });
 
+  it('plans a ladder-top exit when the feet are in the air cell above the climb source', () => {
+    const map = new VoxelMap('world', { now: () => 1000 });
+    let sequence = 0;
+    const observe = (state: typeof AIR, pos: { x: number; y: number; z: number }) => {
+      sequence += 1;
+      map.observe(obs(state, pos, { sequence, observedAt: 1000 + sequence }));
+    };
+    // The only ladder block is at y=0. After climbing, feet are at y=1 in air;
+    // the source region [0,1] still covers those feet.
+    for (let y = 0; y <= 2; y++) {
+      observe(AIR, { x: -1, y, z: 0 });
+      observe(y === 0 ? LADDER : AIR, { x: 0, y, z: 0 });
+      observe(AIR, { x: 1, y, z: 0 });
+    }
+    observe(STONE, { x: -1, y: -1, z: 0 });
+    observe(STONE, { x: 1, y: 0, z: 0 });
+    const rules = { shapeProvider: ladderShapes, climbProvider: ladderClimb };
+    const result = searchLandRoute(map, request({
+      body: bodyAt(-0.5, 0, 0.5),
+      to: { x: 1.5, y: 1, z: 0.5 },
+      rules,
+      allowed: ['ladder'],
+    }), 2000);
+
+    expect(result.status).toBe('FOUND');
+    expect(result.transitions.map((transition) => [transition.kind, transition.from.y, transition.to.y])).toEqual([
+      ['ladder', 0, 0],
+      ['ladder', 0, 1],
+      ['ladder', 1, 1],
+    ]);
+  });
+
   it('plans an independent horizontal jump only when jump is explicitly allowed', () => {
     const jumpModel = {
       version: 'test-jump-v1',

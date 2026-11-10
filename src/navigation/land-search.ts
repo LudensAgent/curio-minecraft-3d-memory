@@ -611,24 +611,27 @@ function* searchChunks(
     const cached = climbSourceCache.get(key);
     if (cached !== undefined) return cached;
     const cell = { x: Math.floor(point.x), y: Math.floor(point.y), z: Math.floor(point.z) };
-    const readCell = read.cell(cell.x, cell.y, cell.z);
-    if (readCell.kind !== 'observed') {
-      climbSourceCache.set(key, false);
-      return false;
-    }
-    const resolution = provider.resolve(
-      { cell, state: readCell.state, body: { ...body, feet: point } },
-      read,
-    );
-    const climbable = resolution.kind === 'regions'
-      && Array.isArray(resolution.regions)
-      && resolution.regions.some((region) =>
-        region !== null
-        && typeof region === 'object'
-        && Number.isFinite(region.minFeetY)
-        && Number.isFinite(region.maxFeetY)
-        && region.minFeetY <= point.y + EPS
-        && region.maxFeetY >= point.y - EPS);
+    const coversFeet = (candidate: Vec3Like): boolean => {
+      const readCell = read.cell(candidate.x, candidate.y, candidate.z);
+      if (readCell.kind !== 'observed') return false;
+      const resolution = provider.resolve(
+        { cell: candidate, state: readCell.state, body: { ...body, feet: point } },
+        read,
+      );
+      return resolution.kind === 'regions'
+        && Array.isArray(resolution.regions)
+        && resolution.regions.some((region) =>
+          region !== null
+          && typeof region === 'object'
+          && Number.isFinite(region.minFeetY)
+          && Number.isFinite(region.maxFeetY)
+          && region.minFeetY <= point.y + EPS
+          && region.maxFeetY >= point.y - EPS);
+    };
+    // A ladder top can put the feet in the air cell above the source block, so
+    // the cell one below the feet is also a legitimate climb source there.
+    const climbable = coversFeet(cell)
+      || coversFeet({ ...cell, y: cell.y - 1 });
     climbSourceCache.set(key, climbable);
     return climbable;
   };
