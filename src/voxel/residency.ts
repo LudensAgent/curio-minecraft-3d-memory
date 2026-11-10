@@ -52,6 +52,12 @@ export interface VoxelDirectory {
   sections: VoxelDirectoryEntry[];
 }
 
+/** One stable page over the committed directory; `nextAfter` is an opaque seq cursor. */
+export interface VoxelDirectoryPage {
+  items: VoxelDirectoryEntry[];
+  nextAfter?: number;
+}
+
 /** Why an unload was refused for a resident section. */
 export type UnloadRejectionReason = 'pinned' | 'dirty' | 'not_committed';
 

@@ -62,6 +62,7 @@ import type {
   SectionResidencyInfo,
   UnloadSectionsResult,
   VoxelDirectoryEntry,
+  VoxelDirectoryPage,
 } from './residency.js';
 import type {
   VoxelCheckpointCounts,
@@ -1065,6 +1066,34 @@ export class VoxelMap {
       this.directory.set(key, entry);
     }
     this.directoryInstalled = true;
+  }
+
+  /**
+   * Stable page over the committed directory, ordered by `seq`. This is a
+   * read-only metadata projection; it never loads payloads, observes, evicts or
+   * saves. `nextAfter` is the opaque cursor for the next page.
+   */
+  directoryPage(options: { after?: number; limit?: number } = {}): VoxelDirectoryPage {
+    if (!this.manualResidency) {
+      throw new Error('directoryPage is only available in manual residency mode');
+    }
+    const after = options.after;
+    if (after !== undefined && (!Number.isSafeInteger(after) || after < 0)) {
+      throw new Error(`directoryPage after must be a non-negative safe integer: ${String(after)}`);
+    }
+    const limit = options.limit ?? 128;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
+      throw new Error(`directoryPage limit must be an integer in 1..1024: ${String(limit)}`);
+    }
+    const all = [...this.directory.values()].sort((a, b) => a.seq - b.seq);
+    const start = after === undefined ? 0 : all.findIndex((entry) => entry.seq > after);
+    if (start < 0) return { items: [] };
+    const items = all.slice(start, start + limit).map((entry) => ({
+      ...entry,
+      key: { ...entry.key },
+    }));
+    const nextAfter = start + items.length < all.length ? items.at(-1)!.seq : undefined;
+    return nextAfter === undefined ? { items } : { items, nextAfter };
   }
 
   /** Residency of one section plus its committed record, when one exists. */

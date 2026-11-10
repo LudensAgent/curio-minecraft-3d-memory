@@ -821,3 +821,33 @@ describe('synchronous change hook', () => {
     expect(reports[1]!.sections[0]!.invalidated).toBe(true);
   });
 });
+
+describe('manual directory paging', () => {
+  it('returns stable seq pages without loading payloads', () => {
+    const map = new VoxelMap('world', { manualResidency: true });
+    map.installDirectory(Array.from({ length: 5 }, (_, i) => ({
+      key: { worldId: 'world', dim: 'overworld', cx: i, cz: 0, sy: 0 },
+      seq: 10 + i,
+      bytes: 100 + i,
+      observedCells: 1,
+      paletteEntries: 1,
+      revision: 1,
+    })));
+    const first = map.directoryPage({ limit: 2 });
+    expect(first.items.map((entry) => entry.seq)).toEqual([10, 11]);
+    expect(first.nextAfter).toBe(11);
+    const second = map.directoryPage({ after: first.nextAfter, limit: 2 });
+    expect(second.items.map((entry) => entry.seq)).toEqual([12, 13]);
+    const last = map.directoryPage({ after: second.nextAfter, limit: 2 });
+    expect(last.items.map((entry) => entry.seq)).toEqual([14]);
+    expect(last.nextAfter).toBeUndefined();
+    expect(map.directoryPage({ after: 14, limit: 2 }).items).toEqual([]);
+  });
+
+  it('rejects an invalid cursor or limit and is manual-only', () => {
+    const map = new VoxelMap('world', { manualResidency: true });
+    expect(() => map.directoryPage({ after: -1 })).toThrow(/after/);
+    expect(() => map.directoryPage({ limit: 0 })).toThrow(/limit/);
+    expect(() => new VoxelMap('world').directoryPage()).toThrow(/manual/);
+  });
+});

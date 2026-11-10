@@ -28,6 +28,7 @@ export type {
   UnloadSectionsResult,
   VoxelDirectory,
   VoxelDirectoryEntry,
+  VoxelDirectoryPage,
 } from './residency.js';
 export type {
   VoxelCellEvidenceSnapshot,
