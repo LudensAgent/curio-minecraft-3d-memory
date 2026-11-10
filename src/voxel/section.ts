@@ -55,4 +55,11 @@ export interface Section {
   revision: number;
   /** Statistics only — never proof that the whole section is fresh. */
   lastObservedAt?: number;
+  /**
+   * Revision carried by cells that observation retention has forgotten (their
+   * evidence revisions plus one per retention event). Invariant:
+   * `revision === sum(evidence revisions) + (retiredRevision ?? 0)`, so `revision`
+   * stays monotonic while the per-cell evidence it counted is gone.
+   */
+  retiredRevision?: number;
 }

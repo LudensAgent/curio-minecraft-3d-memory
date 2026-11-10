@@ -105,6 +105,8 @@ export interface VoxelSectionSnapshot {
   modified?: Uint8Array;
   /** Derived current risk candidates (optional: absent in v1 snapshots). */
   risk?: Uint8Array;
+  /** Revision retired by observation retention (optional; absent means 0). See `Section.retiredRevision`. */
+  retiredRevision?: number;
 }
 
 /** Deep-copied, world-scoped snapshot of the voxel map's full observed state. */
@@ -132,6 +134,7 @@ export function snapshotVoxelSection(section: Section): VoxelSectionSnapshot {
     palette: [...section.palette],
     bits: section.bits,
     cells: section.cells.slice(),
+    ...(section.retiredRevision ? { retiredRevision: section.retiredRevision } : {}),
     evidence: [...section.evidence].map(([index, evidence]) => ({
       index,
       evidence: {
@@ -259,9 +262,14 @@ export function restoreVoxelSection(worldId: string, raw: VoxelSectionSnapshot):
     lastObservedAt = lastObservedAt === undefined ? at : Math.max(lastObservedAt, at);
   }
   // section.revision counts every insert/changed/restored/staled event, which is
-  // exactly the sum of the per-cell evidence revisions.
-  if (raw.revision !== revisionSum) {
-    throw new Error(`voxel section revision ${raw.revision} disagrees with evidence revisions (${revisionSum})`);
+  // exactly the sum of the per-cell evidence revisions plus what observation
+  // retention retired together with the forgotten cells.
+  const retired = raw.retiredRevision ?? 0;
+  if (!Number.isInteger(retired) || retired < 0) {
+    throw new Error(`voxel section retiredRevision must be a non-negative integer: ${String(raw.retiredRevision)}`);
+  }
+  if (raw.revision !== revisionSum + retired) {
+    throw new Error(`voxel section revision ${raw.revision} disagrees with evidence revisions (${revisionSum}) plus retired (${retired})`);
   }
 
   const explored = new Uint8Array(bitmapBytes);
@@ -285,6 +293,7 @@ export function restoreVoxelSection(worldId: string, raw: VoxelSectionSnapshot):
     revision: raw.revision,
   };
   if (lastObservedAt !== undefined) section.lastObservedAt = lastObservedAt;
+  if (retired > 0) section.retiredRevision = retired;
   return section;
 }
 

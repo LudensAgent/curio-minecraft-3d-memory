@@ -86,6 +86,8 @@ export interface VoxelSectionPayloadV2 {
   modified: string;
   evidence: VoxelCellPayloadV2[];
   revision: number;
+  /** Revision retired by observation retention; absent means 0. */
+  rr?: number;
 }
 
 const BITMAP_BYTES = SECTION_CELL_COUNT / 8;
@@ -163,6 +165,7 @@ export function encodeVoxelSectionPayload(
       vu: cell.evidence.validUntil,
     })),
     revision: section.revision,
+    ...(section.retiredRevision ? { rr: section.retiredRevision } : {}),
   };
 }
 
@@ -213,6 +216,7 @@ export function decodeVoxelSectionPayload(payload: unknown): VoxelSectionSnapsho
     throw new Error('voxel section payload evidence must be an array');
   }
   const evidence = raw.evidence.map((cell) => decodeV2Cell(cell));
+  const retiredRevision = raw.rr === undefined ? 0 : requireInteger(raw.rr, 'rr');
   return {
     dim,
     cx,
@@ -226,6 +230,7 @@ export function decodeVoxelSectionPayload(payload: unknown): VoxelSectionSnapsho
     traversed,
     modified,
     risk,
+    ...(retiredRevision > 0 ? { retiredRevision } : {}),
   };
 }
 

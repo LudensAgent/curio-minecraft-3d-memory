@@ -759,19 +759,21 @@ export class VoxelMap {
     if (all.length <= maxCells) return { forgottenCells: 0, removedSections: 0, keptCells: all.length };
     all.sort((a, b) => a.at - b.at);
     const forget = all.slice(0, all.length - maxCells);
-    const touched = new Set<Section>();
+    // Per touched section: revision carried by its forgotten cells (see Section.retiredRevision).
+    const touched = new Map<Section, number>();
     for (const { section, index } of forget) {
+      touched.set(section, (touched.get(section) ?? 0) + section.evidence.get(index)!.revision);
       section.evidence.delete(index);
       setBit(section.explored, index, false);
       setBit(section.stale, index, false);
       setBit(section.risk, index, false);
       writeCell(section.cells, section.bits, index, 0);
-      touched.add(section);
     }
     const changes: SectionChange[] = [];
     let removed = 0;
-    for (const section of touched) {
+    for (const [section, forgottenRevision] of touched) {
       section.revision += 1;
+      section.retiredRevision = (section.retiredRevision ?? 0) + forgottenRevision + 1;
       changes.push({ key: { ...section.key }, revision: section.revision, invalidated: true, cells: [] });
       const { dim, cx, cz, sy } = section.key;
       const dk = dirKey(dim, cx, cz, sy);

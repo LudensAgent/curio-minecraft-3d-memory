@@ -113,3 +113,38 @@ describe('observation retention persists through incremental checkpoints', () =>
     await s2.close();
   });
 });
+
+describe('a partially trimmed section keeps the revision invariant across save and restore', () => {
+  it('reopens after forgetting some cells of a section, with revision still monotonic', async () => {
+    const dbPath = makeDbPath();
+    const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    s1.voxel.beginSession('s1');
+    s1.voxel.observe(obs(0, 1000)); // same section cx=0: older
+    s1.voxel.observe(obs(1, 3000)); // same section cx=0: newer
+    s1.voxel.observe(obs(1, 4000, { state: { name: 'minecraft:dirt', properties: {} } })); // re-observed: evidence revision 2
+    s1.voxel.observe(obs(20, 2000)); // section cx=1
+    await s1.checkpoint();
+    const before = s1.voxel.sectionAt(DIM, 0, 0, 0)!.revision;
+
+    expect(s1.voxel.retainNewestObservedCells(1)).toMatchObject({ forgottenCells: 2, removedSections: 1 });
+    const trimmed = s1.voxel.sectionAt(DIM, 0, 0, 0)!;
+    expect(trimmed.revision).toBeGreaterThan(before);
+    expect(trimmed.evidence.size).toBe(1);
+    await s1.checkpoint();
+    await s1.close();
+
+    const s2 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    const restored = s2.voxel.sectionAt(DIM, 0, 0, 0)!;
+    expect(restored.revision).toBe(trimmed.revision);
+    expect(s2.voxel.cellAt(DIM, 0, 0, 0).observed).toBe(false);
+    expect(s2.voxel.cellAt(DIM, 1, 0, 0).observed).toBe(true);
+    // Further changes after restore keep the invariant and save again.
+    s2.voxel.beginSession('s2');
+    s2.voxel.observe(obs(2, 5000, { sessionId: 's2' }));
+    await s2.checkpoint();
+    await s2.close();
+    const s3 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
+    expect(s3.voxel.checkpointCounts()).toMatchObject({ sections: 1, observedCells: 2 });
+    await s3.close();
+  });
+});
