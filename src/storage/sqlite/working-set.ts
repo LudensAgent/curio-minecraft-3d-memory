@@ -322,6 +322,9 @@ export class WorkingSetManager {
         this.recordRejection('prepare', rejectionKindOf(error), messageOf(error), keys);
         throw error;
       }
+      // Count the request even when a hard batch bound refuses it before any
+      // load or eviction: `requested` describes submitted work, not success.
+      this.bump('requestedSections', deduped.length);
       if (deduped.length > this.residency.maxLoadBatchSections) {
         result.capacity = this.gap(
           'request_too_large',
@@ -330,7 +333,6 @@ export class WorkingSetManager {
         diagnostics.push(result.capacity.message);
         return result;
       }
-      this.bump('requestedSections', deduped.length);
 
       const resident: SectionKey[] = [];
       for (const key of deduped) {
