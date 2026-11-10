@@ -96,6 +96,8 @@ export interface MemoryHostCapabilities {
     components: boolean;
     segments: boolean;
     portals: boolean;
+    /** Additive to contract §2.3: bounded places-only paging over semantic facts. */
+    places: boolean;
     /** Additive to contract §2.3: resource anchors are a separate query kind. */
     resourceAnchors: boolean;
     containerAnchors: boolean;

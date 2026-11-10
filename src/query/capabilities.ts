@@ -79,6 +79,9 @@ export function buildMemoryHostCapabilities(
       components: routeMemory,
       segments: routeMemory,
       portals: routeMemory,
+      // Places-only paging is answered by the facts authority; the legacy
+      // topology `nodes` kind is not a places pager.
+      places: facts,
       resourceAnchors: facts || topology,
       containerAnchors: facts || (topology && context.isContainer !== undefined),
       // Available only when the host injected the caller-supplied snapshot

@@ -52,6 +52,7 @@ describe('query capabilities', () => {
       components: true,
       segments: true,
       portals: true,
+      places: false,
       resourceAnchors: true,
       containerAnchors: false,
       frontiers: false,

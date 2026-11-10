@@ -76,6 +76,7 @@ describe('capability report matches facts dispatch', () => {
       segments: false,
       portals: false,
       nodes: true,
+      places: true,
       resourceAnchors: true,
       containerAnchors: true,
     });

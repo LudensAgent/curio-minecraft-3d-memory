@@ -214,6 +214,7 @@ describe('Capability composition — library and host are separate facts', () =>
         components: true,
         segments: true,
         portals: true,
+        places: true,
         resourceAnchors: true,
         containerAnchors: false,
         frontiers: false,
