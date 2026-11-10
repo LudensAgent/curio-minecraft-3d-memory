@@ -469,6 +469,16 @@ let worldId: string | null = null;
 let limits: ResolvedSnapshotLimits | null = null;
 let journalLimits: ResolvedJournalLimits | null = null;
 let ledgerLimits: ResolvedLedgerLimits = DEFAULT_LEDGER_LIMITS;
+interface VoxelCommittedStats {
+  sections: number;
+  observedCells: number;
+  paletteEntries: number;
+  payloadBytes: number;
+}
+/** Committed voxel aggregate, read once at open and updated by each checkpoint delta. */
+let voxelStats: VoxelCommittedStats | null = null;
+/** Committed journal aggregate, read once at open and updated by appended rows. */
+let journalStats: { records: number; bytes: number } | null = null;
 
 function respond(msg: WorkerResponse): void {
   parentPort!.postMessage(msg);
@@ -1210,8 +1220,16 @@ function writeCheckpoint(
   ledger: { mode: 'none' | 'full' | 'delta'; revision: number; prepared: PreparedLedgerWrite | null },
   resolved: ResolvedSnapshotLimits,
   resolvedJournal: ResolvedJournalLimits,
-): LedgerStats | null {
-  const tx = connection.transaction((): LedgerStats | null => {
+): {
+  ledgerStats: LedgerStats | null;
+  voxelStats: VoxelCommittedStats;
+  journalStats: { records: number; bytes: number };
+} {
+  const tx = connection.transaction((): {
+    ledgerStats: LedgerStats | null;
+    voxelStats: VoxelCommittedStats;
+    journalStats: { records: number; bytes: number };
+  } => {
     const nextSeqRow = connection
       .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM checkpoints WHERE world_id = ?')
       .get(wId) as { n: number };
@@ -1247,12 +1265,14 @@ function writeCheckpoint(
     // `none` never touches spatial_sections, so an existing voxel baseline
     // survives. `full` replaces the whole set (first save baseline). `incremental`
     // upserts only the included sections — a missing key is never a deletion.
+    let nextVoxelStats: VoxelCommittedStats;
     if (voxel.mode === 'full') {
       connection.prepare('DELETE FROM spatial_sections WHERE world_id = ?').run(wId);
       const insertSection = connection.prepare(
         'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy, game_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       );
-      voxel.sections.forEach((s, i) =>
+      nextVoxelStats = { sections: 0, observedCells: 0, paletteEntries: 0, payloadBytes: 0 };
+      voxel.sections.forEach((s, i) => {
         insertSection.run(
           wId,
           i,
@@ -1266,9 +1286,19 @@ function writeCheckpoint(
           s.cz,
           s.sy,
           gameVersion,
-        ),
-      );
+        );
+        nextVoxelStats.sections += 1;
+        nextVoxelStats.observedCells += s.observedCells;
+        nextVoxelStats.paletteEntries += s.paletteEntries;
+        nextVoxelStats.payloadBytes += Buffer.byteLength(s.payload, 'utf8');
+      });
     } else if (voxel.mode === 'incremental') {
+      if (voxelStats === null) throw new Error('voxel committed stats are not initialized');
+      nextVoxelStats = { ...voxelStats };
+      const readSectionStats = connection.prepare(
+        'SELECT observed_cells, palette_entries, octet_length(payload) AS bytes '
+        + 'FROM spatial_sections WHERE world_id = ? AND id = ?',
+      );
       // Existing rows keep their `seq` (stable order); new rows are appended after
       // the current max seq, in batch order. Only an existing row's payload changes,
       // so the on-disk order never moves and seq never duplicates.
@@ -1280,13 +1310,32 @@ function writeCheckpoint(
       // section re-created after its removal is written back as a fresh row.
       if (voxel.removedIds?.length) {
         const deleteSection = connection.prepare('DELETE FROM spatial_sections WHERE world_id = ? AND id = ?');
-        for (const id of voxel.removedIds) deleteSection.run(wId, id);
+        for (const id of voxel.removedIds) {
+          const old = readSectionStats.get(wId, id) as
+            { observed_cells: number; palette_entries: number; bytes: number } | undefined;
+          if (old !== undefined) {
+            nextVoxelStats.sections -= 1;
+            nextVoxelStats.observedCells -= old.observed_cells;
+            nextVoxelStats.paletteEntries -= old.palette_entries;
+            nextVoxelStats.payloadBytes -= old.bytes;
+          }
+          deleteSection.run(wId, id);
+        }
       }
       const upsertSection = connection.prepare(
         'INSERT INTO spatial_sections (world_id, seq, id, payload, observed_cells, palette_entries, revision, dimension, cx, cz, sy, game_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
           'ON CONFLICT(world_id, id) DO UPDATE SET payload = excluded.payload, observed_cells = excluded.observed_cells, palette_entries = excluded.palette_entries, revision = excluded.revision, dimension = excluded.dimension, cx = excluded.cx, cz = excluded.cz, sy = excluded.sy, game_version = excluded.game_version',
       );
-      voxel.sections.forEach((s, i) =>
+      voxel.sections.forEach((s, i) => {
+        const old = readSectionStats.get(wId, s.id) as
+          { observed_cells: number; palette_entries: number; bytes: number } | undefined;
+        if (old === undefined) {
+          nextVoxelStats.sections += 1;
+        } else {
+          nextVoxelStats.observedCells -= old.observed_cells;
+          nextVoxelStats.paletteEntries -= old.palette_entries;
+          nextVoxelStats.payloadBytes -= old.bytes;
+        }
         upsertSection.run(
           wId,
           baseSeq + i + 1,
@@ -1300,18 +1349,24 @@ function writeCheckpoint(
           s.cz,
           s.sy,
           gameVersion,
-        ),
-      );
-      // The resulting full set must still re-open under the same limits: reject
-      // (and roll back) before commit if the increments accumulate past capacity.
-      assertVoxelFullSetWithinLimits(connection, wId, prepared.bytes, resolved);
+        );
+        nextVoxelStats.observedCells += s.observedCells;
+        nextVoxelStats.paletteEntries += s.paletteEntries;
+        nextVoxelStats.payloadBytes += Buffer.byteLength(s.payload, 'utf8');
+      });
+    } else {
+      nextVoxelStats = voxelStats ?? readVoxelStats(connection, wId);
     }
+    // The resulting full set must still re-open under the same limits: reject
+    // (and roll back) before commit if the increments accumulate past capacity.
+    assertVoxelFullSetWithinLimits(nextVoxelStats, wId, prepared.bytes, resolved);
 
     // The journal is append-only. `none` never touches rows or the journal
     // baseline; `append` inserts the captured batch (possibly empty) and records
     // the captured local revision. An empty append never deletes committed rows.
+    let nextJournalStats = journalStats ?? { records: 0, bytes: 0 };
     if (journal.mode === 'append') {
-      appendJournal(connection, wId, journal.prepared, resolvedJournal);
+      nextJournalStats = appendJournal(connection, wId, journal.prepared, resolvedJournal, nextJournalStats);
     }
 
     // `none` never touches ledger rows; `full` replaces this world's ledger rows
@@ -1365,7 +1420,7 @@ function writeCheckpoint(
         gameVersion,
         nextSeq,
       );
-    return ledgerStats;
+    return { ledgerStats, voxelStats: nextVoxelStats, journalStats: nextJournalStats };
   });
   return tx();
 }
@@ -1380,7 +1435,9 @@ function appendJournal(
   wId: string,
   prepared: PreparedJournal,
   resolved: ResolvedJournalLimits,
-): void {
+  stats: { records: number; bytes: number },
+): { records: number; bytes: number } {
+  const next = { ...stats };
   const existingAction = connection.prepare(
     'SELECT payload FROM action_records WHERE world_id = ? AND session_id = ? AND id = ?',
   );
@@ -1417,6 +1474,8 @@ function appendJournal(
       continue;
     }
     insertAction.run(wId, action.id, action.sessionId, action.dim, action.ts, action.payload);
+    next.records += 1;
+    next.bytes += Buffer.byteLength(action.payload, 'utf8');
   }
 
   const batchSeenEvents = new Map<string, string>();
@@ -1442,20 +1501,20 @@ function appendJournal(
       continue;
     }
     insertEvent.run(wId, event.id, event.sessionId, event.dim, event.kind, event.observedAt, event.payload);
+    next.records += 1;
+    next.bytes += Buffer.byteLength(event.payload, 'utf8');
   }
 
   // Duplicate replays do not grow these counts, so a full-capacity replay still
   // succeeds. A genuinely new row is rejected (and the whole checkpoint rolls
   // back) rather than evicting old facts.
-  const records = countRows(connection, 'action_records', wId) + countRows(connection, 'spatial_events', wId);
-  if (records > resolved.maxCommittedRecords) {
-    throw new Error(`journal exceeds maxCommittedRecords (${records})`);
+  if (next.records > resolved.maxCommittedRecords) {
+    throw new Error(`journal exceeds maxCommittedRecords (${next.records})`);
   }
-  const bytes =
-    sumPayloadBytes(connection, 'action_records', wId) + sumPayloadBytes(connection, 'spatial_events', wId);
-  if (bytes > resolved.maxCommittedBytes) {
-    throw new Error(`journal exceeds maxCommittedBytes (${bytes})`);
+  if (next.bytes > resolved.maxCommittedBytes) {
+    throw new Error(`journal exceeds maxCommittedBytes (${next.bytes})`);
   }
+  return next;
 }
 
 /**
@@ -1465,28 +1524,25 @@ function appendJournal(
  * rolls back history + voxel + metadata together.
  */
 function assertVoxelFullSetWithinLimits(
-  connection: Database.Database,
+  stats: VoxelCommittedStats,
   wId: string,
   historyBytes: number,
   resolved: ResolvedSnapshotLimits,
 ): void {
-  const sections = countRows(connection, 'spatial_sections', wId);
-  if (sections > resolved.maxVoxelSections) {
-    throw new Error(`snapshot exceeds maxVoxelSections (${sections})`);
+  if (stats.sections > resolved.maxVoxelSections) {
+    throw new Error(`snapshot exceeds maxVoxelSections (${stats.sections})`);
   }
-  const observedCells = sumColumn(connection, 'spatial_sections', 'observed_cells', wId);
-  if (observedCells > resolved.maxObservedCells) {
-    throw new Error(`snapshot exceeds maxObservedCells (${observedCells})`);
+  if (stats.observedCells > resolved.maxObservedCells) {
+    throw new Error(`snapshot exceeds maxObservedCells (${stats.observedCells})`);
   }
-  const paletteEntries = sumColumn(connection, 'spatial_sections', 'palette_entries', wId);
-  if (paletteEntries > resolved.maxPaletteEntries) {
-    throw new Error(`snapshot exceeds maxPaletteEntries (${paletteEntries})`);
+  if (stats.paletteEntries > resolved.maxPaletteEntries) {
+    throw new Error(`snapshot exceeds maxPaletteEntries (${stats.paletteEntries})`);
   }
   const voxelBytes =
-    sumPayloadBytes(connection, 'spatial_sections', wId) +
+    stats.payloadBytes +
     VOXEL_FRAME_BYTES +
     Buffer.byteLength(JSON.stringify(wId), 'utf8') +
-    Math.max(0, sections - 1);
+    Math.max(0, stats.sections - 1);
   const total = historyBytes + voxelBytes;
   if (total > resolved.maxBytes) {
     throw new Error(`snapshot exceeds maxBytes (${total})`);
@@ -2184,6 +2240,22 @@ function loadVoxel(
  * revision metadata — never the payloads. The byte/count budget is checked before
  * any row is materialized, so a manual open never decodes a single payload.
  */
+function readVoxelStats(connection: Database.Database, wId: string): VoxelCommittedStats {
+  const row = connection
+    .prepare(
+      'SELECT COUNT(*) AS sections, COALESCE(SUM(observed_cells), 0) AS observed_cells, '
+      + 'COALESCE(SUM(palette_entries), 0) AS palette_entries, COALESCE(SUM(octet_length(payload)), 0) AS payload_bytes '
+      + 'FROM spatial_sections WHERE world_id = ?',
+    )
+    .get(wId) as { sections: number; observed_cells: number; palette_entries: number; payload_bytes: number };
+  return {
+    sections: row.sections,
+    observedCells: row.observed_cells,
+    paletteEntries: row.palette_entries,
+    payloadBytes: row.payload_bytes,
+  };
+}
+
 function loadVoxelDirectory(
   connection: Database.Database,
   wId: string,
@@ -2346,6 +2418,8 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
   try {
     const world = loadWorld(connection, msg.worldId, msg.limits, msg.historyLoading !== 'none');
     const journal = loadJournalMeta(connection, msg.worldId, msg.journalLimits);
+    voxelStats = readVoxelStats(connection, msg.worldId);
+    journalStats = { records: journal.recordCount, bytes: journal.recordBytes };
     // The Minecraft game version of the voxel baseline this open restores from.
     // It is read from the latest *voxel* checkpoint (`has_voxel = 1`), never from
     // a newer history-only checkpoint, which writes no voxel rows and records
@@ -2403,6 +2477,8 @@ function handleOpen(msg: WorkerRequest & { type: 'open' }): void {
     limits = null;
     journalLimits = null;
     ledgerLimits = DEFAULT_LEDGER_LIMITS;
+    voxelStats = null;
+    journalStats = null;
     connection.close();
     const message = (err as Error).message;
     const kind = /exceeds/.test(message) ? 'capacity' : 'data';
@@ -2533,7 +2609,7 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
   }
   let committedLedger: LedgerStats | null = null;
   try {
-    committedLedger = writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, {
+    const committed = writeCheckpoint(db, msg.checkpointId, msg.worldId, msg.fragmentRevision, msg.topologyRevision, gameVersion, {
       history: historyMode,
       topology: topologyMode,
     }, prepared, {
@@ -2550,6 +2626,9 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
       revision: ledgerRevision,
       prepared: preparedLedger,
     }, limits, journalLimits);
+    committedLedger = committed.ledgerStats;
+    voxelStats = committed.voxelStats;
+    journalStats = committed.journalStats;
   } catch (err) {
     // Capacity/conflict rejections raised inside the transaction roll the whole
     // batch back; a conflict is never reported as a generic SQL fault.
@@ -2568,8 +2647,8 @@ function handleCheckpoint(msg: WorkerRequest & { type: 'checkpoint' }): void {
     requestId: msg.requestId,
     checkpointId: msg.checkpointId,
     voxelBytes,
-    journalRecordCount: countRows(db, 'action_records', worldId) + countRows(db, 'spatial_events', worldId),
-    journalRecordBytes: sumPayloadBytes(db, 'action_records', worldId) + sumPayloadBytes(db, 'spatial_events', worldId),
+    journalRecordCount: journalStats?.records ?? 0,
+    journalRecordBytes: journalStats?.bytes ?? 0,
     ...(committedLedger === null
       ? {}
       : {
@@ -2833,6 +2912,8 @@ function handleClose(msg: WorkerRequest & { type: 'close' }): void {
     db.close();
     db = null;
   }
+  voxelStats = null;
+  journalStats = null;
   respond({ type: 'closed', requestId: msg.requestId });
   parentPort!.close();
 }
