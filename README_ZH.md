@@ -11,38 +11,32 @@
 
 [English](README.md) | 简体中文
 
-面向 Minecraft Java 1.20.1 Agent 的独立 TypeScript 库。它记录某个位置最后观察到什么、过去如何经过、当前证据是否支持通行，以及路线的哪一段需要重新验证。目标、策略、资源投入与风险取舍仍由 Agent 决定。
+面向 Minecraft Java 1.20.1 Agent 的独立 TypeScript 库。它记录每个格最后观察到的状态，保存语义地点/资源/容器事实，在已观察体素地图上进行有界陆地路线搜索，验证陆地与水面几何，并通过显式 checkpoint 持久化工作集。目标、策略、资源投入与风险取舍仍由 Agent 决定。
 
-范围限于**陆地行走与水面移动**——跳跃、台阶、梯子、下落衔接、水面游泳、已乘船移动以及上下岸。飞行、鞘翅与水下三维导航不在范围内。
+范围是**陆地行走与水面移动**，包括跳跃、台阶、梯子、下落衔接、水面游泳、已乘船移动及上下岸。飞行、鞘翅和水下三维导航不在范围内。
 
-**状态：0.10.0（未发布）。** 观测/查询、`planRoute` + `walkPath` walk 导航、运行态 Store 组合、拓扑运行态、SQLite 持久化与 M6 重启/checkpoint 回归已实现并有离线测试覆盖；`memory`/`navigation` 子路径已由包 `exports` 暴露；`MemoryHostCapabilities.execute.walk`/`groundedArrival`/`invalidation`/`cancellation` 因运行时入口已实现而报告 `true`，`execute.swim`/`boat` 与 `persistence.*` 仍为 `false`（D-059）。真实 Minecraft / mineflayer / Curio 接入尚未验收（H-01）。
+**状态：v0.11 体素优先核心。** 库现在由已观察的 `VoxelMap`、语义事实、有界 `LandSearch`、陆地/水面验证器以及体素、事实、账本和 journal 的 SQLite 持久化组成。旧 fragment/topology store、历史路线规划、路线注册表、walk-path 绑定和库内 walk executor 已删除。宿主的 `navigate_to` / `advance` 与直接移动原语负责执行；本库只返回证据与候选路线，不声明到达。
 
-**v0.11.0** 的推进状态见[实施计划](docs/v0.11.0-implementation-plan.md)。升级以已观察的体素地图作为普通导航来源：`planRoute({ source: 'auto', ... })` 直接使用提供的体素搜索，`pathId` 仅在显式 `source: 'history'` 请求中生效。已有历史 API 继续兼容保留；计划分别标明已实现改动、待接入宿主、待迁移与待游戏验证的部分。
+`MemoryHostCapabilities` 只包含 `memory`、`query` 和 `persistence` 域，契约版本为 `memory-host-contract/2`；身体执行与路线规划不属于库能力。本包不验证真实 Minecraft / mineflayer / Curio 接入。
 
 ## 功能
 
-- **带证据的观测地图**（`voxel/`、`observation/`）：稀疏、版本化的 Section，逐格证据、新鲜度与会话处理；有界 `ObservationQueue`；局部 `ChangeReport` 只失效真正依赖它的工作。
-- **历史几何与当前状态严格分离**（`topology/`）：`FragmentStore` 保存路径片段与已确认经过证据；`TopologyStore` 保存显式节点与有向边。别处的堵塞不会删除历史，历史也从不证明当前可通行。
-- **有界历史查询**：`adjacency`、`reachable`、`route` 与 `historicalAnchorCandidates` 在有限工作预算内返回已记录事实——从不产生实时 `OPEN`、到达声明或可执行点列。
-- **拓扑运行态**（`topology/`）：按方向验证边、独立的门户边、锚点查询、瞬时占位，以及有证据的碎片连通/合并记录。派生状态可失效，但不删除历史。
-- **Walk 导航管线**（`navigation/`）：`planRoute` 基于有界搜索/历史证据发出单次使用 `routeId`；`walkPath` 通过调用方提供的单步身体端口执行该句柄，支持接地 `bodyArrival`、证据/会话失效的 `INVALIDATED` 停止与可选 `persistAction` 钩子。`navigateTo` 执行「实测起点 → 有界搜索 → 复验执行 → 实测到达」；`followKnownPath` 沿调用方显式指定的历史片段执行；`inspectRoute`、`inspectKnownRoute` 与 `frontierCandidates` 是只读投影。`recall_route` 未实现。
-- **体素三维候选规划**（`searchLandRoute` / `searchLandRouteAsync`，v0.11 开发中）：按已观察支撑面进行有界 walk/step/drop A*；调用方显式允许且提供 `LandMotionModel` 时生成同脚高的水平 `jump` 边；调用方显式允许且提供 `ClimbRegionProvider` 时生成 `ladder` 边，包括同 XZ 的上下攀爬，以及从相邻地面进入悬挂梯、从梯子同高侧向退出到平台。支持精确/附近目标与显式历史几何模式。结果始终要求当前复验并标记 `executable: false`。库内 `planRoute` 不自动选择这些候选，由宿主显式接线；本搜索尚不负责冷页加载。
-- **有界派生缓存**：`TraversabilityCache` 默认最多 2048 项、最长复用年龄 60 秒。查询时有限清理过期项，宿主可显式调用 `pruneExpired()` / `clear()` 维护或释放；这些操作不删除地图观察。
-- **受控路线执行**（`execution/`）：`WalkRouteExecutor` 驱动注入的单步 `MoveExecutor`；每段开始前要求当前 `OPEN` 证据；仅接受实测精确位置作为到达；证据变化时撤销在途路段。
-- **陆地与水面验证**（`traversability/`、`water/`）：`evaluateLandTransition` / `LandRouteVerifier` 检查调用方声明的陆地转换与路线；`evaluateWaterRoute` / `checkWaterArrival` 检查水面游泳与已乘船几何。结果固定带 `assurance: 'geometry_only'` 与 `executable: false`。
-- **显式 SQLite 持久化**（`storage/`，`curio-minecraft-3d-memory/storage/sqlite`）：单个 Worker 独占连接与事务。`checkpoint()` 是唯一显式保存触发点并返回确认后的 `CheckpointResult`；包含体素增量 checkpoint、手动 Section 驻留、`WorkingSetManager`、放置/访问/门户账本、追加式 journal，以及离线旧账本迁移演练。manual 打开只安装目录聚合与精确 key 成员，`directoryPage()` 由 Worker 按 SQL 页读取；checkpoint 可带绝对期限，脏批捕获有时间切片，已提交体素/journal 统计按增量维护，`historyLoading: 'none'` 只校验旧基线而不恢复或静默覆盖。
-- **与宿主解耦的集成面**：`SpatialMemoryStoreImpl` 组合运行态 Store 并提供作用域守卫；库通过窄适配类型消费感知与执行，从不 import 宿主源码。
+- **证据化观察地图**（`voxel/`、`observation/`）：稀疏、带版本的 Section，逐格证据、新鲜度与会话处理；有界 `ObservationQueue`；局部化 `ChangeReport` 只使依赖它的工作失效。
+- **语义事实**（`facts/`）：扁平的地点、资源、容器 anchor，保留稳定 id、真实观察时间、gone/revoked 状态与有界游标分页。资源 anchor 可携带精确来源格证据版本。容器内容仍由宿主账本管理。
+- **有界体素陆地搜索**（`searchLandRoute` / `searchLandRouteAsync`）：在已观察支撑面上进行 A*，支持 walk/step/drop；调用方显式允许并提供 `LandMotionModel` 时生成水平 `jump` 边；显式允许并提供 `ClimbRegionProvider` 时生成 `ladder` 边。结果要求当前复验，且始终 `executable: false`。
+- **陆地与水面验证**（`traversability/`、`water/`）：`evaluateLandTransition` / `LandRouteVerifier` 验证调用方声明的陆地转换与路线；`evaluateWaterRoute` / `checkWaterArrival` 验证水面游泳与已乘船几何。结果是几何/证据判断，不是执行。
+- **显式 SQLite 持久化**（`storage/`、`curio-minecraft-3d-memory/storage/sqlite`）：单个 Worker 独占连接与事务。`checkpoint()` 是唯一显式保存触发点，在一个事务中提交体素 Section、放置/访问/门户账本、追加式 journal 与语义事实域。包含手动 Section 驻留、`WorkingSetManager`、有界脏批与事实迁移 receipt。
+- **退役域只读为元数据。** `legacyStoreSummary` 报告旧路线表行数与旧 `curio:migration` 标记。Worker 从不加载、写入、恢复或删除旧路线表；全新数据库也不会创建它们。
+- **与宿主解耦的集成面**：观察、事实、搜索、验证和持久化都消费调用方提供的证据、身体尺寸与版本化形状 Provider；库不 import 宿主源码。
 
-## 运行要求
+## 要求
 
-- 核心入口与 `water` 入口要求 **Node.js `>= 18`**。
-- SQLite 入口要求 **Node.js `>= 20`** 与 **`better-sqlite3@^12`**。`better-sqlite3` 是可选 peer dependency，只有 `curio-minecraft-3d-memory/storage/sqlite` 会加载它。
-- 碰撞形状与流体解释遵循 **Minecraft Java 1.20.1 语义**。库运行时不依赖 Minecraft 客户端或服务器；由调用方注入版本化 Provider。
-- 面向 ESM / NodeNext TypeScript 消费者。包从 `dist/` 提供运行时 JavaScript 与 `.d.ts` 声明。
+- 核心与 `water` 入口要求 **Node.js `>= 18`**。
+- SQLite 入口要求 **Node.js `>= 20` 与 `better-sqlite3@^12`**。`better-sqlite3` 是可选 peer dependency，仅由 `curio-minecraft-3d-memory/storage/sqlite` 加载。
+- 碰撞形状与流体解释采用 **Minecraft Java 1.20.1 语义**；库本身不依赖 Minecraft 客户端或服务端，由调用方注入版本化 Provider。
+- ESM / NodeNext TypeScript 消费者。包从 `dist/` 发布运行时 JavaScript 与 `.d.ts` 声明。
 
 ## 安装与消费
-
-构建并生成可安装归档：
 
 ```bash
 npm install --no-audit --no-fund
@@ -50,7 +44,7 @@ npm run build
 npm pack
 ```
 
-消费者在自己的项目中安装实际 `.tgz`，用包名与公开子路径引入——不要使用源码路径、`../dist`、`npm link` 或开发机目录别名：
+消费者把实际 `.tgz` 安装到自己的项目，并按包名与公开子路径导入——不要使用源码路径、`../dist`、`npm link` 或开发机目录别名：
 
 ```json
 {
@@ -63,17 +57,15 @@ npm pack
 
 | 入口 | 内容 | 原生依赖 |
 |---|---|---|
-| `curio-minecraft-3d-memory` | 兼容根入口：观测、体素、通行性、拓扑、导航、执行与运行态 Store | 无 |
-| `curio-minecraft-3d-memory/memory` | 纯记忆核心：观测、体素、拓扑、查询与能力报告；不含导航或身体入口 | 无 |
-| `curio-minecraft-3d-memory/navigation` | `planRoute`、`walkPath`、路线注册表、搜索/执行绑定与只读导航投影 | 无 |
+| `curio-minecraft-3d-memory` | 根入口：观察、体素、通行性、陆地搜索、事实、持久化类型与水面验证 | 无 |
+| `curio-minecraft-3d-memory/memory` | 纯记忆核心：观察、体素、查询与能力报告；无导航或身体入口 | 无 |
+| `curio-minecraft-3d-memory/navigation` | 有界体素陆地搜索（`searchLandRoute`、`searchLandRouteAsync`） | 无 |
 | `curio-minecraft-3d-memory/water` | 水面与已乘船验证 | 无 |
-| `curio-minecraft-3d-memory/storage/sqlite` | SQLite 会话、账本、journal 与 `WorkingSetManager` | `better-sqlite3@^12` |
+| `curio-minecraft-3d-memory/storage/sqlite` | SQLite 会话、账本、journal、事实与工作集 | `better-sqlite3@^12` |
 
 ## 快速开始
 
-### 打开共享空间会话
-
-宿主通常为每个世界保留一个空间会话，并在感知更新与导航委托之间复用同一张地图：
+### 打开空间会话
 
 ```ts
 import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
@@ -81,201 +73,126 @@ import { openSpatialSession } from 'curio-minecraft-3d-memory/storage/sqlite';
 const session = await openSpatialSession({
   databasePath,
   worldId: 'world',
-  // 可选：'manual' 打开时不把全部已提交 Section 解码进内存。
+  // 可选：'manual' 打开时只读已提交的 Section 目录。
   voxelLoading: 'eager',
 });
 
 session.voxel.beginSession('session-a');
-session.voxel.observe({ /* 已确认的观测 */ });
+session.voxel.observe({ /* 已确认观察 */ });
+session.facts.upsertPlace({ /* 语义地点事实 */ });
 
 await session.checkpoint(); // 唯一显式保存触发点
 await session.close();
 ```
 
-恢复的事实保留原观测时间与来源，但已保存的 `FRESH` 会变回 `STALE`。新观测只刷新实际观察到的格。
+恢复的格保留原始证据时间与来源，但读作 `STALE`；新观察只刷新实际观察到的格。恢复的事实域保留精确 id、时间与 gone/revoked 状态。
 
-### 导航
+### 搜索有界陆地路线
 
 ```ts
-import { navigateTo } from 'curio-minecraft-3d-memory';
+import { searchLandRoute } from 'curio-minecraft-3d-memory/navigation';
 
-const { result, record } = await navigateTo(
-  {
-    destination: { x: 10, y: 64, z: 10 },
-    arrival: { kind: 'exact' },
-    allowedModes: ['walk'],
-    allowDigging: false,
-    allowPlacing: false,
-    allowTower: false,
-    materials: [],
-    exploration: 'known_only',
-  },
-  environment,
-);
-
-if (result.outcome === 'ARRIVED') {
-  // result.confirmed、result.lastPosition 与 result.lastObservation 均为实测。
-}
+const result = searchLandRoute({
+  map: session.voxel,
+  scope: { worldId, dim, sessionId },
+  start: measuredFeet,
+  target: { kind: 'exact', pos: destinationFeet },
+  body,
+  shapeProvider,
+  allowed: ['walk', 'step', 'drop'],
+  limits: { maxNodes: 4096, maxExpandedEdges: 16384, maxWork: 65536 },
+  now: Date.now,
+});
+// result.status: FOUND | NO_PATH | INSECURE | BUDGET_EXHAUSTED | CANCELLED | ...
+// result.executable 恒为 false：当前证据不是授权。
 ```
 
-`environment` 由调用方提供，包含世界/维度/会话身份、实测身体样本、`WalkRouteSearch` 来源、绑定同一地图的 `WalkRouteExecutor`、形状 Provider、预算以及可选取消信号。库不扫描世界，也不拥有身体。
+`searchLandRouteAsync` 以协作切片执行同一有界搜索。宿主自行用 `navigate_to` / `advance` 验证并执行选定路线；本库不移动身体。
 
-沿调用方显式指定的历史片段执行时使用 `followKnownPath(request, { ...environment, history, drive: true })`；未开启 `drive` 时只返回起点边界。
+### 查询体素与事实
+
+```ts
+import { createVoxelFactsQueryPort } from 'curio-minecraft-3d-memory';
+
+const port = createVoxelFactsQueryPort({
+  worldId,
+  voxel: session.voxel,
+  facts: session.facts,
+});
+
+const cells = port.query({ kind: 'cells', dim, positions: [cell] });
+const places = port.query({ kind: 'places', dim, limit: 50 });
+```
+
+支持的查询 kind：`cells`、`nodes`、`places`、`resourceAnchors`、`containerAnchors`、`containerContents`、`snapshot`、`capabilities`。`nodes` 是 facts-backed 语义视图，不是旧拓扑图；`containerContents` 始终返回宿主账本边界而不是空列表；旧路线 kind 会被当作未知请求拒绝。
 
 ### 验证陆地与水面几何
 
 ```ts
-import {
-  evaluateLandTransition,
-  LandRouteVerifier,
-  resolveLandLimits,
-} from 'curio-minecraft-3d-memory';
+import { evaluateLandTransition, LandRouteVerifier } from 'curio-minecraft-3d-memory';
 import { checkWaterArrival, evaluateWaterRoute } from 'curio-minecraft-3d-memory/water';
-
-const transition = evaluateLandTransition(
-  map,
-  { worldId, dim, sessionId, body, transition: declaredTransition },
-  { shapeProvider, jumpModel, climbProvider },
-  Date.now(),
-  resolveLandLimits({ maxWork: 4096 }),
-);
-
-const route = evaluateWaterRoute(
-  map,
-  {
-    worldId, dim, sessionId,
-    points,
-    profile: 'surface_swim',
-    solidShapeProvider,
-    fluidShapeProvider,
-  },
-  Date.now(),
-);
-
-const arrival = checkWaterArrival({ goal, scope, map, samples, now, maxSampleAgeMs });
 ```
 
-陆地验证支持 `step`、`drop`、`jump` 与 `ladder`；`jump` 必须注入版本化 `LandMotionModel`，`ladder` 必须注入版本化 `ClimbRegionProvider`。梯子验证覆盖同列上下攀爬，以及相邻地面平台与攀爬源之间同脚高的进入/退出。水面路线必须等高且姿态固定为 90° 的整数倍。两个验证器都不搜索路线、不移动身体、不挖掘、不放置、不上下船，也不接管救援策略。
+陆地验证支持 `step`、`drop`、`jump`、`ladder`；`jump` 需要注入版本化 `LandMotionModel`，`ladder` 需要版本化 `ClimbRegionProvider`。水面路线必须是固定 90° 朝向的等高路线。验证器不搜索路线、不移动身体、不挖掘/放置、不操控船，也不执行救援策略。
 
-### 保存历史与拓扑
-
-```ts
-import { FragmentStore, TopologyStore } from 'curio-minecraft-3d-memory';
-
-const history = new FragmentStore('world');
-const topology = new TopologyStore(history);
-
-topology.saveNode({ id: 'a', kind: 'place', source: 'agent', worldId: 'world',
-  dim: 'overworld', location: { kind: 'exact', pos: { x: 0.5, y: 64, z: 0.5 } } });
-topology.saveNode({ id: 'b', kind: 'place', source: 'agent', worldId: 'world',
-  dim: 'overworld', location: { kind: 'exact', pos: { x: 1.5, y: 64, z: 0.5 } } });
-
-topology.saveEdge({ id: 'e-ab', from: 'a', to: 'b', type: 'HORIZONTAL',
-  basis: 'traversed', evidenceIds: ['ev-1'] });
-
-const route = topology.route('a', 'b', { mode: 'walk' });
-// route.status: FOUND | NO_RECORDED_ROUTE | INSUFFICIENT_EVIDENCE | BUDGET_EXHAUSTED
-```
-
-A→B 与 B→A 是两条独立记录。只有证据仍可解析的 `traversed` 边参与历史查询。候选边只是待验证关系，不证明曾经经过。完整结果与失败语义见下方验收文档。
-
-一条实际确认走过的通道应作为一个原子单元写入，而不是依次调用单记录接口：
-
-```ts
-import { writeConfirmedCorridor } from 'curio-minecraft-3d-memory';
-
-const receipt = writeConfirmedCorridor(history, topology, {
-  fragment,                 // 只含确认几何
-  traversals,               // 每个确认走过的段一条
-  nodes,                    // 精确端点；id 必须稳定
-  edges,                    // 有向 traversed 边，引用 evidence
-  sessionId,
-  coordinate: 'cell',       // 显式按整数格规范化；'exact' 保留浮点
-});
-// receipt.status: 'written' | 'unchanged' | 'rejected'
-// receipt.committed: 'all' | 'none'（没有 prefix 半写入）
-// receipt.problem: node_referenced | endpoint_mismatch | scope_mismatch | ...
-```
-
-写入器先校验整条通道再改动，任一失败同时回滚两个 store，相同重试幂等。它不按邻近格缝合：节点位置变化但仍被本次通道之外的边引用时，返回外部边 id 并拒绝，不会静默改端点。规划点列、未确认位移和历史几何不得作为 traversal 提交。
-
-### 管理有界工作集
+### 管理工作集
 
 ```ts
 import { WorkingSetManager } from 'curio-minecraft-3d-memory/storage/sqlite';
 
-const session = await openSpatialSession({
-  databasePath,
-  worldId: 'world',
-  voxelLoading: 'manual',
-  residencyLimits: { maxResidentSections: 8 },
-});
 const manager = new WorkingSetManager(session);
-
-const prepared = await manager.prepare(routeDependencySections);
+const prepared = await manager.prepare(dependencySections);
 // prepared.status: 'ready' | 'incomplete' | 'failed'
-// 仅 status === 'ready' 时 prepared.lease 有效；由调用方负责释放。
+// 仅 ready 时 lease 有效，由调用方负责释放。
 ```
 
-`prepare` 先整批校验请求，用临时 Pin 租约保护，再按 LRU 淘汰已提交、干净且未被 Pin 的 Section，其余通过会话单 Worker 加载。`free()` 为接受新观测腾空间，`stats()` 返回只读快照。
+`prepare` 先验证整个请求，用临时 pin lease 保护，只淘汰已提交、干净、未固定且 LRU 可淘汰的 Section，其余通过会话的单一 Worker 加载。`free()` 为新观察腾出空间，`stats()` 返回只读快照。
+
+## 持久化与迁移
+
+- `checkpoint()` 提交每个已变化域的捕获 revision；干净域不会被重写。
+- 体素脏批有界；ACK 只确认实际捕获的 Section key，之后的新变化保持 pending。
+- 事实仅在其引用的来源格版本已存在于同一事务时提交；否则返回结构化 `factsDeferred` 缺口并保持 pending。
+- journal 只追加；空批次不会删除已提交行。
+- `legacyStoreSummary` 是旧路线表唯一读取路径。旧行在新 checkpoint 后保持逐字节不变，不会 `DROP`/`DELETE`。
+- `runLegacySemanticMigrationDryRun` / `applyLegacySemanticMigration` 是独立纯数据函数，用于离线语义事实迁移，不 import 已删除的旧 store。
 
 ## 宿主接入生命周期
 
-库只提供事实与执行辅助；宿主负责连接、合法感知与身体控制。可运行的 Fake 示例见 `examples/shared-session-lifecycle.ts`。
+1. **启动**：宿主提供绝对数据库路径与 `worldId`；使用 `session.voxel` 前等待 `openSpatialSession()`。不要每个动作重建地图。
+2. **共享地图**：持续感知、陆地搜索与宿主导航复用 `session.voxel`。
+3. **连接/重连**：观察 `sessionId` 来自真实连接生命周期；同世界重连保留 `worldId`，用 `map.beginSession(sessionId)` 切换。旧会话的迟到证据会被拒绝。
+4. **感知更新**：先写 `map.observe(...)`，再把返回的 `ChangeReport` 交给宿主控制循环。库不扫描世界。
+5. **搜索与执行**：宿主保护所需 Section（`WorkingSetManager.prepare` + lease），调用 `searchLandRoute`，复验后用自身原语执行。取消一个委托不会关闭共享会话。
+6. **保存与关闭**：`checkpoint()` 捕获并提交当前变化；`flush()` 只等待已接受的保存；`close()` 在有界时间内关闭。
+7. **恢复**：原始证据时间与事实记录会恢复；当前可通行性必须重新建立，不能把磁盘数据当作新观察。
 
-1. **启动**：宿主提供数据库绝对路径与 `worldId`；`await openSpatialSession()` 完成后再使用 `session.voxel`，不要每个动作新建地图。
-2. **共享地图**：持续感知与多个 walk 委托共用 `session.voxel`；共享地图不代表共享执行所有权。
-3. **连接与重连**：观测 `sessionId` 来自实际连接生命周期。正常重连同一世界不更换 `worldId`；用 `map.beginSession(sessionId)` 切换，旧会话的迟到证据会被拒绝。
-4. **感知更新**：先 `map.observe(...)` 写入合法观测，再把返回的 `ChangeReport` 交给活跃的验证器或执行器。库从不主动扫描世界。
-5. **路线生命周期**：加载并保护实际路线依赖（`WorkingSetManager.prepare` + 租约），验证、执行，然后释放。取消某个委托不关闭共享会话。
-6. **保存与关闭**：`checkpoint()` 捕获并提交当前变化；`flush()` 只等待已接受的保存；`close()` 在有界时间内关闭。顺序：停止接收写入 → 最终 checkpoint → 检查确认 → close。
-7. **恢复**：历史记录与原证据时间会恢复；当前通行性必须重新建立，不能把从磁盘读回的数据当作新观测。
+## 能力契约
 
-## 导航能力状态
+`MemoryHostCapabilities` 只报告：
 
-| 设计 §7 名称 | 状态 | 公开入口 | 边界 |
-|---|---|---|---|
-| `navigate_to` | implemented | `navigateTo` | 仅 walk；精确到达；同高度、沿 X/Z 单格；搜索、执行器与实测样本由调用方提供 |
-| `follow_known_path` | implemented | `followKnownPath`、`startKnownWalkRoute` | 仅 walk；一条显式选定的历史片段；`followKnownPath` 仅在 `drive: true` 时驱动执行 |
-| `inspect_route` | read_only | `inspectRoute`、`inspectKnownRoute` | 只投影已有快照或历史片段；不移动、不观察、不 Pin、不保存 |
-| `frontier_candidates` | read_only | `frontierCandidates` | 只投影有界的未知边界候选；不选择目标、不启动探索 |
-| `recall_route` | not implemented | — | 无公开运行时入口；历史查询不等于路线召回或执行 |
+- `memory`：观察/会话写入与 checkpoint/flush/close 生命周期；
+- `query`：cells、facts-backed nodes/places/anchors 与 snapshot/capabilities；
+- `persistence`：SQLite、手动驻留、工作集与迁移权威切换。
 
-`navigateTo` 会明确拒绝 `near` / `reach_block` 到达条件、非 walk 模式、挖掘、放置、搭柱、非空材料列表、非空 `avoid` 约束与 `allow_frontier`。这些拒绝以结构化结果返回，绝不静默忽略设置。
+`memory-host-contract/2` 不存在 `execute` 与 `plan` 块。接线时应使用 `composeCapabilities` 与宿主自身接线求交集；`false` 或未声明的能力是明确的 `unsupported` 拒绝，不是静默回退。
 
-`planRoute` 报告 walk search/history/auto 为 `true`，更宽模式为 `false`；`walkPath` 只接受注册表发出、单次使用的 walk 路线，且从不重新规划。规范的 `MemoryHostCapabilities` 将已实现的 walk 执行位（`walk`、`groundedArrival`、`invalidation`、`cancellation`）报告为 `true`；`swim`、`boat` 与全部 `persistence.*` 位保持 `false`（D-059）。接线时应使用 `composeCapabilities` 与宿主自身接线求交集；`false` 或未声明的能力是明确的 `unsupported` 拒绝，不是静默回退。
-
-## 目录结构
+## 项目结构
 
 ```
 src/
-├── index.ts            # 公共 API 出口（最小且明确的导出面）
+├── index.ts            # 公共 API 入口（最小、明确）
 ├── constants.ts        # 共享配置常量
 ├── types.ts            # 基础原语（Vec3Like / BlockState / WorldScope / MoveMode）
 ├── observation/        # Observation / 证据 / 新鲜度与有界队列
-├── voxel/              # 稀疏 Section、Palette、位打包与证据历史
-├── traversability/     # 派生通行性 + 有界陆地转换/路线验证
-├── water/              # 水面与已乘船验证（子路径 /water）
-├── topology/           # 历史、显式拓扑、运行态边、门户、锚点与占位
-├── adapter/            # WorldAdapter 目标适配面
-├── navigation/         # walk 搜索、navigateTo、followKnownPath 与只读投影
-├── execution/          # 受控 walk 路线执行闭环
-├── store/              # SpatialMemoryStore 运行态组合与作用域守卫
-├── storage/            # SQLite 持久化、账本、journal 与 Worker
-└── compat/             # 旧 WorldMemory 兼容层与迁移演练
-
-examples/
-├── walk-route-execution.ts         # Fake 执行闭环
-├── fragment-store-history.ts       # 历史事实与当前阻塞对照
-├── topology-facts.ts               # 显式拓扑事实与当前阻塞对照
-├── historical-topology-query.ts    # 有界历史图查询
-├── historical-anchor-query.ts      # 有界历史锚点查询
-├── history-checkpoint.ts           # SQLite 历史 checkpoint 生命周期
-├── spatial-checkpoint.ts           # 组合空间 checkpoint 生命周期
-├── spatial-checkpoint-incremental.ts # 体素增量 checkpoint
-├── spatial-residency.ts            # 手动按需 Section 驻留
-├── working-set.ts                  # 有界工作集 + Fake 路线
-└── shared-session-lifecycle.ts     # 宿主共享会话生命周期参考
+├── voxel/              # 稀疏 Section、palette、位打包、驻留与快照
+├── traversability/     # 通行性、陆地转换与 LandRouteVerifier
+├── water/              # 水面与已乘船验证（/water 子路径）
+├── facts/              # 语义事实、分页、持久化与离线迁移
+├── navigation/         # 有界体素 LandSearch 与共享委托契约
+├── query/              # 只读体素 + facts 投影
+├── adapter/            # WorldAdapter 目标接口
+└── storage/            # SQLite 持久化、账本、journal、事实与 Worker
 ```
 
 ## 开发
@@ -284,51 +201,32 @@ examples/
 npm install
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run
-npm run build       # 产出 dist/（NodeNext ESM + 类型声明）
+npm run build       # 输出 dist/（NodeNext ESM + 类型声明）
 ```
 
-用 `tsx` 运行示例：
-
-```bash
-npx tsx examples/walk-route-execution.ts
-npx tsx examples/shared-session-lifecycle.ts
-npx tsx examples/working-set.ts
-# 完整列表见 examples/ 目录
-```
-
-运行独立消费者验收（打包 → 临时安装 → 运行时断言 + 类型检查）：
-
-```bash
-node acceptance/run.mjs
-```
-
-示例与测试使用 Fake 感知、Fake 身体与 Fake move executor；持久化测试使用真实 SQLite 数据库与真实 Worker。这些测试都不会启动 Minecraft 服务器或连接 mineflayer Bot，真实游戏验收仍未执行。
-
-> 以公开包名（`curio-minecraft-3d-memory`，或 `curio-minecraft-3d-memory/storage/sqlite` 子路径）导入的示例用于验证包的 `exports` 入口；请先 `npm run build`。
+测试使用 Fake 感知、Fake 身体与 Fake 形状 Provider；持久化测试使用真实 SQLite 与真实 Worker。任何测试都不启动 Minecraft 服务端或连接 mineflayer bot；游戏内验收仍未完成。
 
 ## 文档
 
-- [设计与开发约束](docs/spatial-memory-library-design.md)——目标契约、数据模型与落地顺序。
-- [AGENTS.md](AGENTS.md)——仓库开发规则与边界。
-- [记忆宿主接口契约](docs/memory-host-interface-contract.md)——§15 实现状态表与能力协商。
-- [记忆宿主实现计划](docs/memory-host-implementation-plan.md)——里程碑、文件级任务与退出条件。
-- [0.10.0 实现审计](docs/implementation-audit-0.10.0.md)——纯记忆库历史审计与已知缺口。
-- M2/M3/M4 审计：[查询](docs/memory-host-m2-query-audit.md)、[路线规划](docs/memory-host-m3-route-plan-audit.md)、[walk 执行](docs/memory-host-m4-walk-path-audit.md)。
-- [运行态 Store 组合](docs/spatial-memory-store.md)——`SpatialMemoryStoreImpl` 行为与已知事实缺口。
-- [旧账迁移门禁](docs/legacy-migration-gate.md)——离线 JSON → SQLite 演练与权威切换门禁。
+- [AGENTS.md](AGENTS.md)：仓库开发规范与边界。
+- [v0.11.0 升级方案](docs/v0.11.0-upgrade-plan.md) 与[实施计划](docs/v0.11.0-implementation-plan.md)：体素优先设计与实施记录。
+- [空间记忆库设计](docs/spatial-memory-library-design.md)：目标契约、数据模型与实现顺序。
+- [宿主接口契约](docs/memory-host-interface-contract.md)：能力协商与宿主边界。
+- [旧数据迁移门禁](docs/legacy-migration-gate.md)：离线迁移权威规则。
+
+`docs/` 中的旧审计保留为历史记录，描述的是本分支已退役的实现。
 
 ## 已知限制
 
-- **未做真实游戏验收。** 身体样本、世界适配器、搜索实例与形状/流体 Provider 均由调用方提供。Fake 测试证明库内逻辑，不证明 mineflayer 控制或 Minecraft 物理。
-- **仅限 walk 范围。** `navigateTo` 只支持同高度、沿 X/Z 单格的精确到达。跳跃、台阶、梯子、下落、游泳、船、`near` / `reach_block`、挖掘、放置、搭柱、材料、非空 `avoid` 与 Frontier 探索都不是可执行导航模式。
-- **`recall_route` 未实现。** 历史路线与锚点查询只是事实，不是可执行路线选择，也不构成到达声明。
-- **陆地与水面验证是纯几何的。** 它们不搜索路线、不移动身体、不操作船，也不接管救援策略；结果固定带 `assurance: 'geometry_only'` 与 `executable: false`。
-- **持久化是显式的。** 没有自动保存或后台重试；只有 `checkpoint()` 提交。恢复后的观测为 `STALE`，当前通行性必须重新建立。JSON → SQLite 权威切换尚未执行，目前只有离线迁移演练。
-- **感知由宿主负责。** 库不扫描客户端世界、不加载区块，也不把原始 `blockUpdate` 事件当作证据。它只记录宿主合法提供的观测。
-- **容器与库存仍归宿主账本。** 库关联位置与可达证据，不复制或维护物品数量。
-- **不包含飞行、鞘翅与水下三维导航。** 这些不在本库范围内。
-- **Store 投影限制。** `SpatialEdge` 只是 `TopologyStore` 的有损投影；门户边独立于步行图。未提供历史查询时，`Frontier.historicalConnection` 返回 `unknown`。请使用 Store 文档中列出的详细读取与 inspection API。
+- **无真实游戏验收。** 身体样本、世界适配器与形状/流体 Provider 均由调用方提供；测试证明库内逻辑，不证明 mineflayer 控制或 Minecraft 物理。
+- **只搜索，不执行。** `searchLandRoute` 只返回有界候选；到达、移动、挖掘、放置、搭柱与材料支出都是宿主决策和宿主动作。
+- **陆地/水面验证器仅几何。** 不搜索路线、不移动身体、不管理船、不执行救援策略；结果标记 `assurance: 'geometry_only'` 与 `executable: false`。
+- **持久化是显式的。** 没有自动保存或后台重试；只有 `checkpoint()` 提交。恢复的观察是 `STALE`，当前可通行性需重新建立。
+- **感知由宿主负责。** 库不扫描客户端世界、不加载区块，也不把原始 `blockUpdate` 当证据；只记录宿主合法提供的观察。
+- **容器与库存仍由宿主管理。** 库关联位置、身份与可达证据，不复制或维护物品数量。
+- **不含飞行、鞘翅或水下三维导航。**
+- **旧路线数据不再参与当前事实。** 旧表可被统计用于诊断，但不会向当前查询提供地点、边、路线或可通行性。
 
-## License
+## 许可证
 
-使用 [Apache License 2.0](LICENSE) 许可。
+Apache License 2.0，见 [LICENSE](LICENSE)。
