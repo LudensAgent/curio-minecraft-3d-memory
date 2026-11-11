@@ -53,6 +53,13 @@ describe('diagonal walks', () => {
     expect(result.cost).toBeCloseTo(2 * Math.SQRT2, 9);
   });
 
+  it('keeps remembered candidate routes cardinal', () => {
+    const result = searchLandRoute(world(open3x3()), request({ evidenceMode: 'remembered' }), 2000);
+    expect(result.status).toBe('FOUND');
+    expect(result.transitions.every((transition) => transition.from.x === transition.to.x || transition.from.z === transition.to.z)).toBe(true);
+    expect(result.cost).toBe(4);
+  });
+
   it('never cuts a blocked corner: a wall beside the diagonal forces cardinal moves', () => {
     const columns = open3x3();
     columns['1,0'] = wall;

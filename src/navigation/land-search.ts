@@ -1056,7 +1056,10 @@ function* searchChunks(
             if (outcome === 'stop') break search;
           }
         }
-        if (allowed.has('walk') && fromInCorridor) {
+        // Remembered geometry is only a candidate that execution re-verifies step by
+        // step. Keeping it cardinal makes a refused step stop at an axis-aligned
+        // frontier that an observation can resolve, instead of a cut corner.
+        if (allowed.has('walk') && fromInCorridor && evidenceMode === 'current') {
           for (const [dx, dz] of DIAGONALS) {
             const to = { x: node.point.x + dx, y: node.point.y, z: node.point.z + dz };
             if (!corridorContains(to)) {
