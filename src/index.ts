@@ -196,6 +196,7 @@ export type {
   MemoryHostCapabilities,
 } from './memory/index.js';
 
+export { evidenceStale } from './observation/freshness.js';
 // Query — read-only voxel + facts projection
 export { createVoxelFactsQueryPort } from './query/index.js';
 export type {

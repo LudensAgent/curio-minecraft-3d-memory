@@ -490,27 +490,20 @@ describe('LandRouteVerifier — local invalidation, recovery and identity change
     expect(done.verifiedTransitionIndexes).toEqual([0, 1]);
   });
 
-  it('recovers a STALE conclusion on a refresh-only ChangeReport without a revision bump', () => {
+  it('keeps an OPEN conclusion past the evidence validUntil, and a refresh-only report leaves it OPEN', () => {
     const map = new VoxelMap('world', { validityWindowMs: 100 });
     fillOpenStep(map);
     let clock = 1050;
     const verifier = new LandRouteVerifier(map, { now: () => clock });
     verifier.register(request([STEP], { shapeProvider: landProvider }));
 
-    const open = verifier.advance(10000);
-    expect(open.verdict).toBe('OPEN');
-    expect(open.validUntil).toBe(1100);
-    // Reading status does not extend the proof TTL.
-    expect(statusOf(verifier).validUntil).toBe(1100);
+    expect(verifier.advance(10000).verdict).toBe('OPEN');
 
+    // Spatial evidence does not age: passing the evidence validUntil is not a reason to withdraw OPEN.
     clock = 1200;
-    const expiredView = statusOf(verifier);
-    expect(expiredView.verdict).not.toBe('OPEN');
-    expect(expiredView.pendingTransitionIndexes).toEqual([0]);
-
-    const stale = verifier.advance(10000);
-    expect(stale.verdict).toBe('STALE');
-    expect(stale.earliestProblem?.reason?.kind).toBe('expired');
+    const aged = verifier.advance(10000);
+    expect(aged.verdict).toBe('OPEN');
+    expect(aged.earliestProblem).toBeNull();
 
     const revisionBefore = map.sectionAt('overworld', 0, 0, 0)?.revision;
     const report = refill(
@@ -533,12 +526,12 @@ describe('LandRouteVerifier — local invalidation, recovery and identity change
     expect(report.sections.every((section) => !section.invalidated)).toBe(true);
     expect(map.sectionAt('overworld', 0, 0, 0)?.revision).toBe(revisionBefore);
 
-    const recovered = verifier.apply(report, 10000);
-    expect(recovered?.verdict).toBe('OPEN');
-    expect(recovered?.earliestProblem).toBeNull();
+    const refreshed = verifier.apply(report, 10000);
+    expect(refreshed?.verdict).toBe('OPEN');
+    expect(refreshed?.earliestProblem).toBeNull();
   });
 
-  it('recovers an evidence-limited UNSUPPORTED conclusion on a same-content refresh', () => {
+  it('reads a provider-consulted neighbour past its validUntil as observed evidence', () => {
     const map = new VoxelMap('world', { validityWindowMs: 100 });
     const PROBE: BlockState = { name: 'minecraft:freshness_probe', properties: {} };
     const freshnessProvider: CollisionShapeProvider = {
@@ -569,30 +562,16 @@ describe('LandRouteVerifier — local invalidation, recovery and identity change
       [1, 2, 0],
     ], 1100);
     fill(map, PROBE, [[0, 1, 0]], 1100);
-    // This provider-consulted neighbour expires at 1100 while the corridor
-    // evidence stays valid until 1200.
+    // This provider-consulted neighbour passed its validUntil (1100) before now (1150).
     fill(map, STONE, [[0, 1, 2]], 1000);
 
     const verifier = new LandRouteVerifier(map, { now: () => 1150 });
     verifier.register(request([STEP], { shapeProvider: freshnessProvider }));
 
-    const unsupported = verifier.advance(10000);
-    expect(unsupported.verdict).toBe('UNSUPPORTED');
-    expect(unsupported.earliestProblem?.reason?.kind).toBe('unsupported_shape');
-    expect(unsupported.pendingTransitionIndexes).toEqual([]);
-    expect(unsupported.verifiedTransitionIndexes).toEqual([0]);
-    const segment = unsupported.segments[0];
-    if (segment?.kind !== 'verified') throw new Error('expected a verified conclusion');
-    expect(segment.result.reasons.some((reason) => reason.kind === 'expired')).toBe(true);
-
-    const revisionBefore = map.sectionAt('overworld', 0, 0, 0)?.revision;
-    const report = fill(map, STONE, [[0, 1, 2]], 1150);
-    expect(report.sections.every((section) => !section.invalidated)).toBe(true);
-    expect(map.sectionAt('overworld', 0, 0, 0)?.revision).toBe(revisionBefore);
-
-    const recovered = verifier.apply(report, 10000);
-    expect(recovered?.verdict).toBe('OPEN');
-    expect(recovered?.earliestProblem).toBeNull();
+    const open = verifier.advance(10000);
+    expect(open.verdict).toBe('OPEN');
+    expect(open.earliestProblem).toBeNull();
+    expect(open.verifiedTransitionIndexes).toEqual([0]);
   });
 
   it('revokes proofs on shape-provider and jump-model version changes', () => {
@@ -692,7 +671,7 @@ describe('LandRouteVerifier — local invalidation, recovery and identity change
 });
 
 describe('LandRouteVerifier — TTL and residency', () => {
-  it('revokes an old OPEN after Section unload/reload and recovers only after current evidence', () => {
+  it('revokes an old OPEN after Section unload, and reloaded evidence is usable again', () => {
     const map = new VoxelMap('world', { manualResidency: true });
     map.installDirectory([]);
     fillOpenStep(map);
@@ -716,9 +695,9 @@ describe('LandRouteVerifier — TTL and residency', () => {
     );
     if (sectionSnapshot === undefined) throw new Error('missing checkpoint section');
     map.installLoadedSections([sectionSnapshot]);
+    // Reloaded evidence keeps its saved freshness: the restored cells are usable again.
     const afterReload = verifier.advance(10000);
-    expect(afterReload.verdict).toBe('STALE');
-    expect(afterReload.verdict).not.toBe('OPEN');
+    expect(afterReload.verdict).toBe('OPEN');
 
     const report = refill(
       map,

@@ -67,6 +67,7 @@ import {
 import type { BoundedCells } from './land-geometry.js';
 import type { BodyContext } from './step.js';
 import type { HazardFact, ObstacleEvidence } from './types.js';
+import { evidenceStale } from '../observation/freshness.js';
 
 /** The four passage states plus the capability gap and unfinished work. */
 export type LandTransitionStatus = 'OPEN' | 'BLOCKED' | 'UNKNOWN' | 'STALE' | 'UNSUPPORTED' | 'INCOMPLETE';
@@ -606,10 +607,7 @@ function evaluateLandGeometry(
     const dep = recordDependency(key, section.revision, 'resident', generation);
     const evidence = section.evidence.get(cellIndex(lx, ly, lz));
     if (evidence === undefined) return { kind: 'unobserved', key };
-    if (!remembered && evidence.freshness === 'STALE') return { kind: 'stale', reason: 'stale', key };
-    if (!remembered && evidence.observation.sessionId !== sessionId) return { kind: 'stale', reason: 'session', key };
-    if (!remembered && now > evidence.validUntil) return { kind: 'stale', reason: 'expired', key };
-    dep.validUntil = Math.min(dep.validUntil, evidence.validUntil);
+    if (!remembered && evidenceStale(evidence)) return { kind: 'stale', reason: 'stale', key };
     if (!evidence.observation.stateComplete) return { kind: 'incomplete', key };
     // The live SectionRef is not copied. Copy the evidence/observation that
     // leaves this evaluation so a caller/provider cannot mutate the store and

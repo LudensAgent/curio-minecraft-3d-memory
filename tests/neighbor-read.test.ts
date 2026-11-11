@@ -115,7 +115,7 @@ describe('neighbour-dependent shape rules', () => {
     expect(result.problem?.cells).not.toContainEqual({ x: 15, y: 0, z: 0 });
   });
 
-  it('a neighbour from an older session cannot yield OPEN', () => {
+  it('a neighbour from an older session is still usable evidence', () => {
     const map = gateMap15();
     map.observe(obs(AIR, { x: 16, y: 0, z: 0 })); // neighbour observed in s1
     map.beginSession('s2');
@@ -138,10 +138,10 @@ describe('neighbour-dependent shape rules', () => {
       gateProvider,
       3000,
     );
-    expect(result.status).toBe('STALE');
+    expect(result.status).toBe('OPEN');
   });
 
-  it('neighbour TTL bounds cached validity, and re-observation recovers', () => {
+  it('a neighbour past its validUntil stays usable; a pending effect stales it and re-observation recovers', () => {
     const map = new VoxelMap('world');
     fillAt(map, STONE, [
       [14, -1, 0],
@@ -160,7 +160,10 @@ describe('neighbour-dependent shape rules', () => {
 
     expect(cache.get(q15, gateProvider).status).toBe('OPEN');
 
-    clock = 70_000; // past the neighbour's validity, but not the others'
+    clock = 70_000; // past the neighbour's validUntil: evidence does not age
+    expect(cache.get(q15, gateProvider).status).toBe('OPEN');
+
+    cache.invalidate(map.invalidatePendingEffect('overworld', { x: 16, y: 0, z: 0 }));
     expect(cache.get(q15, gateProvider).status).toBe('STALE');
 
     clock = 71_000;
@@ -168,7 +171,7 @@ describe('neighbour-dependent shape rules', () => {
     expect(cache.get(q15, gateProvider).status).toBe('OPEN');
   });
 
-  it('an expired neighbour cannot yield OPEN', () => {
+  it('a neighbour past its validUntil can still yield OPEN', () => {
     const map = new VoxelMap('world');
     fillAt(map, STONE, [
       [0, -1, 0],
@@ -180,9 +183,9 @@ describe('neighbour-dependent shape rules', () => {
       [1, 1, 0],
     ], 100_000);
     map.observe(obs(GATE, { x: 1, y: 0, z: 0 }, { observedAt: 100_000 }));
-    map.observe(obs(AIR, { x: 2, y: 0, z: 0 }, { observedAt: 1000 })); // expired by now=70_000
+    map.observe(obs(AIR, { x: 2, y: 0, z: 0 }, { observedAt: 1000 })); // past validUntil by now=70_000
 
-    expect(evaluateWalkStep(map, stepQuery(), gateProvider, 70_000).status).toBe('STALE');
+    expect(evaluateWalkStep(map, stepQuery(), gateProvider, 70_000).status).toBe('OPEN');
   });
 
   it('an unrelated section change does not invalidate the cached entry', () => {

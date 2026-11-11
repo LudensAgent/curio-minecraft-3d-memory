@@ -351,13 +351,12 @@ function restoreCompactCell(
   };
   validateObservation(worldId, observation);
 
-  // A saved FRESH cell was fresh only in the old session; it is STALE now.
-  const wasFresh = raw.freshness === 'FRESH';
+  // Spatial evidence does not age across restores: keep the saved freshness.
   return {
     observation: cloneObservation(observation),
     revision: raw.revision,
-    freshness: 'STALE',
-    staleReason: wasFresh ? 'observation_gap' : raw.staleReason,
+    freshness: raw.freshness,
+    ...(raw.staleReason === undefined ? {} : { staleReason: raw.staleReason }),
     validUntil: raw.validUntil,
   };
 }
@@ -417,12 +416,11 @@ function restoreLegacyCell(
     throw new Error(`voxel cell ${index} palette/evidence disagree`);
   }
 
-  const wasFresh = raw.freshness === 'FRESH';
   return {
     observation,
     revision: raw.revision,
-    freshness: 'STALE',
-    staleReason: wasFresh ? 'observation_gap' : raw.staleReason,
+    freshness: raw.freshness,
+    ...(raw.staleReason === undefined ? {} : { staleReason: raw.staleReason }),
     validUntil: raw.validUntil,
   };
 }

@@ -59,7 +59,9 @@ describe.each(['walk', 'step', 'drop'] as const)('measured %s execution corridor
     const { evaluate } = fixture(kind, { x: 0, y: kind === 'drop' ? 2 : 1, z: 0 });
     expect(evaluate().status).toBe('UNKNOWN');
     const stale = fixture(kind);
-    stale.map.beginSession('s2');
+    stale.map.beginSession('s2'); // a session switch alone does not age evidence
+    expect(stale.evaluate().status).toBe('OPEN');
+    stale.map.invalidatePendingEffect('overworld', { x: 1, y: kind === 'step' ? 2 : 1, z: 0 });
     expect(stale.evaluate().status).toBe('STALE');
   });
 

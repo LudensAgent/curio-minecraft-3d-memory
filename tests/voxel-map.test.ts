@@ -241,11 +241,11 @@ describe('ordering and scope isolation', () => {
     map.beginSession('A');
     map.observe(obs({ sessionId: 'A', observedAt: 100, sequence: 1, state: stone, pos: { x: 0, y: 0, z: 0 } }));
 
-    const staleReport = map.beginSession('B');
-    expect(staleReport.sections).toHaveLength(1);
-    expect(staleReport.sections[0]!.invalidated).toBe(true);
-    expect(staleReport.sections[0]!.cells[0]!.kind).toBe('staled');
-    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('STALE');
+    // Switching sessions does not age evidence: the session-A cell stays FRESH and nothing is reported.
+    const revisionBefore = sectionAt(map, 'overworld', 0, 0, 0).revision;
+    expect(map.beginSession('B').sections).toEqual([]);
+    expect(evidenceAt(map, 'overworld', 0, 0, 0).freshness).toBe('FRESH');
+    expect(sectionAt(map, 'overworld', 0, 0, 0).revision).toBe(revisionBefore);
 
     map.observe(obs({ sessionId: 'B', observedAt: 200, sequence: 1, state: dirt, pos: { x: 0, y: 0, z: 0 } }));
     expect(evidenceAt(map, 'overworld', 0, 0, 0).observation.state).toEqual(dirt);

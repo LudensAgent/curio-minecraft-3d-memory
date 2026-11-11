@@ -230,18 +230,20 @@ describe('land step geometry', () => {
     expect(result.reasons.some((reason) => reason.kind === 'incomplete_evidence')).toBe(true);
   });
 
-  it('STALE: wrong observation session and expired evidence are distinct', () => {
-    const wrongSession = new VoxelMap('world');
-    fillOpenStep(wrongSession);
-    const sessionResult = evaluate(wrongSession, STEP, { shapeProvider: landProvider }, { sessionId: 's2' });
-    expect(sessionResult.status).toBe('STALE');
-    expect(sessionResult.reasons.some((reason) => reason.kind === 'wrong_session')).toBe(true);
+  it('evidence from another session or past validUntil stays usable; only a pending effect is STALE', () => {
+    const otherSession = new VoxelMap('world');
+    fillOpenStep(otherSession);
+    expect(evaluate(otherSession, STEP, { shapeProvider: landProvider }, { sessionId: 's2' }).status).toBe('OPEN');
 
-    const expired = new VoxelMap('world', { validityWindowMs: 100 });
-    fillOpenStep(expired);
-    const expiredResult = evaluate(expired, STEP, { shapeProvider: landProvider }, { now: 2000 });
-    expect(expiredResult.status).toBe('STALE');
-    expect(expiredResult.reasons.some((reason) => reason.kind === 'expired')).toBe(true);
+    const aged = new VoxelMap('world', { validityWindowMs: 100 });
+    fillOpenStep(aged);
+    expect(evaluate(aged, STEP, { shapeProvider: landProvider }, { now: 2000 }).status).toBe('OPEN');
+
+    aged.invalidatePendingEffect('overworld', { x: 1, y: 1, z: 0 });
+    const pending = evaluate(aged, STEP, { shapeProvider: landProvider }, { now: 2000 });
+    expect(pending.status).toBe('STALE');
+    expect(pending.reasons.some((reason) => reason.kind === 'stale')).toBe(true);
+    expect(pending.reasons.some((reason) => reason.kind === 'expired' || reason.kind === 'wrong_session')).toBe(false);
   });
 
   it('BLOCKED: all-observed zero-area support contact does not count as support', () => {

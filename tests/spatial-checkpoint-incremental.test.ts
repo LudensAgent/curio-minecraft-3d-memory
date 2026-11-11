@@ -196,14 +196,16 @@ describe('VoxelMap pending-section tracking', () => {
     expect(map.captureDirtySections().length).toBe(1);
   });
 
-  it('beginSession dirties the affected sections when it marks them stale', () => {
+  it('beginSession leaves earlier evidence FRESH and dirties nothing', () => {
     const map = new VoxelMap(WORLD);
     map.observe(obs({ state: stone, pos: { x: 0, y: 0, z: 0 } })); // session s1, FRESH
     map.confirmSections(map.saveRevision);
+    const saveRevision = map.saveRevision;
     expect(map.captureDirtySections().length).toBe(0);
 
-    map.beginSession('other-session'); // FRESH s1 cell → STALE
-    expect(map.captureDirtySections().length).toBe(1);
+    expect(map.beginSession('other-session').sections).toEqual([]); // the s1 cell stays FRESH
+    expect(map.captureDirtySections().length).toBe(0);
+    expect(map.saveRevision).toBe(saveRevision);
   });
 
   it('sealInitialization forbids a later restore even when the map is empty', () => {

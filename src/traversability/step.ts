@@ -32,6 +32,7 @@ import { sectionKeyString } from '../voxel/section.js';
 import type { SectionRef, VoxelMap } from '../voxel/voxel-map.js';
 import type { CollisionShape, CollisionShapeProvider, NeighborCellView, NeighborRead, UnitBox } from './collision-shape.js';
 import type { HazardFact, ObstacleEvidence, Traversability } from './types.js';
+import { evidenceStale } from '../observation/freshness.js';
 
 /** The four passage states plus the capability gap they cannot express. */
 export type StepStatus = Traversability | 'UNSUPPORTED';
@@ -530,20 +531,11 @@ function evaluateWalkGeometry(
     if (evidence === undefined) {
       return { kind: 'missing', sectionKey, sectionRevision: section.revision };
     }
-    if (!remembered && evidence.freshness === 'STALE') {
+    if (!remembered && evidenceStale(evidence)) {
       return { kind: 'stale', sectionKey, sectionRevision: section.revision };
     }
-    if (!remembered && evidence.observation.sessionId !== query.sessionId) {
-      return { kind: 'session', sectionKey, sectionRevision: section.revision };
-    }
-    if (!remembered && now > evidence.validUntil) {
-      return { kind: 'expired', sectionKey, sectionRevision: section.revision };
-    }
-    // Only evidence that is still valid at evaluation time bounds the conclusion's
-    // validity. Already-stale/expired/session cells are reflected in a STALE result
-    // (or are irrelevant to an OPEN/BLOCKED conclusion) and must not drag `validUntil`
-    // into the past.
-    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
+    // Evidence does not age, so it does not bound the conclusion's validity; a
+    // conclusion is invalidated by section revision / residency changes instead.
     if (!evidence.observation.stateComplete) {
       return { kind: 'incomplete', sectionKey, sectionRevision: section.revision };
     }

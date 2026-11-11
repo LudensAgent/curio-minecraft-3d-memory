@@ -438,7 +438,7 @@ describe('v4 → v5 schema migration and section payload compatibility', () => {
     const reopened = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     expect(reopened.voxel.cellAt(DIM, 0, 0, 0)).toMatchObject({
       observed: true,
-      evidence: { freshness: 'STALE', observation: { state: stone } },
+      evidence: { freshness: 'FRESH', observation: { state: stone } }, // a restore does not age evidence
     });
     await reopened.close();
   });

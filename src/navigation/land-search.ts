@@ -19,6 +19,7 @@ import { blockToSection, cellIndex } from '../voxel/coordinates.js';
 import type { SectionKey } from '../voxel/section.js';
 import { sectionKeyString } from '../voxel/section.js';
 import type { VoxelMap } from '../voxel/voxel-map.js';
+import { evidenceStale } from '../observation/freshness.js';
 
 export type LandSearchKind = 'walk' | 'step' | 'drop' | 'jump' | 'ladder';
 export type LandSearchArrival = { kind: 'exact' } | {
@@ -576,9 +577,7 @@ function* searchChunks(
       }
       const evidence = section.evidence.get(cellIndex(lx, ly, lz));
       if (evidence === undefined) return { pos, kind: 'unobserved' };
-      const staleReason = evidence.freshness === 'STALE' ? 'stale'
-        : evidence.observation.sessionId !== request.sessionId ? 'session'
-        : now > evidence.validUntil ? 'expired' : null;
+      const staleReason = evidenceStale(evidence) ? 'stale' : null;
       if (staleReason !== null) {
         stats.staleReads += 1;
         if (evidenceMode === 'current') {
