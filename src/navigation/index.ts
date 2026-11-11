@@ -20,7 +20,7 @@ export type {
   NavResult,
 } from './types.js';
 
-export { searchLandRoute, searchLandRouteAsync } from './land-search.js';
+export { DEFAULT_LAND_SEARCH_MAX_EDGES, DEFAULT_LAND_SEARCH_MAX_NODES, searchLandRoute, searchLandRouteAsync } from './land-search.js';
 export type {
   LandSearchArrival,
   LandSearchBoundary,

@@ -36,6 +36,8 @@ export type LandSearchStatus =
   | 'INVALIDATED';
 export type LandSearchBoundaryStatus = 'BLOCKED' | 'UNKNOWN' | 'STALE' | 'UNSUPPORTED' | 'INCOMPLETE';
 export type LandSearchBudget = 'nodes' | 'edges' | 'reads' | 'sections' | 'points' | 'time' | 'geometry';
+export const DEFAULT_LAND_SEARCH_MAX_NODES = 2048;
+export const DEFAULT_LAND_SEARCH_MAX_EDGES = 8192;
 
 /**
  * Finite-width delegation limit around an observed start/corridor line. It is
@@ -176,6 +178,8 @@ export interface LandSearchBoundary {
   to: Vec3Like;
   status: LandSearchBoundaryStatus;
   reason: string;
+  /** Inclusive block Y bounds scanned under the candidate footprint when no support surface was found. */
+  supportColumn?: { minY: number; maxY: number };
 }
 
 /**
@@ -397,8 +401,8 @@ function* searchChunks(
   }
   const maxDrop = request.maxDrop ?? 4;
   if (!Number.isFinite(maxDrop) || maxDrop < 0) throw new Error('maxDrop must be finite and nonnegative');
-  const maxNodes = positive(request.maxNodes, 2048, 'maxNodes');
-  const maxEdges = positive(request.maxEdges, 8192, 'maxEdges');
+  const maxNodes = positive(request.maxNodes, DEFAULT_LAND_SEARCH_MAX_NODES, 'maxNodes');
+  const maxEdges = positive(request.maxEdges, DEFAULT_LAND_SEARCH_MAX_EDGES, 'maxEdges');
   const maxSurfaceReads = positive(request.maxSurfaceReads, 262144, 'maxSurfaceReads');
   const maxPolicyReads = positive(request.maxPolicyReads, 131072, 'maxPolicyReads');
   const maxPolicyReadsPerEdge = positive(request.maxPolicyReadsPerEdge, 64, 'maxPolicyReadsPerEdge');
@@ -469,11 +473,12 @@ function* searchChunks(
     to: Vec3Like,
     status: LandSearchBoundaryStatus,
     reason: string,
+    supportColumn?: LandSearchBoundary['supportColumn'],
   ): void => {
     if (node.blocker !== undefined) return;
     if (status !== 'BLOCKED' && status !== 'UNSUPPORTED') return;
     if (!(remainingMetric(to) < remainingMetric(node.point))) return;
-    node.blocker = { from: { ...node.point }, to: { ...to }, status, reason };
+    node.blocker = { from: { ...node.point }, to: { ...to }, status, reason, ...(supportColumn && { supportColumn }) };
   };
   const stopped = (): LandSearchStatus | null => {
     if (request.signal?.aborted) return 'CANCELLED';
@@ -481,9 +486,9 @@ function* searchChunks(
     if (clock() >= deadline) budget = 'time';
     return budget === undefined ? null : 'BUDGET_EXHAUSTED';
   };
-  const boundary = (from: Vec3Like, to: Vec3Like, status: LandSearchBoundaryStatus, reason: string): void => {
+  const boundary = (from: Vec3Like, to: Vec3Like, status: LandSearchBoundaryStatus, reason: string, supportColumn?: LandSearchBoundary['supportColumn']): void => {
     counts[status] += 1;
-    if (boundaries.length < maxBoundaries) boundaries.push({ from: { ...from }, to: { ...to }, status, reason });
+    if (boundaries.length < maxBoundaries) boundaries.push({ from: { ...from }, to: { ...to }, status, reason, ...(supportColumn && { supportColumn }) });
     else stats.boundariesTruncated = true;
   };
   const addDependency = (key: SectionKey): void => {
@@ -592,16 +597,18 @@ function* searchChunks(
     x: number,
     z: number,
     fromY: number,
-  ): Generator<void, { surfaces: Set<number>; gaps: Set<LandSearchBoundaryStatus> }, void> {
+  ): Generator<void, { surfaces: Set<number>; gaps: Set<LandSearchBoundaryStatus>; minY: number; maxY: number }, void> {
     const half = body.width / 2;
     const surfaces = new Set<number>();
     const gaps = new Set<LandSearchBoundaryStatus>();
+    const minY = Math.floor(fromY - maxDrop) - 1, maxY = Math.ceil(fromY + 1);
+    const scan = { surfaces, gaps, minY, maxY };
     // Candidate heights come from actual support faces under the body footprint.
     // No top-of-column shortcut merges a bridge with the cave below it.
     for (let bx = Math.floor(x - half + EPS); bx <= Math.floor(x + half - EPS); bx++) {
       for (let bz = Math.floor(z - half + EPS); bz <= Math.floor(z + half - EPS); bz++) {
-        for (let by = Math.floor(fromY - maxDrop) - 1; by <= Math.ceil(fromY + 1); by++) {
-          if (stopped() !== null) return { surfaces, gaps };
+        for (let by = minY; by <= maxY; by++) {
+          if (stopped() !== null) return scan;
           const cell = read.cell(bx, by, bz);
           if (cell.kind === 'stale') gaps.add('STALE');
           if (cell.kind === 'unobserved' || cell.kind === 'incomplete') gaps.add('UNKNOWN');
@@ -611,7 +618,7 @@ function* searchChunks(
               if (resolution.shape.supportFaces.length > geometryLimits.maxSupportFaces
                 || resolution.shape.boxes.length > geometryLimits.maxShapeBoxes) {
                 budget = 'geometry';
-                return { surfaces, gaps };
+                return scan;
               }
               for (const face of resolution.shape.supportFaces) {
                 const y = by + face.top;
@@ -627,7 +634,7 @@ function* searchChunks(
         }
       }
     }
-    return { surfaces, gaps };
+    return scan;
   }
   const climbSourceCache = new Map<string, boolean>();
   /**
@@ -741,6 +748,7 @@ function* searchChunks(
             ...blocker,
             from: { ...blocker.from },
             to: { ...blocker.to },
+            ...(blocker.supportColumn && { supportColumn: { ...blocker.supportColumn } }),
           },
         }),
       };
@@ -1003,7 +1011,7 @@ function* searchChunks(
             stats.corridorSkipped += 1;
             continue;
           }
-          const { surfaces, gaps: columnGaps } = yield* columnSurfaces(x, z, node.point.y);
+          const { surfaces, gaps: columnGaps, minY, maxY } = yield* columnSurfaces(x, z, node.point.y);
           if (stopped() !== null) break search;
           if (surfaces.size === 0) {
             // Stale support evidence is a more specific fact than cells that were
@@ -1017,8 +1025,9 @@ function* searchChunks(
                 ? 'support-surface evidence in the bounded column is stale and is not treated as current geometry'
                 : 'support-surface coverage or shape rules are incomplete in the bounded column';
             const candidate = { x, y: node.point.y, z };
-            boundary(node.point, candidate, columnStatus, columnReason);
-            noteBlocker(node, candidate, columnStatus, columnReason);
+            const supportColumn = { minY, maxY };
+            boundary(node.point, candidate, columnStatus, columnReason, supportColumn);
+            noteBlocker(node, candidate, columnStatus, columnReason, supportColumn);
           }
           for (const y of surfaces) {
             if (stopped() !== null) break search;

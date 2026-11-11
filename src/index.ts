@@ -235,7 +235,7 @@ export type {
 } from './adapter/index.js';
 
 // Navigation — current voxel land search + shared delegation contracts
-export { searchLandRoute, searchLandRouteAsync } from './navigation/index.js';
+export { DEFAULT_LAND_SEARCH_MAX_EDGES, DEFAULT_LAND_SEARCH_MAX_NODES, searchLandRoute, searchLandRouteAsync } from './navigation/index.js';
 export type {
   ActionRecord,
   ArrivalSpec,

@@ -353,7 +353,25 @@ describe('bounded voxel land search', () => {
     }
     const result = searchLandRoute(map, request({ to: { x: 1.5, y: 0, z: 0.5 } }), 100_000);
     expect(result.status).toBe('INSUFFICIENT_EVIDENCE');
-    expect(result.boundaries.some((entry) => entry.status === 'STALE' && entry.to.x === 1.5)).toBe(true);
+    expect(result.boundaries.find((entry) => entry.status === 'STALE' && entry.to.x === 1.5)?.supportColumn)
+      .toEqual({ minY: -5, maxY: 1 });
+  });
+
+  it('reports the support cells scanned from fractional feet and keeps a separate copy in the prefix', () => {
+    const map = terrain([{ x: 0, z: 0, height: 0.5 }, { x: 1, z: 0, height: -8 }]);
+    const reads = vi.spyOn(map, 'sectionRef');
+    const query = request({ body: bodyAt(0.5, 0.5, 0.5), to: { x: 1.5, y: 0.5, z: 0.5 }, maxDrop: 1.5 });
+    const result = searchLandRoute(map, query, 2000);
+    const scanned = [...new Set(reads.mock.calls.filter(([, x, , z]) => x === 1 && z === 0).map(([, , y]) => y))];
+    expect(scanned).toEqual([-2, -1, 0, 1, 2]);
+    const boundary = result.boundaries.find(edge => edge.to.x === 1.5 && edge.to.z === 0.5);
+    expect(boundary).toMatchObject({ status: 'BLOCKED', supportColumn: { minY: -2, maxY: 2 } });
+    expect(result.prefix?.knownBlockerAhead).toEqual(boundary);
+    expect(result.prefix?.knownBlockerAhead?.supportColumn).not.toBe(boundary?.supportColumn);
+
+    const partial = searchLandRoute(map, { ...query, maxSurfaceReads: 1 }, 2000);
+    expect(partial.budget).toBe('reads');
+    expect(partial.boundaries).toHaveLength(0);
   });
 
   it('plans remembered geometry across sessions without refreshing or changing any source evidence', () => {
