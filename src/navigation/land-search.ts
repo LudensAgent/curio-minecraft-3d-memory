@@ -810,9 +810,10 @@ function* searchChunks(
   // its change is at most |dy|+1, covered by the step/drop overhead.
   // L1 inside a near sphere is at most sqrt(dimensions)*radius. Subtracting it
   // keeps the heuristic admissible and consistent; policy costs are nonnegative.
-  // Jumps can travel more than two horizontal blocks for cost two, so use h=0.
+  // A jump costs its horizontal distance plus one, never less than the blocks it
+  // covers, so the octile distance stays admissible with jumps enabled.
   const verticalHeuristic = heuristicMode === 'distance' && goalMetric === '3d';
-  const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' || allowed.has('jump') ? 0
+  const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' ? 0
     : Math.max(0, octile(Math.abs(coordinateDelta(point.x, target.x)), Math.abs(coordinateDelta(point.z, target.z)))
       + (verticalHeuristic ? Math.abs(coordinateDelta(point.y, target.y)) : 0)
       - (arrival.kind === 'near' ? Math.sqrt(verticalHeuristic ? 3 : 2) * arrival.radius : 0));
@@ -949,7 +950,8 @@ function* searchChunks(
           }
           return 'ok';
         }
-        let cost = diagonal ? Math.SQRT2 : kind === 'walk' ? 1 : kind === 'ladder' ? 1 : 2 + Math.abs(dy);
+        let cost = diagonal ? Math.SQRT2 : kind === 'walk' ? 1 : kind === 'ladder' ? 1
+          : kind === 'jump' ? Math.hypot(dx, dz) + 1 : 2 + Math.abs(dy);
         if (edgePolicy !== undefined) {
           if (stopped() !== null) return 'stop';
           policyReadsThisEdge = 0;

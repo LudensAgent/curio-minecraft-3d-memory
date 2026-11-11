@@ -274,7 +274,7 @@ describe('bounded voxel land search', () => {
     expect(result.status).toBe('FOUND');
     expect(result.transitions.map((transition) => transition.kind)).toEqual(['jump']);
     expect(result.points).toEqual([{ x: -0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }]);
-    expect(result.cost).toBe(2);
+    expect(result.cost).toBe(3);
 
     const walkOnly = searchLandRoute(map, { ...jumpRequest, allowed: ['walk', 'step', 'drop'] }, 2000);
     expect(walkOnly.status).not.toBe('FOUND');
@@ -285,7 +285,8 @@ describe('bounded voxel land search', () => {
       Array.from({ length: 5 }, (_, z) => ({ x, z, height: 0 }))
     ).flat());
     const edges = new Map([
-      ['0.5,0.5>4.5,0.5', 6],
+      // 跳跃代价为水平距离 + 1：直跳 4+1+11=16，三段绕跳 3×5=15。
+      ['0.5,0.5>4.5,0.5', 11],
       ['0.5,0.5>0.5,4.5', 0],
       ['0.5,4.5>4.5,4.5', 0],
       ['4.5,4.5>4.5,0.5', 0],
@@ -308,11 +309,11 @@ describe('bounded voxel land search', () => {
     const reference = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
     expect(result.status).toBe('FOUND');
     expect(reference.status).toBe('FOUND');
-    expect(reference.cost).toBe(6);
+    expect(reference.cost).toBe(15);
     expect(result.cost).toBe(reference.cost);
     expect(result.transitions).toHaveLength(3);
-    expect(result.stats.nodesExpanded).toBe(reference.stats.nodesExpanded);
-    expect(result.stats.edgesEvaluated).toBe(reference.stats.edgesEvaluated);
+    // 跳跃也保留 octile 启发：A* 不比零启发展开更多。
+    expect(result.stats.nodesExpanded).toBeLessThanOrEqual(reference.stats.nodesExpanded);
   });
 
   it('preserves fractional starting offsets and exact targets without centering or height snapping', () => {
