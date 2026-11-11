@@ -146,7 +146,7 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     expect(result.status).toBe('UNKNOWN');
   });
 
-  it('STALE: evidence past validUntil is treated as expired without mutating the map', () => {
+  it('evidence past validUntil does not age: it still reads OPEN without mutating the map', () => {
     const map = new VoxelMap('world');
     fill(map, STONE, [
       [0, -1, 0],
@@ -156,21 +156,23 @@ describe('evaluateWalkStep — geometry and evidence', () => {
 
     const before = map.sectionAt('overworld', 0, 0, 0)?.revision;
     const result = evaluateWalkStep(map, stepQuery(), fakeProvider, 200_000);
-    expect(result.status).toBe('STALE');
+    expect(result.status).toBe('OPEN');
     expect(map.sectionAt('overworld', 0, 0, 0)?.revision).toBe(before); // unchanged
   });
 
-  it('STALE: cells marked stale by a session switch report STALE', () => {
+  it('a session switch keeps earlier evidence usable; a pending effect reports STALE', () => {
     const map = new VoxelMap('world');
     fill(map, STONE, [
       [0, -1, 0],
       [1, -1, 0],
     ]);
     fill(map, AIR, SWEPT_AIR);
-    map.beginSession('s2');
+    expect(map.beginSession('s2').sections).toEqual([]);
 
-    const result = evaluateWalkStep(map, stepQuery(), fakeProvider, 2000);
-    expect(result.status).toBe('STALE');
+    expect(evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 2000).status).toBe('OPEN');
+
+    map.invalidatePendingEffect('overworld', { x: 1, y: 0, z: 0 });
+    expect(evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 2000).status).toBe('STALE');
   });
 
   it('reads negative coordinates and cross-section support/clearance', () => {
@@ -423,7 +425,7 @@ describe('evaluateWalkStep — geometry and evidence', () => {
     expect(result.dependencies.every((d) => d.key.sy !== -1)).toBe(true);
   });
 
-  it('a late query from an older session reports STALE, not OPEN', () => {
+  it('the query session does not gate evidence: older and newer session queries both read OPEN', () => {
     const map = new VoxelMap('world');
     fill(map, STONE, [
       [0, -1, 0],
@@ -440,8 +442,8 @@ describe('evaluateWalkStep — geometry and evidence', () => {
       map.observe(obs(state, { x: cell[0], y: cell[1], z: cell[2] }, { sessionId: 's2', observedAt: 2000, sequence: 2 }));
     }
 
-    const stale = evaluateWalkStep(map, stepQuery({ sessionId: 's1' }), fakeProvider, 3000);
-    expect(stale.status).toBe('STALE');
+    const older = evaluateWalkStep(map, stepQuery({ sessionId: 's1' }), fakeProvider, 3000);
+    expect(older.status).toBe('OPEN');
 
     const open = evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 3000);
     expect(open.status).toBe('OPEN');

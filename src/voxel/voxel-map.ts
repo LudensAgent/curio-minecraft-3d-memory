@@ -446,22 +446,9 @@ export class VoxelMap {
   beginSession(sessionId: string): ChangeReport {
     assertNonEmptyString(sessionId, 'sessionId');
     if (sessionId === this.currentSessionId) return { sections: [] };
-    const previous = this.currentSessionId;
+    // Spatial evidence does not age with sessions: earlier cells stay usable until re-observed.
     this.currentSessionId = sessionId;
-    if (previous === null) return { sections: [] };
-
-    const bySection = new Map<Section, SectionChange>();
-    for (const dimMap of this.sections.values()) {
-      for (const section of dimMap.values()) {
-        this.markSectionCellsStale(
-          section,
-          (evidence) => evidence.observation.sessionId !== sessionId,
-          'observation_gap',
-          bySection,
-        );
-      }
-    }
-    return this.emit({ sections: [...bySection.values()] });
+    return { sections: [] };
   }
 
   /**

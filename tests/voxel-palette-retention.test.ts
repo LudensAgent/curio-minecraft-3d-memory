@@ -272,8 +272,8 @@ describe('bounded palette reclamation', () => {
     map.installLoadedSections(source.checkpointSnapshot().sections);
     const bytesBefore = map.residentSize().bytes;
 
-    // The first observation restores the loaded STALE cell, the second is a
-    // genuine same-state refresh. Neither may touch the palette.
+    // The loaded cell keeps its saved FRESH state; both observations are
+    // same-state refreshes. Neither may touch the palette.
     map.observe(obs({ pos: cellPos(0), state: states[0], observedAt: 20_000, sequence: 10_000 }));
     map.observe(obs({ pos: cellPos(0), state: states[0], observedAt: 20_001, sequence: 10_001 }));
 
@@ -425,7 +425,7 @@ describe('palette reference sharing and remapping', () => {
       expect(evidence.observation.state).toEqual(states[index]);
       expect(evidence.observation.observedAt).toBe(1_000 + index);
       expect(evidence.observation.originObservationId).toBe(7_000 + index);
-      expect(evidence.freshness).toBe('STALE'); // restored evidence is never current
+      expect(evidence.freshness).toBe('FRESH'); // a restore keeps the saved freshness
     }
     const restoredAir = cellPos(1);
     const airEvidence = evidenceAt(restored, restoredAir.x, restoredAir.y, restoredAir.z);
@@ -534,7 +534,7 @@ describe('loading and restoring palettes with unused entries', () => {
     expect(sectionOf(map).bits).toBe(8);
     // Loading never rewrites the original observation identity or time.
     expect(evidenceAt(map, 0, 0, 0).observation.observedAt).toBe(1_234);
-    expect(evidenceAt(map, 0, 0, 0).freshness).toBe('STALE');
+    expect(evidenceAt(map, 0, 0, 0).freshness).toBe('FRESH');
 
     // A real state change reclaims every unused entry and the released stone
     // slot because the live palette now fits a one-bit width.
@@ -633,7 +633,7 @@ describe('checkpoint capture stays independent of later reclamation', () => {
       sections: captured,
     });
     expect(evidenceAt(restored, 0, 0, 0).observation.observedAt).toBe(1_000);
-    expect(evidenceAt(restored, 0, 0, 0).freshness).toBe('STALE');
+    expect(evidenceAt(restored, 0, 0, 0).freshness).toBe('FRESH');
   });
 
   it('reuses freed slots across an unload/reload round trip', () => {

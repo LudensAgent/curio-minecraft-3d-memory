@@ -370,7 +370,7 @@ describe('water route validation', () => {
     expect(result.points).toEqual(swimRoute);
     expect(result.hazards.some((hazard) => hazard.kind === 'water_contact')).toBe(true);
     expect(result.budget.candidateCells).toBeGreaterThan(0);
-    expect(result.validUntil).toBe(61000);
+    expect(result.validUntil).toBe(Number.POSITIVE_INFINITY);
   });
 
   it('does not pass a dry-air route with no water surface', () => {
@@ -1060,7 +1060,7 @@ describe('water evidence and budgets', () => {
     expect(evaluateWaterRoute(map, swimQuery(swimRoute), 1000).status).toBe('OPEN');
   });
 
-  it('expires evidence, refreshes the same state, and re-evaluates fresh', () => {
+  it('does not age evidence past validUntil, and a same-state refresh keeps the revision', () => {
     const map = new VoxelMap('world');
     fillSwimWater(map, 0, 2);
 
@@ -1068,13 +1068,13 @@ describe('water evidence and budgets', () => {
     expect(fresh.status).toBe('OPEN');
     const revision = fresh.dependencies[0]!.revision;
 
-    const expired = evaluateWaterRoute(map, swimQuery(swimRoute), 70000);
-    expect(expired.status).toBe('STALE');
+    const aged = evaluateWaterRoute(map, swimQuery(swimRoute), 70000);
+    expect(aged.status).toBe('OPEN');
 
     fillSwimWater(map, 0, 2, { observedAt: 69000 });
     const refreshed = evaluateWaterRoute(map, swimQuery(swimRoute), 70000);
     expect(refreshed.status).toBe('OPEN');
-    expect(refreshed.validUntil).toBe(129000);
+    expect(refreshed.validUntil).toBe(Number.POSITIVE_INFINITY);
     expect(refreshed.dependencies[0]!.revision).toBe(revision);
   });
 
@@ -1092,10 +1092,13 @@ describe('water evidence and budgets', () => {
     expect(after.dependencies[0]!.revision).toBeGreaterThan(beforeRevision);
   });
 
-  it('rejects wrong-session evidence', () => {
+  it('accepts evidence from another session and rejects evidence pending an effect', () => {
     const map = new VoxelMap('world');
     fillSwimWater(map, 0, 2, { sessionId: 's2' });
 
+    expect(evaluateWaterRoute(map, swimQuery(swimRoute), 1000).status).toBe('OPEN');
+
+    map.invalidatePendingEffect('overworld', { x: 1, y: 0, z: 0 });
     const result = evaluateWaterRoute(map, swimQuery(swimRoute), 1000);
 
     expect(result.status).toBe('STALE');
@@ -1347,7 +1350,7 @@ describe('water arrival completion', () => {
     expect(result.surfaceGeometry?.hazards.some((hazard) => hazard.kind === 'submersion')).toBe(true);
   });
 
-  it('rejects missing or stale surface geometry', () => {
+  it('rejects missing or pending-effect surface geometry, but not surface evidence past validUntil', () => {
     const missing = checkWaterArrival(
       arrivalRequest(
         swimTargetGoal(),
@@ -1359,11 +1362,22 @@ describe('water arrival completion', () => {
     expect(missing.problem?.kind).toBe('surface_geometry');
     expect(missing.surfaceGeometry?.status).toBe('UNKNOWN');
 
-    const stale = checkWaterArrival(
+    const aged = checkWaterArrival(
       arrivalRequest(
         swimTargetGoal(),
         [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, observedAt: 69000, inWater: true })],
         { map: surfaceTargetMap(), now: 70000 },
+      ),
+    );
+    expect(aged.status).toBe('ARRIVED');
+
+    const pendingMap = surfaceTargetMap();
+    pendingMap.invalidatePendingEffect('overworld', { x: 0, y: 1, z: 0 });
+    const stale = checkWaterArrival(
+      arrivalRequest(
+        swimTargetGoal(),
+        [sample({ pos: { x: 0.5, y: 0.5, z: 0.5 }, observedAt: 1500, inWater: true })],
+        { map: pendingMap, now: 2000 },
       ),
     );
     expect(stale.status).toBe('UNCONFIRMED');

@@ -137,6 +137,8 @@ describe('VoxelMap manual residency (pure core)', () => {
     map.beginSession('s1');
     const source = new VoxelMap(WORLD);
     source.observe(voxelObs({ pos: { x: 0, y: 0, z: 0 } }));
+    source.observe(voxelObs({ pos: { x: 1, y: 0, z: 0 } }));
+    source.invalidatePendingEffect(DIM, { x: 1, y: 0, z: 0 });
     const snapshot = source.checkpointSnapshot();
 
     const installed = map.installLoadedSections(snapshot.sections);
@@ -144,8 +146,10 @@ describe('VoxelMap manual residency (pure core)', () => {
     expect(map.sectionResidency(sectionKey(DIM, 0, 0, 0)).residency).toBe('resident');
     expect(map.captureDirtySections()).toHaveLength(0); // load never dirties
     expect(map.checkpointDirtyMeasure().count).toBe(0);
-    // Restored evidence is STALE, not a fresh/current observation.
-    expect(evidence(map, 0, 0, 0).freshness).toBe('STALE');
+    // Restored evidence keeps its saved freshness: loading does not age it,
+    // and a saved pending effect is still STALE.
+    expect(evidence(map, 0, 0, 0).freshness).toBe('FRESH');
+    expect(evidence(map, 1, 0, 0)).toMatchObject({ freshness: 'STALE', staleReason: 'pending_effect' });
   });
 
   it('unload refuses pinned, dirty and uncommitted sections with reasons', () => {
@@ -383,9 +387,9 @@ describe('residency invalidation of derived conclusions', () => {
     expect(map.unloadSections([supportKey]).unloaded).toEqual([supportKey]);
     expect(cache.get(stepQuery(), fakeProvider).status).toBe('UNKNOWN');
 
-    // Reload: the restored support is STALE, not stuck at the pre-load UNKNOWN.
+    // Reload: the restored support is usable again, not stuck at the pre-load UNKNOWN.
     map.installLoadedSections(supportSnapshot());
-    expect(cache.get(stepQuery(), fakeProvider).status).toBe('STALE');
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('OPEN');
   });
 
   it('pins an explicitly selected dependency section and releases it', () => {
@@ -402,7 +406,7 @@ describe('residency invalidation of derived conclusions', () => {
 // ==============================================================================
 
 describe('SQLite manual voxel loading', () => {
-  it('manual open reads only the directory; load restores original facts as STALE', async () => {
+  it('manual open reads only the directory; load restores original facts with their saved freshness', async () => {
     const dbPath = makeDbPath();
     const s1 = await openSpatialSession({ databasePath: dbPath, worldId: WORLD });
     s1.voxel.beginSession('s1');
@@ -424,7 +428,7 @@ describe('SQLite manual voxel loading', () => {
     expect(ev.observation.state).toEqual(stone);
     expect(ev.observation.observedAt).toBe(1000);
     expect(ev.observation.sessionId).toBe('s1');
-    expect(ev.freshness).toBe('STALE');
+    expect(ev.freshness).toBe('FRESH');
     await s2.close();
   });
 

@@ -13,7 +13,8 @@ export type {
   SupportFace,
   UnitBox,
 } from './collision-shape.js';
-export { evaluateWalkSegment, evaluateWalkStep } from './step.js';
+export { MAX_STEP_RISE } from './land-geometry.js';
+export { MAX_WALK_TO_DISTANCE, evaluateWalkSegment, evaluateWalkStep, evaluateWalkTo } from './step.js';
 export type {
   BodyContext,
   StepConstraints,

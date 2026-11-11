@@ -50,7 +50,7 @@ describe('TraversabilityCache', () => {
     expect(cache.size).toBe(1);
   });
 
-  it('does not serve a cached OPEN past the evidence validUntil', () => {
+  it('re-evaluates past the evidence validUntil and still reads OPEN: evidence does not age', () => {
     const map = openMap();
     let clock = 2000;
     const cache = new TraversabilityCache(map, { now: () => clock });
@@ -58,10 +58,10 @@ describe('TraversabilityCache', () => {
     expect(cache.get(stepQuery(), fakeProvider).status).toBe('OPEN');
 
     clock = 70_000; // past observedAt 1000 + 60_000 window
-    expect(cache.get(stepQuery(), fakeProvider).status).toBe('STALE');
+    expect(cache.get(stepQuery(), fakeProvider).status).toBe('OPEN');
   });
 
-  it('recovers to OPEN after expiry when the same state is re-observed', () => {
+  it('stays OPEN past validUntil and after the same state is re-observed', () => {
     const map = openMap();
     let clock = 2000;
     const cache = new TraversabilityCache(map, { now: () => clock });
@@ -70,7 +70,7 @@ describe('TraversabilityCache', () => {
     expect(cache.get(q, fakeProvider).status).toBe('OPEN');
 
     clock = 70_000;
-    expect(cache.get(q, fakeProvider).status).toBe('STALE');
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
 
     clock = 71_000;
     for (const cell of [
@@ -86,7 +86,7 @@ describe('TraversabilityCache', () => {
     expect(evaluateWalkStep(map, q, fakeProvider, 71_000).status).toBe('OPEN');
   });
 
-  it('UNKNOWN with partial evidence expires to STALE, matching direct evaluation', () => {
+  it('UNKNOWN with partial evidence stays UNKNOWN past validUntil, matching direct evaluation', () => {
     const map = new VoxelMap('world');
     let clock = 2000;
     const cache = new TraversabilityCache(map, { now: () => clock });
@@ -97,8 +97,8 @@ describe('TraversabilityCache', () => {
     expect(cache.get(q, fakeProvider).status).toBe('UNKNOWN');
 
     clock = 70_000;
-    expect(cache.get(q, fakeProvider).status).toBe('STALE'); // observed cells expired, not stale UNKNOWN
-    expect(evaluateWalkStep(map, q, fakeProvider, 70_000).status).toBe('STALE');
+    expect(cache.get(q, fakeProvider).status).toBe('UNKNOWN'); // observed cells do not age
+    expect(evaluateWalkStep(map, q, fakeProvider, 70_000).status).toBe('UNKNOWN');
   });
 
   it('invalidates only entries depending on the changed section', () => {
@@ -167,7 +167,7 @@ describe('TraversabilityCache', () => {
     expect(cache.get(q, fakeProvider).status).toBe('OPEN');
   });
 
-  it('STALE recovers to OPEN after the section is re-observed and invalidated', () => {
+  it('a pending effect stales a cached OPEN, and re-observation recovers it after invalidation', () => {
     let clock = 2000;
     const map = new VoxelMap('world', { now: () => clock });
     const cache = new TraversabilityCache(map, { now: () => clock });
@@ -180,7 +180,10 @@ describe('TraversabilityCache', () => {
 
     expect(cache.get(q, fakeProvider).status).toBe('OPEN');
 
+    // An interruption mark does not age evidence; only a pending effect makes it STALE.
     cache.invalidate(map.markStale('overworld', 'unloaded'));
+    expect(cache.get(q, fakeProvider).status).toBe('OPEN');
+    cache.invalidate(map.invalidatePendingEffect('overworld', { x: 1, y: 0, z: 0 }));
     expect(cache.get(q, fakeProvider).status).toBe('STALE');
 
     clock = 3000;

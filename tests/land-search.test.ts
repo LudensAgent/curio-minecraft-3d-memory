@@ -274,7 +274,7 @@ describe('bounded voxel land search', () => {
     expect(result.status).toBe('FOUND');
     expect(result.transitions.map((transition) => transition.kind)).toEqual(['jump']);
     expect(result.points).toEqual([{ x: -0.5, y: 0, z: 0.5 }, { x: 1.5, y: 0, z: 0.5 }]);
-    expect(result.cost).toBe(2);
+    expect(result.cost).toBe(3);
 
     const walkOnly = searchLandRoute(map, { ...jumpRequest, allowed: ['walk', 'step', 'drop'] }, 2000);
     expect(walkOnly.status).not.toBe('FOUND');
@@ -285,7 +285,8 @@ describe('bounded voxel land search', () => {
       Array.from({ length: 5 }, (_, z) => ({ x, z, height: 0 }))
     ).flat());
     const edges = new Map([
-      ['0.5,0.5>4.5,0.5', 6],
+      // 跳跃代价为水平距离 + 1：直跳 4+1+11=16，三段绕跳 3×5=15。
+      ['0.5,0.5>4.5,0.5', 11],
       ['0.5,0.5>0.5,4.5', 0],
       ['0.5,4.5>4.5,4.5', 0],
       ['4.5,4.5>4.5,0.5', 0],
@@ -308,11 +309,11 @@ describe('bounded voxel land search', () => {
     const reference = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
     expect(result.status).toBe('FOUND');
     expect(reference.status).toBe('FOUND');
-    expect(reference.cost).toBe(6);
+    expect(reference.cost).toBe(15);
     expect(result.cost).toBe(reference.cost);
     expect(result.transitions).toHaveLength(3);
-    expect(result.stats.nodesExpanded).toBe(reference.stats.nodesExpanded);
-    expect(result.stats.edgesEvaluated).toBe(reference.stats.edgesEvaluated);
+    // 跳跃也保留 octile 启发：A* 不比零启发展开更多。
+    expect(result.stats.nodesExpanded).toBeLessThanOrEqual(reference.stats.nodesExpanded);
   });
 
   it('preserves fractional starting offsets and exact targets without centering or height snapping', () => {
@@ -341,20 +342,25 @@ describe('bounded voxel land search', () => {
     expect(tooHigh.status).not.toBe('FOUND');
   });
 
-  it('reports stale support evidence as STALE even when the same column also has never-observed cells', () => {
+  it('reports pending-effect support evidence as STALE even when the same column also has never-observed cells', () => {
     const map = new VoxelMap('world', { now: () => 100_000, validityWindowMs: 1000 });
-    // Current column is fresh; the next column has stale support/air evidence and
-    // never-observed upper cells. Stale geometry is a more specific fact than a
-    // plain evidence gap, so the boundary must stay distinguishable from UNKNOWN.
+    // The next column has support/air evidence past its validUntil and
+    // never-observed upper cells. Evidence does not age, so it still plans.
     for (const [x, observedAt] of [[0, 100_000], [1, 1000]] as const) {
       map.observe(obs(STONE, { x, y: -1, z: 0 }, { observedAt }));
       map.observe(obs(AIR, { x, y: 0, z: 0 }, { observedAt }));
       map.observe(obs(AIR, { x, y: 1, z: 0 }, { observedAt }));
     }
-    const result = searchLandRoute(map, request({ to: { x: 1.5, y: 0, z: 0.5 } }), 100_000);
+    const query = request({ to: { x: 1.5, y: 0, z: 0.5 } });
+    expect(searchLandRoute(map, query, 100_000).status).toBe('FOUND');
+
+    // Pending-effect geometry is a more specific fact than a plain evidence gap,
+    // so the boundary must stay distinguishable from UNKNOWN.
+    for (let y = -1; y <= 1; y++) map.invalidatePendingEffect('overworld', { x: 1, y, z: 0 });
+    const result = searchLandRoute(map, query, 100_000);
     expect(result.status).toBe('INSUFFICIENT_EVIDENCE');
     expect(result.boundaries.find((entry) => entry.status === 'STALE' && entry.to.x === 1.5)?.supportColumn)
-      .toEqual({ minY: -5, maxY: 1 });
+      .toEqual({ minY: -5, maxY: 2 });
   });
 
   it('reports the support cells scanned from fractional feet and keeps a separate copy in the prefix', () => {
@@ -374,20 +380,20 @@ describe('bounded voxel land search', () => {
     expect(partial.boundaries).toHaveLength(0);
   });
 
-  it('plans remembered geometry across sessions without refreshing or changing any source evidence', () => {
+  it('plans geometry from an older session in both evidence modes without refreshing or changing any source evidence', () => {
     const map = terrain(flat());
     map.beginSession('s2');
     const before = map.checkpointSnapshot();
     const current = searchLandRoute(map, request({ sessionId: 's2' }), 1000000);
-    expect(current.status).toBe('INSUFFICIENT_EVIDENCE');
-    expect(current.boundaries.some((entry) => entry.status === 'STALE')).toBe(true);
+    expect(current.status).toBe('FOUND');
+    expect(current.stats.staleReads).toBe(0);
     const remembered = searchLandRoute(map, request({ sessionId: 's2', evidenceMode: 'remembered' }), 1000000);
     expect(remembered.status).toBe('FOUND');
     expect(remembered.assurance).toBe('historical_geometry');
     expect(remembered.executable).toBe(false);
-    expect(remembered.stats.staleReads).toBeGreaterThan(0);
+    expect(remembered.stats.staleReads).toBe(0);
     expect(map.checkpointSnapshot()).toEqual(before);
-    expect(evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 1000000).status).toBe('STALE');
+    expect(evaluateWalkStep(map, stepQuery({ sessionId: 's2' }), fakeProvider, 1000000).status).toBe('OPEN');
   });
 
   it('does not turn unknown or incomplete headroom into remembered air', () => {
@@ -532,6 +538,8 @@ describe('A* cost and cooperative work', () => {
     const columns = heights.map((height, index) => ({ x: index % 3 - 2, z: Math.floor(index / 3) - 2, height }));
     // Independent finite graph oracle. Every column has full observed clearance;
     // its known support height alone defines these cardinal walk/step/drop edges.
+    // A same-height diagonal walk (cost √2) also needs both corner columns no
+    // higher than the walking feet, because the swept body passes over them.
     const frontier = [{ index: 0, cost: 0 }];
     const best = new Map<number, number>([[0, 0]]);
     let expected = Infinity;
@@ -541,11 +549,20 @@ describe('A* cost and cooperative work', () => {
       if (current.cost !== best.get(current.index)) continue;
       if (current.index === 8) { expected = current.cost; break; }
       const column = columns[current.index]!;
+      const heightAt = (x: number, z: number) => columns.find((entry) => entry.x === x && entry.z === z)?.height;
       columns.forEach((next, index) => {
-        if (Math.abs(next.x - column.x) + Math.abs(next.z - column.z) !== 1) return;
+        const ax = Math.abs(next.x - column.x), az = Math.abs(next.z - column.z);
         const dy = next.height - column.height;
-        if (dy > 1 || dy < -4) return;
-        const cost = current.cost + (dy === 0 ? 1 : 2 + Math.abs(dy));
+        let step: number;
+        if (ax + az === 1) {
+          if (dy > 1.25 || dy < -4) return;
+          step = dy === 0 ? 1 : 2 + Math.abs(dy);
+        } else if (ax === 1 && az === 1) {
+          const corners = [heightAt(next.x, column.z), heightAt(column.x, next.z)];
+          if (dy !== 0 || corners.some((height) => height === undefined || height > column.height)) return;
+          step = Math.SQRT2;
+        } else return;
+        const cost = current.cost + step;
         if (cost >= (best.get(index) ?? Infinity)) return;
         best.set(index, cost);
         frontier.push({ index, cost });
@@ -556,8 +573,8 @@ describe('A* cost and cooperative work', () => {
     const astar = searchLandRoute(map, query, 2000);
     const dijkstra = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
     expect(astar.status).toBe('FOUND');
-    expect(astar.cost).toBe(expected);
-    expect(dijkstra.cost).toBe(expected);
+    expect(astar.cost).toBeCloseTo(expected, 9);
+    expect(dijkstra.cost).toBeCloseTo(expected, 9);
     expect(astar.stats.nodesExpanded).toBeLessThanOrEqual(astar.stats.nodesReached);
   });
 
@@ -609,21 +626,20 @@ describe('A* cost and cooperative work', () => {
     expect(result.transitions).toHaveLength(2);
   });
 
-  it('invalidates a current search when a same-content refresh restores evidence it read as expired', async () => {
+  it('keeps a current search alive when a same-content refresh renews evidence past its validUntil', async () => {
     const map = terrainObserved(flat().map((column) => ({ ...column, observedAt: column.x === 1 ? 1000 : 62_000 })));
     const pending = searchLandRouteAsync(map, request({ maxWorkPerSlice: 1 }), 62_000);
-    // The first support-column read is (1,-5,0); it was already expired at
-    // search time, although the stored freshness flag still says FRESH.
+    // The first support-column read is (1,-5,0); it was past its validUntil at
+    // search time, which no longer ages it, so a same-content refresh changes nothing read.
     const report = map.observe(obs(STONE, { x: 1, y: -5, z: 0 }, { observedAt: 62_000 }));
 
     expect(report.sections[0]!.invalidated).toBe(false);
     const result = await pending;
-    expect(result.status).toBe('INVALIDATED');
-    expect(result.transitions).toEqual([]);
-    expect(result.prefix).toBeUndefined();
+    expect(result.status).toBe('FOUND');
+    expect(result.stats.staleReads).toBe(0);
   });
 
-  it('does not invalidate a fresh cell refresh because another cell in its section is expired', async () => {
+  it('does not invalidate a fresh cell refresh, nor count cells past validUntil as stale reads', async () => {
     const map = terrain(flat());
     flat().forEach(({ x, z }) => {
       for (let y = -1; y <= 2; y++) {
@@ -634,7 +650,7 @@ describe('A* cost and cooperative work', () => {
     map.observe(obs(STONE, { x: 1, y: -1, z: 0 }, { observedAt: 62_001 }));
 
     const result = await pending;
-    expect(result.stats.staleReads).toBeGreaterThan(0);
+    expect(result.stats.staleReads).toBe(0);
     expect(result.status).toBe('FOUND');
   });
 
@@ -790,12 +806,14 @@ describe('constrained corridor expansion', () => {
 });
 
 describe('current-evidence candidate prefix', () => {
-  it('stops at the last current edge before stale evidence and never refreshes timestamps', () => {
+  it('stops at the last current edge before pending-effect evidence and never refreshes timestamps', () => {
     const map = terrainObserved([
       { x: 0, z: 0, height: 0, observedAt: 60000 },
       { x: 1, z: 0, height: 0, observedAt: 60000 },
       { x: 2, z: 0, height: 0, observedAt: 1000 },
     ]);
+    // Evidence past its validUntil does not stop the prefix; a pending effect does.
+    for (let y = -1; y <= 1; y++) map.invalidatePendingEffect('overworld', { x: 2, y, z: 0 });
     const before = map.checkpointSnapshot();
     const result = searchLandRoute(map, request({ to: { x: 2.5, y: 0, z: 0.5 } }), 62000);
     expect(result.status).toBe('INSUFFICIENT_EVIDENCE');

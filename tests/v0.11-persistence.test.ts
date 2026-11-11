@@ -60,7 +60,7 @@ describe('v0.11 voxel + facts persistence', () => {
       const cell = reopened.voxel.cellAt(DIM, -1, 64, 7);
       expect(cell).toMatchObject({
         observed: true,
-        evidence: { freshness: 'STALE' },
+        evidence: { freshness: 'FRESH' }, // a restore does not age evidence
       });
       expect(reopened.facts.places().items.map((fact) => fact.id)).toEqual(['base']);
       expect(reopened.ledger.chunkVisitCount(DIM, 0, 0)).toBe(1);

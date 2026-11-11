@@ -57,6 +57,7 @@ import type {
   WaterRouteQuery,
   WaterValidationLimits,
 } from './types.js';
+import { evidenceStale } from '../observation/freshness.js';
 
 /** Epsilon for treating exact-boundary contact as non-overlap / zero-width gaps as none. */
 const EPS = 1e-9;
@@ -454,13 +455,8 @@ export function evaluateWaterRoute(map: VoxelMap, query: WaterRouteQuery, now: n
       return result;
     };
     if (evidence === undefined) return finish({ kind: 'unobserved', sectionKey, sectionRevision });
-    if (evidence.freshness === 'STALE') return finish({ kind: 'stale', sectionKey, sectionRevision });
-    if (evidence.observation.sessionId !== query.sessionId) {
-      return finish({ kind: 'session', sectionKey, sectionRevision });
-    }
-    if (now > evidence.validUntil) return finish({ kind: 'expired', sectionKey, sectionRevision });
-    // Only evidence still valid at evaluation time bounds the conclusion's validity.
-    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
+    if (evidenceStale(evidence)) return finish({ kind: 'stale', sectionKey, sectionRevision });
+    // Evidence does not age, so it does not bound the conclusion's validity.
     if (!evidence.observation.stateComplete) {
       return finish({ kind: 'incomplete', sectionKey, sectionRevision });
     }

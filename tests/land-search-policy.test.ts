@@ -120,10 +120,11 @@ describe('edge policy integration', () => {
     };
     const result = searchLandRoute(map, request({ edgePolicy: policy }), 2000);
     expect(result.status).toBe('FOUND');
-    expect(result.cost).toBe(4);
+    // Two diagonal walks through the z=1 row.
+    expect(result.cost).toBeCloseTo(2 * Math.SQRT2, 9);
     expect(result.points.some((point) => point.z === 1.5)).toBe(true);
     expect(result.points.at(-1)).toEqual({ x: 2.5, y: 0, z: 0.5 });
-    expect(result.transitions.reduce((sum, transition) => sum + transition.cost, 0)).toBe(4);
+    expect(result.transitions.reduce((sum, transition) => sum + transition.cost, 0)).toBeCloseTo(2 * Math.SQRT2, 9);
     expect(result.policy!.rejectedEdges).toBeGreaterThan(0);
     expect(result.policy!.firstRejection).toMatchObject({
       from: { x: 0.5, y: 0, z: 0.5 },
@@ -152,11 +153,11 @@ describe('edge policy integration', () => {
     const zero = searchLandRoute(map, request({ edgePolicy: policy, heuristic: 'zero' }), 2000);
     expect(astar.status).toBe('FOUND');
     expect(zero.status).toBe('FOUND');
-    expect(astar.cost).toBe(4);
-    expect(zero.cost).toBe(4);
+    expect(astar.cost).toBeCloseTo(2 * Math.SQRT2, 9);
+    expect(zero.cost).toBeCloseTo(2 * Math.SQRT2, 9);
     expect(astar.points.some((point) => point.z === 1.5)).toBe(true);
-    expect(astar.transitions.reduce((sum, transition) => sum + transition.cost, 0)).toBe(astar.cost);
-    expect(zero.transitions.reduce((sum, transition) => sum + transition.cost, 0)).toBe(zero.cost);
+    expect(astar.transitions.reduce((sum, transition) => sum + transition.cost, 0)).toBeCloseTo(astar.cost, 9);
+    expect(zero.transitions.reduce((sum, transition) => sum + transition.cost, 0)).toBeCloseTo(zero.cost, 9);
 
     const sole: LandSearchEdgePolicy = {
       version: 'surcharge-all',
@@ -178,7 +179,8 @@ describe('edge policy integration', () => {
     const result = searchLandRoute(map, request({ edgePolicy: rejectAll }), 2000);
     expect(result.status).toBe('UNSUPPORTED');
     expect(result.reason).toContain('edge policy');
-    expect(result.policy).toMatchObject({ version: 'reject-all', reads: 0, rejectedEdges: 4 });
+    // Four cardinal and four diagonal walks from the start, all geometry-OPEN.
+    expect(result.policy).toMatchObject({ version: 'reject-all', reads: 0, rejectedEdges: 8 });
     expect(result.policy!.firstRejection).toMatchObject({
       from: { x: 0.5, y: 0, z: 0.5 },
       to: { x: 1.5, y: 0, z: 0.5 },

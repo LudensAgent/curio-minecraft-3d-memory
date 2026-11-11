@@ -147,6 +147,26 @@ describe('bounded places paging', () => {
     expect(collected).toEqual(['p1', 'p2', 'p3', 'p4', 'p5']);
   });
 
+  it('reuses the filtered id sequence across pages and rebuilds it after a write', () => {
+    const facts = new InMemoryFactStore();
+    for (const id of ['p1', 'p2', 'p3', 'p4']) facts.upsertPlace(place(id));
+
+    const first = facts.places({ limit: 2 });
+    expect(first.total).toBe(4);
+    expect(first.items.map((item) => item.id)).toEqual(['p1', 'p2']);
+    const second = facts.places({ limit: 2, after: first.nextAfter });
+    expect(second.items.map((item) => item.id)).toEqual(['p3', 'p4']);
+    expect(second.total).toBe(4);
+    expect(second.nextAfter).toBeUndefined();
+
+    facts.markPlaceGone('p2', { observedAt: 200, source: { source: 'vision' } });
+    const live = facts.places({ limit: 10 });
+    expect(live.total).toBe(3);
+    expect(live.items.map((item) => item.id)).toEqual(['p1', 'p3', 'p4']);
+    const all = facts.places({ limit: 10, includeGone: true });
+    expect(all.total).toBe(4);
+  });
+
   it('filters by tag, label and source with an exact total', () => {
     const facts = new InMemoryFactStore();
     facts.upsertPlace(place('base1', { kind: 'base', label: 'home' }));

@@ -32,6 +32,7 @@ import { sectionKeyString } from '../voxel/section.js';
 import type { SectionRef, VoxelMap } from '../voxel/voxel-map.js';
 import type { CollisionShape, CollisionShapeProvider, NeighborCellView, NeighborRead, UnitBox } from './collision-shape.js';
 import type { HazardFact, ObstacleEvidence, Traversability } from './types.js';
+import { evidenceStale } from '../observation/freshness.js';
 
 /** The four passage states plus the capability gap they cannot express. */
 export type StepStatus = Traversability | 'UNSUPPORTED';
@@ -366,6 +367,47 @@ export function evaluateWalkSegment(
   return evaluateGroundedWalkSegment(map, query, to, shapeProvider, now, feetTolerance);
 }
 
+/**
+ * Longest straight walk this evaluator proves in one call: a diagonal cell move
+ * (√2) started anywhere inside the planned start column, plus float slack.
+ */
+export const MAX_WALK_TO_DISTANCE = Math.SQRT2 * 1.5 + 0.01;
+
+/**
+ * Same-height straight walk from the body feet to an explicit endpoint, along any
+ * horizontal bearing (cardinal or diagonal). The body sweep is checked for
+ * collision over every cell it touches, so a diagonal move needs both corner
+ * columns clear; support must overlap a standable face at every instant.
+ * `remembered` evaluates recorded geometry as a candidate, never current proof.
+ */
+export function evaluateWalkTo(
+  map: VoxelMap,
+  query: StepQuery,
+  to: Vec3Like,
+  shapeProvider: CollisionShapeProvider,
+  now: number,
+  options: { feetTolerance?: number; remembered?: boolean } = {},
+): StepEvaluation {
+  const feetTolerance = options.feetTolerance ?? 0;
+  if (![to.x, to.y, to.z, feetTolerance].every(Number.isFinite)) {
+    throw new Error('walk endpoint and feetTolerance must be finite');
+  }
+  if (feetTolerance < 0 || feetTolerance >= 0.5) {
+    throw new Error('walk feetTolerance must be in [0, 0.5)');
+  }
+  if (Math.hypot(to.x - query.body.feet.x, to.z - query.body.feet.z) > MAX_WALK_TO_DISTANCE
+    || Math.abs(to.y - query.body.feet.y) > feetTolerance + EPS) {
+    return {
+      status: 'UNSUPPORTED', from: { ...query.body.feet }, to: { ...to }, mode: 'walk',
+      reason: 'walk endpoint exceeds the supported straight-walk range',
+      problem: { kind: 'unsupported_mode', cells: [], detail: `horizontal distance must be at most ${MAX_WALK_TO_DISTANCE.toFixed(2)} blocks and vertical distance within feetTolerance` },
+      obstacles: [], hazards: [], dependencies: [], sessionId: query.sessionId,
+      computedAt: now, validUntil: Number.POSITIVE_INFINITY,
+    };
+  }
+  return evaluateWalkGeometry(map, query, shapeProvider, now, { to, feetTolerance }, options.remembered === true);
+}
+
 /** Internal measured corridor, including non-walk arrival diagnostics. */
 export function evaluateGroundedWalkSegment(
   map: VoxelMap,
@@ -489,20 +531,11 @@ function evaluateWalkGeometry(
     if (evidence === undefined) {
       return { kind: 'missing', sectionKey, sectionRevision: section.revision };
     }
-    if (!remembered && evidence.freshness === 'STALE') {
+    if (!remembered && evidenceStale(evidence)) {
       return { kind: 'stale', sectionKey, sectionRevision: section.revision };
     }
-    if (!remembered && evidence.observation.sessionId !== query.sessionId) {
-      return { kind: 'session', sectionKey, sectionRevision: section.revision };
-    }
-    if (!remembered && now > evidence.validUntil) {
-      return { kind: 'expired', sectionKey, sectionRevision: section.revision };
-    }
-    // Only evidence that is still valid at evaluation time bounds the conclusion's
-    // validity. Already-stale/expired/session cells are reflected in a STALE result
-    // (or are irrelevant to an OPEN/BLOCKED conclusion) and must not drag `validUntil`
-    // into the past.
-    minValidUntil = Math.min(minValidUntil, evidence.validUntil);
+    // Evidence does not age, so it does not bound the conclusion's validity; a
+    // conclusion is invalidated by section revision / residency changes instead.
     if (!evidence.observation.stateComplete) {
       return { kind: 'incomplete', sectionKey, sectionRevision: section.revision };
     }
