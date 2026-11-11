@@ -19,14 +19,14 @@ Open the local URL printed by Vite (normally `http://127.0.0.1:5174`). The devel
 ## Explore a database
 
 1. Choose or drop a `.sqlite` file.
-2. Choose a world and dimension. The left map shows the stored section directory.
-3. Drag a rectangle on the map, or enter coordinates and a height range. Only that region is decoded and sent to the 3D view.
-4. Orbit, pan, or zoom the 3D view. Select a voxel or fact to inspect the original coordinates, observation time, source, and retained state.
-5. Toggle resource, container, portal, place, historical, and observed-air layers as needed.
+2. Choose a world and dimension in the region panel at the upper left. It opens on import.
+3. Drag a rectangle on its map, or enter coordinates and a height range. Once the region loads, the panel closes and the terrain fills the window.
+4. Open the records and layers panel at the upper left to browse resources, containers, portal endpoints and saved places, or toggle their visibility.
+5. Select a voxel or fact to inspect its coordinates, time and source in the lower-left panel. Open that panel directly for region bounds and counts. Click the same button or press Escape to close a panel.
 
 ## Simulate a 3D A* route
 
-After loading a region, choose **Pick A**, then click a support voxel in the 3D view; choose B the same way. Solid voxels select the feet cell immediately above them, while observed air selects that cell. Coordinates remain editable; adjust Y for slab surfaces. X/Z refer to cell indices, and the simulated body stands at their centers.
+After loading a region, open the redstone route panel at the upper right and choose **Pick A**. The panel closes while you pick A and B on the terrain, then reopens. Solid voxels select the feet cell immediately above them, while observed air selects that cell. You can also enter coordinates or adjust Y for slab surfaces. X/Z refer to cell indices, and the simulated body stands at their centers.
 
 Choose **Start search** to run the library's real `searchLandRoute` in a separate Worker. Dim red dust replays the actual expanded nodes in order; bright red dust connects the final path. Pause, scrub the timeline, or jump to the complete path. The translucent body is an animation, not game control, and playback speed is not search timing.
 

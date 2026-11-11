@@ -10,45 +10,80 @@ if (!app) throw new Error('Missing app container');
 app.innerHTML = `
   <header class="masthead">
     <a class="brand" href="./" aria-label="Curio Voxel Atlas"><span class="brand-mark" aria-hidden="true">▧</span><span>CURIO <span class="brand-divider">/</span> <strong>VOXEL ATLAS</strong><small>空间记忆观察台</small></span></a>
-    <div class="file-toolbar"><span class="file-name" id="file-name">尚未导入数据库</span><button id="clear-file" class="button quiet" disabled>清除文件</button><button id="import-file" class="button primary">导入 SQLite <span aria-hidden="true">↗</span></button><input id="file-input" type="file" accept=".sqlite,.sqlite3,.db,application/vnd.sqlite3" hidden /></div>
+    <div class="file-toolbar">
+      <span class="file-name" id="file-name">尚未导入数据库</span>
+      <button id="clear-file" class="button quiet" disabled>清除文件</button>
+      <button id="import-file" class="button primary">导入 SQLite <span aria-hidden="true">↗</span></button>
+      <input id="file-input" type="file" accept=".sqlite,.sqlite3,.db,application/vnd.sqlite3" hidden />
+    </div>
   </header>
-  <main class="workspace">
-    <aside class="sidebar" aria-label="选择空间区域">
-      <div class="section-heading"><span class="eyebrow">01 / DIRECTORY</span><span class="local-badge"><i></i> 本地读取</span></div>
-      <h1>选择一片记忆</h1>
-      <p class="intro">从已保存区块中框选范围，只展开你想查看的那一部分。</p>
-      <label class="field scope-field">世界 / 维度<select id="scope-select" disabled><option>等待导入文件</option></select></label>
-      <div class="directory-meta" id="directory-meta">文件仅在本地处理，不上传。</div>
-      <canvas id="region-map" class="region-map" aria-label="区块分布：左键框选区域，滚轮缩放，右键或 Shift 拖动平移"></canvas>
-      <div class="map-key"><span><i class="density-key"></i> 已保存区块</span><span><i class="selection-key"></i> 选区</span></div>
-      <p class="map-help">左键框选 · 滚轮缩放 · 右键平移</p>
-      <form id="region-form">
-        <div class="coordinate-fields"><label class="field">中心 X<input id="center-x" type="number" step="1" value="0" required /></label><label class="field">中心 Z<input id="center-z" type="number" step="1" value="0" required /></label><label class="field">半径 / 格<input id="radius" type="number" min="8" max="96" step="1" value="24" required /></label></div>
-        <div class="height-fields"><label class="field">最低 Y<input id="min-y" type="number" step="1" value="48" required /></label><span aria-hidden="true">—</span><label class="field">最高 Y<input id="max-y" type="number" step="1" value="80" required /></label></div>
-        <div id="selection-bounds" class="selection-bounds">尚未选择区域</div>
-        <button id="load-region" class="button primary full" disabled>加载选区 <span aria-hidden="true">→</span></button>
-      </form>
-      <section class="facts-panel" aria-labelledby="facts-title"><div class="section-heading"><h2 id="facts-title">本区记录</h2><span id="facts-count" class="mono">0</span></div><div id="facts-list" class="facts-list"><p class="muted">加载区域后显示资源、容器和地点。</p></div></section>
-      <details class="read-notes"><summary>关于已保存数据</summary><p>只读取所选 SQLite 文件。若运行中的数据库还有 WAL 文件，请先使用一致性备份或已完成 checkpoint 的副本。空间库保存容器位置与身份，不包含物品库存。</p><p>首次导入将文件流式复制到浏览器本地存储；之后按选区读取。清除文件会移除本页面的导入副本。</p></details>
+  <main class="workspace" aria-label="体素地图">
+    <div class="viewport-wrap">
+      <div id="scene" class="scene" aria-label="三维体素视图"></div>
+      <div id="empty-view" class="empty-view">
+        <h1 id="empty-title">导入空间数据库</h1>
+        <p id="empty-message">拖入已保存的 SQLite 文件，然后选择要查看的区域。</p>
+        <button class="button light" id="empty-import">选择数据库</button>
+      </div>
+      <div id="region-busy" class="region-busy" hidden><span class="spinner" aria-hidden="true"></span><span>正在读取所选区域…</span></div>
+    </div>
+    <aside class="atlas-tools" aria-label="地图工具">
+      <div class="atlas-tool-buttons">
+        <button type="button" class="float-toggle" id="directory-toggle" aria-controls="directory-panel" aria-expanded="false">选区</button>
+        <button type="button" class="float-toggle" id="facts-toggle" aria-controls="facts-panel" aria-expanded="false">记录与图层</button>
+      </div>
+      <section id="directory-panel" class="float-panel directory-panel" aria-labelledby="directory-toggle" hidden>
+        <label class="field scope-field">世界 / 维度<select id="scope-select" disabled><option>等待导入文件</option></select></label>
+        <div class="directory-meta" id="directory-meta">文件仅在本地处理。</div>
+        <canvas id="region-map" class="region-map" aria-label="区块分布：左键框选区域，滚轮缩放，右键或 Shift 拖动平移"></canvas>
+        <div class="map-key"><span><i class="density-key"></i> 已保存区块</span><span><i class="selection-key"></i> 选区</span></div>
+        <p class="map-help">左键框选 · 滚轮缩放 · 右键平移</p>
+        <form id="region-form">
+          <div class="coordinate-fields">
+            <label class="field">中心 X<input id="center-x" type="number" step="1" value="0" required /></label>
+            <label class="field">中心 Z<input id="center-z" type="number" step="1" value="0" required /></label>
+            <label class="field">半径 / 格<input id="radius" type="number" min="8" max="96" step="1" value="24" required /></label>
+          </div>
+          <div class="height-fields">
+            <label class="field">最低 Y<input id="min-y" type="number" step="1" value="48" required /></label>
+            <span aria-hidden="true">—</span>
+            <label class="field">最高 Y<input id="max-y" type="number" step="1" value="80" required /></label>
+          </div>
+          <div id="selection-bounds" class="selection-bounds">尚未选择区域</div>
+          <button id="load-region" class="button primary full" disabled>加载选区 <span aria-hidden="true">→</span></button>
+        </form>
+        <details class="read-notes"><summary>导入说明</summary><p>请使用一致性备份或已完成 checkpoint 的 SQLite 副本。首次导入会将文件流式复制到浏览器本地存储，之后按选区读取。“清除文件”会删除这份导入副本。</p></details>
+      </section>
+      <section id="facts-panel" class="float-panel facts-panel" aria-labelledby="facts-toggle" hidden>
+        <div class="layers" aria-label="可见图层">
+          <label><input type="checkbox" id="layer-resources" checked /><i class="dot resource" aria-hidden="true"></i>资源点</label>
+          <label><input type="checkbox" id="layer-containers" checked /><i class="dot container" aria-hidden="true"></i>容器</label>
+          <label><input type="checkbox" id="layer-portals" checked /><i class="dot portal" aria-hidden="true"></i>传送门</label>
+          <label><input type="checkbox" id="layer-places" checked /><i class="dot place" aria-hidden="true"></i>记录点</label>
+          <label><input type="checkbox" id="layer-air" />已观测空气</label>
+          <label><input type="checkbox" id="layer-gone" />已消失 / 撤销</label>
+        </div>
+        <div class="section-heading"><h2 id="facts-title">本区记录</h2><span id="facts-count" class="mono">0</span></div>
+        <div id="facts-list" class="facts-list"><p class="muted">加载区域后显示资源、容器和地点。</p></div>
+      </section>
     </aside>
-    <section class="visual-panel" aria-label="三维体素视图">
-      <div class="viewport-header"><div><span class="eyebrow">02 / VOXEL FIELD</span><h2>三维观测</h2></div><div class="view-actions"><button id="fit-view" class="button dark" disabled>居中</button><button id="top-view" class="button dark" disabled>俯视</button></div></div>
-      <div class="layers" aria-label="可见图层">
-        <label><input type="checkbox" id="layer-resources" checked /><i class="dot resource"></i>资源点</label><label><input type="checkbox" id="layer-containers" checked /><i class="dot container"></i>容器</label><label><input type="checkbox" id="layer-portals" checked /><i class="dot portal"></i>传送门</label><label><input type="checkbox" id="layer-places" checked /><i class="dot place"></i>记录点</label><label><input type="checkbox" id="layer-air" />空气</label><label><input type="checkbox" id="layer-gone" />已消失 / 撤销</label>
-      </div>
-      <section class="navigation-panel" id="navigation-panel" aria-label="三维 A* 红石寻路模拟"></section>
-      <div class="viewport-wrap">
-        <div id="scene" class="scene"></div>
-        <div id="empty-view" class="empty-view"><div class="empty-cube" aria-hidden="true"><span></span><span></span><span></span></div><span class="eyebrow">YOUR WORLD, AS REMEMBERED</span><h2>让记忆有形状</h2><p>拖入 SQLite 文件，或从上方导入。<br />在左侧选择区域，体素会在这里展开。</p><button class="button light" id="empty-import">选择数据库</button></div>
-        <div id="region-busy" class="region-busy" hidden><span class="spinner" aria-hidden="true"></span><span>正在读取所选区域…</span></div>
-        <div class="viewport-caption"><span id="loaded-bounds">未加载区域</span><span>拖动旋转 · 右键平移 · 滚轮缩放</span></div>
-      </div>
-      <div class="region-stats" id="region-stats"><span><b>—</b> 体素格</span><span><b>—</b> 非空气</span><span><b>—</b> 记录点</span><span class="stat-note">未知位置不会补成空气或方块</span></div>
-      <section class="inspector" aria-labelledby="inspector-title"><div class="inspector-heading"><span class="eyebrow">03 / INSPECT</span><h2 id="inspector-title">查看一条观测</h2></div><div id="inspector-content" class="inspector-content"><p class="muted">点击三维视图中的体素或标记，查看位置、观测时间和来源。</p></div></section>
-    </section>
+    <div class="navigation-float">
+      <button type="button" id="navigation-toggle" class="float-toggle" aria-controls="navigation-panel" aria-expanded="false"><i class="redstone-icon" aria-hidden="true"></i><span data-toggle-label>红石寻路</span></button>
+      <section class="float-panel navigation-panel" id="navigation-panel" aria-labelledby="navigation-toggle" hidden></section>
+    </div>
+    <div class="observation-float">
+      <button type="button" id="observation-toggle" class="float-toggle" aria-controls="observation-panel" aria-expanded="false">观测详情</button>
+      <section id="observation-panel" class="float-panel observation-panel" aria-labelledby="observation-toggle" hidden>
+        <div id="loaded-bounds" class="loaded-bounds">未加载区域</div>
+        <div id="file-meta">原始数据库只读</div>
+        <div class="region-stats" id="region-stats"><span><b>—</b> 体素格</span><span><b>—</b> 非空气</span><span><b>—</b> 记录点</span></div>
+        <div class="inspector"><div class="inspector-heading"><h2 id="inspector-title">体素与记录详情</h2></div><div id="inspector-content" class="inspector-content"><p class="muted">点击体素或记录可查看位置、观测时间和来源。</p></div></div>
+      </section>
+    </div>
+    <div class="view-actions"><button id="fit-view" class="button dark" disabled>居中</button><button id="top-view" class="button dark" disabled>俯视</button></div>
   </main>
-  <footer class="status-bar"><span id="status" role="status" aria-live="polite">就绪 · 导入 SQLite 开始浏览</span><span id="file-meta">原始数据库只读</span></footer>
-  <div id="drop-overlay" class="drop-overlay" hidden><div><span class="eyebrow">LOCAL IMPORT</span><strong>松开以导入 SQLite</strong><span>文件留在本地浏览器</span></div></div>
+  <footer class="status-bar"><span id="status" role="status" aria-live="polite">导入 SQLite 开始浏览</span></footer>
+  <div id="drop-overlay" class="drop-overlay" hidden><div><strong>松开以导入 SQLite</strong></div></div>
   <div id="error" class="error-message" role="alert" hidden></div>
 `;
 
@@ -74,6 +109,28 @@ const layerInputs = {
   showPortals: element<HTMLInputElement>('layer-portals'), showPlaces: element<HTMLInputElement>('layer-places'),
   showAir: element<HTMLInputElement>('layer-air'), showGone: element<HTMLInputElement>('layer-gone'),
 };
+
+const panelNames = ['directory', 'facts', 'navigation', 'observation'] as const;
+type PanelName = typeof panelNames[number];
+const panels = panelNames.map(name => ({
+  name,
+  toggle: element<HTMLButtonElement>(`${name}-toggle`),
+  panel: element(`${name}-panel`),
+}));
+let openPanels: PanelName[] = [];
+
+function setPanel(name: PanelName, open: boolean) {
+  const narrow = window.matchMedia('(max-width: 760px)').matches;
+  for (const item of panels) {
+    const bothLeft = (name === 'directory' || name === 'facts') && (item.name === 'directory' || item.name === 'facts');
+    if (item.name !== name && !(open && (bothLeft || narrow))) continue;
+    const expanded = item.name === name && open;
+    item.panel.hidden = !expanded;
+    item.toggle.setAttribute('aria-expanded', String(expanded));
+    openPanels = openPanels.filter(previous => previous !== item.name);
+    if (expanded) openPanels.push(item.name);
+  }
+}
 let summary: DatabaseSummary | null = null;
 let scope: ScopeSummary | null = null;
 let pendingBounds: Bounds | null = null;
@@ -102,12 +159,45 @@ const map = createRegionMap(element<HTMLCanvasElement>('region-map'), rectangle 
   radiusInput.value = String(Math.min(96, Math.max(8, Math.ceil(Math.max(rectangle.maxX - rectangle.minX, rectangle.maxZ - rectangle.minZ) / 2))));
   updateBounds(); void loadRegion();
 });
-try { scene = createVoxelScene(element('scene'), showSelection); }
+try {
+  scene = createVoxelScene(element('scene'), selection => {
+    if (navigation?.select(selection)) return;
+    showSelection(selection);
+    if (selection) setPanel('observation', true);
+  });
+}
 catch (error) { showError(error); }
-navigation = createNavigationPanel(element('navigation-panel'), scene);
+navigation = createNavigationPanel(
+  element('navigation-panel'),
+  scene,
+  element<HTMLButtonElement>('navigation-toggle'),
+  open => setPanel('navigation', open),
+);
+
+for (const item of panels) {
+  item.toggle.addEventListener('click', () => {
+    navigation?.cancelPicking();
+    setPanel(item.name, item.panel.hidden);
+  });
+}
+
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  navigation?.cancelPicking();
+  const last = openPanels.at(-1);
+  const item = panels.find(panel => panel.name === last);
+  if (item) {
+    setPanel(item.name, false);
+    item.toggle.focus();
+  }
+});
 
 function updateAvailability() {
   importButton.disabled = fileBusy; emptyImport.disabled = fileBusy; clearButton.disabled = fileBusy || !summary;
+  const hasScopes = Boolean(summary?.scopes.length);
+  element('empty-title').textContent = hasScopes ? '选择要查看的区域' : '导入空间数据库';
+  element('empty-message').textContent = hasScopes ? '打开选区，在地图上框选，或填写坐标和高度。' : '拖入已保存的 SQLite 文件，然后选择要查看的区域。';
+  emptyImport.textContent = hasScopes ? '打开选区' : '选择数据库';
   scopeSelect.disabled = fileBusy || !summary?.scopes.length; loadButton.disabled = fileBusy || !scope;
   for (const input of [xInput, zInput, radiusInput, minYInput, maxYInput]) input.disabled = fileBusy || !scope;
   fitButton.disabled = !loaded; topButton.disabled = !loaded; busyOverlay.hidden = !regionBusy;
@@ -121,6 +211,8 @@ function emptyRegion(currentScope: ScopeSummary): RegionData {
 
 function resetView(previousScope: ScopeSummary | null = scope) {
   navigation?.setRegion(null);
+  setPanel('navigation', false);
+  setPanel('observation', false);
   if (previousScope) scene?.setData(emptyRegion(previousScope));
   loaded = null; regionBusy = false; emptyView.hidden = false;
   element('loaded-bounds').textContent = '未加载区域';
@@ -135,7 +227,10 @@ function updateBounds() {
 
 function chooseScope(index: number) {
   generation++; clearError(); resetView();
-  scope = summary?.scopes[index] ?? null; pendingBounds = null; map.setScope(scope);
+  scope = summary?.scopes[index] ?? null;
+  pendingBounds = null;
+  if (scope) setPanel('directory', true);
+  map.setScope(scope);
   if (scope) {
     const p = scope.suggestedCenter;
     xInput.value = String(Math.floor(p.x)); zInput.value = String(Math.floor(p.z)); radiusInput.value = '24';
@@ -182,6 +277,7 @@ async function loadRegion() {
     for (const [value, label] of values) { const item = document.createElement('span'), strong = document.createElement('b'); strong.textContent = num(value); item.append(strong, ` ${label}`); stats.append(item); }
     const note = document.createElement('span'); note.className = 'stat-note'; note.textContent = `${num(result.stats.sections)} 个 Section · ${num(result.stats.staleCells)} 格已标过期`; stats.append(note);
     renderFacts(); showSelection(null);
+    setPanel('directory', false);
     status.textContent = result.stats.observedCells || result.markers.length ? '已加载选区 · 点击体素或标记查看原始观测' : '该选区没有已保存的体素或事实记录，请选择其他区域。';
   } catch (error) { if (request === generation) { navigation?.setRegion(loaded); showError(error); } }
   finally { if (request === generation) { regionBusy = false; updateAvailability(); } }
@@ -201,13 +297,19 @@ function renderFacts() {
     const marker = document.createElement('i'); marker.className = `dot ${fact.type}`;
     const name = document.createElement('span'); name.textContent = fact.label || factNames[fact.type];
     const pos = document.createElement('small'); pos.textContent = `${fact.pos.x}, ${fact.pos.y}, ${fact.pos.z}`;
-    button.append(marker, name, pos); button.addEventListener('click', () => showSelection({ type: 'fact', fact })); list.append(button);
+    button.append(marker, name, pos);
+    button.addEventListener('click', () => {
+      navigation?.cancelPicking();
+      setPanel('facts', false);
+      showSelection({ type: 'fact', fact });
+      setPanel('observation', true);
+    });
+    list.append(button);
   }
   if (facts.length > 200) { const note = document.createElement('p'); note.className = 'muted'; note.textContent = `显示前 200 条，共 ${num(facts.length)} 条。缩小选区可继续查看。`; list.append(note); }
 }
 
 function showSelection(selection: ViewerSelection) {
-  navigation?.select(selection);
   const content = element('inspector-content'); content.replaceChildren();
   if (!selection) { element('inspector-title').textContent = '查看一条观测'; const p = document.createElement('p'); p.className = 'muted'; p.textContent = '点击体素、标记或左侧记录，查看坐标、观测时间和来源。'; content.append(p); return; }
   const data = document.createElement('dl'); data.className = 'detail-grid';
@@ -244,7 +346,11 @@ function inputBounds() {
 for (const input of [xInput, zInput, radiusInput, minYInput, maxYInput]) input.addEventListener('input', inputBounds);
 regionForm.addEventListener('submit', event => { event.preventDefault(); if (!pendingBounds) { showError(new Error('请填写有效坐标、8–96 格半径及高度范围。')); return; } void loadRegion(); });
 scopeSelect.addEventListener('change', () => chooseScope(Number(scopeSelect.value)));
-importButton.addEventListener('click', () => fileInput.click()); emptyImport.addEventListener('click', () => fileInput.click());
+importButton.addEventListener('click', () => fileInput.click());
+emptyImport.addEventListener('click', () => {
+  if (summary?.scopes.length) setPanel('directory', true);
+  else fileInput.click();
+});
 fileInput.addEventListener('change', () => { const file = fileInput.files?.[0]; if (file) void importFile(file); });
 clearButton.addEventListener('click', async () => {
   if (fileBusy) return;

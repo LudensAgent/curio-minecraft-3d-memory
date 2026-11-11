@@ -4,7 +4,12 @@ import type { createVoxelScene } from './scene';
 import type { RegionData, Vec3, ViewerSelection } from './types';
 
 /** Owns the simulator controls and cancels work whenever its loaded region changes. */
-export function createNavigationPanel(container: HTMLElement, scene: ReturnType<typeof createVoxelScene> | null) {
+export function createNavigationPanel(
+  container: HTMLElement,
+  scene: ReturnType<typeof createVoxelScene> | null,
+  toggle: HTMLButtonElement,
+  setOpen: (open: boolean) => void,
+) {
   container.innerHTML = `
     <div class="navigation-heading"><h2><i class="redstone-icon" aria-hidden="true"></i> 三维 A* · 红石寻路</h2><span>仅在已加载选区模拟</span></div>
     <div class="navigation-endpoints">
@@ -42,6 +47,7 @@ export function createNavigationPanel(container: HTMLElement, scene: ReturnType<
   const playButton = get<HTMLButtonElement>('#navigation-play');
   const progressInput = get<HTMLInputElement>('#navigation-progress');
   const phase = get('#navigation-phase');
+  const toggleLabel = toggle.querySelector<HTMLElement>('[data-toggle-label]')!;
   const client = createPathfindingClient();
   let region: RegionData | null = null;
   let a: Vec3 | null = null, b: Vec3 | null = null;
@@ -60,6 +66,8 @@ export function createNavigationPanel(container: HTMLElement, scene: ReturnType<
     cancelButton.hidden = !searching;
     runButton.textContent = searching ? '正在搜索…' : '开始寻路';
     container.classList.toggle('is-picking', picking !== null);
+    toggle.toggleAttribute('data-picking', picking !== null);
+    toggleLabel.textContent = picking ? `点选 ${picking} · 取消` : '红石寻路';
   }
 
   function pause() {
@@ -117,8 +125,8 @@ export function createNavigationPanel(container: HTMLElement, scene: ReturnType<
 
   inputs.forEach(input => input.addEventListener('input', () => updatePoint(input.dataset.point as 'A' | 'B')));
   pickButtons.forEach(button => button.addEventListener('click', () => {
-    picking = picking === button.dataset.pick ? null : button.dataset.pick as 'A' | 'B';
-    hint.textContent = picking ? `请在三维视图点击 ${picking} 点的支撑方块（取上方脚格），或打开空气图层直接点选脚格。` : '也可以直接修改 A、B 的脚格坐标；X/Z 为整数，Y 可为半格高度。';
+    picking = button.dataset.pick as 'A' | 'B';
+    setOpen(false);
     availability();
   }));
   mode.addEventListener('change', () => {
@@ -167,6 +175,13 @@ export function createNavigationPanel(container: HTMLElement, scene: ReturnType<
   availability();
 
   return {
+    cancelPicking() {
+      if (!picking) return false;
+      picking = null;
+      hint.textContent = '点选已结束。可继续填写脚格坐标或重新点选。';
+      availability();
+      return true;
+    },
     setRegion(next: RegionData | null) {
       a = b = null; picking = null; inputs.forEach(input => { input.value = ''; });
       clearResult(); region = next;
@@ -176,8 +191,11 @@ export function createNavigationPanel(container: HTMLElement, scene: ReturnType<
       availability();
     },
     select(selection: ViewerSelection) {
-      if (!picking || !selection || !region || searching) return;
-      if (selection.type !== 'cell') { hint.textContent = '请点击体素；资源、容器和区域型记录不一定是可站立的脚格。'; return; }
+      if (!picking || !selection || !region || searching) return false;
+      if (selection.type !== 'cell') {
+        toggleLabel.textContent = `请点选体素 ${picking} · 取消`;
+        return true;
+      }
       const cell = selection.cell;
       const air = /^(?:minecraft:)?(?:air|cave_air|void_air)(?:\[|$)/.test(cell.state);
       const point = { x: cell.x, y: cell.y + (air ? 0 : 1), z: cell.z };
@@ -187,6 +205,8 @@ export function createNavigationPanel(container: HTMLElement, scene: ReturnType<
       picking = selected === 'A' && !b ? 'B' : null;
       hint.textContent = picking ? 'A 点已选定，现在点击 B 点。' : 'A/B 使用脚格坐标。点击“开始寻路”，查看红石搜索与路径回放。';
       availability();
+      if (!picking) setOpen(true);
+      return true;
     },
     dispose() { requestId++; pause(); client.dispose(); },
   };
