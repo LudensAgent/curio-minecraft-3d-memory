@@ -38,7 +38,7 @@ Search has finite time/node/read budgets. Replay retains at most the first 6,000
 
 - SQLite is streamed into a private browser-local OPFS copy, then queried in a Web Worker. The original file is not changed or uploaded to a server. A full file copy is necessary, but the file is not loaded into a single JavaScript buffer.
 - Import reads directory metadata. Section payloads and voxels are decoded for the selected region only. A new selection replaces the previous visible region.
-- A region is bounded to 512 sections, 64 MiB of serialized section payloads, and 200,000 observed cells. Oversized requests return a visible error asking for a smaller region; there is no silent sampling.
+- Open the upper-left region panel and set **加载上限** before loading a selection. The default **较高** preset allows a manual radius of 128 blocks, 768 sections, 96 MiB of serialized section payloads, and 300,000 observed cells. **标准** sets these limits to 96 blocks, 512 sections, 64 MiB, and 200,000 cells. The initial radius is 24 blocks in both presets.
 - Air is known only when backed by a stored observation. Missing cells remain unknown. Stored stale state is shown as history, not refreshed to the present.
 - Facts come from `fact_resources`, `fact_containers`, and `fact_places`. Retired route graphs are not loaded. Area locations remain approximate, and portal endpoints do not imply connectivity.
 - Container anchors do not contain inventory. The viewer exposes saved identity and ledger references without inferring contents.

@@ -2,6 +2,8 @@ import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import { getBit, readCell } from '../../../../src/voxel/palette.ts';
 import { decodeVoxelSectionPayload } from '../../../../src/voxel/serialization.ts';
 import type { VoxelSectionSnapshot } from '../../../../src/voxel/snapshot.ts';
+import { DEFAULT_REGION_LIMIT_PRESET, REGION_LIMITS } from '../region-limits';
+import type { RegionLimitPreset } from '../region-limits';
 import type {
   Bounds,
   ChunkTile,
@@ -19,9 +21,6 @@ import type { WorkerRequest, WorkerResponse } from './protocol';
 const SECTION_SIZE = 16;
 const SECTION_CELL_COUNT = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
 const SECTION_BITMAP_BYTES = SECTION_CELL_COUNT / 8;
-const MAX_REGION_SECTIONS = 512;
-const MAX_REGION_PAYLOAD_BYTES = 64 * 1024 * 1024;
-const MAX_REGION_OBSERVED_CELLS = 200_000;
 const MAX_FACT_CANDIDATES = 20_000;
 const OPFS_DIRECTORY = 'voxel-atlas';
 const SQLITE_HEADER = 'SQLite format 3\u0000';
@@ -480,8 +479,7 @@ function readSummary(
   return { fileName, fileBytes, schemaVersion, scopes };
 }
 
-function validateRegionQuery(raw: RegionQuery): RegionQuery {
-  const candidate: unknown = raw;
+function validateRegionQuery(candidate: unknown): Required<RegionQuery> {
   if (!isRecord(candidate)) {
     throw new ReaderError('invalid_region', '区域查询必须是对象。');
   }
@@ -492,6 +490,10 @@ function validateRegionQuery(raw: RegionQuery): RegionQuery {
   }
   if (typeof rawDimension !== 'string' || rawDimension.trim().length === 0) {
     throw new ReaderError('invalid_region', '区域查询的 dimension 不能为空。');
+  }
+  const limitPreset = candidate.limitPreset === undefined ? DEFAULT_REGION_LIMIT_PRESET : candidate.limitPreset;
+  if (limitPreset !== 'standard' && limitPreset !== 'expanded') {
+    throw new ReaderError('invalid_region', '区域查询的 limitPreset 必须是 standard（标准档）或 expanded（扩展档）。');
   }
   const rawBounds = candidate.bounds;
   if (!isRecord(rawBounds)) {
@@ -508,7 +510,7 @@ function validateRegionQuery(raw: RegionQuery): RegionQuery {
   if (bounds.minX > bounds.maxX || bounds.minY > bounds.maxY || bounds.minZ > bounds.maxZ) {
     throw new ReaderError('invalid_region', '区域查询无效：每个轴的 min 必须小于或等于 max。');
   }
-  return { worldId: rawWorldId, dimension: rawDimension, bounds };
+  return { worldId: rawWorldId, dimension: rawDimension, bounds, limitPreset };
 }
 
 function readQueryInteger(value: unknown, field: string): number {
@@ -533,8 +535,15 @@ interface RegionAccumulator {
   latestObservedAt: number | null;
 }
 
-function readRegion(db: OpfsDatabase, query: RegionQuery): RegionData {
+function capacityHint(preset: RegionLimitPreset, fitsExpanded: boolean): string {
+  return preset === 'standard' && fitsExpanded
+    ? '可在“选区 → 加载上限”选择“较高”，或缩小选区范围。'
+    : '请缩小 XZ 选区或 Y 高度范围后重试。';
+}
+
+function readRegion(db: OpfsDatabase, query: Required<RegionQuery>): RegionData {
   const bounds = query.bounds;
+  const limits = REGION_LIMITS[query.limitPreset];
   const minCx = Math.floor(bounds.minX / SECTION_SIZE);
   const maxCx = Math.floor(bounds.maxX / SECTION_SIZE);
   const minCz = Math.floor(bounds.minZ / SECTION_SIZE);
@@ -563,19 +572,20 @@ function readRegion(db: OpfsDatabase, query: RegionQuery): RegionData {
   if (preflightRow === undefined) {
     throw new ReaderError('read_failed', '无法预检区域大小：数据库未返回统计行。');
   }
-  const sectionCount = readDbCount(preflightRow.sections, '区域区块数');
+  const sectionCount = readDbCount(preflightRow.sections, '区域区块段（Section）数');
   const payloadBytes = readDbCount(preflightRow.payload_bytes, '区域 payload 字节数');
-  if (sectionCount > MAX_REGION_SECTIONS) {
+  if (sectionCount > limits.maxSections) {
     throw new ReaderError(
       'capacity',
-      `所选区域包含 ${sectionCount} 个区块，超过上限 ${MAX_REGION_SECTIONS}。请缩小 XYZ 范围后重试。`,
+      `所选区域包含 ${sectionCount} 个区块段（Section），超过当前档位上限 ${limits.maxSections}。`
+        + capacityHint(query.limitPreset, sectionCount <= REGION_LIMITS.expanded.maxSections),
     );
   }
-  if (payloadBytes > MAX_REGION_PAYLOAD_BYTES) {
+  if (payloadBytes > limits.maxPayloadBytes) {
     throw new ReaderError(
       'capacity',
-      `所选区域的序列化 payload 约 ${formatBytes(payloadBytes)}，超过上限 ${formatBytes(MAX_REGION_PAYLOAD_BYTES)}。`
-        + '请缩小 XYZ 范围后重试。',
+      `所选区域的序列化数据约 ${formatBytes(payloadBytes)}，超过当前档位上限 ${formatBytes(limits.maxPayloadBytes)}。`
+        + capacityHint(query.limitPreset, payloadBytes <= REGION_LIMITS.expanded.maxPayloadBytes),
     );
   }
 
@@ -620,14 +630,15 @@ function readRegion(db: OpfsDatabase, query: RegionQuery): RegionData {
 
 function appendSectionCells(
   row: SectionRow,
-  query: RegionQuery,
+  query: Required<RegionQuery>,
   accumulator: RegionAccumulator,
 ): void {
   const cx = readDbInteger(row.cx, 'spatial_sections.cx');
   const cz = readDbInteger(row.cz, 'spatial_sections.cz');
   const sy = readDbInteger(row.sy, 'spatial_sections.sy');
-  const where = `${query.worldId}/${query.dimension} 区块 (${cx}, ${sy}, ${cz})`;
+  const where = `${query.worldId}/${query.dimension} 区块段（Section）(${cx}, ${sy}, ${cz})`;
   const section = decodeSection(row.payload, where, cx, cz, sy, query.dimension);
+  const { maxObservedCells } = REGION_LIMITS[query.limitPreset];
 
   for (const cell of section.evidence) {
     const index = cell.index;
@@ -656,10 +667,11 @@ function appendSectionCells(
     ) {
       continue;
     }
-    if (accumulator.cells.length >= MAX_REGION_OBSERVED_CELLS) {
+    if (accumulator.cells.length >= maxObservedCells) {
       throw new ReaderError(
         'capacity',
-        `所选区域的已观测格超过上限 ${MAX_REGION_OBSERVED_CELLS}。请缩小 XYZ 范围后重试。`,
+        `所选区域的已观测格超过当前档位上限 ${maxObservedCells}。`
+          + capacityHint(query.limitPreset, accumulator.cells.length + 1 <= REGION_LIMITS.expanded.maxObservedCells),
       );
     }
 
