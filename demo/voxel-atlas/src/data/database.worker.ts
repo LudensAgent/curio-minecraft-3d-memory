@@ -21,7 +21,7 @@ import type { WorkerRequest, WorkerResponse } from './protocol';
 const SECTION_SIZE = 16;
 const SECTION_CELL_COUNT = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
 const SECTION_BITMAP_BYTES = SECTION_CELL_COUNT / 8;
-const MAX_FACT_CANDIDATES = 20_000;
+const MAX_FACT_CANDIDATES = 50_000;
 const OPFS_DIRECTORY = 'voxel-atlas';
 const SQLITE_HEADER = 'SQLite format 3\u0000';
 
