@@ -1,3 +1,5 @@
+import type { RegionLimitPreset } from './region-limits';
+
 export type Vec3 = { x: number; y: number; z: number };
 export type Bounds = { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number };
 export type ViewerCell = {
@@ -43,7 +45,7 @@ export type ScopeSummary = {
   chunks: ChunkTile[];
 };
 export type DatabaseSummary = { fileName: string; fileBytes: number; schemaVersion: number; scopes: ScopeSummary[] };
-export type RegionQuery = { worldId: string; dimension: string; bounds: Bounds };
+export type RegionQuery = { worldId: string; dimension: string; bounds: Bounds; limitPreset?: RegionLimitPreset };
 export type RegionData = {
   query: RegionQuery;
   bounds: Bounds;

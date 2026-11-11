@@ -3,6 +3,7 @@ import { createDatabaseClient } from './data/client';
 import { createVoxelScene } from './scene';
 import { createRegionMap } from './region-map';
 import { createNavigationPanel } from './navigation-panel';
+import { DEFAULT_REGION_LIMIT_PRESET, REGION_LIMITS, type RegionLimitPreset } from './region-limits';
 import type { Bounds, DatabaseSummary, FactMarker, RegionData, ScopeSummary, ViewerSelection } from './types';
 
 const app = document.getElementById('app');
@@ -39,10 +40,12 @@ app.innerHTML = `
         <div class="map-key"><span><i class="density-key"></i> 已保存区块</span><span><i class="selection-key"></i> 选区</span></div>
         <p class="map-help">左键框选 · 滚轮缩放 · 右键平移</p>
         <form id="region-form">
+          <label class="field">加载上限<select id="region-limit-preset" aria-describedby="region-limit-info"><option value="expanded">较高</option><option value="standard">标准</option></select></label>
+          <p class="map-help" id="region-limit-info"></p>
           <div class="coordinate-fields">
             <label class="field">中心 X<input id="center-x" type="number" step="1" value="0" required /></label>
             <label class="field">中心 Z<input id="center-z" type="number" step="1" value="0" required /></label>
-            <label class="field">半径 / 格<input id="radius" type="number" min="8" max="96" step="1" value="24" required /></label>
+            <label class="field">半径 / 格<input id="radius" type="number" min="8" step="1" value="24" required /></label>
           </div>
           <div class="height-fields">
             <label class="field">最低 Y<input id="min-y" type="number" step="1" value="48" required /></label>
@@ -98,6 +101,9 @@ const clearButton = element<HTMLButtonElement>('clear-file');
 const emptyImport = element<HTMLButtonElement>('empty-import');
 const scopeSelect = element<HTMLSelectElement>('scope-select');
 const regionForm = element<HTMLFormElement>('region-form');
+const limitSelect = element<HTMLSelectElement>('region-limit-preset');
+let limitPreset: RegionLimitPreset = DEFAULT_REGION_LIMIT_PRESET;
+limitSelect.value = limitPreset;
 const loadButton = element<HTMLButtonElement>('load-region');
 const xInput = element<HTMLInputElement>('center-x'), zInput = element<HTMLInputElement>('center-z'), radiusInput = element<HTMLInputElement>('radius');
 const minYInput = element<HTMLInputElement>('min-y'), maxYInput = element<HTMLInputElement>('max-y');
@@ -134,6 +140,7 @@ function setPanel(name: PanelName, open: boolean) {
 let summary: DatabaseSummary | null = null;
 let scope: ScopeSummary | null = null;
 let pendingBounds: Bounds | null = null;
+let boxSelected = false;
 let loaded: RegionData | null = null;
 let fileBusy = false, regionBusy = false, generation = 0;
 let scene: ReturnType<typeof createVoxelScene> | null = null;
@@ -155,8 +162,8 @@ const map = createRegionMap(element<HTMLCanvasElement>('region-map'), rectangle 
   const minY = minYInput.valueAsNumber, maxY = maxYInput.valueAsNumber;
   if (!Number.isInteger(minY) || !Number.isInteger(maxY) || minY > maxY) { showError(new Error('请填写有效的 Y 高度范围。')); return; }
   pendingBounds = { ...rectangle, minY, maxY };
+  boxSelected = true;
   xInput.value = String(Math.floor((rectangle.minX + rectangle.maxX) / 2)); zInput.value = String(Math.floor((rectangle.minZ + rectangle.maxZ) / 2));
-  radiusInput.value = String(Math.min(96, Math.max(8, Math.ceil(Math.max(rectangle.maxX - rectangle.minX, rectangle.maxZ - rectangle.minZ) / 2))));
   updateBounds(); void loadRegion();
 });
 try {
@@ -199,6 +206,7 @@ function updateAvailability() {
   element('empty-message').textContent = hasScopes ? '打开选区，在地图上框选，或填写坐标和高度。' : '拖入已保存的 SQLite 文件，然后选择要查看的区域。';
   emptyImport.textContent = hasScopes ? '打开选区' : '选择数据库';
   scopeSelect.disabled = fileBusy || !summary?.scopes.length; loadButton.disabled = fileBusy || !scope;
+  limitSelect.disabled = fileBusy || regionBusy;
   for (const input of [xInput, zInput, radiusInput, minYInput, maxYInput]) input.disabled = fileBusy || !scope;
   fitButton.disabled = !loaded; topButton.disabled = !loaded; busyOverlay.hidden = !regionBusy;
   loadButton.textContent = regionBusy ? '重新加载选区 →' : '加载选区 →';
@@ -221,12 +229,17 @@ function resetView(previousScope: ScopeSummary | null = scope) {
 }
 
 function updateBounds() {
+  if (boxSelected && pendingBounds) {
+    const span = Math.max(pendingBounds.maxX - pendingBounds.minX, pendingBounds.maxZ - pendingBounds.minZ);
+    radiusInput.value = String(Math.min(REGION_LIMITS[limitPreset].maxRadius, Math.max(8, Math.ceil(span / 2))));
+  }
   element('selection-bounds').textContent = pendingBounds ? boundsLabel(pendingBounds) : '尚未选择区域';
   map.setSelection(pendingBounds);
 }
 
 function chooseScope(index: number) {
   generation++; clearError(); resetView();
+  boxSelected = false;
   scope = summary?.scopes[index] ?? null;
   pendingBounds = null;
   if (scope) setPanel('directory', true);
@@ -265,7 +278,7 @@ async function loadRegion() {
   if (!scope || !pendingBounds || fileBusy) return;
   const request = ++generation;
   navigation?.setRegion(null);
-  const query = { worldId: scope.worldId, dimension: scope.dimension, bounds: { ...pendingBounds } };
+  const query = { worldId: scope.worldId, dimension: scope.dimension, bounds: { ...pendingBounds }, limitPreset };
   clearError(); regionBusy = true; status.textContent = `读取选区 · ${boundsLabel(query.bounds)}`; updateAvailability();
   try {
     const result = await client.loadRegion(query);
@@ -339,12 +352,26 @@ function showSelection(selection: ViewerSelection) {
 
 function inputBounds() {
   if (!scope) return;
+  boxSelected = false;
   const x = xInput.valueAsNumber, z = zInput.valueAsNumber, radius = radiusInput.valueAsNumber, minY = minYInput.valueAsNumber, maxY = maxYInput.valueAsNumber;
-  if (![x, z, radius, minY, maxY].every(Number.isInteger) || radius < 8 || radius > 96 || minY > maxY) { pendingBounds = null; updateBounds(); return; }
+  if (![x, z, radius, minY, maxY].every(Number.isInteger) || radius < 8 || radius > REGION_LIMITS[limitPreset].maxRadius || minY > maxY) { pendingBounds = null; updateBounds(); return; }
   pendingBounds = { minX: x - radius, maxX: x + radius, minZ: z - radius, maxZ: z + radius, minY, maxY }; updateBounds();
 }
+function updateLimitDisplay() {
+  const limits = REGION_LIMITS[limitPreset];
+  radiusInput.max = String(limits.maxRadius);
+  element('region-limit-info').textContent = `手动半径 ≤ ${limits.maxRadius} 格 · ${limits.maxSections} 个 Section · ${limits.maxPayloadBytes / (1024 * 1024)} MiB · ${num(limits.maxObservedCells)} 个已观测格`;
+}
+updateLimitDisplay();
+limitSelect.addEventListener('change', () => {
+  limitPreset = limitSelect.value === 'standard' ? 'standard' : 'expanded';
+  updateLimitDisplay();
+  if (boxSelected) updateBounds(); else inputBounds();
+  clearError();
+  if (scope) status.textContent = '加载上限已更新，点击“加载选区”应用。';
+});
 for (const input of [xInput, zInput, radiusInput, minYInput, maxYInput]) input.addEventListener('input', inputBounds);
-regionForm.addEventListener('submit', event => { event.preventDefault(); if (!pendingBounds) { showError(new Error('请填写有效坐标、8–96 格半径及高度范围。')); return; } void loadRegion(); });
+regionForm.addEventListener('submit', event => { event.preventDefault(); if (!pendingBounds) { showError(new Error(`请填写有效坐标、8–${radiusInput.max} 格半径及高度范围。`)); return; } void loadRegion(); });
 scopeSelect.addEventListener('change', () => chooseScope(Number(scopeSelect.value)));
 importButton.addEventListener('click', () => fileInput.click());
 emptyImport.addEventListener('click', () => {
