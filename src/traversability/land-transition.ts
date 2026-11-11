@@ -14,7 +14,7 @@
  * Supported geometric subsets and their canonical corridors:
  *
  * - `step`: one-axis horizontal move of one block with a positive rise of at
- *   most one block. Lift vertically at the original XZ, then translate at the
+ *   most `MAX_STEP_RISE` (one jump). Lift vertically at the original XZ, then translate at the
  *   target foot height. Both legs must be continuously collision-free; start
  *   and destination must be standable.
  * - `drop`: one-axis horizontal move of one block to a lower target column.
@@ -53,6 +53,7 @@ import type {
 } from './collision-shape.js';
 import {
   LAND_EPS,
+  MAX_STEP_RISE,
   bodyAabb,
   cellsInAabbBounded,
   jumpEnvelope,
@@ -93,8 +94,9 @@ export interface LandTransitionQuery {
   transition: LandTransition;
   /**
    * Execution-only step/drop start from the original unit route edge. The actual
-   * body/from may differ by at most 0.12 horizontally and 0.05 vertically; the
-   * endpoint is unchanged and collision/support still use the actual from.
+   * body/from must stand in the same block column as plannedFrom, within 0.05
+   * vertically; the endpoint is unchanged and collision/support still use the
+   * actual from, so the corrected corridor is proved, not assumed.
    * Omit for the strict unit transition contract used by route search.
    */
   plannedFrom?: Vec3Like;
@@ -1012,9 +1014,9 @@ function evaluateLandGeometry(
     if (query.plannedFrom !== undefined) {
       if (transition.kind !== 'step' && transition.kind !== 'drop') {
         unsupportedRange.push('plannedFrom correction is only supported for step/drop');
-      } else if (Math.hypot(from.x - query.plannedFrom.x, from.z - query.plannedFrom.z) > 0.12 + LAND_EPS
+      } else if (Math.floor(from.x) !== Math.floor(query.plannedFrom.x) || Math.floor(from.z) !== Math.floor(query.plannedFrom.z)
         || Math.abs(from.y - query.plannedFrom.y) > 0.05 + LAND_EPS) {
-        unsupportedRange.push('actual start exceeds the 0.12 horizontal / 0.05 vertical correction tolerance');
+        unsupportedRange.push('actual start must stand in the planned start column within 0.05 vertically');
       }
       if (unsupportedRange.length > 0) return finalize();
     }
@@ -1025,8 +1027,8 @@ function evaluateLandGeometry(
           unsupportedRange.push(unsupported);
           break;
         }
-        if (!(to.y - from.y > LAND_EPS && to.y - from.y <= 1 + LAND_EPS)) {
-          unsupportedRange.push('actual step rise must be positive and at most one block');
+        if (!(to.y - from.y > LAND_EPS && to.y - from.y <= MAX_STEP_RISE + LAND_EPS)) {
+          unsupportedRange.push(`actual step rise must be positive and at most ${MAX_STEP_RISE} blocks`);
           break;
         }
         const targetXz = { x: from.x, y: to.y, z: from.z };
@@ -1292,8 +1294,8 @@ function stepRangeProblem(from: Vec3Like, to: Vec3Like): string | null {
   if (!((xUnit && zZero) || (zUnit && xZero))) {
     return 'step must move exactly one block along one horizontal axis';
   }
-  if (!(dy > LAND_EPS && dy <= 1 + LAND_EPS)) {
-    return 'step rise must be positive and at most one explicit implementation block';
+  if (!(dy > LAND_EPS && dy <= MAX_STEP_RISE + LAND_EPS)) {
+    return `step rise must be positive and at most ${MAX_STEP_RISE} blocks (one jump)`;
   }
   return null;
 }

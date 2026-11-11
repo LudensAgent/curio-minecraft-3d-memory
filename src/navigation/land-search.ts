@@ -11,7 +11,8 @@ import {
   resolveLandLimits,
 } from '../traversability/land-transition.js';
 import type { LandLimits, LandRules } from '../traversability/land-transition.js';
-import { evaluateRememberedWalkStep, evaluateWalkStep } from '../traversability/step.js';
+import { evaluateRememberedWalkStep, evaluateWalkStep, evaluateWalkTo } from '../traversability/step.js';
+import { MAX_STEP_RISE } from '../traversability/land-geometry.js';
 import type { BodyContext } from '../traversability/step.js';
 import type { HazardFact } from '../traversability/types.js';
 import { blockToSection, cellIndex } from '../voxel/coordinates.js';
@@ -37,7 +38,8 @@ export type LandSearchStatus =
 export type LandSearchBoundaryStatus = 'BLOCKED' | 'UNKNOWN' | 'STALE' | 'UNSUPPORTED' | 'INCOMPLETE';
 export type LandSearchBudget = 'nodes' | 'edges' | 'reads' | 'sections' | 'points' | 'time' | 'geometry';
 export const DEFAULT_LAND_SEARCH_MAX_NODES = 2048;
-export const DEFAULT_LAND_SEARCH_MAX_EDGES = 8192;
+/** Eight walk neighbours plus step/drop candidates per node; keeps roughly the old node reach. */
+export const DEFAULT_LAND_SEARCH_MAX_EDGES = 16384;
 
 /**
  * Finite-width delegation limit around an observed start/corridor line. It is
@@ -255,6 +257,13 @@ export interface LandSearchResult {
 
 const EPS = 1e-9;
 const DIRECTIONS = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+/**
+ * Same-height diagonal walks. The swept body must clear both corner columns and
+ * keep continuous support, so a diagonal never cuts a blocked or unknown corner.
+ */
+const DIAGONALS = [[1, 1], [1, -1], [-1, 1], [-1, -1]] as const;
+/** Exact 8-neighbour lattice distance for unit cardinal and √2 diagonal costs. */
+const octile = (dx: number, dz: number): number => Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz);
 
 class LandSearchGeometryBudgetExceeded extends Error {}
 /** Private sentinel: policy reads hit work/readability limits or stop state. */
@@ -601,7 +610,7 @@ function* searchChunks(
     const half = body.width / 2;
     const surfaces = new Set<number>();
     const gaps = new Set<LandSearchBoundaryStatus>();
-    const minY = Math.floor(fromY - maxDrop) - 1, maxY = Math.ceil(fromY + 1);
+    const minY = Math.floor(fromY - maxDrop) - 1, maxY = Math.ceil(fromY + MAX_STEP_RISE);
     const scan = { surfaces, gaps, minY, maxY };
     // Candidate heights come from actual support faces under the body footprint.
     // No top-of-column shortcut merges a bridge with the cave below it.
@@ -622,7 +631,7 @@ function* searchChunks(
               }
               for (const face of resolution.shape.supportFaces) {
                 const y = by + face.top;
-                if (y < fromY - maxDrop - EPS || y > fromY + 1 + EPS) continue;
+                if (y < fromY - maxDrop - EPS || y > fromY + MAX_STEP_RISE + EPS) continue;
                 if (bx + face.maxX <= x - half + EPS || bx + face.minX >= x + half - EPS
                   || bz + face.maxZ <= z - half + EPS || bz + face.minZ >= z + half - EPS) continue;
                 surfaces.add(Math.abs(y - fromY) <= EPS ? fromY : y);
@@ -804,7 +813,7 @@ function* searchChunks(
   // Jumps can travel more than two horizontal blocks for cost two, so use h=0.
   const verticalHeuristic = heuristicMode === 'distance' && goalMetric === '3d';
   const heuristic = (point: Vec3Like): number => heuristicMode === 'zero' || allowed.has('jump') ? 0
-    : Math.max(0, Math.abs(coordinateDelta(point.x, target.x)) + Math.abs(coordinateDelta(point.z, target.z))
+    : Math.max(0, octile(Math.abs(coordinateDelta(point.x, target.x)), Math.abs(coordinateDelta(point.z, target.z)))
       + (verticalHeuristic ? Math.abs(coordinateDelta(point.y, target.y)) : 0)
       - (arrival.kind === 'near' ? Math.sqrt(verticalHeuristic ? 3 : 2) * arrival.radius : 0));
   const keyOf = (point: Vec3Like): string => `${Math.round(point.x - start.x)},${point.y},${Math.round(point.z - start.z)}`;
@@ -857,6 +866,9 @@ function* searchChunks(
         to: Vec3Like,
         dx: number,
         dz: number,
+        // Diagonal candidates are shortcuts: the cardinal edges already report the
+        // frontier, so a non-OPEN diagonal adds no boundary or blocker of its own.
+        quiet = false,
       ): Generator<void, 'ok' | 'stop', void> {
         if (!allowed.has(kind)) {
           // Keep the diagnostic boundary, but never turn an authorization /
@@ -904,7 +916,11 @@ function* searchChunks(
         };
         const rules = { ...request.rules, shapeProvider };
         stats.edgesEvaluated += 1;
-        const evaluation = kind === 'walk'
+        const diagonal = kind === 'walk' && dx !== 0 && dz !== 0;
+        const evaluation = diagonal
+          ? evaluateWalkTo(map, { ...scope, mode: 'walk', direction: { axis: 'x', sign: dx as 1 | -1 } }, to, shapeProvider, now,
+            { remembered: evidenceMode === 'remembered' })
+          : kind === 'walk'
           ? evidenceMode === 'remembered'
             ? evaluateRememberedWalkStep(map, { ...scope, mode: 'walk', direction: dx === 0 ? { axis: 'z', sign: dz as 1 | -1 } : { axis: 'x', sign: dx as 1 | -1 } }, shapeProvider, now)
             : evaluateWalkStep(map, { ...scope, mode: 'walk', direction: dx === 0 ? { axis: 'z', sign: dz as 1 | -1 } : { axis: 'x', sign: dx as 1 | -1 } }, shapeProvider, now)
@@ -927,11 +943,13 @@ function* searchChunks(
         if (status !== 'OPEN') {
           const reason = typeof evaluation.reason === 'string'
             ? evaluation.reason : evaluation.reason?.detail ?? 'transition geometry is not available';
-          boundary(node.point, to, status, reason);
-          noteBlocker(node, to, status, reason);
+          if (!quiet) {
+            boundary(node.point, to, status, reason);
+            noteBlocker(node, to, status, reason);
+          }
           return 'ok';
         }
-        let cost = kind === 'walk' ? 1 : kind === 'ladder' ? 1 : 2 + Math.abs(dy);
+        let cost = diagonal ? Math.SQRT2 : kind === 'walk' ? 1 : kind === 'ladder' ? 1 : 2 + Math.abs(dy);
         if (edgePolicy !== undefined) {
           if (stopped() !== null) return 'stop';
           policyReadsThisEdge = 0;
@@ -1035,6 +1053,21 @@ function* searchChunks(
             const kind: LandSearchKind = Math.abs(dy) <= EPS ? 'walk' : dy > 0 ? 'step' : 'drop';
             const to = { x, y, z };
             const outcome = yield* considerEdge(kind, to, dx, dz);
+            if (outcome === 'stop') break search;
+          }
+        }
+        if (allowed.has('walk') && fromInCorridor) {
+          for (const [dx, dz] of DIAGONALS) {
+            const to = { x: node.point.x + dx, y: node.point.y, z: node.point.z + dz };
+            if (!corridorContains(to)) {
+              stats.corridorSkipped += 1;
+              continue;
+            }
+            // Only a recorded same-height support face makes a diagonal worth evaluating.
+            const { surfaces } = yield* columnSurfaces(to.x, to.z, node.point.y);
+            if (stopped() !== null) break search;
+            if (!surfaces.has(node.point.y)) continue;
+            const outcome = yield* considerEdge('walk', to, dx, dz, true);
             if (outcome === 'stop') break search;
           }
         }

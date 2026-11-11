@@ -17,6 +17,12 @@ import type { UnitBox } from './collision-shape.js';
 
 /** Tolerance for treating exact boundary contact as non-overlap and touching intervals as continuous. */
 export const LAND_EPS = 1e-9;
+/**
+ * Highest feet rise a standing body clears with one vanilla jump (apex ≈ 1.2522
+ * blocks). Partial-height starts such as dirt paths (15/16) or farmland reach a
+ * full block above with a rise of 1.0625, which a jump does clear.
+ */
+export const MAX_STEP_RISE = 1.25;
 
 export interface Aabb {
   minX: number;

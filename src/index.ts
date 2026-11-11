@@ -112,7 +112,10 @@ export {
   evaluateLandTransition,
   evaluateWalkSegment,
   evaluateWalkStep,
+  evaluateWalkTo,
   LandRouteVerifier,
+  MAX_STEP_RISE,
+  MAX_WALK_TO_DISTANCE,
   resolveLandLimits,
   TraversabilityCache,
 } from './traversability/index.js';

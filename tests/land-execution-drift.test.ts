@@ -63,9 +63,16 @@ describe.each(['walk', 'step', 'drop'] as const)('measured %s execution corridor
     expect(stale.evaluate().status).toBe('STALE');
   });
 
-  it('refuses a residual outside the supported correction distance', () => {
+  it('refuses a residual outside the supported correction range', () => {
     const { evaluate, plannedFrom } = fixture(kind);
-    expect(evaluate({ ...plannedFrom, x: plannedFrom.x - 0.13 }).status).toBe('UNSUPPORTED');
+    if (kind === 'walk') {
+      expect(evaluate({ ...plannedFrom, x: plannedFrom.x - 0.13 }).status).toBe('UNSUPPORTED');
+      return;
+    }
+    // step/drop: any start inside the planned start column is proved from the actual
+    // feet; a start in another column is not this edge.
+    expect(evaluate({ ...plannedFrom, x: 0.05 }).status).toBe('OPEN');
+    expect(evaluate({ ...plannedFrom, x: -0.05 }).status).toBe('UNSUPPORTED');
   });
 });
 
@@ -80,14 +87,15 @@ it('keeps strict unit step/drop semantics unless the original planned start is e
   }
 });
 
-it('requires actual support and retains the one-block step rise limit with plannedFrom', () => {
+it('requires actual support and keeps the vertical correction tolerance with plannedFrom', () => {
   for (const kind of ['step', 'drop'] as const) {
     const { evaluate, plannedFrom } = fixture(kind);
     expect(evaluate({ ...plannedFrom, y: plannedFrom.y + 0.03 }).status).toBe('BLOCKED');
     expect(evaluate({ ...plannedFrom, y: plannedFrom.y + 0.06 }).status).toBe('UNSUPPORTED');
   }
+  // A start 0.03 below the planned feet has no support there; the rise stays within one jump.
   const { evaluate, plannedFrom } = fixture('step');
-  expect(evaluate({ ...plannedFrom, y: plannedFrom.y - 0.03 }).status).toBe('UNSUPPORTED');
+  expect(evaluate({ ...plannedFrom, y: plannedFrom.y - 0.03 }).status).toBe('BLOCKED');
 });
 
 it('rejects a non-unit planned edge and does not grant jump/ladder correction support', () => {

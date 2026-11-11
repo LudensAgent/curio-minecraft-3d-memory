@@ -354,7 +354,7 @@ describe('bounded voxel land search', () => {
     const result = searchLandRoute(map, request({ to: { x: 1.5, y: 0, z: 0.5 } }), 100_000);
     expect(result.status).toBe('INSUFFICIENT_EVIDENCE');
     expect(result.boundaries.find((entry) => entry.status === 'STALE' && entry.to.x === 1.5)?.supportColumn)
-      .toEqual({ minY: -5, maxY: 1 });
+      .toEqual({ minY: -5, maxY: 2 });
   });
 
   it('reports the support cells scanned from fractional feet and keeps a separate copy in the prefix', () => {
@@ -532,6 +532,8 @@ describe('A* cost and cooperative work', () => {
     const columns = heights.map((height, index) => ({ x: index % 3 - 2, z: Math.floor(index / 3) - 2, height }));
     // Independent finite graph oracle. Every column has full observed clearance;
     // its known support height alone defines these cardinal walk/step/drop edges.
+    // A same-height diagonal walk (cost √2) also needs both corner columns no
+    // higher than the walking feet, because the swept body passes over them.
     const frontier = [{ index: 0, cost: 0 }];
     const best = new Map<number, number>([[0, 0]]);
     let expected = Infinity;
@@ -541,11 +543,20 @@ describe('A* cost and cooperative work', () => {
       if (current.cost !== best.get(current.index)) continue;
       if (current.index === 8) { expected = current.cost; break; }
       const column = columns[current.index]!;
+      const heightAt = (x: number, z: number) => columns.find((entry) => entry.x === x && entry.z === z)?.height;
       columns.forEach((next, index) => {
-        if (Math.abs(next.x - column.x) + Math.abs(next.z - column.z) !== 1) return;
+        const ax = Math.abs(next.x - column.x), az = Math.abs(next.z - column.z);
         const dy = next.height - column.height;
-        if (dy > 1 || dy < -4) return;
-        const cost = current.cost + (dy === 0 ? 1 : 2 + Math.abs(dy));
+        let step: number;
+        if (ax + az === 1) {
+          if (dy > 1.25 || dy < -4) return;
+          step = dy === 0 ? 1 : 2 + Math.abs(dy);
+        } else if (ax === 1 && az === 1) {
+          const corners = [heightAt(next.x, column.z), heightAt(column.x, next.z)];
+          if (dy !== 0 || corners.some((height) => height === undefined || height > column.height)) return;
+          step = Math.SQRT2;
+        } else return;
+        const cost = current.cost + step;
         if (cost >= (best.get(index) ?? Infinity)) return;
         best.set(index, cost);
         frontier.push({ index, cost });
@@ -556,8 +567,8 @@ describe('A* cost and cooperative work', () => {
     const astar = searchLandRoute(map, query, 2000);
     const dijkstra = searchLandRoute(map, { ...query, heuristic: 'zero' }, 2000);
     expect(astar.status).toBe('FOUND');
-    expect(astar.cost).toBe(expected);
-    expect(dijkstra.cost).toBe(expected);
+    expect(astar.cost).toBeCloseTo(expected, 9);
+    expect(dijkstra.cost).toBeCloseTo(expected, 9);
     expect(astar.stats.nodesExpanded).toBeLessThanOrEqual(astar.stats.nodesReached);
   });
 
