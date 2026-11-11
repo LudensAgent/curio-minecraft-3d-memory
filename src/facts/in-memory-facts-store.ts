@@ -55,9 +55,13 @@ import {
   assertResource,
 } from './validation.js';
 
+/** Distinct filtered id sequences kept per store; each entry is id strings only. */
+const QUERY_CACHE_LIMIT = 16;
+
 export class InMemoryFactStore {
   private readonly maxQueryLimit: number;
   private revisionField = 0;
+  private readonly queryCache = new Map<string, { revision: number; ids: string[] }>();
 
   /**
    * Local write revision: advanced only by an insert/update that actually
@@ -397,6 +401,7 @@ export class InMemoryFactStore {
   places(query: FactQuery = {}): FactPage<PlaceFact> {
     const includeGone = query.includeGone ?? false;
     return this.page(
+      queryCacheKey('place', query),
       this.placeOrder,
       this.placeKeysById,
       this.placesByKey,
@@ -412,6 +417,7 @@ export class InMemoryFactStore {
     const includeGone = query.includeGone ?? false;
     const cell = query.sourceCell;
     return this.page(
+      queryCacheKey('resource', query),
       this.resourceOrder,
       this.resourceKeysById,
       this.resourcesByKey,
@@ -428,6 +434,7 @@ export class InMemoryFactStore {
   containers(query: FactQuery = {}): FactPage<ContainerAnchorFact> {
     const includeGone = query.includeGone ?? false;
     return this.page(
+      queryCacheKey('container', query),
       this.containerOrder,
       this.containerKeysById,
       this.containersByKey,
@@ -522,6 +529,7 @@ export class InMemoryFactStore {
       insertSorted(containerOrder, record.id);
     }
 
+    this.queryCache.clear();
     this.placesByKey.clear();
     this.placeKeysById.clear();
     this.placeOrder.length = 0;
@@ -605,6 +613,7 @@ export class InMemoryFactStore {
   }
 
   private page<T extends { id: string }>(
+    cacheKey: string,
     order: readonly string[],
     keysById: ReadonlyMap<string, string>,
     records: ReadonlyMap<string, T>,
@@ -613,33 +622,49 @@ export class InMemoryFactStore {
     snapshot: (record: T) => T,
   ): FactPage<T> {
     const limit = this.resolveLimit(query.limit);
-    const start = firstIdAfter(order, query.after);
-    const items: T[] = [];
-    let total = 0;
-    let more = false;
-
-    for (let index = 0; index < order.length; index += 1) {
-      const id = order[index];
-      if (id === undefined) continue;
+    // The matching id sequence and its total are reused across the pages of one
+    // projection; locating a page is then a binary search plus a bounded slice
+    // instead of re-filtering the whole order for every page.
+    const ids = this.matchedIds(cacheKey, order, keysById, records, matches);
+    const start = firstIdAfter(ids, query.after);
+    const pageIds = ids.slice(start, start + limit);
+    const items = pageIds.map((id) => {
       const key = keysById.get(id);
-      if (key === undefined) continue;
+      if (key === undefined) throw new Error('facts store page index is inconsistent');
       const record = records.get(key);
-      if (record === undefined || !matches(record)) continue;
-      total += 1;
-      if (index < start) continue;
-      if (items.length < limit) {
-        items.push(snapshot(record));
-      } else {
-        more = true;
-      }
-    }
-
+      if (record === undefined) throw new Error('facts store page record is inconsistent');
+      return snapshot(record);
+    });
     const last = items[items.length - 1];
     return {
       items,
-      total,
-      ...(more && last !== undefined ? { nextAfter: last.id } : {}),
+      total: ids.length,
+      ...(start + items.length < ids.length && last !== undefined ? { nextAfter: last.id } : {}),
     };
+  }
+
+  private matchedIds<T extends { id: string }>(
+    cacheKey: string,
+    order: readonly string[],
+    keysById: ReadonlyMap<string, string>,
+    records: ReadonlyMap<string, T>,
+    matches: (record: T) => boolean,
+  ): readonly string[] {
+    const cached = this.queryCache.get(cacheKey);
+    if (cached !== undefined && cached.revision === this.revisionField) return cached.ids;
+    const ids: string[] = [];
+    for (const id of order) {
+      const key = keysById.get(id);
+      if (key === undefined) continue;
+      const record = records.get(key);
+      if (record !== undefined && matches(record)) ids.push(id);
+    }
+    if (this.queryCache.size >= QUERY_CACHE_LIMIT) {
+      const oldest = this.queryCache.keys().next().value;
+      if (oldest !== undefined) this.queryCache.delete(oldest);
+    }
+    this.queryCache.set(cacheKey, { revision: this.revisionField, ids });
+    return ids;
   }
 
   private resolveLimit(limit: number | undefined): number {
@@ -669,6 +694,13 @@ export class InMemoryFactStore {
     if (record === undefined) throw new Error('facts store container index is inconsistent');
     return record;
   }
+}
+
+/** Every field that changes which records match; `limit`/`after` are page cursors, not filters. */
+function queryCacheKey(kind: 'place' | 'resource' | 'container', query: FactQuery): string {
+  const cell = (query as ResourceFactQuery).sourceCell;
+  return JSON.stringify([kind, query.worldId, query.dim, query.label, query.sourceKind,
+    query.placeKinds, query.includeGone ?? false, cell?.x, cell?.y, cell?.z]);
 }
 
 function matchesQuery(record: SemanticFact, query: FactQuery): boolean {
