@@ -1,3 +1,4 @@
+import { hydrateIcons } from './icons';
 import { createPathfindingClient } from './pathfinding/client';
 import type { SimulationResult } from './pathfinding/types';
 import type { createVoxelScene } from './scene';
@@ -11,7 +12,7 @@ export function createNavigationPanel(
   setOpen: (open: boolean) => void,
 ) {
   container.innerHTML = `
-    <div class="navigation-heading"><h2><i class="redstone-icon" aria-hidden="true"></i> 三维 A* · 红石寻路</h2><span>仅在已加载选区模拟</span></div>
+    <div class="navigation-heading"><h2><i class="fact-icon" data-icon="redstone" aria-hidden="true"></i> 三维 A* · 红石寻路</h2><span>仅在已加载选区模拟</span></div>
     <div class="navigation-endpoints">
       ${(['A', 'B'] as const).map((name) => `<div class="navigation-endpoint"><button type="button" class="button dark pick-point" data-pick="${name}" aria-pressed="false">点选 ${name}</button>${(['x', 'y', 'z'] as const).map((axis) => `<label>${axis.toUpperCase()}<input type="number" data-point="${name}" data-axis="${axis}" aria-label="${name} 点 ${axis.toUpperCase()}" step="${axis === 'y' ? '0.5' : '1'}" placeholder="—" /></label>`).join('')}</div>`).join('')}
     </div>
@@ -33,6 +34,7 @@ export function createNavigationPanel(
     </div>
     <div class="navigation-key"><span><i></i> 暗红：实际展开节点</span><span><i></i> 亮红：最终路径</span><span>动画为计算完成后的过程回放</span></div>
   `;
+  hydrateIcons(container);
   const get = <T extends HTMLElement>(selector: string) => container.querySelector<T>(selector)!;
   const inputs = Array.from(container.querySelectorAll<HTMLInputElement>('[data-point]'));
   const pickButtons = Array.from(container.querySelectorAll<HTMLButtonElement>('[data-pick]'));

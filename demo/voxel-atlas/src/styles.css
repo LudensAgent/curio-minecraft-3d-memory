@@ -164,16 +164,15 @@ p { line-height: 1.6; }
 .layers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
 .layers label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
 .layers input { margin: 0; accent-color: #afc68d; }
-.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; }
-.dot.resource { background: #e1a164; }
-.dot.container { background: #d5c184; border-radius: 1px; }
-.dot.portal { background: #b49bd3; }
-.dot.place { background: #70bbb1; }
+.fact-icon { display: inline-flex; flex: none; width: 16px; height: 16px; align-items: center; justify-content: center; }
+.fact-icon > img { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+img.fact-icon { display: block; width: 16px; height: 16px; image-rendering: pixelated; }
+.layers .fact-icon { width: 15px; height: 15px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; margin: 13px 0 6px; }
 .section-heading h2, .inspector h2, .navigation-heading h2 { font-size: 13px; font-weight: 600; }
 .section-heading .mono, .muted { color: var(--muted); font-size: 11px; }
 .facts-list { max-height: min(38dvh, 320px); overflow: auto; }
-.fact-row { display: grid; grid-template-columns: 8px minmax(0,1fr) auto; width: 100%; padding: 9px 2px; align-items: center; gap: 7px; color: #e1e8da; background: transparent; border: 0; border-bottom: 1px solid #364536; text-align: left; font-size: 11px; }
+.fact-row { display: grid; grid-template-columns: 16px minmax(0,1fr) auto; width: 100%; padding: 9px 2px; align-items: center; gap: 7px; color: #e1e8da; background: transparent; border: 0; border-bottom: 1px solid #364536; text-align: left; font-size: 11px; }
 .fact-row:hover { background: #334231; }
 .fact-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fact-row small { color: var(--muted); font: 10px var(--mono); }
@@ -191,7 +190,6 @@ p { line-height: 1.6; }
 .detail-note, .inspector-content details { margin-top: 10px; }
 .inspector-content pre { font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-.redstone-icon { display: inline-block; width: 7px; height: 7px; background: #e5533d; transform: rotate(45deg); }
 .navigation-panel { width: min(350px, calc(100vw - 2 * var(--edge))); }
 .navigation-heading, .navigation-heading h2 { display: flex; align-items: center; gap: 8px; }
 .navigation-heading { justify-content: space-between; margin-bottom: 11px; }

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { factVisual } from './icons';
 import type { FactMarker, RegionData, Vec3, ViewerCell, ViewerSelection } from './types';
 
 export type NavigationOverlay = {
@@ -106,6 +107,7 @@ export function createVoxelScene(
   const extent = new THREE.Box3(new THREE.Vector3(-12, -4, -12), new THREE.Vector3(12, 8, 12));
   const pickSources = new Map<THREE.Object3D, PickSource>();
   const factObjects: { object: THREE.Object3D; fact: FactMarker }[] = [];
+  const iconTextures = new Map<string, THREE.Texture>();
   let airPoints: THREE.Points | undefined;
   let playbackBody: THREE.Mesh<THREE.BoxGeometry, THREE.MeshBasicMaterial> | undefined;
   let playbackPath: THREE.Vector3[] = [];
@@ -352,6 +354,18 @@ export function createVoxelScene(
     requestRender();
   };
 
+  const iconTexture = (key: string, canvas: HTMLCanvasElement): THREE.Texture => {
+    const existing = iconTextures.get(key);
+    if (existing) return existing;
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = THREE.NearestFilter;
+    texture.generateMipmaps = false;
+    iconTextures.set(key, texture);
+    return texture;
+  };
+
   const disposeContent = () => {
     const geometries = new Set<THREE.BufferGeometry>();
     const materials = new Set<THREE.Material>();
@@ -360,11 +374,15 @@ export function createVoxelScene(
         geometries.add(object.geometry);
         const values = Array.isArray(object.material) ? object.material : [object.material];
         values.forEach(material => materials.add(material));
+      } else if (object instanceof THREE.Sprite) {
+        materials.add(object.material);
       }
       if (object instanceof THREE.InstancedMesh) object.dispose();
     });
     geometries.forEach(geometry => geometry.dispose());
     materials.forEach(material => material.dispose());
+    iconTextures.forEach(texture => texture.dispose());
+    iconTextures.clear();
     content.clear();
     pickSources.clear();
     factObjects.length = 0;
@@ -439,27 +457,26 @@ export function createVoxelScene(
       pickSources.set(airPoints, { type: 'air', cells: air });
     }
 
-    const geometries = {
-      resource: new THREE.OctahedronGeometry(0.55),
-      container: new THREE.BoxGeometry(0.8, 0.65, 0.8),
-      portal: new THREE.TorusGeometry(0.65, 0.12, 8, 20),
-      place: new THREE.ConeGeometry(0.48, 1, 6),
-    };
-    const materialColors = { resource: 0xe69b52, container: 0xe2c565, portal: 0xbc8dcc, place: 0x66c4b4 };
-    const usedMarkerTypes = new Set<FactMarker['type']>();
+    const markerColors = { resource: 0xe69b52, container: 0xe2c565, portal: 0xbc8dcc, place: 0x66c4b4 };
     data.markers.forEach(fact => {
       const group = new THREE.Group();
-      const markerColor = materialColors[fact.type];
-      const material = new THREE.MeshBasicMaterial({ color: markerColor, transparent: fact.gone, opacity: fact.gone ? 0.4 : 1, depthTest: false });
-      const marker = new THREE.Mesh(geometries[fact.type], material);
-      usedMarkerTypes.add(fact.type);
-      marker.position.set(fact.pos.x + 0.5 - origin.x, fact.pos.y + 1.3 - origin.y, fact.pos.z + 0.5 - origin.z);
+      const visual = factVisual(fact);
+      const material = new THREE.SpriteMaterial({
+        map: iconTexture(visual.key, visual.canvas),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        opacity: fact.gone ? 0.42 : 1,
+      });
+      const marker = new THREE.Sprite(material);
+      marker.position.set(fact.pos.x + 0.5 - origin.x, fact.pos.y + 1.35 - origin.y, fact.pos.z + 0.5 - origin.z);
+      marker.scale.set(1.12, 1.12, 1);
       marker.renderOrder = 4;
       group.add(marker);
       pickSources.set(marker, { type: 'fact', facts: [fact] });
       if (fact.locationKind === 'area') {
         const radius = Math.max(fact.radius ?? 0.5, 0.5);
-        const ring = new THREE.Mesh(new THREE.RingGeometry(Math.max(0, radius - 0.065), radius + 0.065, 48), new THREE.MeshBasicMaterial({ color: markerColor, transparent: true, opacity: fact.gone ? 0.2 : 0.65, side: THREE.DoubleSide, depthWrite: false }));
+        const ring = new THREE.Mesh(new THREE.RingGeometry(Math.max(0, radius - 0.065), radius + 0.065, 48), new THREE.MeshBasicMaterial({ color: markerColors[fact.type], transparent: true, opacity: fact.gone ? 0.2 : 0.65, side: THREE.DoubleSide, depthWrite: false }));
         ring.rotation.x = -Math.PI / 2;
         ring.position.set(fact.pos.x - origin.x, fact.pos.y + 0.12 - origin.y, fact.pos.z - origin.z);
         group.add(ring);
@@ -468,9 +485,6 @@ export function createVoxelScene(
       content.add(group);
       factObjects.push({ object: group, fact });
       if (visibleFact(fact)) extent.expandByPoint(marker.position);
-    });
-    Object.entries(geometries).forEach(([kind, geometry]) => {
-      if (!usedMarkerTypes.has(kind as FactMarker['type'])) geometry.dispose();
     });
     if (extent.isEmpty()) {
       extent.set(new THREE.Vector3(bounds.minX - origin.x, bounds.minY - origin.y, bounds.minZ - origin.z), new THREE.Vector3(bounds.maxX + 1 - origin.x, bounds.maxY + 1 - origin.y, bounds.maxZ + 1 - origin.z));
@@ -512,7 +526,7 @@ export function createVoxelScene(
       const fact = source.facts[hit.instanceId ?? 0];
       if (!fact) return;
       selected = { type: 'fact', fact };
-      outline.position.set(fact.pos.x + 0.5 - origin.x, fact.pos.y + 1.3 - origin.y, fact.pos.z + 0.5 - origin.z);
+      outline.position.set(fact.pos.x + 0.5 - origin.x, fact.pos.y + 1.35 - origin.y, fact.pos.z + 0.5 - origin.z);
       outline.scale.setScalar(1.2);
     } else {
       const index = source.type === 'air' ? hit.index : hit.instanceId;

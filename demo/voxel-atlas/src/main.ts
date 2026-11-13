@@ -1,5 +1,6 @@
 import './styles.css';
 import { createDatabaseClient } from './data/client';
+import { factIconImage, hydrateIcons } from './icons';
 import { createVoxelScene } from './scene';
 import { createRegionMap } from './region-map';
 import { createNavigationPanel } from './navigation-panel';
@@ -59,19 +60,19 @@ app.innerHTML = `
       </section>
       <section id="facts-panel" class="float-panel facts-panel" aria-labelledby="facts-toggle" hidden>
         <div class="layers" aria-label="可见图层">
-          <label><input type="checkbox" id="layer-resources" checked /><i class="dot resource" aria-hidden="true"></i>资源点</label>
-          <label><input type="checkbox" id="layer-containers" checked /><i class="dot container" aria-hidden="true"></i>容器</label>
-          <label><input type="checkbox" id="layer-portals" checked /><i class="dot portal" aria-hidden="true"></i>传送门</label>
-          <label><input type="checkbox" id="layer-places" checked /><i class="dot place" aria-hidden="true"></i>记录点</label>
-          <label><input type="checkbox" id="layer-air" />已观测空气</label>
-          <label><input type="checkbox" id="layer-gone" />已消失 / 撤销</label>
+          <label><input type="checkbox" id="layer-resources" checked /><i class="fact-icon" data-icon="resource" aria-hidden="true"></i>资源点</label>
+          <label><input type="checkbox" id="layer-containers" checked /><i class="fact-icon" data-icon="container" aria-hidden="true"></i>容器</label>
+          <label><input type="checkbox" id="layer-portals" checked /><i class="fact-icon" data-icon="portal" aria-hidden="true"></i>传送门</label>
+          <label><input type="checkbox" id="layer-places" checked /><i class="fact-icon" data-icon="place" aria-hidden="true"></i>记录点</label>
+          <label><input type="checkbox" id="layer-air" /><i class="fact-icon" data-icon="air" aria-hidden="true"></i>已观测空气</label>
+          <label><input type="checkbox" id="layer-gone" /><i class="fact-icon" data-icon="gone" aria-hidden="true"></i>已消失 / 撤销</label>
         </div>
         <div class="section-heading"><h2 id="facts-title">本区记录</h2><span id="facts-count" class="mono">0</span></div>
         <div id="facts-list" class="facts-list"><p class="muted">加载区域后显示资源、容器和地点。</p></div>
       </section>
     </aside>
     <div class="navigation-float">
-      <button type="button" id="navigation-toggle" class="float-toggle" aria-controls="navigation-panel" aria-expanded="false"><i class="redstone-icon" aria-hidden="true"></i><span data-toggle-label>红石寻路</span></button>
+      <button type="button" id="navigation-toggle" class="float-toggle" aria-controls="navigation-panel" aria-expanded="false"><i class="fact-icon" data-icon="redstone" aria-hidden="true"></i><span data-toggle-label>红石寻路</span></button>
       <section class="float-panel navigation-panel" id="navigation-panel" aria-labelledby="navigation-toggle" hidden></section>
     </div>
     <div class="observation-float">
@@ -89,6 +90,7 @@ app.innerHTML = `
   <div id="drop-overlay" class="drop-overlay" hidden><div><strong>松开以导入 SQLite</strong></div></div>
   <div id="error" class="error-message" role="alert" hidden></div>
 `;
+hydrateIcons();
 
 const element = <T extends HTMLElement>(id: string) => {
   const value = document.getElementById(id);
@@ -307,7 +309,7 @@ function renderFacts() {
   if (!facts.length) { const hint = document.createElement('p'); hint.className = 'muted'; hint.textContent = loaded ? '当前选区和图层下没有记录。' : '加载区域后显示资源、容器和地点。'; list.append(hint); return; }
   for (const fact of facts.slice(0, 200)) {
     const button = document.createElement('button'); button.type = 'button'; button.className = `fact-row ${fact.type}${fact.gone ? ' gone' : ''}`;
-    const marker = document.createElement('i'); marker.className = `dot ${fact.type}`;
+    const marker = factIconImage(fact);
     const name = document.createElement('span'); name.textContent = fact.label || factNames[fact.type];
     const pos = document.createElement('small'); pos.textContent = `${fact.pos.x}, ${fact.pos.y}, ${fact.pos.z}`;
     button.append(marker, name, pos);
